@@ -152,3 +152,58 @@ checkpoints
 internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
+
+# Local model/data artifacts for VLMap safety integration.
+# Keep server-side checkpoints, datasets, debug outputs, and generated maps out of git.
+/checkpoints/
+/data/
+/datasets/
+/logs/
+/outputs/
+/results/
+/result/
+/runs/
+/wandb/
+/test_data/
+/vlmap_debug/
+/internnav.egg-info/
+/.vscode/
+/.idea/
+
+# Large model/data files
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+*.h5df
+*.lmdb
+*.npy
+*.npz
+*.pkl
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.whl
+
+# Runtime/debug artifacts
+*.mp4
+*.avi
+*.mov
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.pid
+nohup.out
+*.log
+*.log.json
+
+# Hydra and cache outputs
+.hydra/
+.cache/
+.pytest_cache/
