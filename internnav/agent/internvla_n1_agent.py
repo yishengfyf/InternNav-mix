@@ -16,6 +16,7 @@ from internnav.configs.model.base_encoders import ModelCfg
 from internnav.model import get_config, get_policy
 from internnav.model.utils.misc import set_random_seed
 from internnav.model.utils.vln_utils import S1Input, S1Output, S2Input, S2Output
+from internnav.agent.vlmap_safety import VLMapActionSafety
 
 
 @Agent.register('internvla_n1')
@@ -45,6 +46,7 @@ class InternVLAN1Agent(Agent):
         self.camera_intrinsic = self.get_intrinsic_matrix(
             self._model_settings.width, self._model_settings.height, self._model_settings.hfov
         )
+        self.vlmap_safety = VLMapActionSafety(vln_sensor_config.get("vlmap_safety", {}), self.camera_intrinsic)
 
         self.episode_step = 0
         self.episode_idx = 0
@@ -111,6 +113,7 @@ class InternVLAN1Agent(Agent):
         # Reset s2 agent
         with self.s2_agent_lock:
             self.policy.reset()
+        self.vlmap_safety.reset()
 
         if self.vis_debug:
             self.fps_writer = imageio.get_writer(f"{self.debug_path}/fps_{self.episode_idx}.mp4", fps=5)
@@ -370,6 +373,16 @@ class InternVLAN1Agent(Agent):
                         print("!!!!!!!!!!!!")
 
         print('Output discretized traj:', output['action'], self.dual_forward_step)
+
+        if 'action' in output:
+            safe_action, changed = self.vlmap_safety.postprocess(obs, output['action'][0])
+            if changed:
+                output['action'] = [safe_action]
+                with self.s2_output_lock:
+                    self.s2_output.output_action = None
+                    self.s2_output.output_pixel = None
+                    self.s2_output.output_latent = None
+                self.dual_forward_step = self.sys2_max_forward_step
 
         # Visualization
         if self.vis_debug:

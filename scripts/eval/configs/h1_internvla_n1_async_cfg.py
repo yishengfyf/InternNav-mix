@@ -34,6 +34,21 @@ eval_cfg = EvalCfg(
             # debug
             'vis_debug': True,  # If vis_debug=True, you can get visualization results
             'vis_debug_path': './logs/test_n1/vis_debug',
+            'vlmap_safety': {
+                'enable': False,
+                'vlmaps_repo': '../vlmaps',
+                'grid_size': 1000,
+                'cell_size': 0.05,
+                'camera_height': 1.5,
+                'depth_scale': 10.0,
+                'depth_sample_rate': 80,
+                'forward_distance': 0.25,
+                'turn_angle_deg': 15.0,
+                'radius_cells': 2,
+                'update_every_steps': 1,
+                'quat_order': 'wxyz',
+                'verbose': True,
+            },
         },
     ),
     env=EnvCfg(
