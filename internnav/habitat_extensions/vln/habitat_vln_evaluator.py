@@ -10,6 +10,7 @@ import itertools
 import random
 import re
 from collections import OrderedDict
+from typing import Optional
 
 import cv2
 import habitat
@@ -178,6 +179,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             vlmap_safety_cfg,
             get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
         )
+        self._vlmap_last_nav_action = None
 
     def eval_action(self):
         """
@@ -249,13 +251,31 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         actions = itertools.chain.from_iterable(actions)
         return list(actions)
 
-    def _postprocess_habitat_action_with_vlmap_safety(self, action, observations: dict, depth_m: np.ndarray):
+    def _postprocess_habitat_action_with_vlmap_safety(
+        self,
+        action,
+        observations: dict,
+        depth_m: np.ndarray,
+        rgb: Optional[np.ndarray] = None,
+        step_id: Optional[int] = None,
+        scene_id: Optional[str] = None,
+        episode_id: Optional[int] = None,
+        pixel_goal=None,
+    ):
         if not hasattr(self, "vlmap_safety"):
             return action, False
         safety_obs = {
             "depth": depth_m,
+            "rgb": rgb,
             "gps": observations.get("gps"),
             "compass": observations.get("compass"),
+            "last_nav_action": self._vlmap_last_nav_action,
+            "debug_context": {
+                "step_id": step_id,
+                "scene_id": scene_id,
+                "episode_id": episode_id,
+                "pixel_goal": pixel_goal,
+            },
         }
         if safety_obs["gps"] is None or safety_obs["compass"] is None:
             return action, False
@@ -306,6 +326,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             episode_instruction = episode.instruction.instruction_text
             print("episode start", episode_instruction)
             self.vlmap_safety.reset()
+            self._vlmap_last_nav_action = None
 
             # save first frame per rank to validate sim quality
             os.makedirs(os.path.join(self.output_path, f'check_sim_{self.epoch}'), exist_ok=True)
@@ -555,15 +576,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     action = 0
 
                 action, vlmap_safety_changed = self._postprocess_habitat_action_with_vlmap_safety(
-                    action, observations, current_depth_m
+                    action,
+                    observations,
+                    current_depth_m,
+                    rgb=rgb,
+                    step_id=step_id,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    pixel_goal=pixel_goal,
                 )
                 if vlmap_safety_changed:
                     action_seq = []
                     local_actions = []
-                    pixel_goal = None
-                    output_ids = None
                     messages = []
                     forward_action = 0
+                    if pixel_goal is None:
+                        output_ids = None
 
                 info = self.env.get_metrics()
 
@@ -600,6 +628,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     step_id += 1
                     messages = []
                     flag = False
+                    if action in (action_code.FORWARD, action_code.LEFT, action_code.RIGHT):
+                        self._vlmap_last_nav_action = int(action)
 
             # ---------- 3. End of episode -----------
             # collect the metric result of this episode and write progress to the output_path/progress.json
