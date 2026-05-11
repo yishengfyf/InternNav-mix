@@ -13,6 +13,19 @@ eval_cfg = EvalCfg(
             "max_new_tokens": 1024,  # maximum number of tokens for generation
             "vis_debug": False,  # If vis_debug=True, save debug videos per episode
             "vis_debug_path": "./logs/habitat/vis_debug",
+            "vlmap_safety": {
+                "enable": False,
+                "vlmaps_repo": "../vlmaps",
+                "grid_size": 1000,
+                "cell_size": 0.05,
+                "depth_scale": 1.0,
+                "depth_sample_rate": 80,
+                "forward_distance": 0.25,
+                "turn_angle_deg": 15.0,
+                "radius_cells": 2,
+                "update_every_steps": 1,
+                "verbose": True,
+            },
         },
     ),
     env=EnvCfg(

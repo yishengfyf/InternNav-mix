@@ -42,6 +42,7 @@ from internnav.habitat_extensions.vln.utils import (
 )
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
+from internnav.utils.vlmap_safety import VLMapActionSafety
 
 # Import for Habitat registry side effects — do not remove
 import internnav.habitat_extensions.vln.measures  # noqa: F401 # isort: skip
@@ -170,6 +171,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         camera_fov_rad = np.deg2rad(self.sim_sensors_config.depth_sensor.hfov)
         self._camera_fov = camera_fov_rad
         self._fx = self._fy = self.sim_sensors_config.depth_sensor.width / (2 * np.tan(camera_fov_rad / 2))
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        vlmap_safety_cfg.setdefault("camera_height", float(self._camera_height))
+        vlmap_safety_cfg.setdefault("depth_scale", 1.0)
+        self.vlmap_safety = VLMapActionSafety(
+            vlmap_safety_cfg,
+            get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
+        )
 
     def eval_action(self):
         """
@@ -241,6 +249,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         actions = itertools.chain.from_iterable(actions)
         return list(actions)
 
+    def _postprocess_habitat_action_with_vlmap_safety(self, action, observations: dict, depth_m: np.ndarray):
+        if not hasattr(self, "vlmap_safety"):
+            return action, False
+        safety_obs = {
+            "depth": depth_m,
+            "gps": observations.get("gps"),
+            "compass": observations.get("compass"),
+        }
+        if safety_obs["gps"] is None or safety_obs["compass"] is None:
+            return action, False
+        safe_action, changed = self.vlmap_safety.postprocess(safety_obs, int(action))
+        if changed:
+            print(f"[VLMapSafety][Habitat] replace action {int(action)} -> {int(safe_action)}")
+        return int(safe_action), changed
+
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
         if self.rank != 0:
@@ -282,6 +305,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             episode_id = int(episode.episode_id)
             episode_instruction = episode.instruction.instruction_text
             print("episode start", episode_instruction)
+            self.vlmap_safety.reset()
 
             # save first frame per rank to validate sim quality
             os.makedirs(os.path.join(self.output_path, f'check_sim_{self.epoch}'), exist_ok=True)
@@ -325,7 +349,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 x, y = observations["gps"]
                 depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
                 depth = depth * (self._max_depth - self._min_depth) + self._min_depth
-                depth = depth * 1000
+                current_depth_m = depth.copy()
+                depth = current_depth_m * 1000
 
                 image = Image.fromarray(rgb).convert('RGB')
                 save_raw_image = image.copy()
@@ -528,6 +553,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         continue
                 else:
                     action = 0
+
+                action, vlmap_safety_changed = self._postprocess_habitat_action_with_vlmap_safety(
+                    action, observations, current_depth_m
+                )
+                if vlmap_safety_changed:
+                    action_seq = []
+                    local_actions = []
+                    pixel_goal = None
+                    output_ids = None
+                    messages = []
+                    forward_action = 0
 
                 info = self.env.get_metrics()
 

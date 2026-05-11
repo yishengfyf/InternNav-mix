@@ -16,7 +16,7 @@ from internnav.configs.model.base_encoders import ModelCfg
 from internnav.model import get_config, get_policy
 from internnav.model.utils.misc import set_random_seed
 from internnav.model.utils.vln_utils import S1Input, S1Output, S2Input, S2Output
-from internnav.agent.vlmap_safety import VLMapActionSafety
+from internnav.utils.vlmap_safety import VLMapActionSafety
 
 
 @Agent.register('internvla_n1')
