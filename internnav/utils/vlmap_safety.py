@@ -58,12 +58,18 @@ class VLMapActionSafety:
         self.update_every_steps = max(1, int(self.config.get("update_every_steps", 1)))
         self.min_update_distance = float(self.config.get("min_update_distance", 0.0))
         self.quat_order = str(self.config.get("quat_order", "wxyz"))
+        self.line_skip_distance = float(self.config.get("line_skip_distance", 0.10))
+        self.line_blocked_fraction = float(self.config.get("line_blocked_fraction", 0.50))
+        self.line_blocked_min_cells = int(self.config.get("line_blocked_min_cells", 2))
+        self.line_cell_blocked_fraction = float(self.config.get("line_cell_blocked_fraction", 0.25))
         self.prefer_previous_turn = bool(self.config.get("prefer_previous_turn", True))
         self.shadow_only = bool(self.config.get("shadow_only", False))
         self.debug = bool(self.config.get("debug", False))
         self.debug_dir = os.path.abspath(
             os.path.expanduser(str(self.config.get("debug_dir", "./logs/vlmap_safety_debug")))
         )
+        self.debug_log_all_events = bool(self.config.get("debug_log_all_events", True))
+        self.debug_max_snapshots = int(self.config.get("debug_max_snapshots", 200))
         self.debug_save_on_change = bool(self.config.get("debug_save_on_change", True))
         self.debug_save_every_steps = int(self.config.get("debug_save_every_steps", 0))
         self.debug_crop_radius_cells = int(self.config.get("debug_crop_radius_cells", 80))
@@ -72,6 +78,7 @@ class VLMapActionSafety:
         self._step = 0
         self._disabled_reason: Optional[str] = None
         self._debug_import_warned = False
+        self._debug_saved_snapshots = 0
 
         self.builder = None
         if self.enabled:
@@ -80,6 +87,7 @@ class VLMapActionSafety:
     def reset(self) -> None:
         self._last_update_position = None
         self._step = 0
+        self._debug_saved_snapshots = 0
         if self.builder is not None:
             self.builder.reset()
 
@@ -99,11 +107,11 @@ class VLMapActionSafety:
 
         self._maybe_update(obs["depth"], pose_tf)
         if original_action == self.forward_action:
-            front_free = self.builder.is_forward_free(
-                pose_tf, self.forward_distance, radius_cells=self.radius_cells
-            )
+            front_free, front_stats = self._is_forward_free(pose_tf)
+            probe_info = {"front": front_stats}
             if not front_free:
                 corrected, probe_info = self._pick_turn_action(pose_tf, obs)
+                probe_info["front"] = front_stats
                 if self.shadow_only:
                     safe_action = original_action
                 else:
@@ -153,7 +161,7 @@ class VLMapActionSafety:
             "depth_sample_rate": int(self.config.get("depth_sample_rate", 80)),
             "min_depth": float(self.config.get("min_depth", 0.1)),
             "max_depth": float(self.config.get("max_depth", 6.0)),
-            "obstacle_height_min": float(self.config.get("obstacle_height_min", 0.05)),
+            "obstacle_height_min": float(self.config.get("obstacle_height_min", 0.15)),
             "obstacle_height_max": float(self.config.get("obstacle_height_max", 1.5)),
             "center_on_first_pose": bool(self.config.get("center_on_first_pose", True)),
         }
@@ -220,8 +228,8 @@ class VLMapActionSafety:
         right_yaw = yaw - math.radians(self.turn_angle_deg)
         left_probe = self._probe_grid(row, col, left_yaw, probe_distance)
         right_probe = self._probe_grid(row, col, right_yaw, probe_distance)
-        left_free = self.builder.is_line_free((row, col), left_probe, radius_cells=self.radius_cells)
-        right_free = self.builder.is_line_free((row, col), right_probe, radius_cells=self.radius_cells)
+        left_free, left_stats = self._is_line_free((row, col), left_probe)
+        right_free, right_stats = self._is_line_free((row, col), right_probe)
         preferred_turn = self._preferred_turn_action(obs)
         if left_free and not right_free:
             corrected = self.left_action
@@ -241,10 +249,80 @@ class VLMapActionSafety:
             "right_probe": [int(right_probe[0]), int(right_probe[1])],
             "left_free": bool(left_free),
             "right_free": bool(right_free),
+            "left_stats": left_stats,
+            "right_stats": right_stats,
             "preferred_turn": int(preferred_turn) if preferred_turn is not None else None,
             "corrected": int(corrected),
         }
         return corrected, probe_info
+
+    def _is_forward_free(self, pose_tf: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
+        start_row, start_col, _ = self.builder.base_pose_to_grid(pose_tf)
+        goal_row, goal_col = self.builder.forward_target_grid(pose_tf, self.forward_distance)
+        return self._is_line_free((start_row, start_col), (goal_row, goal_col))
+
+    def _is_line_free(self, start: Tuple[int, int], goal: Tuple[int, int]) -> Tuple[bool, Dict[str, Any]]:
+        obstacle_map = self.builder.get_obstacle_map()
+        line = list(self._grid_line(start, goal))
+        skip_cells = max(0, int(math.floor(self.line_skip_distance / self.builder.cs)))
+        if skip_cells > 0 and len(line) > skip_cells:
+            line = line[skip_cells:]
+
+        checked = 0
+        blocked = 0
+        radius = max(0, int(self.radius_cells))
+        for row, col in line:
+            if row < 0 or row >= self.builder.gs or col < 0 or col >= self.builder.gs:
+                continue
+            r0 = max(0, row - radius)
+            r1 = min(self.builder.gs, row + radius + 1)
+            c0 = max(0, col - radius)
+            c1 = min(self.builder.gs, col + radius + 1)
+            local = obstacle_map[r0:r1, c0:c1]
+            checked += 1
+            if local.size and float(np.mean(local == 0)) >= self.line_cell_blocked_fraction:
+                blocked += 1
+
+        blocked_fraction = blocked / checked if checked > 0 else 0.0
+        is_blocked = (
+            checked > 0
+            and blocked >= self.line_blocked_min_cells
+            and blocked_fraction >= self.line_blocked_fraction
+        )
+        stats = {
+            "start": [int(start[0]), int(start[1])],
+            "goal": [int(goal[0]), int(goal[1])],
+            "checked": int(checked),
+            "blocked": int(blocked),
+            "blocked_fraction": float(blocked_fraction),
+            "skip_cells": int(skip_cells),
+            "radius_cells": int(radius),
+            "blocked_min_cells": int(self.line_blocked_min_cells),
+            "blocked_fraction_threshold": float(self.line_blocked_fraction),
+            "cell_blocked_fraction_threshold": float(self.line_cell_blocked_fraction),
+        }
+        return not is_blocked, stats
+
+    def _grid_line(self, start: Tuple[int, int], goal: Tuple[int, int]):
+        r0, c0 = int(start[0]), int(start[1])
+        r1, c1 = int(goal[0]), int(goal[1])
+        dr = abs(r1 - r0)
+        dc = abs(c1 - c0)
+        sr = 1 if r0 < r1 else -1
+        sc = 1 if c0 < c1 else -1
+        err = dr - dc
+        row, col = r0, c0
+        while True:
+            yield row, col
+            if row == r1 and col == c1:
+                break
+            err2 = 2 * err
+            if err2 > -dc:
+                err -= dc
+                row += sr
+            if err2 < dr:
+                err += dr
+                col += sc
 
     def _preferred_turn_action(self, obs: Dict[str, Any]) -> Optional[int]:
         if not self.prefer_previous_turn:
@@ -275,15 +353,9 @@ class VLMapActionSafety:
             should_save = True
         else:
             should_save = False
-        if not should_save:
-            return
-
-        try:
-            from PIL import Image, ImageDraw
-        except Exception as exc:
-            if not self._debug_import_warned:
-                print(f"[VLMapSafety] debug snapshot disabled because PIL import failed: {exc}")
-                self._debug_import_warned = True
+        if self.debug_max_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_max_snapshots:
+            should_save = False
+        if not should_save and not self.debug_log_all_events:
             return
 
         os.makedirs(self.debug_dir, exist_ok=True)
@@ -293,22 +365,32 @@ class VLMapActionSafety:
         eval_step = context.get("step_id", self._step)
         prefix = f"{scene_id}_ep{episode_id}_step{int(eval_step):05d}_safe{self._step:05d}"
 
-        rgb_img = self._rgb_debug_image(obs.get("rgb"), Image, ImageDraw)
-        depth_img = self._depth_debug_image(obs.get("depth"), Image, ImageDraw)
-        map_img = self._map_debug_image(pose_tf, probe_info, front_free, Image, ImageDraw)
-        panels = [img for img in (rgb_img, depth_img, map_img) if img is not None]
-        if panels:
-            height = max(img.height for img in panels)
-            width = sum(img.width for img in panels)
-            canvas = Image.new("RGB", (width, height), (20, 20, 20))
-            offset = 0
-            for img in panels:
-                canvas.paste(img, (offset, 0))
-                offset += img.width
-            image_path = os.path.join(self.debug_dir, f"{prefix}.png")
-            canvas.save(image_path)
-        else:
-            image_path = None
+        image_path = None
+        if should_save:
+            try:
+                from PIL import Image, ImageDraw
+            except Exception as exc:
+                if not self._debug_import_warned:
+                    print(f"[VLMapSafety] debug snapshot disabled because PIL import failed: {exc}")
+                    self._debug_import_warned = True
+                should_save = False
+
+        if should_save:
+            rgb_img = self._rgb_debug_image(obs.get("rgb"), Image, ImageDraw)
+            depth_img = self._depth_debug_image(obs.get("depth"), Image, ImageDraw)
+            map_img = self._map_debug_image(pose_tf, probe_info, front_free, Image, ImageDraw)
+            panels = [img for img in (rgb_img, depth_img, map_img) if img is not None]
+            if panels:
+                height = max(img.height for img in panels)
+                width = sum(img.width for img in panels)
+                canvas = Image.new("RGB", (width, height), (20, 20, 20))
+                offset = 0
+                for img in panels:
+                    canvas.paste(img, (offset, 0))
+                    offset += img.width
+                image_path = os.path.join(self.debug_dir, f"{prefix}.png")
+                canvas.save(image_path)
+                self._debug_saved_snapshots += 1
 
         event = {
             "scene_id": context.get("scene_id"),
