@@ -58,16 +58,20 @@ class VLMapActionSafety:
         self.update_every_steps = max(1, int(self.config.get("update_every_steps", 1)))
         self.min_update_distance = float(self.config.get("min_update_distance", 0.0))
         self.quat_order = str(self.config.get("quat_order", "wxyz"))
-        self.line_skip_distance = float(self.config.get("line_skip_distance", 0.10))
-        self.line_blocked_fraction = float(self.config.get("line_blocked_fraction", 0.50))
-        self.line_blocked_min_cells = int(self.config.get("line_blocked_min_cells", 2))
+        self.line_skip_distance = float(self.config.get("line_skip_distance", 0.08))
+        self.line_blocked_fraction = float(self.config.get("line_blocked_fraction", 0.67))
+        self.line_blocked_min_cells = int(self.config.get("line_blocked_min_cells", 3))
+        self.line_min_checked_cells = int(self.config.get("line_min_checked_cells", 3))
         self.line_cell_blocked_fraction = float(self.config.get("line_cell_blocked_fraction", 0.25))
         self.prefer_previous_turn = bool(self.config.get("prefer_previous_turn", True))
         self.shadow_only = bool(self.config.get("shadow_only", False))
         self.debug = bool(self.config.get("debug", False))
-        self.debug_dir = os.path.abspath(
+        self.debug_root_dir = os.path.abspath(
             os.path.expanduser(str(self.config.get("debug_dir", "./logs/vlmap_safety_debug")))
         )
+        self.debug_use_run_subdir = bool(self.config.get("debug_use_run_subdir", True))
+        self.debug_run_prefix = str(self.config.get("debug_run_prefix", "run"))
+        self.debug_dir: Optional[str] = None
         self.debug_log_all_events = bool(self.config.get("debug_log_all_events", True))
         self.debug_max_snapshots = int(self.config.get("debug_max_snapshots", 200))
         self.debug_save_on_change = bool(self.config.get("debug_save_on_change", True))
@@ -285,7 +289,7 @@ class VLMapActionSafety:
 
         blocked_fraction = blocked / checked if checked > 0 else 0.0
         is_blocked = (
-            checked > 0
+            checked >= self.line_min_checked_cells
             and blocked >= self.line_blocked_min_cells
             and blocked_fraction >= self.line_blocked_fraction
         )
@@ -297,6 +301,7 @@ class VLMapActionSafety:
             "blocked_fraction": float(blocked_fraction),
             "skip_cells": int(skip_cells),
             "radius_cells": int(radius),
+            "min_checked_cells": int(self.line_min_checked_cells),
             "blocked_min_cells": int(self.line_blocked_min_cells),
             "blocked_fraction_threshold": float(self.line_blocked_fraction),
             "cell_blocked_fraction_threshold": float(self.line_cell_blocked_fraction),
@@ -358,7 +363,8 @@ class VLMapActionSafety:
         if not should_save and not self.debug_log_all_events:
             return
 
-        os.makedirs(self.debug_dir, exist_ok=True)
+        debug_dir = self._get_debug_dir()
+        os.makedirs(debug_dir, exist_ok=True)
         context = obs.get("debug_context", {}) or {}
         episode_id = context.get("episode_id", "unknown")
         scene_id = str(context.get("scene_id", "scene")).replace(os.sep, "_")
@@ -388,7 +394,7 @@ class VLMapActionSafety:
                 for img in panels:
                     canvas.paste(img, (offset, 0))
                     offset += img.width
-                image_path = os.path.join(self.debug_dir, f"{prefix}.png")
+                image_path = os.path.join(debug_dir, f"{prefix}.png")
                 canvas.save(image_path)
                 self._debug_saved_snapshots += 1
 
@@ -409,8 +415,29 @@ class VLMapActionSafety:
             "probe": probe_info,
             "image_path": image_path,
         }
-        with open(os.path.join(self.debug_dir, "events.jsonl"), "a", encoding="utf-8") as f:
+        with open(os.path.join(debug_dir, "events.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _get_debug_dir(self) -> str:
+        if self.debug_dir is not None:
+            return self.debug_dir
+        if not self.debug_use_run_subdir:
+            self.debug_dir = self.debug_root_dir
+            return self.debug_dir
+
+        os.makedirs(self.debug_root_dir, exist_ok=True)
+        for idx in range(1, 10000):
+            candidate = os.path.join(self.debug_root_dir, f"{self.debug_run_prefix}_{idx:03d}")
+            try:
+                os.makedirs(candidate)
+            except FileExistsError:
+                continue
+            self.debug_dir = candidate
+            if self.verbose:
+                print(f"[VLMapSafety] debug output dir: {self.debug_dir}")
+            return self.debug_dir
+
+        raise RuntimeError(f"Unable to allocate a debug run directory under {self.debug_root_dir}")
 
     def _rgb_debug_image(self, rgb: Any, Image: Any, ImageDraw: Any) -> Optional[Any]:
         if rgb is None:
@@ -502,6 +529,12 @@ class VLMapActionSafety:
         draw.line([agent_xy, heading_xy], fill=(40, 220, 80), width=max(2, scale))
 
         front_text = "unknown" if front_free is None else ("free" if front_free else "blocked")
+        front_stats = probe_info.get("front") if probe_info is not None else None
+        if front_stats is not None:
+            front_text += (
+                f" F={front_stats.get('blocked', '?')}/{front_stats.get('checked', '?')}"
+                f"@{front_stats.get('blocked_fraction', 0.0):.2f}"
+            )
         if probe_info is not None:
             turn_text = (
                 f"L={probe_info.get('left_free')} R={probe_info.get('right_free')} "
