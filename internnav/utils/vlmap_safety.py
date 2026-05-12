@@ -69,6 +69,14 @@ class VLMapActionSafety:
         self.repeat_block_window_steps = int(self.config.get("repeat_block_window_steps", 10))
         self.repeat_block_distance = float(self.config.get("repeat_block_distance", 0.60))
         self.repeat_turn_lock_steps = int(self.config.get("repeat_turn_lock_steps", 10))
+        self.cluster_reset_distance = float(self.config.get("cluster_reset_distance", self.repeat_block_distance))
+        self.cluster_reset_steps = int(
+            self.config.get("cluster_reset_steps", max(20, self.repeat_block_window_steps * 3))
+        )
+        self.max_same_turn_in_cluster = max(1, int(self.config.get("max_same_turn_in_cluster", 2)))
+        self.max_replans_per_cluster = int(self.config.get("max_replans_per_cluster", 2))
+        self.replan_cooldown_steps = max(0, int(self.config.get("replan_cooldown_steps", 8)))
+        self.recovery_turn_steps = max(1, int(self.config.get("recovery_turn_steps", 1)))
         self.shadow_only = bool(self.config.get("shadow_only", False))
         self.debug = bool(self.config.get("debug", False))
         self.debug_root_dir = os.path.abspath(
@@ -92,6 +100,16 @@ class VLMapActionSafety:
         self._last_safety_turn_action: Optional[int] = None
         self._last_safety_turn_step: Optional[int] = None
         self._last_safety_turn_position: Optional[np.ndarray] = None
+        self._cluster_seq = 0
+        self._active_cluster_id: Optional[int] = None
+        self._cluster_start_position: Optional[np.ndarray] = None
+        self._cluster_last_position: Optional[np.ndarray] = None
+        self._cluster_last_step: Optional[int] = None
+        self._cluster_replan_count = 0
+        self._cluster_turn_counts = {self.left_action: 0, self.right_action: 0}
+        self._same_turn_streak_action: Optional[int] = None
+        self._same_turn_streak_count = 0
+        self._replan_cooldown_until_step = -1
         self.last_decision: Dict[str, Any] = {}
 
         self.builder = None
@@ -106,6 +124,8 @@ class VLMapActionSafety:
         self._last_safety_turn_action = None
         self._last_safety_turn_step = None
         self._last_safety_turn_position = None
+        self._clear_block_cluster()
+        self._cluster_seq = 0
         self.last_decision = {}
         if self.builder is not None:
             self.builder.reset()
@@ -124,6 +144,8 @@ class VLMapActionSafety:
         front_free = None
         probe_info = None
         replan_required = False
+        replan_suppressed_reason = None
+        recovery_actions = []
         repeat_block_count = 0
         position = pose_tf[:3, 3].copy()
         self.last_decision = {
@@ -132,7 +154,11 @@ class VLMapActionSafety:
             "changed": False,
             "front_free": None,
             "replan_required": False,
+            "replan_suppressed_reason": None,
             "repeat_block_count": 0,
+            "cluster_id": self._active_cluster_id,
+            "cluster_replan_count": int(self._cluster_replan_count),
+            "recovery_actions": [],
         }
 
         self._maybe_update(obs["depth"], pose_tf)
@@ -140,6 +166,7 @@ class VLMapActionSafety:
             front_free, front_stats = self._is_forward_free(pose_tf)
             probe_info = {"front": front_stats}
             if not front_free:
+                self._ensure_block_cluster(position)
                 obs_for_pick = dict(obs)
                 locked_turn = self._locked_safety_turn(position)
                 if locked_turn is not None:
@@ -147,15 +174,32 @@ class VLMapActionSafety:
                 corrected, probe_info = self._pick_turn_action(pose_tf, obs_for_pick)
                 probe_info["front"] = front_stats
                 repeat_block_count = self._record_block(position, corrected)
-                replan_required = (
-                    self.repeat_block_enable
-                    and not self.shadow_only
-                    and repeat_block_count >= self.repeat_block_count
-                )
-                if replan_required:
+                repeat_threshold_met = self.repeat_block_enable and repeat_block_count >= self.repeat_block_count
+                if repeat_threshold_met and not self.shadow_only:
+                    if self.recovery_turn_steps > 1:
+                        recovery_actions = [int(corrected)] * (self.recovery_turn_steps - 1)
+                    cooldown_remaining = self._replan_cooldown_remaining()
+                    if cooldown_remaining > 0:
+                        replan_suppressed_reason = "cooldown"
+                    elif self.max_replans_per_cluster >= 0 and self._cluster_replan_count >= self.max_replans_per_cluster:
+                        replan_suppressed_reason = "max_cluster_replans"
+                    else:
+                        replan_required = True
+                        self._cluster_replan_count += 1
+                        self._replan_cooldown_until_step = self._step + self.replan_cooldown_steps
                     self._clear_recent_blocks()
                 probe_info["repeat_block_count"] = int(repeat_block_count)
                 probe_info["replan_required"] = bool(replan_required)
+                probe_info["replan_suppressed_reason"] = replan_suppressed_reason
+                probe_info["cluster_id"] = self._active_cluster_id
+                probe_info["cluster_replan_count"] = int(self._cluster_replan_count)
+                probe_info["cluster_turn_counts"] = {
+                    "left": int(self._cluster_turn_counts.get(self.left_action, 0)),
+                    "right": int(self._cluster_turn_counts.get(self.right_action, 0)),
+                }
+                probe_info["same_turn_streak"] = int(self._same_turn_streak_count)
+                probe_info["replan_cooldown_remaining"] = int(self._replan_cooldown_remaining())
+                probe_info["recovery_actions"] = recovery_actions
                 if self.shadow_only:
                     safe_action = original_action
                 else:
@@ -171,8 +215,18 @@ class VLMapActionSafety:
                     if replan_required:
                         print(
                             "[VLMapSafety] repeated blocked forward; "
-                            f"request S2 replan after {repeat_block_count} local triggers"
+                            f"request S2 replan after {repeat_block_count} local triggers "
+                            f"in cluster {self._active_cluster_id}"
                         )
+                    elif replan_suppressed_reason is not None:
+                        print(
+                            "[VLMapSafety] repeated blocked forward; "
+                            f"suppress S2 replan by {replan_suppressed_reason} "
+                            f"in cluster {self._active_cluster_id}"
+                        )
+            else:
+                self._clear_recent_blocks()
+                self._clear_block_cluster()
         self._maybe_save_debug_snapshot(
             obs=obs,
             pose_tf=pose_tf,
@@ -188,7 +242,12 @@ class VLMapActionSafety:
             "changed": bool(changed),
             "front_free": None if front_free is None else bool(front_free),
             "replan_required": bool(replan_required),
+            "replan_suppressed_reason": replan_suppressed_reason,
             "repeat_block_count": int(repeat_block_count),
+            "cluster_id": self._active_cluster_id,
+            "cluster_replan_count": int(self._cluster_replan_count),
+            "replan_cooldown_remaining": int(self._replan_cooldown_remaining()),
+            "recovery_actions": recovery_actions,
             "safety_step": int(self._step),
         }
         return safe_action, changed
@@ -288,16 +347,7 @@ class VLMapActionSafety:
         left_free, left_stats = self._is_line_free((row, col), left_probe)
         right_free, right_stats = self._is_line_free((row, col), right_probe)
         preferred_turn = self._preferred_turn_action(obs)
-        if left_free and not right_free:
-            corrected = self.left_action
-        elif right_free and not left_free:
-            corrected = self.right_action
-        elif preferred_turn is not None:
-            corrected = preferred_turn
-        elif left_free and right_free:
-            corrected = self.left_action
-        else:
-            corrected = self.fallback_action
+        corrected = self._choose_turn_action(left_free, right_free, preferred_turn)
         probe_info = {
             "row": int(row),
             "col": int(col),
@@ -393,8 +443,53 @@ class VLMapActionSafety:
                 return action
         return None
 
+    def _choose_turn_action(
+        self,
+        left_free: bool,
+        right_free: bool,
+        preferred_turn: Optional[int],
+    ) -> int:
+        options = []
+        if left_free:
+            options.append(self.left_action)
+        if right_free:
+            options.append(self.right_action)
+        if not options:
+            return int(self.fallback_action)
+        if len(options) == 1:
+            return int(options[0])
+
+        opposite = {
+            self.left_action: self.right_action,
+            self.right_action: self.left_action,
+        }
+        if (
+            self._same_turn_streak_action in options
+            and self._same_turn_streak_count >= self.max_same_turn_in_cluster
+            and opposite[self._same_turn_streak_action] in options
+        ):
+            return int(opposite[self._same_turn_streak_action])
+
+        if preferred_turn in options:
+            preferred_count = self._cluster_turn_counts.get(int(preferred_turn), 0)
+            other = opposite[int(preferred_turn)]
+            other_count = self._cluster_turn_counts.get(other, 0)
+            if preferred_count <= other_count + self.max_same_turn_in_cluster:
+                return int(preferred_turn)
+
+        left_count = self._cluster_turn_counts.get(self.left_action, 0)
+        right_count = self._cluster_turn_counts.get(self.right_action, 0)
+        if right_count < left_count:
+            return int(self.right_action)
+        return int(self.left_action)
+
     def _locked_safety_turn(self, position: np.ndarray) -> Optional[int]:
         if self._last_safety_turn_action not in (self.left_action, self.right_action):
+            return None
+        if (
+            self._same_turn_streak_action == self._last_safety_turn_action
+            and self._same_turn_streak_count >= self.max_same_turn_in_cluster
+        ):
             return None
         if self._last_safety_turn_step is None or self._last_safety_turn_position is None:
             return None
@@ -407,6 +502,7 @@ class VLMapActionSafety:
         return int(self._last_safety_turn_action)
 
     def _record_block(self, position: np.ndarray, turn_action: int) -> int:
+        self._ensure_block_cluster(position)
         self._recent_blocks = self._filtered_recent_blocks(position)
         self._recent_blocks.append(
             {
@@ -419,6 +515,12 @@ class VLMapActionSafety:
             self._last_safety_turn_action = int(turn_action)
             self._last_safety_turn_step = int(self._step)
             self._last_safety_turn_position = position.astype(np.float32, copy=True)
+            self._cluster_turn_counts[int(turn_action)] = self._cluster_turn_counts.get(int(turn_action), 0) + 1
+            if self._same_turn_streak_action == int(turn_action):
+                self._same_turn_streak_count += 1
+            else:
+                self._same_turn_streak_action = int(turn_action)
+                self._same_turn_streak_count = 1
         return len(self._recent_blocks)
 
     def _filtered_recent_blocks(self, position: np.ndarray):
@@ -435,6 +537,55 @@ class VLMapActionSafety:
 
     def _clear_recent_blocks(self) -> None:
         self._recent_blocks = []
+
+    def _ensure_block_cluster(self, position: np.ndarray) -> int:
+        should_start = self._active_cluster_id is None
+        if not should_start and self._cluster_last_step is not None:
+            should_start = self._step - self._cluster_last_step > self.cluster_reset_steps
+        if (
+            not should_start
+            and self.cluster_reset_distance >= 0
+            and self._cluster_start_position is not None
+        ):
+            dist_from_start = np.linalg.norm(position[:2] - self._cluster_start_position[:2])
+            should_start = dist_from_start > self.cluster_reset_distance
+        if should_start:
+            self._start_block_cluster(position)
+        self._cluster_last_position = position.astype(np.float32, copy=True)
+        self._cluster_last_step = int(self._step)
+        return int(self._active_cluster_id)
+
+    def _start_block_cluster(self, position: np.ndarray) -> None:
+        self._cluster_seq += 1
+        self._active_cluster_id = int(self._cluster_seq)
+        self._cluster_start_position = position.astype(np.float32, copy=True)
+        self._cluster_last_position = position.astype(np.float32, copy=True)
+        self._cluster_last_step = int(self._step)
+        self._cluster_replan_count = 0
+        self._cluster_turn_counts = {self.left_action: 0, self.right_action: 0}
+        self._same_turn_streak_action = None
+        self._same_turn_streak_count = 0
+        self._last_safety_turn_action = None
+        self._last_safety_turn_step = None
+        self._last_safety_turn_position = None
+        self._replan_cooldown_until_step = -1
+
+    def _clear_block_cluster(self) -> None:
+        self._active_cluster_id = None
+        self._cluster_start_position = None
+        self._cluster_last_position = None
+        self._cluster_last_step = None
+        self._cluster_replan_count = 0
+        self._cluster_turn_counts = {self.left_action: 0, self.right_action: 0}
+        self._same_turn_streak_action = None
+        self._same_turn_streak_count = 0
+        self._last_safety_turn_action = None
+        self._last_safety_turn_step = None
+        self._last_safety_turn_position = None
+        self._replan_cooldown_until_step = -1
+
+    def _replan_cooldown_remaining(self) -> int:
+        return max(0, int(self._replan_cooldown_until_step - self._step))
 
     def _maybe_save_debug_snapshot(
         self,
@@ -510,6 +661,13 @@ class VLMapActionSafety:
             "pixel_goal": self._jsonable(context.get("pixel_goal")),
             "repeat_block_count": int(probe_info.get("repeat_block_count", 0)) if probe_info else 0,
             "replan_required": bool(probe_info.get("replan_required", False)) if probe_info else False,
+            "replan_suppressed_reason": probe_info.get("replan_suppressed_reason") if probe_info else None,
+            "cluster_id": probe_info.get("cluster_id") if probe_info else None,
+            "cluster_replan_count": int(probe_info.get("cluster_replan_count", 0)) if probe_info else 0,
+            "cluster_turn_counts": probe_info.get("cluster_turn_counts") if probe_info else None,
+            "same_turn_streak": int(probe_info.get("same_turn_streak", 0)) if probe_info else 0,
+            "replan_cooldown_remaining": int(probe_info.get("replan_cooldown_remaining", 0)) if probe_info else 0,
+            "recovery_actions": probe_info.get("recovery_actions", []) if probe_info else [],
             "probe": probe_info,
             "image_path": image_path,
         }
@@ -641,7 +799,10 @@ class VLMapActionSafety:
         if probe_info is not None:
             turn_text = (
                 f"L={probe_info.get('left_free')} R={probe_info.get('right_free')} "
-                f"pref={probe_info.get('preferred_turn')} -> {probe_info.get('corrected')}"
+                f"pref={probe_info.get('preferred_turn')} -> {probe_info.get('corrected')} "
+                f"c={probe_info.get('cluster_id')} "
+                f"rp={probe_info.get('cluster_replan_count', 0)} "
+                f"cd={probe_info.get('replan_cooldown_remaining', 0)}"
             )
         else:
             turn_text = "no turn probe"

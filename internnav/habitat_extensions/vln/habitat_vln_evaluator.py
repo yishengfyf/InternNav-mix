@@ -453,6 +453,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             action = None
             messages = []
             local_actions = []
+            vlmap_recovery_actions = []
 
             done = False
             flag = False
@@ -510,7 +511,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     self.env.step(action_code.LOOKUP)
                     self.env.step(action_code.LOOKUP)
 
-                if len(action_seq) == 0 and pixel_goal is None:
+                if len(vlmap_recovery_actions) == 0 and len(action_seq) == 0 and pixel_goal is None:
                     if action == action_code.LOOKDOWN:
                         # last action is look down
                         sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
@@ -624,7 +625,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
 
-                if len(action_seq) != 0:
+                if len(vlmap_recovery_actions) != 0:
+                    action = vlmap_recovery_actions.pop(0)
+                    print("vlmap_recovery_action", action, flush=True)
+                elif len(action_seq) != 0:
                     action = action_seq[0]
                     action_seq.pop(0)
                 elif pixel_goal is not None:
@@ -687,6 +691,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     local_actions = []
                     messages = []
                     forward_action = 0
+                    recovery_actions = [
+                        int(item)
+                        for item in vlmap_safety_decision.get("recovery_actions", [])
+                        if int(item) in (action_code.LEFT, action_code.RIGHT)
+                    ]
+                    if recovery_actions:
+                        vlmap_recovery_actions = recovery_actions
+                        print("[VLMapSafety][Habitat] queue recovery actions", vlmap_recovery_actions)
                     if vlmap_safety_decision.get("replan_required"):
                         pixel_goal = None
                         output_ids = None
