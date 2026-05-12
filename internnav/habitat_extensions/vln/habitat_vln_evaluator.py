@@ -263,7 +263,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         pixel_goal=None,
     ):
         if not hasattr(self, "vlmap_safety"):
-            return action, False
+            return action, False, {}
         safety_obs = {
             "depth": depth_m,
             "rgb": rgb,
@@ -278,11 +278,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             },
         }
         if safety_obs["gps"] is None or safety_obs["compass"] is None:
-            return action, False
+            return action, False, {}
         safe_action, changed = self.vlmap_safety.postprocess(safety_obs, int(action))
+        decision = dict(getattr(self.vlmap_safety, "last_decision", {}) or {})
         if changed:
             print(f"[VLMapSafety][Habitat] replace action {int(action)} -> {int(safe_action)}")
-        return int(safe_action), changed
+            if decision.get("replan_required"):
+                print(
+                    "[VLMapSafety][Habitat] repeated block; "
+                    "clear local goal and request S2 replan"
+                )
+        return int(safe_action), changed, decision
 
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
@@ -575,7 +581,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 else:
                     action = 0
 
-                action, vlmap_safety_changed = self._postprocess_habitat_action_with_vlmap_safety(
+                action, vlmap_safety_changed, vlmap_safety_decision = self._postprocess_habitat_action_with_vlmap_safety(
                     action,
                     observations,
                     current_depth_m,
@@ -590,7 +596,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     local_actions = []
                     messages = []
                     forward_action = 0
-                    if pixel_goal is None:
+                    if vlmap_safety_decision.get("replan_required"):
+                        pixel_goal = None
+                        output_ids = None
+                        messages = []
+                    elif pixel_goal is None:
                         output_ids = None
 
                 info = self.env.get_metrics()

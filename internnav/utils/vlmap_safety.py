@@ -64,6 +64,11 @@ class VLMapActionSafety:
         self.line_min_checked_cells = int(self.config.get("line_min_checked_cells", 3))
         self.line_cell_blocked_fraction = float(self.config.get("line_cell_blocked_fraction", 0.25))
         self.prefer_previous_turn = bool(self.config.get("prefer_previous_turn", True))
+        self.repeat_block_enable = bool(self.config.get("repeat_block_enable", True))
+        self.repeat_block_count = int(self.config.get("repeat_block_count", 3))
+        self.repeat_block_window_steps = int(self.config.get("repeat_block_window_steps", 10))
+        self.repeat_block_distance = float(self.config.get("repeat_block_distance", 0.60))
+        self.repeat_turn_lock_steps = int(self.config.get("repeat_turn_lock_steps", 10))
         self.shadow_only = bool(self.config.get("shadow_only", False))
         self.debug = bool(self.config.get("debug", False))
         self.debug_root_dir = os.path.abspath(
@@ -83,6 +88,11 @@ class VLMapActionSafety:
         self._disabled_reason: Optional[str] = None
         self._debug_import_warned = False
         self._debug_saved_snapshots = 0
+        self._recent_blocks = []
+        self._last_safety_turn_action: Optional[int] = None
+        self._last_safety_turn_step: Optional[int] = None
+        self._last_safety_turn_position: Optional[np.ndarray] = None
+        self.last_decision: Dict[str, Any] = {}
 
         self.builder = None
         if self.enabled:
@@ -92,6 +102,11 @@ class VLMapActionSafety:
         self._last_update_position = None
         self._step = 0
         self._debug_saved_snapshots = 0
+        self._recent_blocks = []
+        self._last_safety_turn_action = None
+        self._last_safety_turn_step = None
+        self._last_safety_turn_position = None
+        self.last_decision = {}
         if self.builder is not None:
             self.builder.reset()
 
@@ -108,14 +123,39 @@ class VLMapActionSafety:
         changed = False
         front_free = None
         probe_info = None
+        replan_required = False
+        repeat_block_count = 0
+        position = pose_tf[:3, 3].copy()
+        self.last_decision = {
+            "input_action": original_action,
+            "output_action": safe_action,
+            "changed": False,
+            "front_free": None,
+            "replan_required": False,
+            "repeat_block_count": 0,
+        }
 
         self._maybe_update(obs["depth"], pose_tf)
         if original_action == self.forward_action:
             front_free, front_stats = self._is_forward_free(pose_tf)
             probe_info = {"front": front_stats}
             if not front_free:
-                corrected, probe_info = self._pick_turn_action(pose_tf, obs)
+                obs_for_pick = dict(obs)
+                locked_turn = self._locked_safety_turn(position)
+                if locked_turn is not None:
+                    obs_for_pick["preferred_turn_action"] = locked_turn
+                corrected, probe_info = self._pick_turn_action(pose_tf, obs_for_pick)
                 probe_info["front"] = front_stats
+                repeat_block_count = self._record_block(position, corrected)
+                replan_required = (
+                    self.repeat_block_enable
+                    and not self.shadow_only
+                    and repeat_block_count >= self.repeat_block_count
+                )
+                if replan_required:
+                    self._clear_recent_blocks()
+                probe_info["repeat_block_count"] = int(repeat_block_count)
+                probe_info["replan_required"] = bool(replan_required)
                 if self.shadow_only:
                     safe_action = original_action
                 else:
@@ -128,7 +168,11 @@ class VLMapActionSafety:
                         f"{verb} action {original_action} -> {corrected} at step {self._step}"
                         f"{' (shadow only)' if self.shadow_only else ''}"
                     )
-
+                    if replan_required:
+                        print(
+                            "[VLMapSafety] repeated blocked forward; "
+                            f"request S2 replan after {repeat_block_count} local triggers"
+                        )
         self._maybe_save_debug_snapshot(
             obs=obs,
             pose_tf=pose_tf,
@@ -138,6 +182,15 @@ class VLMapActionSafety:
             front_free=front_free,
             probe_info=probe_info,
         )
+        self.last_decision = {
+            "input_action": original_action,
+            "output_action": int(safe_action),
+            "changed": bool(changed),
+            "front_free": None if front_free is None else bool(front_free),
+            "replan_required": bool(replan_required),
+            "repeat_block_count": int(repeat_block_count),
+            "safety_step": int(self._step),
+        }
         return safe_action, changed
 
     def _init_builder(self, camera_intrinsic: np.ndarray) -> None:
@@ -340,6 +393,49 @@ class VLMapActionSafety:
                 return action
         return None
 
+    def _locked_safety_turn(self, position: np.ndarray) -> Optional[int]:
+        if self._last_safety_turn_action not in (self.left_action, self.right_action):
+            return None
+        if self._last_safety_turn_step is None or self._last_safety_turn_position is None:
+            return None
+        if self._step - self._last_safety_turn_step > self.repeat_turn_lock_steps:
+            return None
+        if self.repeat_block_distance >= 0:
+            dist = np.linalg.norm(position[:2] - self._last_safety_turn_position[:2])
+            if dist > self.repeat_block_distance:
+                return None
+        return int(self._last_safety_turn_action)
+
+    def _record_block(self, position: np.ndarray, turn_action: int) -> int:
+        self._recent_blocks = self._filtered_recent_blocks(position)
+        self._recent_blocks.append(
+            {
+                "step": int(self._step),
+                "position": position.astype(np.float32, copy=True),
+                "turn_action": int(turn_action),
+            }
+        )
+        if int(turn_action) in (self.left_action, self.right_action):
+            self._last_safety_turn_action = int(turn_action)
+            self._last_safety_turn_step = int(self._step)
+            self._last_safety_turn_position = position.astype(np.float32, copy=True)
+        return len(self._recent_blocks)
+
+    def _filtered_recent_blocks(self, position: np.ndarray):
+        filtered = []
+        for item in self._recent_blocks:
+            if self._step - int(item["step"]) > self.repeat_block_window_steps:
+                continue
+            if self.repeat_block_distance >= 0:
+                dist = np.linalg.norm(position[:2] - item["position"][:2])
+                if dist > self.repeat_block_distance:
+                    continue
+            filtered.append(item)
+        return filtered
+
+    def _clear_recent_blocks(self) -> None:
+        self._recent_blocks = []
+
     def _maybe_save_debug_snapshot(
         self,
         obs: Dict[str, Any],
@@ -412,6 +508,8 @@ class VLMapActionSafety:
             "compass": self._jsonable(obs.get("compass")),
             "last_nav_action": self._jsonable(obs.get("last_nav_action")),
             "pixel_goal": self._jsonable(context.get("pixel_goal")),
+            "repeat_block_count": int(probe_info.get("repeat_block_count", 0)) if probe_info else 0,
+            "replan_required": bool(probe_info.get("replan_required", False)) if probe_info else False,
             "probe": probe_info,
             "image_path": image_path,
         }
