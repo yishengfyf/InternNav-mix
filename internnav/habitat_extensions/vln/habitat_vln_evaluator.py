@@ -10,6 +10,7 @@ import itertools
 import random
 import re
 from collections import OrderedDict
+from datetime import datetime
 from typing import Optional
 
 import cv2
@@ -53,6 +54,57 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
+
+
+class _JsonlTeeStream:
+    def __init__(self, stream, log_path: str, stream_name: str, rank: int):
+        self.stream = stream
+        self.log_path = log_path
+        self.stream_name = stream_name
+        self.rank = rank
+        self._buffer = ""
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self._file = open(log_path, "a", encoding="utf-8")
+
+    def write(self, data):
+        self.stream.write(data)
+        if not isinstance(data, str) or not data:
+            return
+        self._buffer += data
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.rstrip("\r")
+            if line:
+                self._write_json_line(line)
+
+    def flush(self):
+        self.stream.flush()
+        self._file.flush()
+
+    def close(self):
+        if self._buffer:
+            self._write_json_line(self._buffer.rstrip("\r"))
+            self._buffer = ""
+        self._file.close()
+
+    def isatty(self):
+        return self.stream.isatty()
+
+    def fileno(self):
+        return self.stream.fileno()
+
+    def _write_json_line(self, message: str) -> None:
+        event = {
+            "time": datetime.now().isoformat(timespec="microseconds"),
+            "rank": int(self.rank),
+            "stream": self.stream_name,
+            "message": message,
+        }
+        self._file.write(json.dumps(event, ensure_ascii=False) + "\n")
+        self._file.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 class action_code(IntEnum):
@@ -180,6 +232,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
         )
         self._vlmap_last_nav_action = None
+        self._vlmap_log_stdout = None
+        self._vlmap_log_stderr = None
+        self._vlmap_run_dir = None
+        self._setup_vlmap_run_logging()
 
     def eval_action(self):
         """
@@ -208,6 +264,41 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         if ndtws is not None:
             result["ndtws"] = ndtws  # shape [N_local]
         return result
+
+    def _get_vlmap_run_dir(self) -> Optional[str]:
+        if self._vlmap_run_dir is not None:
+            return self._vlmap_run_dir
+        if not hasattr(self, "vlmap_safety"):
+            return None
+        get_debug_dir = getattr(self.vlmap_safety, "get_debug_dir", None)
+        if get_debug_dir is None:
+            return None
+        self._vlmap_run_dir = get_debug_dir()
+        return self._vlmap_run_dir
+
+    def _setup_vlmap_run_logging(self) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        if not run_dir:
+            return
+        log_path = os.path.join(run_dir, "log.jsonl")
+        if getattr(sys.stdout, "log_path", None) != log_path:
+            self._vlmap_log_stdout = _JsonlTeeStream(sys.stdout, log_path, "stdout", self.rank)
+            sys.stdout = self._vlmap_log_stdout
+        if getattr(sys.stderr, "log_path", None) != log_path:
+            self._vlmap_log_stderr = _JsonlTeeStream(sys.stderr, log_path, "stderr", self.rank)
+            sys.stderr = self._vlmap_log_stderr
+        print(f"[VLMapSafety][Habitat] run log path: {log_path}")
+
+    def _write_episode_progress(self, result: dict) -> None:
+        os.makedirs(self.output_path, exist_ok=True)
+        with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
+            f.write(json.dumps(result) + "\n")
+
+        run_dir = self._get_vlmap_run_dir()
+        if run_dir:
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, 'progress.json'), 'a', encoding="utf-8") as f:
+                f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
     def calc_metrics(self, global_metrics: dict) -> dict:
         """
@@ -677,9 +768,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result['ndtw'] = metrics['ndtw']
 
             # save current progress
-            os.makedirs(self.output_path, exist_ok=True)
-            with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
-                f.write(json.dumps(result) + "\n")
+            self._write_episode_progress(result)
 
             # save video
             if self.save_video and metrics['success'] == 1.0:
@@ -995,9 +1084,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
 
-            os.makedirs(self.output_path, exist_ok=True)
-            with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
-                f.write(json.dumps(result) + "\n")
+            self._write_episode_progress(result)
             if self.save_video and metrics['success'] == 1.0:
                 images_to_video(
                     vis_frames,

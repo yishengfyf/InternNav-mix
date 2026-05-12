@@ -537,6 +537,11 @@ class VLMapActionSafety:
 
         raise RuntimeError(f"Unable to allocate a debug run directory under {self.debug_root_dir}")
 
+    def get_debug_dir(self) -> Optional[str]:
+        if not self.debug:
+            return None
+        return self._get_debug_dir()
+
     def _rgb_debug_image(self, rgb: Any, Image: Any, ImageDraw: Any) -> Optional[Any]:
         if rgb is None:
             return None
