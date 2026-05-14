@@ -379,6 +379,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "[VLMapSafety][Habitat] repeated block; "
                     "clear local goal and request S2 replan"
                 )
+            if decision.get("waypoint_repair_required"):
+                print(
+                    "[VLMapSafety][Habitat] stuck cluster; "
+                    "clear local goal and mark waypoint-level repair required"
+                )
         return int(safe_action), changed, decision
 
     def resume_from_output_path(self) -> None:
@@ -699,7 +704,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     if recovery_actions:
                         vlmap_recovery_actions = recovery_actions
                         print("[VLMapSafety][Habitat] queue recovery actions", vlmap_recovery_actions)
-                    if vlmap_safety_decision.get("replan_required"):
+                    if (
+                        vlmap_safety_decision.get("replan_required")
+                        or vlmap_safety_decision.get("waypoint_repair_required")
+                    ):
                         pixel_goal = None
                         output_ids = None
                         messages = []

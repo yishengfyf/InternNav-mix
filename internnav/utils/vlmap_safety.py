@@ -77,6 +77,10 @@ class VLMapActionSafety:
         self.max_replans_per_cluster = int(self.config.get("max_replans_per_cluster", 2))
         self.replan_cooldown_steps = max(0, int(self.config.get("replan_cooldown_steps", 8)))
         self.recovery_turn_steps = max(1, int(self.config.get("recovery_turn_steps", 1)))
+        self.stuck_block_count = max(1, int(self.config.get("stuck_block_count", 8)))
+        self.stuck_distance = float(self.config.get("stuck_distance", 0.15))
+        self.waypoint_repair_on_stuck = bool(self.config.get("waypoint_repair_on_stuck", True))
+        self.max_waypoint_repairs_per_cluster = int(self.config.get("max_waypoint_repairs_per_cluster", 1))
         self.shadow_only = bool(self.config.get("shadow_only", False))
         self.debug = bool(self.config.get("debug", False))
         self.debug_root_dir = os.path.abspath(
@@ -103,9 +107,12 @@ class VLMapActionSafety:
         self._cluster_seq = 0
         self._active_cluster_id: Optional[int] = None
         self._cluster_start_position: Optional[np.ndarray] = None
+        self._cluster_start_step: Optional[int] = None
         self._cluster_last_position: Optional[np.ndarray] = None
         self._cluster_last_step: Optional[int] = None
+        self._cluster_block_count = 0
         self._cluster_replan_count = 0
+        self._cluster_waypoint_repair_count = 0
         self._cluster_turn_counts = {self.left_action: 0, self.right_action: 0}
         self._same_turn_streak_action: Optional[int] = None
         self._same_turn_streak_count = 0
@@ -145,6 +152,10 @@ class VLMapActionSafety:
         probe_info = None
         replan_required = False
         replan_suppressed_reason = None
+        stuck_detected = False
+        waypoint_repair_required = False
+        cluster_displacement = 0.0
+        cluster_duration_steps = 0
         recovery_actions = []
         repeat_block_count = 0
         position = pose_tf[:3, 3].copy()
@@ -157,7 +168,12 @@ class VLMapActionSafety:
             "replan_suppressed_reason": None,
             "repeat_block_count": 0,
             "cluster_id": self._active_cluster_id,
+            "cluster_block_count": int(self._cluster_block_count),
             "cluster_replan_count": int(self._cluster_replan_count),
+            "cluster_displacement": 0.0,
+            "cluster_duration_steps": 0,
+            "stuck": False,
+            "waypoint_repair_required": False,
             "recovery_actions": [],
         }
 
@@ -174,6 +190,9 @@ class VLMapActionSafety:
                 corrected, probe_info = self._pick_turn_action(pose_tf, obs_for_pick)
                 probe_info["front"] = front_stats
                 repeat_block_count = self._record_block(position, corrected)
+                cluster_displacement = self._cluster_displacement(position)
+                cluster_duration_steps = self._cluster_duration_steps()
+                stuck_detected = self._is_cluster_stuck(position)
                 repeat_threshold_met = self.repeat_block_enable and repeat_block_count >= self.repeat_block_count
                 if repeat_threshold_met and not self.shadow_only:
                     if self.recovery_turn_steps > 1:
@@ -188,17 +207,35 @@ class VLMapActionSafety:
                         self._cluster_replan_count += 1
                         self._replan_cooldown_until_step = self._step + self.replan_cooldown_steps
                     self._clear_recent_blocks()
+                if (
+                    self.waypoint_repair_on_stuck
+                    and not self.shadow_only
+                    and stuck_detected
+                    and self._cluster_replan_count >= self.max_replans_per_cluster
+                    and (
+                        self.max_waypoint_repairs_per_cluster < 0
+                        or self._cluster_waypoint_repair_count < self.max_waypoint_repairs_per_cluster
+                    )
+                ):
+                    waypoint_repair_required = True
+                    self._cluster_waypoint_repair_count += 1
                 probe_info["repeat_block_count"] = int(repeat_block_count)
                 probe_info["replan_required"] = bool(replan_required)
                 probe_info["replan_suppressed_reason"] = replan_suppressed_reason
                 probe_info["cluster_id"] = self._active_cluster_id
+                probe_info["cluster_block_count"] = int(self._cluster_block_count)
                 probe_info["cluster_replan_count"] = int(self._cluster_replan_count)
+                probe_info["cluster_waypoint_repair_count"] = int(self._cluster_waypoint_repair_count)
+                probe_info["cluster_displacement"] = float(cluster_displacement)
+                probe_info["cluster_duration_steps"] = int(cluster_duration_steps)
                 probe_info["cluster_turn_counts"] = {
                     "left": int(self._cluster_turn_counts.get(self.left_action, 0)),
                     "right": int(self._cluster_turn_counts.get(self.right_action, 0)),
                 }
                 probe_info["same_turn_streak"] = int(self._same_turn_streak_count)
                 probe_info["replan_cooldown_remaining"] = int(self._replan_cooldown_remaining())
+                probe_info["stuck"] = bool(stuck_detected)
+                probe_info["waypoint_repair_required"] = bool(waypoint_repair_required)
                 probe_info["recovery_actions"] = recovery_actions
                 if self.shadow_only:
                     safe_action = original_action
@@ -224,6 +261,11 @@ class VLMapActionSafety:
                             f"suppress S2 replan by {replan_suppressed_reason} "
                             f"in cluster {self._active_cluster_id}"
                         )
+                    if waypoint_repair_required:
+                        print(
+                            "[VLMapSafety] stuck cluster detected; "
+                            f"request waypoint-level repair for cluster {self._active_cluster_id}"
+                        )
             else:
                 self._clear_recent_blocks()
                 self._clear_block_cluster()
@@ -245,8 +287,13 @@ class VLMapActionSafety:
             "replan_suppressed_reason": replan_suppressed_reason,
             "repeat_block_count": int(repeat_block_count),
             "cluster_id": self._active_cluster_id,
+            "cluster_block_count": int(self._cluster_block_count),
             "cluster_replan_count": int(self._cluster_replan_count),
+            "cluster_displacement": float(cluster_displacement),
+            "cluster_duration_steps": int(cluster_duration_steps),
             "replan_cooldown_remaining": int(self._replan_cooldown_remaining()),
+            "stuck": bool(stuck_detected),
+            "waypoint_repair_required": bool(waypoint_repair_required),
             "recovery_actions": recovery_actions,
             "safety_step": int(self._step),
         }
@@ -512,6 +559,7 @@ class VLMapActionSafety:
             }
         )
         if int(turn_action) in (self.left_action, self.right_action):
+            self._cluster_block_count += 1
             self._last_safety_turn_action = int(turn_action)
             self._last_safety_turn_step = int(self._step)
             self._last_safety_turn_position = position.astype(np.float32, copy=True)
@@ -559,9 +607,12 @@ class VLMapActionSafety:
         self._cluster_seq += 1
         self._active_cluster_id = int(self._cluster_seq)
         self._cluster_start_position = position.astype(np.float32, copy=True)
+        self._cluster_start_step = int(self._step)
         self._cluster_last_position = position.astype(np.float32, copy=True)
         self._cluster_last_step = int(self._step)
+        self._cluster_block_count = 0
         self._cluster_replan_count = 0
+        self._cluster_waypoint_repair_count = 0
         self._cluster_turn_counts = {self.left_action: 0, self.right_action: 0}
         self._same_turn_streak_action = None
         self._same_turn_streak_count = 0
@@ -573,9 +624,12 @@ class VLMapActionSafety:
     def _clear_block_cluster(self) -> None:
         self._active_cluster_id = None
         self._cluster_start_position = None
+        self._cluster_start_step = None
         self._cluster_last_position = None
         self._cluster_last_step = None
+        self._cluster_block_count = 0
         self._cluster_replan_count = 0
+        self._cluster_waypoint_repair_count = 0
         self._cluster_turn_counts = {self.left_action: 0, self.right_action: 0}
         self._same_turn_streak_action = None
         self._same_turn_streak_count = 0
@@ -586,6 +640,22 @@ class VLMapActionSafety:
 
     def _replan_cooldown_remaining(self) -> int:
         return max(0, int(self._replan_cooldown_until_step - self._step))
+
+    def _cluster_displacement(self, position: np.ndarray) -> float:
+        if self._cluster_start_position is None:
+            return 0.0
+        return float(np.linalg.norm(position[:2] - self._cluster_start_position[:2]))
+
+    def _cluster_duration_steps(self) -> int:
+        if self._cluster_start_step is None:
+            return 0
+        return max(0, int(self._step - self._cluster_start_step))
+
+    def _is_cluster_stuck(self, position: np.ndarray) -> bool:
+        return (
+            self._cluster_block_count >= self.stuck_block_count
+            and self._cluster_displacement(position) <= self.stuck_distance
+        )
 
     def _maybe_save_debug_snapshot(
         self,
@@ -663,10 +733,20 @@ class VLMapActionSafety:
             "replan_required": bool(probe_info.get("replan_required", False)) if probe_info else False,
             "replan_suppressed_reason": probe_info.get("replan_suppressed_reason") if probe_info else None,
             "cluster_id": probe_info.get("cluster_id") if probe_info else None,
+            "cluster_block_count": int(probe_info.get("cluster_block_count", 0)) if probe_info else 0,
             "cluster_replan_count": int(probe_info.get("cluster_replan_count", 0)) if probe_info else 0,
+            "cluster_waypoint_repair_count": (
+                int(probe_info.get("cluster_waypoint_repair_count", 0)) if probe_info else 0
+            ),
+            "cluster_displacement": float(probe_info.get("cluster_displacement", 0.0)) if probe_info else 0.0,
+            "cluster_duration_steps": int(probe_info.get("cluster_duration_steps", 0)) if probe_info else 0,
             "cluster_turn_counts": probe_info.get("cluster_turn_counts") if probe_info else None,
             "same_turn_streak": int(probe_info.get("same_turn_streak", 0)) if probe_info else 0,
             "replan_cooldown_remaining": int(probe_info.get("replan_cooldown_remaining", 0)) if probe_info else 0,
+            "stuck": bool(probe_info.get("stuck", False)) if probe_info else False,
+            "waypoint_repair_required": (
+                bool(probe_info.get("waypoint_repair_required", False)) if probe_info else False
+            ),
             "recovery_actions": probe_info.get("recovery_actions", []) if probe_info else [],
             "probe": probe_info,
             "image_path": image_path,
@@ -801,8 +881,10 @@ class VLMapActionSafety:
                 f"L={probe_info.get('left_free')} R={probe_info.get('right_free')} "
                 f"pref={probe_info.get('preferred_turn')} -> {probe_info.get('corrected')} "
                 f"c={probe_info.get('cluster_id')} "
+                f"b={probe_info.get('cluster_block_count', 0)} "
                 f"rp={probe_info.get('cluster_replan_count', 0)} "
-                f"cd={probe_info.get('replan_cooldown_remaining', 0)}"
+                f"cd={probe_info.get('replan_cooldown_remaining', 0)} "
+                f"stuck={probe_info.get('stuck', False)}"
             )
         else:
             turn_text = "no turn probe"
