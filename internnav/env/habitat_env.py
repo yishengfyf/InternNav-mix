@@ -29,6 +29,11 @@ class HabitatEnv(base.Env):
 
         self.rank = env_config.env_settings.get('rank', 0)
         self.world_size = env_config.env_settings.get('world_size', 1)
+        self.episode_start_index = int(env_config.env_settings.get('episode_start_index', 0) or 0)
+        self.max_eval_episodes = env_config.env_settings.get('max_eval_episodes', None)
+        if self.max_eval_episodes is not None:
+            self.max_eval_episodes = int(self.max_eval_episodes)
+        self.episode_ids = self._normalize_episode_ids(env_config.env_settings.get('episode_ids', None))
         self._current_episode_index: int = 0
         self._last_obs: Optional[Dict[str, Any]] = None
 
@@ -64,6 +69,25 @@ class HabitatEnv(base.Env):
                         done_res.add((res["scene_id"], res["episode_id"]))
 
         # iterate scenes in order, collect all episodes
+        if self._uses_fixed_episode_selection():
+            selected = self._select_fixed_episodes(scene_episode_dict)
+            print(
+                "[HabitatEnv] fixed episode selection: "
+                f"start={self.episode_start_index}, max={self.max_eval_episodes}, "
+                f"episode_ids={'set' if self.episode_ids is not None else 'None'}, "
+                f"global_selected={len(selected)}, rank={self.rank}/{self.world_size}"
+            )
+            for idx, episode in enumerate(selected):
+                if idx % self.world_size != self.rank:
+                    continue
+                scene_id = episode.scene_id.split('/')[-2]
+                episode_id = int(episode.episode_id)
+                if (scene_id, episode_id) in done_res:
+                    continue
+                all_episodes.append(episode)
+            print(f"[HabitatEnv] local episodes after rank/done filtering: {len(all_episodes)}")
+            return all_episodes
+
         for scene in sorted(scene_episode_dict.keys()):
             per_scene_eps = scene_episode_dict[scene]
             scene_id = scene.split('/')[-2]
@@ -76,6 +100,48 @@ class HabitatEnv(base.Env):
                 all_episodes.append(episode)
 
         return all_episodes
+
+    def _uses_fixed_episode_selection(self) -> bool:
+        return self.episode_ids is not None or self.episode_start_index > 0 or self.max_eval_episodes is not None
+
+    def _select_fixed_episodes(self, scene_episode_dict: Dict[str, List[Any]]) -> List[Any]:
+        selected = []
+        for scene in sorted(scene_episode_dict.keys()):
+            for episode in scene_episode_dict[scene]:
+                if self._episode_matches_filter(episode):
+                    selected.append(episode)
+
+        if self.episode_start_index > 0:
+            selected = selected[self.episode_start_index :]
+        if self.max_eval_episodes is not None and self.max_eval_episodes >= 0:
+            selected = selected[: self.max_eval_episodes]
+        return selected
+
+    def _normalize_episode_ids(self, episode_ids):
+        if episode_ids in (None, "", []):
+            return None
+        if not isinstance(episode_ids, (list, tuple, set)):
+            episode_ids = [episode_ids]
+
+        normalized = set()
+        for item in episode_ids:
+            if isinstance(item, dict):
+                scene_id = item.get("scene_id")
+                episode_id = item.get("episode_id")
+                if scene_id is not None and episode_id is not None:
+                    normalized.add(f"{scene_id}:{int(episode_id)}")
+                elif episode_id is not None:
+                    normalized.add(str(int(episode_id)))
+                continue
+            normalized.add(str(item))
+        return normalized
+
+    def _episode_matches_filter(self, episode) -> bool:
+        if self.episode_ids is None:
+            return True
+        scene_id = episode.scene_id.split('/')[-2]
+        episode_id = int(episode.episode_id)
+        return str(episode_id) in self.episode_ids or f"{scene_id}:{episode_id}" in self.episode_ids
 
     def reset(self):
         # no more episodes

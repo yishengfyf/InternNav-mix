@@ -69,6 +69,12 @@ eval_cfg = EvalCfg(
         env_settings={
             # habitat sim specifications - agent, sensors, tasks, measures etc. are defined in the habitat config file
             'config_path': 'scripts/eval/configs/vln_r2r.yaml',
+            # Fixed evaluation slice for fair baseline/VLMap comparisons.
+            # Keep these values identical across comparison runs.
+            'episode_start_index': 0,
+            'max_eval_episodes': 50,
+            # Optional exact selection. Supports [139, 140] or [{"scene_id": "2azQ1b91cZZ", "episode_id": 139}].
+            'episode_ids': None,
         },
     ),
     eval_type='habitat_vln',
