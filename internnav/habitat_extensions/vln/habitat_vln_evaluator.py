@@ -351,6 +351,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         step_id: Optional[int] = None,
         scene_id: Optional[str] = None,
         episode_id: Optional[int] = None,
+        episode_index: Optional[int] = None,
+        episode_count: Optional[int] = None,
         pixel_goal=None,
     ):
         if not hasattr(self, "vlmap_safety"):
@@ -365,6 +367,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "step_id": step_id,
                 "scene_id": scene_id,
                 "episode_id": episode_id,
+                "episode_index": episode_index,
+                "episode_count": episode_count,
                 "pixel_goal": pixel_goal,
             },
         }
@@ -411,7 +415,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         sucs, spls, oss, nes, ndtw = self.resume_from_output_path()
 
         # Episode loop is now driven by env.reset() + env.is_running
-        process_bar = tqdm.tqdm(total=len(self.env.episodes), desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
+        episode_count = len(self.env.episodes)
+        process_bar = tqdm.tqdm(total=episode_count, desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
 
         while self.env.is_running:
 
@@ -419,6 +424,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             observations = self.env.reset()
             if not self.env.is_running or observations is None:
                 break
+            episode_index = max(0, getattr(self.env, "_current_episode_index", 1) - 1)
 
             # ---- episode meta (scene_id, episode_id, instruction) ----
             # we get it from the underlying habitat env
@@ -689,6 +695,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     step_id=step_id,
                     scene_id=scene_id,
                     episode_id=episode_id,
+                    episode_index=episode_index,
+                    episode_count=episode_count,
                     pixel_goal=pixel_goal,
                 )
                 if vlmap_safety_changed:

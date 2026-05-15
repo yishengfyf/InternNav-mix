@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import sys
 from typing import Any, Dict, Optional, Tuple
 
@@ -93,6 +94,13 @@ class VLMapActionSafety:
         self.debug_max_snapshots = int(self.config.get("debug_max_snapshots", 200))
         self.debug_save_on_change = bool(self.config.get("debug_save_on_change", True))
         self.debug_save_every_steps = int(self.config.get("debug_save_every_steps", 0))
+        self.debug_sample_snapshots = bool(self.config.get("debug_sample_snapshots", False))
+        self.debug_sample_total_snapshots = int(
+            self.config.get("debug_sample_total_snapshots", self.debug_max_snapshots)
+        )
+        self.debug_sample_episode_count = int(self.config.get("debug_sample_episode_count", 0))
+        self.debug_sample_images_per_episode = max(1, int(self.config.get("debug_sample_images_per_episode", 2)))
+        self.debug_sample_seed = int(self.config.get("debug_sample_seed", 0))
         self.debug_crop_radius_cells = int(self.config.get("debug_crop_radius_cells", 80))
         self.debug_cell_scale = max(1, int(self.config.get("debug_cell_scale", 3)))
         self._last_update_position: Optional[np.ndarray] = None
@@ -100,6 +108,9 @@ class VLMapActionSafety:
         self._disabled_reason: Optional[str] = None
         self._debug_import_warned = False
         self._debug_saved_snapshots = 0
+        self._debug_selected_episode_indices = None
+        self._debug_episode_snapshot_counts = {}
+        self._debug_episode_candidate_counts = {}
         self._recent_blocks = []
         self._last_safety_turn_action: Optional[int] = None
         self._last_safety_turn_step: Optional[int] = None
@@ -126,7 +137,6 @@ class VLMapActionSafety:
     def reset(self) -> None:
         self._last_update_position = None
         self._step = 0
-        self._debug_saved_snapshots = 0
         self._recent_blocks = []
         self._last_safety_turn_action = None
         self._last_safety_turn_step = None
@@ -677,8 +687,6 @@ class VLMapActionSafety:
             should_save = False
         if self.debug_max_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_max_snapshots:
             should_save = False
-        if not should_save and not self.debug_log_all_events:
-            return
 
         debug_dir = self._get_debug_dir()
         os.makedirs(debug_dir, exist_ok=True)
@@ -687,6 +695,9 @@ class VLMapActionSafety:
         scene_id = str(context.get("scene_id", "scene")).replace(os.sep, "_")
         eval_step = context.get("step_id", self._step)
         prefix = f"{scene_id}_ep{episode_id}_step{int(eval_step):05d}_safe{self._step:05d}"
+        should_save = self._sample_debug_snapshot(should_save, context)
+        if not should_save and not self.debug_log_all_events:
+            return
 
         image_path = None
         if should_save:
@@ -753,6 +764,74 @@ class VLMapActionSafety:
         }
         with open(os.path.join(debug_dir, "events.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _sample_debug_snapshot(self, should_save: bool, context: Dict[str, Any]) -> bool:
+        if not should_save:
+            return False
+        if not self.debug_sample_snapshots:
+            return True
+        if self.debug_sample_total_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_sample_total_snapshots:
+            return False
+
+        episode_index = context.get("episode_index")
+        episode_count = context.get("episode_count")
+        if episode_index is None or episode_count is None:
+            return True
+
+        try:
+            episode_index = int(episode_index)
+            episode_count = int(episode_count)
+        except (TypeError, ValueError):
+            return True
+        if episode_count <= 0:
+            return True
+
+        selected = self._get_debug_selected_episode_indices(episode_count)
+        if episode_index not in selected:
+            return False
+
+        current_count = self._debug_episode_snapshot_counts.get(episode_index, 0)
+        if current_count >= self.debug_sample_images_per_episode:
+            return False
+
+        # Keep a deterministic, sparse sample within selected episodes instead of saving every early candidate.
+        candidate_count = self._debug_episode_candidate_counts.get(episode_index, 0)
+        self._debug_episode_candidate_counts[episode_index] = candidate_count + 1
+        stride = max(1, int(self.config.get("debug_sample_candidate_stride", 2)))
+        offset = self._debug_episode_sample_offset(episode_index, stride)
+        if candidate_count % stride != offset and current_count > 0:
+            return False
+
+        self._debug_episode_snapshot_counts[episode_index] = current_count + 1
+        return True
+
+    def _get_debug_selected_episode_indices(self, episode_count: int):
+        if self._debug_selected_episode_indices is not None:
+            return self._debug_selected_episode_indices
+
+        if self.debug_sample_episode_count > 0:
+            sample_episode_count = self.debug_sample_episode_count
+        else:
+            total = self.debug_sample_total_snapshots if self.debug_sample_total_snapshots >= 0 else self.debug_max_snapshots
+            total = max(1, int(total))
+            sample_episode_count = int(math.ceil(total / self.debug_sample_images_per_episode))
+
+        sample_episode_count = max(1, min(int(sample_episode_count), int(episode_count)))
+        rng = random.Random(self.debug_sample_seed + episode_count)
+        self._debug_selected_episode_indices = set(rng.sample(range(episode_count), sample_episode_count))
+        if self.verbose:
+            print(
+                "[VLMapSafety] debug snapshot sampled episodes: "
+                f"{sorted(self._debug_selected_episode_indices)} "
+                f"({sample_episode_count}/{episode_count})"
+            )
+        return self._debug_selected_episode_indices
+
+    def _debug_episode_sample_offset(self, episode_index: int, stride: int) -> int:
+        if stride <= 1:
+            return 0
+        rng = random.Random(self.debug_sample_seed + 7919 * (episode_index + 1))
+        return rng.randrange(stride)
 
     def _get_debug_dir(self) -> str:
         if self.debug_dir is not None:
