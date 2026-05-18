@@ -378,16 +378,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         decision = dict(getattr(self.vlmap_safety, "last_decision", {}) or {})
         if changed:
             print(f"[VLMapSafety][Habitat] replace action {int(action)} -> {int(safe_action)}")
-            if decision.get("replan_required"):
-                print(
-                    "[VLMapSafety][Habitat] repeated block; "
-                    "clear local goal and request S2 replan"
-                )
-            if decision.get("waypoint_repair_required"):
-                print(
-                    "[VLMapSafety][Habitat] stuck cluster; "
-                    "clear local goal and mark waypoint-level repair required"
-                )
+        elif decision.get("budget_suppressed"):
+            print(
+                "[VLMapSafety][Habitat] keep action "
+                f"{int(action)} because {decision.get('budget_suppressed_reason')}"
+            )
+        if decision.get("replan_required"):
+            print(
+                "[VLMapSafety][Habitat] repeated block; "
+                "clear local goal and request S2 replan"
+            )
+        if decision.get("waypoint_repair_required"):
+            print(
+                "[VLMapSafety][Habitat] stuck cluster; "
+                "clear local goal and mark waypoint-level repair required"
+            )
         return int(safe_action), changed, decision
 
     def resume_from_output_path(self) -> None:
@@ -699,7 +704,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     episode_count=episode_count,
                     pixel_goal=pixel_goal,
                 )
-                if vlmap_safety_changed:
+                vlmap_safety_replan = bool(
+                    vlmap_safety_decision.get("replan_required")
+                    or vlmap_safety_decision.get("waypoint_repair_required")
+                )
+                if vlmap_safety_changed or vlmap_safety_replan:
                     action_seq = []
                     local_actions = []
                     messages = []
@@ -712,10 +721,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     if recovery_actions:
                         vlmap_recovery_actions = recovery_actions
                         print("[VLMapSafety][Habitat] queue recovery actions", vlmap_recovery_actions)
-                    if (
-                        vlmap_safety_decision.get("replan_required")
-                        or vlmap_safety_decision.get("waypoint_repair_required")
-                    ):
+                    if vlmap_safety_replan:
                         pixel_goal = None
                         output_ids = None
                         messages = []

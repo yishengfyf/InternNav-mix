@@ -82,6 +82,10 @@ class VLMapActionSafety:
         self.stuck_distance = float(self.config.get("stuck_distance", 0.15))
         self.waypoint_repair_on_stuck = bool(self.config.get("waypoint_repair_on_stuck", True))
         self.max_waypoint_repairs_per_cluster = int(self.config.get("max_waypoint_repairs_per_cluster", 1))
+        self.max_safety_changes_per_cluster = int(self.config.get("max_safety_changes_per_cluster", -1))
+        self.max_safety_changes_per_episode = int(self.config.get("max_safety_changes_per_episode", -1))
+        self.replan_on_budget_exhaustion = bool(self.config.get("replan_on_budget_exhaustion", True))
+        self.max_budget_replans_per_episode = int(self.config.get("max_budget_replans_per_episode", 3))
         self.shadow_only = bool(self.config.get("shadow_only", False))
         self.debug = bool(self.config.get("debug", False))
         self.debug_root_dir = os.path.abspath(
@@ -101,6 +105,13 @@ class VLMapActionSafety:
         self.debug_sample_episode_count = int(self.config.get("debug_sample_episode_count", 0))
         self.debug_sample_images_per_episode = max(1, int(self.config.get("debug_sample_images_per_episode", 2)))
         self.debug_sample_seed = int(self.config.get("debug_sample_seed", 0))
+        self.debug_force_on_replan = bool(self.config.get("debug_force_on_replan", True))
+        self.debug_force_on_budget_suppressed = bool(self.config.get("debug_force_on_budget_suppressed", True))
+        self.debug_force_cluster_block_count = int(self.config.get("debug_force_cluster_block_count", 8))
+        self.debug_force_cluster_block_interval = max(
+            1, int(self.config.get("debug_force_cluster_block_interval", 5))
+        )
+        self.debug_force_max_snapshots = int(self.config.get("debug_force_max_snapshots", 10))
         self.debug_crop_radius_cells = int(self.config.get("debug_crop_radius_cells", 80))
         self.debug_cell_scale = max(1, int(self.config.get("debug_cell_scale", 3)))
         self._last_update_position: Optional[np.ndarray] = None
@@ -108,10 +119,15 @@ class VLMapActionSafety:
         self._disabled_reason: Optional[str] = None
         self._debug_import_warned = False
         self._debug_saved_snapshots = 0
+        self._debug_forced_snapshots = 0
         self._debug_selected_episode_indices = None
         self._debug_episode_snapshot_counts = {}
         self._debug_episode_candidate_counts = {}
         self._recent_blocks = []
+        self._episode_block_count = 0
+        self._episode_safety_change_count = 0
+        self._episode_budget_suppressed_count = 0
+        self._episode_budget_replan_count = 0
         self._last_safety_turn_action: Optional[int] = None
         self._last_safety_turn_step: Optional[int] = None
         self._last_safety_turn_position: Optional[np.ndarray] = None
@@ -138,6 +154,10 @@ class VLMapActionSafety:
         self._last_update_position = None
         self._step = 0
         self._recent_blocks = []
+        self._episode_block_count = 0
+        self._episode_safety_change_count = 0
+        self._episode_budget_suppressed_count = 0
+        self._episode_budget_replan_count = 0
         self._last_safety_turn_action = None
         self._last_safety_turn_step = None
         self._last_safety_turn_position = None
@@ -167,6 +187,8 @@ class VLMapActionSafety:
         cluster_displacement = 0.0
         cluster_duration_steps = 0
         recovery_actions = []
+        budget_suppressed = False
+        budget_suppressed_reason = None
         repeat_block_count = 0
         position = pose_tf[:3, 3].copy()
         self.last_decision = {
@@ -185,6 +207,8 @@ class VLMapActionSafety:
             "stuck": False,
             "waypoint_repair_required": False,
             "recovery_actions": [],
+            "budget_suppressed": False,
+            "budget_suppressed_reason": None,
         }
 
         self._maybe_update(obs["depth"], pose_tf)
@@ -203,9 +227,22 @@ class VLMapActionSafety:
                 cluster_displacement = self._cluster_displacement(position)
                 cluster_duration_steps = self._cluster_duration_steps()
                 stuck_detected = self._is_cluster_stuck(position)
+                budget_suppressed_reason = self._budget_suppression_reason()
+                budget_suppressed = budget_suppressed_reason is not None
+                if budget_suppressed:
+                    self._episode_budget_suppressed_count += 1
                 repeat_threshold_met = self.repeat_block_enable and repeat_block_count >= self.repeat_block_count
+                budget_replan_allowed = (
+                    budget_suppressed
+                    and self.replan_on_budget_exhaustion
+                    and (
+                        self.max_budget_replans_per_episode < 0
+                        or self._episode_budget_replan_count < self.max_budget_replans_per_episode
+                    )
+                )
+                repeat_threshold_met = repeat_threshold_met or budget_replan_allowed
                 if repeat_threshold_met and not self.shadow_only:
-                    if self.recovery_turn_steps > 1:
+                    if not budget_suppressed and self.recovery_turn_steps > 1:
                         recovery_actions = [int(corrected)] * (self.recovery_turn_steps - 1)
                     cooldown_remaining = self._replan_cooldown_remaining()
                     if cooldown_remaining > 0:
@@ -215,6 +252,8 @@ class VLMapActionSafety:
                     else:
                         replan_required = True
                         self._cluster_replan_count += 1
+                        if budget_suppressed:
+                            self._episode_budget_replan_count += 1
                         self._replan_cooldown_until_step = self._step + self.replan_cooldown_steps
                     self._clear_recent_blocks()
                 if (
@@ -247,18 +286,34 @@ class VLMapActionSafety:
                 probe_info["stuck"] = bool(stuck_detected)
                 probe_info["waypoint_repair_required"] = bool(waypoint_repair_required)
                 probe_info["recovery_actions"] = recovery_actions
-                if self.shadow_only:
+                probe_info["episode_block_count"] = int(self._episode_block_count)
+                probe_info["episode_safety_change_count"] = int(self._episode_safety_change_count)
+                probe_info["episode_budget_suppressed_count"] = int(self._episode_budget_suppressed_count)
+                probe_info["episode_budget_replan_count"] = int(self._episode_budget_replan_count)
+                probe_info["budget_suppressed"] = bool(budget_suppressed)
+                probe_info["budget_suppressed_reason"] = budget_suppressed_reason
+                if self.shadow_only or budget_suppressed:
                     safe_action = original_action
                 else:
                     safe_action = corrected
                     changed = safe_action != original_action
+                    if changed:
+                        self._episode_safety_change_count += 1
+                        probe_info["episode_safety_change_count"] = int(self._episode_safety_change_count)
                 if self.verbose:
-                    verb = "would replace" if self.shadow_only else "replace"
-                    print(
-                        "[VLMapSafety] forward blocked; "
-                        f"{verb} action {original_action} -> {corrected} at step {self._step}"
-                        f"{' (shadow only)' if self.shadow_only else ''}"
-                    )
+                    if budget_suppressed:
+                        print(
+                            "[VLMapSafety] forward blocked; "
+                            f"suppress replacement by {budget_suppressed_reason}; "
+                            f"would replace action {original_action} -> {corrected} at step {self._step}"
+                        )
+                    else:
+                        verb = "would replace" if self.shadow_only else "replace"
+                        print(
+                            "[VLMapSafety] forward blocked; "
+                            f"{verb} action {original_action} -> {corrected} at step {self._step}"
+                            f"{' (shadow only)' if self.shadow_only else ''}"
+                        )
                     if replan_required:
                         print(
                             "[VLMapSafety] repeated blocked forward; "
@@ -305,6 +360,12 @@ class VLMapActionSafety:
             "stuck": bool(stuck_detected),
             "waypoint_repair_required": bool(waypoint_repair_required),
             "recovery_actions": recovery_actions,
+            "episode_block_count": int(self._episode_block_count),
+            "episode_safety_change_count": int(self._episode_safety_change_count),
+            "episode_budget_suppressed_count": int(self._episode_budget_suppressed_count),
+            "episode_budget_replan_count": int(self._episode_budget_replan_count),
+            "budget_suppressed": bool(budget_suppressed),
+            "budget_suppressed_reason": budget_suppressed_reason,
             "safety_step": int(self._step),
         }
         return safe_action, changed
@@ -560,6 +621,7 @@ class VLMapActionSafety:
 
     def _record_block(self, position: np.ndarray, turn_action: int) -> int:
         self._ensure_block_cluster(position)
+        self._episode_block_count += 1
         self._recent_blocks = self._filtered_recent_blocks(position)
         self._recent_blocks.append(
             {
@@ -580,6 +642,19 @@ class VLMapActionSafety:
                 self._same_turn_streak_action = int(turn_action)
                 self._same_turn_streak_count = 1
         return len(self._recent_blocks)
+
+    def _budget_suppression_reason(self) -> Optional[str]:
+        if (
+            self.max_safety_changes_per_episode >= 0
+            and self._episode_safety_change_count >= self.max_safety_changes_per_episode
+        ):
+            return "episode_change_budget"
+        if (
+            self.max_safety_changes_per_cluster >= 0
+            and self._cluster_block_count > self.max_safety_changes_per_cluster
+        ):
+            return "cluster_block_budget"
+        return None
 
     def _filtered_recent_blocks(self, position: np.ndarray):
         filtered = []
@@ -685,8 +760,13 @@ class VLMapActionSafety:
             should_save = True
         else:
             should_save = False
+
+        force_save = self._force_debug_snapshot(probe_info)
+        if self.debug_force_max_snapshots >= 0 and self._debug_forced_snapshots >= self.debug_force_max_snapshots:
+            force_save = False
         if self.debug_max_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_max_snapshots:
             should_save = False
+            force_save = False
 
         debug_dir = self._get_debug_dir()
         os.makedirs(debug_dir, exist_ok=True)
@@ -695,7 +775,10 @@ class VLMapActionSafety:
         scene_id = str(context.get("scene_id", "scene")).replace(os.sep, "_")
         eval_step = context.get("step_id", self._step)
         prefix = f"{scene_id}_ep{episode_id}_step{int(eval_step):05d}_safe{self._step:05d}"
-        should_save = self._sample_debug_snapshot(should_save, context)
+        if force_save:
+            should_save = True
+        else:
+            should_save = self._sample_debug_snapshot(should_save, context)
         if not should_save and not self.debug_log_all_events:
             return
 
@@ -725,6 +808,8 @@ class VLMapActionSafety:
                 image_path = os.path.join(debug_dir, f"{prefix}.png")
                 canvas.save(image_path)
                 self._debug_saved_snapshots += 1
+                if force_save:
+                    self._debug_forced_snapshots += 1
 
         event = {
             "scene_id": context.get("scene_id"),
@@ -759,11 +844,41 @@ class VLMapActionSafety:
                 bool(probe_info.get("waypoint_repair_required", False)) if probe_info else False
             ),
             "recovery_actions": probe_info.get("recovery_actions", []) if probe_info else [],
+            "episode_block_count": int(probe_info.get("episode_block_count", 0)) if probe_info else 0,
+            "episode_safety_change_count": (
+                int(probe_info.get("episode_safety_change_count", 0)) if probe_info else 0
+            ),
+            "episode_budget_suppressed_count": (
+                int(probe_info.get("episode_budget_suppressed_count", 0)) if probe_info else 0
+            ),
+            "episode_budget_replan_count": (
+                int(probe_info.get("episode_budget_replan_count", 0)) if probe_info else 0
+            ),
+            "budget_suppressed": bool(probe_info.get("budget_suppressed", False)) if probe_info else False,
+            "budget_suppressed_reason": probe_info.get("budget_suppressed_reason") if probe_info else None,
             "probe": probe_info,
             "image_path": image_path,
+            "debug_forced": bool(force_save and image_path is not None),
         }
         with open(os.path.join(debug_dir, "events.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _force_debug_snapshot(self, probe_info: Optional[Dict[str, Any]]) -> bool:
+        if not probe_info:
+            return False
+        if self.debug_force_on_budget_suppressed and probe_info.get("budget_suppressed"):
+            return True
+        if self.debug_force_on_replan and (
+            probe_info.get("replan_required") or probe_info.get("waypoint_repair_required")
+        ):
+            return True
+        threshold = self.debug_force_cluster_block_count
+        if threshold < 0:
+            return False
+        cluster_blocks = int(probe_info.get("cluster_block_count", 0))
+        if cluster_blocks < threshold:
+            return False
+        return (cluster_blocks - threshold) % self.debug_force_cluster_block_interval == 0
 
     def _sample_debug_snapshot(self, should_save: bool, context: Dict[str, Any]) -> bool:
         if not should_save:
@@ -963,7 +1078,8 @@ class VLMapActionSafety:
                 f"b={probe_info.get('cluster_block_count', 0)} "
                 f"rp={probe_info.get('cluster_replan_count', 0)} "
                 f"cd={probe_info.get('replan_cooldown_remaining', 0)} "
-                f"stuck={probe_info.get('stuck', False)}"
+                f"stuck={probe_info.get('stuck', False)} "
+                f"budget={probe_info.get('budget_suppressed_reason')}"
             )
         else:
             turn_text = "no turn probe"

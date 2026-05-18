@@ -15,11 +15,11 @@ eval_cfg = copy.deepcopy(_load_base_cfg())
 
 eval_cfg.agent.model_settings["vlmap_safety"]["enable"] = True
 eval_cfg.agent.model_settings["vlmap_safety"]["debug_dir"] = (
-    "./logs/habitat/compare_vlmap_200/vlmap_safety_debug"
+    "./logs/habitat/compare_vlmap_200_guarded/vlmap_safety_debug"
 )
 
 eval_cfg.env.env_settings["episode_start_index"] = 0
 eval_cfg.env.env_settings["max_eval_episodes"] = 200
 eval_cfg.env.env_settings["episode_ids"] = None
 
-eval_cfg.eval_settings["output_path"] = "./logs/habitat/compare_vlmap_200"
+eval_cfg.eval_settings["output_path"] = "./logs/habitat/compare_vlmap_200_guarded"
