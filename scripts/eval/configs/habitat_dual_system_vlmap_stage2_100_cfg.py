@@ -19,19 +19,22 @@ vlmap_cfg["action_safety_enable"] = False
 vlmap_cfg["waypoint_check_enable"] = True
 vlmap_cfg["waypoint_shadow_only"] = True
 vlmap_cfg["waypoint_requery_enable"] = False
-vlmap_cfg["debug_dir"] = "./logs/habitat/compare_vlmap_stage2_100_shadow_fix1/vlmap_safety_debug"
+vlmap_cfg["debug_dir"] = "./logs/habitat/compare_vlmap_stage2_100_shadow_fix2/vlmap_safety_debug"
 vlmap_cfg["debug_max_snapshots"] = 35
 vlmap_cfg["debug_sample_total_snapshots"] = 25
 vlmap_cfg["debug_force_max_snapshots"] = 10
 vlmap_cfg["debug_force_max_snapshots_per_episode"] = 1
 vlmap_cfg["waypoint_save_snapshots"] = True
+vlmap_cfg["waypoint_risk_threshold"] = 0.60
+vlmap_cfg["waypoint_risk_min_checked_cells"] = 4
+vlmap_cfg["waypoint_force_save_on_risk"] = True
 vlmap_cfg["waypoint_force_save_on_block"] = True
-vlmap_cfg["waypoint_force_max_snapshots"] = 20
+vlmap_cfg["waypoint_force_max_snapshots"] = 30
 vlmap_cfg["verbose"] = True
 
 eval_cfg.env.env_settings["episode_start_index"] = 0
 eval_cfg.env.env_settings["max_eval_episodes"] = 100
 eval_cfg.env.env_settings["episode_ids"] = None
 
-eval_cfg.eval_settings["output_path"] = "./logs/habitat/compare_vlmap_stage2_100_shadow_fix1"
+eval_cfg.eval_settings["output_path"] = "./logs/habitat/compare_vlmap_stage2_100_shadow_fix2"
 eval_cfg.eval_settings["port"] = "2342"

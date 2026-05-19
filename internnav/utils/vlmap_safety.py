@@ -96,6 +96,11 @@ class VLMapActionSafety:
         self.waypoint_depth_patch_radius = int(self.config.get("waypoint_depth_patch_radius", 2))
         self.waypoint_camera_pitch_deg = float(self.config.get("waypoint_camera_pitch_deg", 30.0))
         self.waypoint_save_snapshots = bool(self.config.get("waypoint_save_snapshots", True))
+        self.waypoint_risk_threshold = float(self.config.get("waypoint_risk_threshold", 0.60))
+        self.waypoint_risk_min_checked_cells = int(
+            self.config.get("waypoint_risk_min_checked_cells", self.line_min_checked_cells)
+        )
+        self.waypoint_force_save_on_risk = bool(self.config.get("waypoint_force_save_on_risk", True))
         self.waypoint_force_save_on_block = bool(self.config.get("waypoint_force_save_on_block", True))
         self.waypoint_force_max_snapshots = int(self.config.get("waypoint_force_max_snapshots", 20))
         self.debug = bool(self.config.get("debug", False))
@@ -136,6 +141,7 @@ class VLMapActionSafety:
         self._debug_sampled_snapshots = 0
         self._debug_forced_snapshots = 0
         self._debug_waypoint_forced_snapshots = 0
+        self._debug_waypoint_risk_snapshots = 0
         self._debug_forced_episode_counts = {}
         self._debug_selected_episode_indices = None
         self._debug_episode_snapshot_counts = {}
@@ -452,12 +458,22 @@ class VLMapActionSafety:
         start = waypoint["start_grid"]
         goal = waypoint["goal_grid"]
         path_free, stats = self._is_line_free(start, goal)
+        risk_score = float(stats.get("blocked_fraction", 0.0))
+        risk_checked = int(stats.get("checked", 0))
+        high_risk = (
+            risk_checked >= self.waypoint_risk_min_checked_cells
+            and risk_score >= self.waypoint_risk_threshold
+        )
         decision.update(
             {
                 "valid": True,
                 "path_free": bool(path_free),
                 "requery_required": bool((not path_free) and self.waypoint_requery_enable and not self.waypoint_shadow_only),
                 "reason": "free" if path_free else "blocked",
+                "waypoint_high_risk": bool(high_risk),
+                "waypoint_risk_score": float(risk_score),
+                "waypoint_risk_threshold": float(self.waypoint_risk_threshold),
+                "waypoint_risk_min_checked_cells": int(self.waypoint_risk_min_checked_cells),
                 "start_grid": [int(start[0]), int(start[1])],
                 "goal_grid": [int(goal[0]), int(goal[1])],
                 "depth_m": float(waypoint["depth_m"]),
@@ -479,13 +495,17 @@ class VLMapActionSafety:
             "waypoint_depth_m": float(waypoint["depth_m"]),
             "waypoint_stats": stats,
             "pixel_oob": bool(waypoint["pixel_oob"]),
+            "waypoint_high_risk": bool(high_risk),
+            "waypoint_risk_score": float(risk_score),
+            "waypoint_risk_threshold": float(self.waypoint_risk_threshold),
         }
         self._write_waypoint_event(obs, context, pose_tf, decision, probe_info)
         self.last_waypoint_decision = decision
-        if self.verbose and not path_free:
+        if self.verbose and (not path_free or high_risk):
             mode = "shadow" if self.waypoint_shadow_only else "active"
+            status = "blocked" if not path_free else "high-risk"
             print(
-                "[VLMapSafety][Waypoint] pixel goal blocked "
+                f"[VLMapSafety][Waypoint] pixel goal {status} "
                 f"({mode}); goal={decision['goal_grid']} "
                 f"blocked={stats.get('blocked')}/{stats.get('checked')} "
                 f"frac={stats.get('blocked_fraction', 0.0):.2f}"
@@ -1163,17 +1183,24 @@ class VLMapActionSafety:
         if not self.debug:
             return None
         is_blocked = decision.get("path_free") is False
-        force_save = bool(is_blocked and self.waypoint_force_save_on_block)
+        is_high_risk = bool(decision.get("waypoint_high_risk", False))
+        force_block_save = bool(is_blocked and self.waypoint_force_save_on_block)
+        force_risk_save = bool(is_high_risk and self.waypoint_force_save_on_risk)
+        force_save = force_block_save or force_risk_save
         if (
             force_save
             and self.waypoint_force_max_snapshots >= 0
             and self._debug_waypoint_forced_snapshots >= self.waypoint_force_max_snapshots
         ):
             force_save = False
+            force_block_save = False
+            force_risk_save = False
         should_save = force_save or bool(self.config.get("waypoint_save_on_free", False))
         if self.debug_max_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_max_snapshots:
             should_save = False
             force_save = False
+            force_block_save = False
+            force_risk_save = False
         if not force_save:
             should_save = self._sample_debug_snapshot(should_save, context)
         if not should_save:
@@ -1212,6 +1239,8 @@ class VLMapActionSafety:
         self._debug_saved_snapshots += 1
         if force_save:
             self._debug_waypoint_forced_snapshots += 1
+            if force_risk_save and not force_block_save:
+                self._debug_waypoint_risk_snapshots += 1
         else:
             self._debug_sampled_snapshots += 1
         return image_path
@@ -1417,8 +1446,14 @@ class VLMapActionSafety:
             waypoint_goal = probe_info.get("waypoint_goal")
             if waypoint_goal is not None:
                 waypoint_free = bool(probe_info.get("waypoint_path_free", False))
+                waypoint_high_risk = bool(probe_info.get("waypoint_high_risk", False))
                 waypoint_xy = to_xy(waypoint_goal[0], waypoint_goal[1])
-                color = (80, 220, 120) if waypoint_free else (255, 80, 80)
+                if not waypoint_free:
+                    color = (255, 80, 80)
+                elif waypoint_high_risk:
+                    color = (255, 180, 40)
+                else:
+                    color = (80, 220, 120)
                 draw.line([agent_xy, waypoint_xy], fill=color, width=max(2, scale))
                 draw.ellipse(
                     [
@@ -1453,6 +1488,7 @@ class VLMapActionSafety:
             stats = probe_info.get("waypoint_stats") or {}
             turn_text = (
                 f"WP={probe_info.get('waypoint_path_free')} "
+                f"risk={probe_info.get('waypoint_high_risk')} "
                 f"g={probe_info.get('waypoint_goal')} "
                 f"d={probe_info.get('waypoint_depth_m', 0.0):.2f} "
                 f"B={stats.get('blocked', '?')}/{stats.get('checked', '?')}"
