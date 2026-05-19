@@ -422,14 +422,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         }
         if safety_obs["gps"] is None or safety_obs["compass"] is None:
             return {}
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        depth_h, depth_w = depth_m.shape[:2]
+        source_image_width = int(vlmap_safety_cfg.get("waypoint_source_image_width") or depth_w)
+        source_image_height = int(vlmap_safety_cfg.get("waypoint_source_image_height") or depth_h)
         context = {
             "step_id": step_id,
             "scene_id": scene_id,
             "episode_id": episode_id,
             "episode_index": episode_index,
             "episode_count": episode_count,
-            "image_width": int(getattr(self.model_args, "resize_w", 384)),
-            "image_height": int(getattr(self.model_args, "resize_h", 384)),
+            "image_width": source_image_width,
+            "image_height": source_image_height,
             "camera_pitch_deg": float(camera_pitch_deg),
         }
         decision = evaluate(safety_obs, pixel_goal, context=context)

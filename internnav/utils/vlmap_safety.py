@@ -96,6 +96,8 @@ class VLMapActionSafety:
         self.waypoint_depth_patch_radius = int(self.config.get("waypoint_depth_patch_radius", 2))
         self.waypoint_camera_pitch_deg = float(self.config.get("waypoint_camera_pitch_deg", 30.0))
         self.waypoint_save_snapshots = bool(self.config.get("waypoint_save_snapshots", True))
+        self.waypoint_force_save_on_block = bool(self.config.get("waypoint_force_save_on_block", True))
+        self.waypoint_force_max_snapshots = int(self.config.get("waypoint_force_max_snapshots", 20))
         self.debug = bool(self.config.get("debug", False))
         self.debug_root_dir = os.path.abspath(
             os.path.expanduser(str(self.config.get("debug_dir", "./logs/vlmap_safety_debug")))
@@ -133,6 +135,7 @@ class VLMapActionSafety:
         self._debug_saved_snapshots = 0
         self._debug_sampled_snapshots = 0
         self._debug_forced_snapshots = 0
+        self._debug_waypoint_forced_snapshots = 0
         self._debug_forced_episode_counts = {}
         self._debug_selected_episode_indices = None
         self._debug_episode_snapshot_counts = {}
@@ -460,6 +463,12 @@ class VLMapActionSafety:
                 "depth_m": float(waypoint["depth_m"]),
                 "target_base_xy": [float(waypoint["target_base_xy"][0]), float(waypoint["target_base_xy"][1])],
                 "camera_pitch_deg": float(waypoint["camera_pitch_deg"]),
+                "source_image_size": waypoint["source_image_size"],
+                "depth_image_size": waypoint["depth_image_size"],
+                "scaled_pixel_float": waypoint["scaled_pixel_float"],
+                "scaled_pixel": waypoint["scaled_pixel"],
+                "pixel_oob": bool(waypoint["pixel_oob"]),
+                "intrinsic": waypoint["intrinsic"],
                 "line_stats": stats,
             }
         )
@@ -469,6 +478,7 @@ class VLMapActionSafety:
             "waypoint_path_free": bool(path_free),
             "waypoint_depth_m": float(waypoint["depth_m"]),
             "waypoint_stats": stats,
+            "pixel_oob": bool(waypoint["pixel_oob"]),
         }
         self._write_waypoint_event(obs, context, pose_tf, decision, probe_info)
         self.last_waypoint_decision = decision
@@ -601,10 +611,13 @@ class VLMapActionSafety:
         if image_width <= 0 or image_height <= 0:
             return None
 
-        x = int(round(px * width / image_width))
-        y = int(round(py * height / image_height))
-        x = max(0, min(width - 1, x))
-        y = max(0, min(height - 1, y))
+        scaled_x = px * width / image_width
+        scaled_y = py * height / image_height
+        raw_x = int(round(scaled_x))
+        raw_y = int(round(scaled_y))
+        pixel_oob = raw_x < 0 or raw_x >= width or raw_y < 0 or raw_y >= height
+        x = max(0, min(width - 1, raw_x))
+        y = max(0, min(height - 1, raw_y))
 
         patch_radius = max(0, int(self.waypoint_depth_patch_radius))
         x0 = max(0, x - patch_radius)
@@ -622,12 +635,10 @@ class VLMapActionSafety:
             depth_value = min(depth_value, self.waypoint_max_distance)
 
         intrinsic = np.asarray(self.builder.camera_intrinsic, dtype=np.float32)
-        sx = width / float(max(image_width, 1))
-        sy = height / float(max(image_height, 1))
-        fx = float(intrinsic[0, 0]) * sx
-        fy = float(intrinsic[1, 1]) * sy
-        cx = float(intrinsic[0, 2]) * sx
-        cy = float(intrinsic[1, 2]) * sy
+        fx = float(intrinsic[0, 0])
+        fy = float(intrinsic[1, 1])
+        cx = float(intrinsic[0, 2])
+        cy = float(intrinsic[1, 2])
         if abs(fx) < 1e-6 or abs(fy) < 1e-6:
             return None
 
@@ -651,7 +662,17 @@ class VLMapActionSafety:
             "depth_m": float(depth_value),
             "target_base_xy": target_base_xy,
             "camera_pitch_deg": float(pitch_deg),
+            "source_image_size": [int(image_width), int(image_height)],
+            "depth_image_size": [int(width), int(height)],
+            "scaled_pixel_float": [float(scaled_x), float(scaled_y)],
             "scaled_pixel": [int(x), int(y)],
+            "pixel_oob": bool(pixel_oob),
+            "intrinsic": {
+                "fx": float(fx),
+                "fy": float(fy),
+                "cx": float(cx),
+                "cy": float(cy),
+            },
         }
 
     def _cam_to_base_for_pitch(self, pitch_down_deg: float) -> np.ndarray:
@@ -1141,10 +1162,20 @@ class VLMapActionSafety:
     ) -> Optional[str]:
         if not self.debug:
             return None
-        should_save = (decision.get("path_free") is False) or bool(self.config.get("waypoint_save_on_free", False))
+        is_blocked = decision.get("path_free") is False
+        force_save = bool(is_blocked and self.waypoint_force_save_on_block)
+        if (
+            force_save
+            and self.waypoint_force_max_snapshots >= 0
+            and self._debug_waypoint_forced_snapshots >= self.waypoint_force_max_snapshots
+        ):
+            force_save = False
+        should_save = force_save or bool(self.config.get("waypoint_save_on_free", False))
         if self.debug_max_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_max_snapshots:
             should_save = False
-        should_save = self._sample_debug_snapshot(should_save, context)
+            force_save = False
+        if not force_save:
+            should_save = self._sample_debug_snapshot(should_save, context)
         if not should_save:
             return None
 
@@ -1179,7 +1210,10 @@ class VLMapActionSafety:
         image_path = os.path.join(debug_dir, f"{prefix}.png")
         canvas.save(image_path)
         self._debug_saved_snapshots += 1
-        self._debug_sampled_snapshots += 1
+        if force_save:
+            self._debug_waypoint_forced_snapshots += 1
+        else:
+            self._debug_sampled_snapshots += 1
         return image_path
 
     def _debug_episode_key(self, context: Dict[str, Any]) -> Tuple[Any, Any, Any]:
