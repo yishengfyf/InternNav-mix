@@ -87,6 +87,15 @@ class VLMapActionSafety:
         self.replan_on_budget_exhaustion = bool(self.config.get("replan_on_budget_exhaustion", True))
         self.max_budget_replans_per_episode = int(self.config.get("max_budget_replans_per_episode", 3))
         self.shadow_only = bool(self.config.get("shadow_only", False))
+        self.action_safety_enable = bool(self.config.get("action_safety_enable", True))
+        self.waypoint_check_enable = bool(self.config.get("waypoint_check_enable", False))
+        self.waypoint_shadow_only = bool(self.config.get("waypoint_shadow_only", True))
+        self.waypoint_requery_enable = bool(self.config.get("waypoint_requery_enable", False))
+        self.waypoint_min_depth = float(self.config.get("waypoint_min_depth", self.config.get("min_depth", 0.15)))
+        self.waypoint_max_distance = float(self.config.get("waypoint_max_distance", 3.0))
+        self.waypoint_depth_patch_radius = int(self.config.get("waypoint_depth_patch_radius", 2))
+        self.waypoint_camera_pitch_deg = float(self.config.get("waypoint_camera_pitch_deg", 30.0))
+        self.waypoint_save_snapshots = bool(self.config.get("waypoint_save_snapshots", True))
         self.debug = bool(self.config.get("debug", False))
         self.debug_root_dir = os.path.abspath(
             os.path.expanduser(str(self.config.get("debug_dir", "./logs/vlmap_safety_debug")))
@@ -150,6 +159,7 @@ class VLMapActionSafety:
         self._same_turn_streak_count = 0
         self._replan_cooldown_until_step = -1
         self.last_decision: Dict[str, Any] = {}
+        self.last_waypoint_decision: Dict[str, Any] = {}
 
         self.builder = None
         if self.enabled:
@@ -169,6 +179,7 @@ class VLMapActionSafety:
         self._clear_block_cluster()
         self._cluster_seq = 0
         self.last_decision = {}
+        self.last_waypoint_decision = {}
         if self.builder is not None:
             self.builder.reset()
 
@@ -217,6 +228,19 @@ class VLMapActionSafety:
         }
 
         self._maybe_update(obs["depth"], pose_tf)
+        if not self.action_safety_enable:
+            self.last_decision = {
+                "input_action": original_action,
+                "output_action": original_action,
+                "changed": False,
+                "front_free": None,
+                "replan_required": False,
+                "waypoint_repair_required": False,
+                "action_safety_enable": False,
+                "safety_step": int(self._step),
+            }
+            return original_action, False
+
         if original_action == self.forward_action:
             front_free, front_stats = self._is_forward_free(pose_tf)
             probe_info = {"front": front_stats}
@@ -375,6 +399,89 @@ class VLMapActionSafety:
         }
         return safe_action, changed
 
+    def evaluate_pixel_goal(self, obs: Dict[str, Any], pixel_goal, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Evaluate whether a System2 pixel waypoint is locally reachable in the VLMap obstacle map.
+
+        This is intentionally a waypoint-level advisor. In shadow mode it never changes
+        InternNav/NextDiT behavior; it only records whether the chosen pixel points
+        through currently mapped obstacles.
+        """
+        context = dict(context or {})
+        decision: Dict[str, Any] = {
+            "enabled": bool(self.enabled and self.waypoint_check_enable),
+            "valid": False,
+            "path_free": None,
+            "requery_required": False,
+            "shadow_only": bool(self.waypoint_shadow_only),
+            "pixel_goal": self._jsonable(pixel_goal),
+            "reason": None,
+        }
+        if not self.enabled or not self.waypoint_check_enable or self.builder is None:
+            decision["reason"] = "disabled"
+            self.last_waypoint_decision = decision
+            return decision
+
+        pose_tf = self._pose_from_obs(obs)
+        if pose_tf is None or "depth" not in obs:
+            decision["reason"] = "missing_pose_or_depth"
+            self.last_waypoint_decision = decision
+            return decision
+
+        depth_m = self._prepare_depth(obs["depth"])
+        if depth_m is None:
+            decision["reason"] = "invalid_depth"
+            self.last_waypoint_decision = decision
+            return decision
+
+        self._maybe_update(depth_m, pose_tf)
+        waypoint = self._pixel_goal_to_grid(
+            pixel_goal=pixel_goal,
+            depth_m=depth_m,
+            pose_tf=pose_tf,
+            context=context,
+        )
+        if waypoint is None:
+            decision["reason"] = "invalid_pixel_goal"
+            self.last_waypoint_decision = decision
+            self._write_waypoint_event(obs, context, pose_tf, decision, None)
+            return decision
+
+        start = waypoint["start_grid"]
+        goal = waypoint["goal_grid"]
+        path_free, stats = self._is_line_free(start, goal)
+        decision.update(
+            {
+                "valid": True,
+                "path_free": bool(path_free),
+                "requery_required": bool((not path_free) and self.waypoint_requery_enable and not self.waypoint_shadow_only),
+                "reason": "free" if path_free else "blocked",
+                "start_grid": [int(start[0]), int(start[1])],
+                "goal_grid": [int(goal[0]), int(goal[1])],
+                "depth_m": float(waypoint["depth_m"]),
+                "target_base_xy": [float(waypoint["target_base_xy"][0]), float(waypoint["target_base_xy"][1])],
+                "camera_pitch_deg": float(waypoint["camera_pitch_deg"]),
+                "line_stats": stats,
+            }
+        )
+        probe_info = {
+            "waypoint_start": decision["start_grid"],
+            "waypoint_goal": decision["goal_grid"],
+            "waypoint_path_free": bool(path_free),
+            "waypoint_depth_m": float(waypoint["depth_m"]),
+            "waypoint_stats": stats,
+        }
+        self._write_waypoint_event(obs, context, pose_tf, decision, probe_info)
+        self.last_waypoint_decision = decision
+        if self.verbose and not path_free:
+            mode = "shadow" if self.waypoint_shadow_only else "active"
+            print(
+                "[VLMapSafety][Waypoint] pixel goal blocked "
+                f"({mode}); goal={decision['goal_grid']} "
+                f"blocked={stats.get('blocked')}/{stats.get('checked')} "
+                f"frac={stats.get('blocked_fraction', 0.0):.2f}"
+            )
+        return decision
+
     def _init_builder(self, camera_intrinsic: np.ndarray) -> None:
         repo_path = self.config.get("vlmaps_repo") or self.config.get("vlmaps_root")
         if repo_path:
@@ -459,6 +566,113 @@ class VLMapActionSafety:
         updated = self.builder.update(depth_m, pose_tf)
         if updated:
             self._last_update_position = position
+
+    def _prepare_depth(self, depth: Any) -> Optional[np.ndarray]:
+        if depth is None:
+            return None
+        depth_m = np.asarray(depth)
+        if depth_m.ndim == 3:
+            depth_m = depth_m[..., 0]
+        if depth_m.ndim != 2:
+            return None
+        depth_m = depth_m.astype(np.float32, copy=False)
+        if self.depth_scale != 1.0:
+            finite = depth_m[np.isfinite(depth_m)]
+            if finite.size and float(np.nanmax(finite)) <= 1.5:
+                depth_m = depth_m * self.depth_scale
+        return depth_m
+
+    def _pixel_goal_to_grid(
+        self,
+        pixel_goal,
+        depth_m: np.ndarray,
+        pose_tf: np.ndarray,
+        context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            px = float(pixel_goal[0])
+            py = float(pixel_goal[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+        height, width = depth_m.shape[:2]
+        image_width = int(context.get("image_width") or context.get("resize_w") or width)
+        image_height = int(context.get("image_height") or context.get("resize_h") or height)
+        if image_width <= 0 or image_height <= 0:
+            return None
+
+        x = int(round(px * width / image_width))
+        y = int(round(py * height / image_height))
+        x = max(0, min(width - 1, x))
+        y = max(0, min(height - 1, y))
+
+        patch_radius = max(0, int(self.waypoint_depth_patch_radius))
+        x0 = max(0, x - patch_radius)
+        x1 = min(width, x + patch_radius + 1)
+        y0 = max(0, y - patch_radius)
+        y1 = min(height, y + patch_radius + 1)
+        patch = depth_m[y0:y1, x0:x1].reshape(-1)
+        patch = patch[np.isfinite(patch)]
+        patch = patch[(patch >= self.waypoint_min_depth) & (patch <= self.config.get("max_depth", 6.0))]
+        if patch.size == 0:
+            return None
+
+        depth_value = float(np.median(patch))
+        if self.waypoint_max_distance > 0:
+            depth_value = min(depth_value, self.waypoint_max_distance)
+
+        intrinsic = np.asarray(self.builder.camera_intrinsic, dtype=np.float32)
+        sx = width / float(max(image_width, 1))
+        sy = height / float(max(image_height, 1))
+        fx = float(intrinsic[0, 0]) * sx
+        fy = float(intrinsic[1, 1]) * sy
+        cx = float(intrinsic[0, 2]) * sx
+        cy = float(intrinsic[1, 2]) * sy
+        if abs(fx) < 1e-6 or abs(fy) < 1e-6:
+            return None
+
+        cam_x = (x + 0.5 - cx) * depth_value / fx
+        cam_y = (y + 0.5 - cy) * depth_value / fy
+        cam_z = depth_value
+        pitch_deg = float(context.get("camera_pitch_deg", self.waypoint_camera_pitch_deg))
+        cam_to_base = self._cam_to_base_for_pitch(pitch_deg)
+        base_point = cam_to_base @ np.array([cam_x, cam_y, cam_z, 1.0], dtype=np.float32)
+        target_base_xy = np.array([base_point[0], base_point[1]], dtype=np.float32)
+
+        # The grid is obstacle-only and ground-plane based. Keep the waypoint on the
+        # local base plane even if the pixel lies on furniture or a far wall.
+        relative_pose = self.builder._relative_base_tf(pose_tf)
+        target_rel = relative_pose @ np.array([target_base_xy[0], target_base_xy[1], 0.0, 1.0], dtype=np.float32)
+        row, col, _ = self.builder.base_pose_to_grid(pose_tf)
+        goal_row, goal_col = self._xy_to_grid(float(target_rel[0]), float(target_rel[1]))
+        return {
+            "start_grid": (int(row), int(col)),
+            "goal_grid": (int(goal_row), int(goal_col)),
+            "depth_m": float(depth_value),
+            "target_base_xy": target_base_xy,
+            "camera_pitch_deg": float(pitch_deg),
+            "scaled_pixel": [int(x), int(y)],
+        }
+
+    def _cam_to_base_for_pitch(self, pitch_down_deg: float) -> np.ndarray:
+        pitch = math.radians(float(pitch_down_deg))
+        c, s = math.cos(pitch), math.sin(pitch)
+        tf = np.eye(4, dtype=np.float32)
+        tf[:3, :3] = np.array(
+            [
+                [0.0, s, c],
+                [-1.0, 0.0, 0.0],
+                [0.0, -c, -s],
+            ],
+            dtype=np.float32,
+        )
+        tf[:3, 3] = np.array([0.0, 0.0, float(self.config.get("camera_height", 0.0))], dtype=np.float32)
+        return tf
+
+    def _xy_to_grid(self, x: float, y: float) -> Tuple[int, int]:
+        row = int(self.builder.gs / 2 - int(x / self.builder.cs))
+        col = int(self.builder.gs / 2 - int(y / self.builder.cs))
+        return row, col
 
     def _pick_turn_action(self, pose_tf: np.ndarray, obs: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         row, col, yaw = self.builder.base_pose_to_grid(pose_tf)
@@ -882,6 +1096,92 @@ class VLMapActionSafety:
         with open(os.path.join(debug_dir, "events.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
+    def _write_waypoint_event(
+        self,
+        obs: Dict[str, Any],
+        context: Dict[str, Any],
+        pose_tf: np.ndarray,
+        decision: Dict[str, Any],
+        probe_info: Optional[Dict[str, Any]],
+    ) -> None:
+        if not self.debug:
+            return
+
+        debug_dir = self._get_debug_dir()
+        os.makedirs(debug_dir, exist_ok=True)
+        image_path = None
+        if self.waypoint_save_snapshots and probe_info is not None:
+            image_path = self._maybe_save_waypoint_snapshot(obs, context, pose_tf, decision, probe_info)
+
+        event = {
+            "scene_id": context.get("scene_id"),
+            "episode_id": context.get("episode_id"),
+            "episode_index": context.get("episode_index"),
+            "episode_count": context.get("episode_count"),
+            "eval_step": context.get("step_id"),
+            "safety_step": int(self._step),
+            "shadow_only": bool(self.waypoint_shadow_only),
+            "requery_enable": bool(self.waypoint_requery_enable),
+            "decision": self._jsonable(decision),
+            "probe": self._jsonable(probe_info),
+            "gps": self._jsonable(obs.get("gps")),
+            "compass": self._jsonable(obs.get("compass")),
+            "image_path": image_path,
+        }
+        with open(os.path.join(debug_dir, "waypoint_events.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _maybe_save_waypoint_snapshot(
+        self,
+        obs: Dict[str, Any],
+        context: Dict[str, Any],
+        pose_tf: np.ndarray,
+        decision: Dict[str, Any],
+        probe_info: Dict[str, Any],
+    ) -> Optional[str]:
+        if not self.debug:
+            return None
+        should_save = (decision.get("path_free") is False) or bool(self.config.get("waypoint_save_on_free", False))
+        if self.debug_max_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_max_snapshots:
+            should_save = False
+        should_save = self._sample_debug_snapshot(should_save, context)
+        if not should_save:
+            return None
+
+        try:
+            from PIL import Image, ImageDraw
+        except Exception as exc:
+            if not self._debug_import_warned:
+                print(f"[VLMapSafety] waypoint debug snapshot disabled because PIL import failed: {exc}")
+                self._debug_import_warned = True
+            return None
+
+        rgb_img = self._rgb_debug_image(obs.get("rgb"), Image, ImageDraw)
+        depth_img = self._depth_debug_image(obs.get("depth"), Image, ImageDraw)
+        map_img = self._map_debug_image(pose_tf, probe_info, decision.get("path_free"), Image, ImageDraw)
+        panels = [img for img in (rgb_img, depth_img, map_img) if img is not None]
+        if not panels:
+            return None
+
+        height = max(img.height for img in panels)
+        width = sum(img.width for img in panels)
+        canvas = Image.new("RGB", (width, height), (20, 20, 20))
+        offset = 0
+        for img in panels:
+            canvas.paste(img, (offset, 0))
+            offset += img.width
+
+        episode_id = context.get("episode_id", "unknown")
+        scene_id = str(context.get("scene_id", "scene")).replace(os.sep, "_")
+        eval_step = context.get("step_id", self._step)
+        prefix = f"{scene_id}_ep{episode_id}_step{int(eval_step):05d}_waypoint{self._step:05d}"
+        debug_dir = self._get_debug_dir()
+        image_path = os.path.join(debug_dir, f"{prefix}.png")
+        canvas.save(image_path)
+        self._debug_saved_snapshots += 1
+        self._debug_sampled_snapshots += 1
+        return image_path
+
     def _debug_episode_key(self, context: Dict[str, Any]) -> Tuple[Any, Any, Any]:
         return (
             context.get("episode_index"),
@@ -1080,6 +1380,22 @@ class VLMapActionSafety:
                 draw.line([agent_xy, to_xy(left_probe[0], left_probe[1])], fill=(50, 170, 255), width=max(1, scale))
             if right_probe is not None:
                 draw.line([agent_xy, to_xy(right_probe[0], right_probe[1])], fill=(160, 120, 255), width=max(1, scale))
+            waypoint_goal = probe_info.get("waypoint_goal")
+            if waypoint_goal is not None:
+                waypoint_free = bool(probe_info.get("waypoint_path_free", False))
+                waypoint_xy = to_xy(waypoint_goal[0], waypoint_goal[1])
+                color = (80, 220, 120) if waypoint_free else (255, 80, 80)
+                draw.line([agent_xy, waypoint_xy], fill=color, width=max(2, scale))
+                draw.ellipse(
+                    [
+                        waypoint_xy[0] - 5,
+                        waypoint_xy[1] - 5,
+                        waypoint_xy[0] + 5,
+                        waypoint_xy[1] + 5,
+                    ],
+                    outline=color,
+                    width=max(2, scale),
+                )
 
         heading_len = max(8, int(0.5 / self.builder.cs))
         heading_xy = to_xy(
@@ -1099,7 +1415,16 @@ class VLMapActionSafety:
                 f" F={front_stats.get('blocked', '?')}/{front_stats.get('checked', '?')}"
                 f"@{front_stats.get('blocked_fraction', 0.0):.2f}"
             )
-        if probe_info is not None:
+        if probe_info is not None and probe_info.get("waypoint_goal") is not None:
+            stats = probe_info.get("waypoint_stats") or {}
+            turn_text = (
+                f"WP={probe_info.get('waypoint_path_free')} "
+                f"g={probe_info.get('waypoint_goal')} "
+                f"d={probe_info.get('waypoint_depth_m', 0.0):.2f} "
+                f"B={stats.get('blocked', '?')}/{stats.get('checked', '?')}"
+                f"@{stats.get('blocked_fraction', 0.0):.2f}"
+            )
+        elif probe_info is not None:
             turn_text = (
                 f"L={probe_info.get('left_free')} R={probe_info.get('right_free')} "
                 f"pref={probe_info.get('preferred_turn')} -> {probe_info.get('corrected')} "

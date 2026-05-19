@@ -220,6 +220,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._camera_height = self.sim_sensors_config.rgb_sensor.position[1]
         self._min_depth = self.sim_sensors_config.depth_sensor.min_depth
         self._max_depth = self.sim_sensors_config.depth_sensor.max_depth
+        self._tilt_angle_deg = float(getattr(self.config.habitat.simulator, "tilt_angle", 15.0))
 
         camera_fov_rad = np.deg2rad(self.sim_sensors_config.depth_sensor.hfov)
         self._camera_fov = camera_fov_rad
@@ -394,6 +395,51 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "clear local goal and mark waypoint-level repair required"
             )
         return int(safe_action), changed, decision
+
+    def _evaluate_pixel_goal_with_vlmap(
+        self,
+        pixel_goal,
+        observations: dict,
+        depth_m: np.ndarray,
+        rgb: Optional[np.ndarray] = None,
+        step_id: Optional[int] = None,
+        scene_id: Optional[str] = None,
+        episode_id: Optional[int] = None,
+        episode_index: Optional[int] = None,
+        episode_count: Optional[int] = None,
+        camera_pitch_deg: float = 0.0,
+    ) -> dict:
+        if not hasattr(self, "vlmap_safety"):
+            return {}
+        evaluate = getattr(self.vlmap_safety, "evaluate_pixel_goal", None)
+        if evaluate is None:
+            return {}
+        safety_obs = {
+            "depth": depth_m,
+            "rgb": rgb,
+            "gps": observations.get("gps"),
+            "compass": observations.get("compass"),
+        }
+        if safety_obs["gps"] is None or safety_obs["compass"] is None:
+            return {}
+        context = {
+            "step_id": step_id,
+            "scene_id": scene_id,
+            "episode_id": episode_id,
+            "episode_index": episode_index,
+            "episode_count": episode_count,
+            "image_width": int(getattr(self.model_args, "resize_w", 384)),
+            "image_height": int(getattr(self.model_args, "resize_h", 384)),
+            "camera_pitch_deg": float(camera_pitch_deg),
+        }
+        decision = evaluate(safety_obs, pixel_goal, context=context)
+        if decision.get("valid") and decision.get("path_free") is False:
+            print(
+                "[VLMapSafety][Habitat][Waypoint] blocked pixel goal "
+                f"{pixel_goal}; shadow={decision.get('shadow_only')} "
+                f"requery={decision.get('requery_required')}"
+            )
+        return dict(decision or {})
 
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
@@ -596,9 +642,32 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         pixel_goal = [int(coord[1]), int(coord[0])]
                         draw_pixel_goal = True
 
+                        # Stage 2 VLMap advisor: check the S2 waypoint before asking
+                        # NextDiT/System1 to turn it into local trajectory actions.
+                        waypoint_camera_pitch_deg = 2.0 * self._tilt_angle_deg if action == action_code.LOOKDOWN else 0.0
+                        vlmap_waypoint_decision = self._evaluate_pixel_goal_with_vlmap(
+                            pixel_goal,
+                            observations,
+                            current_depth_m,
+                            rgb=rgb,
+                            step_id=step_id,
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_index=episode_index,
+                            episode_count=episode_count,
+                            camera_pitch_deg=waypoint_camera_pitch_deg,
+                        )
+
                         # look down --> horizontal
                         self.env.step(action_code.LOOKUP)
                         self.env.step(action_code.LOOKUP)
+                        if vlmap_waypoint_decision.get("requery_required"):
+                            pixel_goal = None
+                            output_ids = None
+                            messages = []
+                            local_actions = []
+                            action_seq = []
+                            continue
 
                         local_actions = []
                         pixel_values = inputs.pixel_values
@@ -607,7 +676,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         with torch.no_grad():
                             traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
 
-                        # prepocess align with navdp
+                        # Preprocess for the active System1 trajectory generator (NextDiT in current DualVLN eval).
                         image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
                         pix_goal_image = copy.copy(image_dp)
                         images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(self.device)
@@ -649,7 +718,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     action_seq.pop(0)
                 elif pixel_goal is not None:
                     if len(local_actions) == 0:
-                        # navdp
+                        # Regenerate local actions from the active System1 trajectory generator.
                         local_actions = []
                         image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
 
