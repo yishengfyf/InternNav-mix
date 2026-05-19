@@ -112,6 +112,9 @@ class VLMapActionSafety:
             1, int(self.config.get("debug_force_cluster_block_interval", 5))
         )
         self.debug_force_max_snapshots = int(self.config.get("debug_force_max_snapshots", 10))
+        self.debug_force_max_snapshots_per_episode = int(
+            self.config.get("debug_force_max_snapshots_per_episode", -1)
+        )
         self.debug_crop_radius_cells = int(self.config.get("debug_crop_radius_cells", 80))
         self.debug_cell_scale = max(1, int(self.config.get("debug_cell_scale", 3)))
         self._last_update_position: Optional[np.ndarray] = None
@@ -119,7 +122,9 @@ class VLMapActionSafety:
         self._disabled_reason: Optional[str] = None
         self._debug_import_warned = False
         self._debug_saved_snapshots = 0
+        self._debug_sampled_snapshots = 0
         self._debug_forced_snapshots = 0
+        self._debug_forced_episode_counts = {}
         self._debug_selected_episode_indices = None
         self._debug_episode_snapshot_counts = {}
         self._debug_episode_candidate_counts = {}
@@ -761,19 +766,28 @@ class VLMapActionSafety:
         else:
             should_save = False
 
-        force_save = self._force_debug_snapshot(probe_info)
-        if self.debug_force_max_snapshots >= 0 and self._debug_forced_snapshots >= self.debug_force_max_snapshots:
-            force_save = False
-        if self.debug_max_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_max_snapshots:
-            should_save = False
-            force_save = False
-
         debug_dir = self._get_debug_dir()
         os.makedirs(debug_dir, exist_ok=True)
         context = obs.get("debug_context", {}) or {}
         episode_id = context.get("episode_id", "unknown")
         scene_id = str(context.get("scene_id", "scene")).replace(os.sep, "_")
         eval_step = context.get("step_id", self._step)
+        episode_key = self._debug_episode_key(context)
+
+        force_save = self._force_debug_snapshot(probe_info)
+        if self.debug_force_max_snapshots >= 0 and self._debug_forced_snapshots >= self.debug_force_max_snapshots:
+            force_save = False
+        if (
+            force_save
+            and self.debug_force_max_snapshots_per_episode >= 0
+            and self._debug_forced_episode_counts.get(episode_key, 0)
+            >= self.debug_force_max_snapshots_per_episode
+        ):
+            force_save = False
+        if self.debug_max_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_max_snapshots:
+            should_save = False
+            force_save = False
+
         prefix = f"{scene_id}_ep{episode_id}_step{int(eval_step):05d}_safe{self._step:05d}"
         if force_save:
             should_save = True
@@ -810,6 +824,11 @@ class VLMapActionSafety:
                 self._debug_saved_snapshots += 1
                 if force_save:
                     self._debug_forced_snapshots += 1
+                    self._debug_forced_episode_counts[episode_key] = (
+                        self._debug_forced_episode_counts.get(episode_key, 0) + 1
+                    )
+                else:
+                    self._debug_sampled_snapshots += 1
 
         event = {
             "scene_id": context.get("scene_id"),
@@ -863,6 +882,13 @@ class VLMapActionSafety:
         with open(os.path.join(debug_dir, "events.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
+    def _debug_episode_key(self, context: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+        return (
+            context.get("episode_index"),
+            context.get("scene_id"),
+            context.get("episode_id"),
+        )
+
     def _force_debug_snapshot(self, probe_info: Optional[Dict[str, Any]]) -> bool:
         if not probe_info:
             return False
@@ -885,7 +911,10 @@ class VLMapActionSafety:
             return False
         if not self.debug_sample_snapshots:
             return True
-        if self.debug_sample_total_snapshots >= 0 and self._debug_saved_snapshots >= self.debug_sample_total_snapshots:
+        if (
+            self.debug_sample_total_snapshots >= 0
+            and self._debug_sampled_snapshots >= self.debug_sample_total_snapshots
+        ):
             return False
 
         episode_index = context.get("episode_index")
