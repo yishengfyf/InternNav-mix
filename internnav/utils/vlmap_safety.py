@@ -103,6 +103,20 @@ class VLMapActionSafety:
         self.waypoint_force_save_on_risk = bool(self.config.get("waypoint_force_save_on_risk", True))
         self.waypoint_force_save_on_block = bool(self.config.get("waypoint_force_save_on_block", True))
         self.waypoint_force_max_snapshots = int(self.config.get("waypoint_force_max_snapshots", 20))
+        self.waypoint_requery_on_block = bool(self.config.get("waypoint_requery_on_block", True))
+        self.waypoint_requery_on_high_risk = bool(self.config.get("waypoint_requery_on_high_risk", True))
+        self.waypoint_requery_risk_threshold = float(
+            self.config.get("waypoint_requery_risk_threshold", 0.75)
+        )
+        self.waypoint_requery_min_checked_cells = int(
+            self.config.get("waypoint_requery_min_checked_cells", 20)
+        )
+        self.max_waypoint_requeries_per_episode = int(
+            self.config.get("max_waypoint_requeries_per_episode", 1)
+        )
+        self.waypoint_requery_cooldown_steps = max(
+            0, int(self.config.get("waypoint_requery_cooldown_steps", 40))
+        )
         self.debug = bool(self.config.get("debug", False))
         self.debug_root_dir = os.path.abspath(
             os.path.expanduser(str(self.config.get("debug_dir", "./logs/vlmap_safety_debug")))
@@ -151,6 +165,8 @@ class VLMapActionSafety:
         self._episode_safety_change_count = 0
         self._episode_budget_suppressed_count = 0
         self._episode_budget_replan_count = 0
+        self._episode_waypoint_requery_count = 0
+        self._last_waypoint_requery_step: Optional[int] = None
         self._last_safety_turn_action: Optional[int] = None
         self._last_safety_turn_step: Optional[int] = None
         self._last_safety_turn_position: Optional[np.ndarray] = None
@@ -182,6 +198,8 @@ class VLMapActionSafety:
         self._episode_safety_change_count = 0
         self._episode_budget_suppressed_count = 0
         self._episode_budget_replan_count = 0
+        self._episode_waypoint_requery_count = 0
+        self._last_waypoint_requery_step = None
         self._last_safety_turn_action = None
         self._last_safety_turn_step = None
         self._last_safety_turn_position = None
@@ -464,16 +482,62 @@ class VLMapActionSafety:
             risk_checked >= self.waypoint_risk_min_checked_cells
             and risk_score >= self.waypoint_risk_threshold
         )
+        requery_required = False
+        requery_candidate = False
+        requery_reason = None
+        requery_suppressed_reason = None
+        requery_cooldown_remaining = 0
+        if self.waypoint_requery_enable and not self.waypoint_shadow_only:
+            if (not path_free) and self.waypoint_requery_on_block:
+                requery_candidate = True
+                requery_reason = "blocked"
+            elif (
+                self.waypoint_requery_on_high_risk
+                and risk_checked >= self.waypoint_requery_min_checked_cells
+                and risk_score >= self.waypoint_requery_risk_threshold
+            ):
+                requery_candidate = True
+                requery_reason = "high_risk"
+
+            if requery_candidate:
+                if (
+                    self.max_waypoint_requeries_per_episode >= 0
+                    and self._episode_waypoint_requery_count >= self.max_waypoint_requeries_per_episode
+                ):
+                    requery_suppressed_reason = "episode_requery_budget"
+                else:
+                    if self._last_waypoint_requery_step is not None:
+                        requery_cooldown_remaining = max(
+                            0,
+                            int(
+                                self.waypoint_requery_cooldown_steps
+                                - (self._step - self._last_waypoint_requery_step)
+                            ),
+                        )
+                    if requery_cooldown_remaining > 0:
+                        requery_suppressed_reason = "cooldown"
+                    else:
+                        requery_required = True
+                        self._episode_waypoint_requery_count += 1
+                        self._last_waypoint_requery_step = int(self._step)
         decision.update(
             {
                 "valid": True,
                 "path_free": bool(path_free),
-                "requery_required": bool((not path_free) and self.waypoint_requery_enable and not self.waypoint_shadow_only),
+                "requery_required": bool(requery_required),
                 "reason": "free" if path_free else "blocked",
                 "waypoint_high_risk": bool(high_risk),
                 "waypoint_risk_score": float(risk_score),
                 "waypoint_risk_threshold": float(self.waypoint_risk_threshold),
                 "waypoint_risk_min_checked_cells": int(self.waypoint_risk_min_checked_cells),
+                "waypoint_requery_candidate": bool(requery_candidate),
+                "waypoint_requery_reason": requery_reason,
+                "waypoint_requery_suppressed_reason": requery_suppressed_reason,
+                "waypoint_requery_risk_threshold": float(self.waypoint_requery_risk_threshold),
+                "waypoint_requery_min_checked_cells": int(self.waypoint_requery_min_checked_cells),
+                "waypoint_requery_cooldown_remaining": int(requery_cooldown_remaining),
+                "episode_waypoint_requery_count": int(self._episode_waypoint_requery_count),
+                "max_waypoint_requeries_per_episode": int(self.max_waypoint_requeries_per_episode),
                 "start_grid": [int(start[0]), int(start[1])],
                 "goal_grid": [int(goal[0]), int(goal[1])],
                 "depth_m": float(waypoint["depth_m"]),
@@ -498,17 +562,28 @@ class VLMapActionSafety:
             "waypoint_high_risk": bool(high_risk),
             "waypoint_risk_score": float(risk_score),
             "waypoint_risk_threshold": float(self.waypoint_risk_threshold),
+            "waypoint_requery_candidate": bool(requery_candidate),
+            "waypoint_requery_required": bool(requery_required),
+            "waypoint_requery_reason": requery_reason,
+            "waypoint_requery_suppressed_reason": requery_suppressed_reason,
+            "episode_waypoint_requery_count": int(self._episode_waypoint_requery_count),
         }
         self._write_waypoint_event(obs, context, pose_tf, decision, probe_info)
         self.last_waypoint_decision = decision
-        if self.verbose and (not path_free or high_risk):
+        if self.verbose and (not path_free or high_risk or requery_required or requery_suppressed_reason):
             mode = "shadow" if self.waypoint_shadow_only else "active"
             status = "blocked" if not path_free else "high-risk"
+            suffix = ""
+            if requery_required:
+                suffix = f"; request S2 requery by {requery_reason}"
+            elif requery_suppressed_reason is not None:
+                suffix = f"; suppress requery by {requery_suppressed_reason}"
             print(
                 f"[VLMapSafety][Waypoint] pixel goal {status} "
                 f"({mode}); goal={decision['goal_grid']} "
                 f"blocked={stats.get('blocked')}/{stats.get('checked')} "
                 f"frac={stats.get('blocked_fraction', 0.0):.2f}"
+                f"{suffix}"
             )
         return decision
 

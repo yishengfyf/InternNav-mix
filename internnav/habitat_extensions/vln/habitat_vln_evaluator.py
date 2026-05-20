@@ -437,6 +437,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "camera_pitch_deg": float(camera_pitch_deg),
         }
         decision = evaluate(safety_obs, pixel_goal, context=context)
+        if decision.get("requery_required"):
+            print(
+                "[VLMapSafety][Habitat][Waypoint] request S2 requery "
+                f"for pixel goal {pixel_goal}; "
+                f"reason={decision.get('waypoint_requery_reason')} "
+                f"risk={decision.get('waypoint_risk_score')}"
+            )
+        elif decision.get("waypoint_requery_suppressed_reason"):
+            print(
+                "[VLMapSafety][Habitat][Waypoint] suppress S2 requery "
+                f"for pixel goal {pixel_goal}; "
+                f"reason={decision.get('waypoint_requery_suppressed_reason')} "
+                f"risk={decision.get('waypoint_risk_score')}"
+            )
         if decision.get("valid") and decision.get("path_free") is False:
             print(
                 "[VLMapSafety][Habitat][Waypoint] blocked pixel goal "
