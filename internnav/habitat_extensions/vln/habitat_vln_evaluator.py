@@ -219,12 +219,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         eval_random_seed = getattr(self.model_args, "eval_random_seed", None)
         if eval_random_seed is not None:
             eval_random_seed = int(eval_random_seed) + int(getattr(self, "rank", 0))
-            random.seed(eval_random_seed)
-            np.random.seed(eval_random_seed)
-            torch.manual_seed(eval_random_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(eval_random_seed)
-            print(f"[HabitatVLN] fixed eval random seed: {eval_random_seed}")
+            self._seed_eval_rng(eval_random_seed, "init")
 
         self._camera_height = self.sim_sensors_config.rgb_sensor.position[1]
         self._min_depth = self.sim_sensors_config.depth_sensor.min_depth
@@ -309,6 +304,32 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             os.makedirs(run_dir, exist_ok=True)
             with open(os.path.join(run_dir, 'progress.json'), 'a', encoding="utf-8") as f:
                 f.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+    def _seed_eval_rng(self, seed: int, label: str = "") -> None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        if label:
+            print(f"[HabitatVLN] fixed eval random seed ({label}): {seed}")
+
+    def _seed_eval_rng_for_episode(self, episode_index: int, episode_id: int) -> None:
+        base_seed = getattr(self.model_args, "eval_random_seed", None)
+        if base_seed is None or not bool(getattr(self.model_args, "eval_seed_per_episode", False)):
+            return
+
+        mode = getattr(self.model_args, "eval_episode_seed_mode", "episode_index")
+        if mode == "episode_id":
+            episode_offset = int(episode_id)
+        elif mode == "episode_index":
+            episode_offset = int(episode_index)
+        else:
+            raise ValueError(f"Invalid eval_episode_seed_mode: {mode}")
+
+        rank_offset = int(getattr(self, "rank", 0)) * 100000
+        episode_seed = int(base_seed) + episode_offset + rank_offset
+        self._seed_eval_rng(episode_seed, f"episode_index={episode_index}, episode_id={episode_id}")
 
     def calc_metrics(self, global_metrics: dict) -> dict:
         """
@@ -579,6 +600,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             scene_id = episode.scene_id.split('/')[-2]
             episode_id = int(episode.episode_id)
             episode_instruction = episode.instruction.instruction_text
+            self._seed_eval_rng_for_episode(episode_index, episode_id)
             print("episode start", episode_instruction)
             self.vlmap_safety.reset()
             self._vlmap_last_nav_action = None
@@ -1053,6 +1075,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             observations = self.env.reset()
             if not self.env.is_running or observations is None:
                 break
+            episode_index = max(0, getattr(self.env, "_current_episode_index", 1) - 1)
 
             # ---- episode meta (scene_id, episode_id, instruction) ----
             # we get it from the underlying habitat env
@@ -1060,6 +1083,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             scene_id = episode.scene_id.split('/')[-2]
             episode_id = int(episode.episode_id)
             episode_instruction = episode.instruction.instruction_text
+            self._seed_eval_rng_for_episode(episode_index, episode_id)
             print("episode start", episode_instruction)
 
             agent_state = self.env._env.sim.get_agent_state()

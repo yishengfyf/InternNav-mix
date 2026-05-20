@@ -14,6 +14,8 @@ eval_cfg = EvalCfg(
             "vis_debug": False,  # If vis_debug=True, save debug videos per episode
             "vis_debug_path": "./logs/habitat/vis_debug",
             "eval_random_seed": None,
+            "eval_seed_per_episode": False,
+            "eval_episode_seed_mode": "episode_index",
             "s2_prompt_conjunction_index": None,
             "vlmap_safety": {
                 "enable": True,
