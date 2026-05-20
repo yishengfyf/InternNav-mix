@@ -676,15 +676,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             camera_pitch_deg=waypoint_camera_pitch_deg,
                         )
 
-                        # look down --> horizontal
-                        self.env.step(action_code.LOOKUP)
-                        self.env.step(action_code.LOOKUP)
+                        # Always restore the camera to the normal forward view before
+                        # either handing the goal to System1 or asking System2 again.
+                        _, _, lookup_done, _ = self.env.step(action_code.LOOKUP)
+                        observations, _, lookup_done_2, _ = self.env.step(action_code.LOOKUP)
+                        done = done or lookup_done or lookup_done_2
                         if vlmap_waypoint_decision.get("requery_required"):
+                            # Drop every state tied to the rejected waypoint. Without
+                            # clearing both messages and input_images, the next Qwen-VL
+                            # prompt can contain one image token but many stale images.
                             pixel_goal = None
                             output_ids = None
                             messages = []
+                            input_images = []
+                            llm_outputs = ""
                             local_actions = []
                             action_seq = []
+                            action = None
+                            forward_action = 0
+                            draw_pixel_goal = False
+                            flag = False
+                            print("[VLMapSafety][Habitat][Waypoint] clear current goal and requery S2")
                             continue
 
                         local_actions = []
