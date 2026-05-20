@@ -77,6 +77,7 @@ eval_cfg = EvalCfg(
                 "waypoint_requery_on_high_risk": True,
                 "waypoint_requery_risk_threshold": 0.75,
                 "waypoint_requery_min_checked_cells": 20,
+                "waypoint_requery_feedback_enable": True,
                 "max_waypoint_requeries_per_episode": 1,
                 "waypoint_requery_cooldown_steps": 40,
                 "shadow_only": False,

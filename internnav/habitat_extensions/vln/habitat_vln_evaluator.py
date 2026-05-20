@@ -459,6 +459,41 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
         return dict(decision or {})
 
+    def _format_vlmap_waypoint_feedback(self, pixel_goal, decision: dict) -> str:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        if not bool(vlmap_safety_cfg.get("waypoint_requery_feedback_enable", True)):
+            return ""
+
+        stats = decision.get("line_stats") or {}
+        checked = int(stats.get("checked", 0) or 0)
+        blocked = int(stats.get("blocked", 0) or 0)
+        risk_score = float(decision.get("waypoint_risk_score", 0.0) or 0.0)
+        reason = decision.get("waypoint_requery_reason") or decision.get("reason") or "unsafe"
+
+        if reason == "blocked":
+            risk_text = "the straight route to it is blocked by mapped obstacles"
+        elif reason == "high_risk":
+            risk_text = (
+                "the straight route to it crosses many mapped obstacle cells "
+                f"({blocked}/{checked}, risk {risk_score:.2f})"
+            )
+        else:
+            risk_text = f"it is considered unsafe by the local VLMap ({reason})"
+
+        try:
+            x, y = int(pixel_goal[0]), int(pixel_goal[1])
+            coord_text = f"column={x}, row={y}"
+        except (TypeError, ValueError, IndexError):
+            coord_text = str(pixel_goal)
+
+        return (
+            "Navigation safety feedback: the previous waypoint you selected "
+            f"({coord_text}) was rejected because {risk_text}. "
+            "Select a different waypoint on visible open floor, away from furniture, walls, "
+            "doorframes, and narrow obstacle bands. Do not repeat the rejected waypoint. "
+            "Still output only the next waypoint coordinates or STOP."
+        )
+
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
         if self.rank != 0:
@@ -534,6 +569,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             messages = []
             local_actions = []
             vlmap_recovery_actions = []
+            pending_vlmap_waypoint_feedback = ""
 
             done = False
             flag = False
@@ -619,6 +655,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         input_images = [rgb_list[i] for i in history_id] + cur_images
                         input_img_id = 0
 
+                    if pending_vlmap_waypoint_feedback:
+                        sources[0]["value"] += f" {pending_vlmap_waypoint_feedback}"
+                        print(
+                            "[VLMapSafety][Habitat][Waypoint] inject S2 feedback: "
+                            f"{pending_vlmap_waypoint_feedback}"
+                        )
+                        pending_vlmap_waypoint_feedback = ""
+
                     prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
@@ -685,6 +729,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             # Drop every state tied to the rejected waypoint. Without
                             # clearing both messages and input_images, the next Qwen-VL
                             # prompt can contain one image token but many stale images.
+                            pending_vlmap_waypoint_feedback = self._format_vlmap_waypoint_feedback(
+                                pixel_goal, vlmap_waypoint_decision
+                            )
                             pixel_goal = None
                             output_ids = None
                             messages = []
