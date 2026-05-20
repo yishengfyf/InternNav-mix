@@ -13,6 +13,8 @@ eval_cfg = EvalCfg(
             "max_new_tokens": 1024,  # maximum number of tokens for generation
             "vis_debug": False,  # If vis_debug=True, save debug videos per episode
             "vis_debug_path": "./logs/habitat/vis_debug",
+            "eval_random_seed": None,
+            "s2_prompt_conjunction_index": None,
             "vlmap_safety": {
                 "enable": True,
                 "vlmaps_repo": "/home/yifeifeng/workspace/vlmaps",
@@ -78,6 +80,8 @@ eval_cfg = EvalCfg(
                 "waypoint_requery_risk_threshold": 0.75,
                 "waypoint_requery_min_checked_cells": 20,
                 "waypoint_requery_feedback_enable": True,
+                "waypoint_requery_duplicate_suppression": True,
+                "waypoint_requery_repeat_grid_radius": 2,
                 "max_waypoint_requeries_per_episode": 1,
                 "waypoint_requery_cooldown_steps": 40,
                 "shadow_only": False,

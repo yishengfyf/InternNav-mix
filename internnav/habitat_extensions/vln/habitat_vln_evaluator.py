@@ -216,6 +216,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         )
 
         self.num_history = self.model_args.num_history
+        eval_random_seed = getattr(self.model_args, "eval_random_seed", None)
+        if eval_random_seed is not None:
+            eval_random_seed = int(eval_random_seed) + int(getattr(self, "rank", 0))
+            random.seed(eval_random_seed)
+            np.random.seed(eval_random_seed)
+            torch.manual_seed(eval_random_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(eval_random_seed)
+            print(f"[HabitatVLN] fixed eval random seed: {eval_random_seed}")
 
         self._camera_height = self.sim_sensors_config.rgb_sensor.position[1]
         self._min_depth = self.sim_sensors_config.depth_sensor.min_depth
@@ -342,6 +351,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         actions = [self.actions2idx[match] for match in matches]
         actions = itertools.chain.from_iterable(actions)
         return list(actions)
+
+    def _select_s2_prompt_prefix(self) -> str:
+        prompt_index = getattr(self.model_args, "s2_prompt_conjunction_index", None)
+        if prompt_index is not None:
+            return self.conjunctions[int(prompt_index) % len(self.conjunctions)]
+        return random.choice(self.conjunctions)
 
     def _postprocess_habitat_action_with_vlmap_safety(
         self,
@@ -494,6 +509,34 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "Still output only the next waypoint coordinates or STOP."
         )
 
+    def _vlmap_goal_grid_from_decision(self, decision: dict):
+        goal_grid = decision.get("goal_grid")
+        if goal_grid is None:
+            return None
+        try:
+            return (int(goal_grid[0]), int(goal_grid[1]))
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _match_rejected_vlmap_goal(self, decision: dict, rejected_goal_grids: list):
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        if not bool(vlmap_safety_cfg.get("waypoint_requery_duplicate_suppression", True)):
+            return None
+        goal_grid = self._vlmap_goal_grid_from_decision(decision)
+        if goal_grid is None:
+            return None
+        radius = max(0, int(vlmap_safety_cfg.get("waypoint_requery_repeat_grid_radius", 2)))
+        for rejected_goal in rejected_goal_grids:
+            dx = abs(goal_grid[0] - rejected_goal[0])
+            dy = abs(goal_grid[1] - rejected_goal[1])
+            if max(dx, dy) <= radius:
+                return {
+                    "goal_grid": goal_grid,
+                    "rejected_goal_grid": rejected_goal,
+                    "chebyshev_distance": max(dx, dy),
+                }
+        return None
+
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
         if self.rank != 0:
@@ -570,6 +613,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             local_actions = []
             vlmap_recovery_actions = []
             pending_vlmap_waypoint_feedback = ""
+            rejected_vlmap_goal_grids = []
 
             done = False
             flag = False
@@ -663,7 +707,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         )
                         pending_vlmap_waypoint_feedback = ""
 
-                    prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
+                    prompt = self._select_s2_prompt_prefix() + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
                     parts = split_and_clean(prompt_instruction)
@@ -719,6 +763,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_count=episode_count,
                             camera_pitch_deg=waypoint_camera_pitch_deg,
                         )
+                        repeated_goal_match = self._match_rejected_vlmap_goal(
+                            vlmap_waypoint_decision, rejected_vlmap_goal_grids
+                        )
+                        if repeated_goal_match is not None:
+                            repeated_msg = (
+                                "[VLMapSafety][Habitat][Waypoint] repeated rejected grid "
+                                f"goal={repeated_goal_match['goal_grid']} "
+                                f"previous={repeated_goal_match['rejected_goal_grid']} "
+                                f"dist={repeated_goal_match['chebyshev_distance']}"
+                            )
+                            if vlmap_waypoint_decision.get("requery_required"):
+                                vlmap_waypoint_decision["requery_required"] = False
+                                vlmap_waypoint_decision["waypoint_requery_suppressed_reason"] = (
+                                    "repeated_rejected_grid"
+                                )
+                                print(repeated_msg + "; suppress duplicate S2 requery")
+                            else:
+                                print(repeated_msg)
 
                         # Always restore the camera to the normal forward view before
                         # either handing the goal to System1 or asking System2 again.
@@ -732,6 +794,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             pending_vlmap_waypoint_feedback = self._format_vlmap_waypoint_feedback(
                                 pixel_goal, vlmap_waypoint_decision
                             )
+                            rejected_goal_grid = self._vlmap_goal_grid_from_decision(vlmap_waypoint_decision)
+                            if rejected_goal_grid is not None:
+                                rejected_vlmap_goal_grids.append(rejected_goal_grid)
                             pixel_goal = None
                             output_ids = None
                             messages = []
@@ -1101,7 +1166,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         input_images = [rgb_list[i] for i in history_id] + cur_images
                         input_img_id = 0
 
-                    prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
+                    prompt = self._select_s2_prompt_prefix() + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
                     parts = split_and_clean(prompt_instruction)
