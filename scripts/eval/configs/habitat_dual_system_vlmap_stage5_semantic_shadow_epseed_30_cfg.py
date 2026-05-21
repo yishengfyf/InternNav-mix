@@ -27,8 +27,10 @@ vlmap_cfg["shadow_only"] = True
 
 vlmap_cfg["semantic_match_enable"] = True
 vlmap_cfg["semantic_match_shadow_only"] = True
+vlmap_cfg["semantic_match_backend"] = "auto"
 vlmap_cfg["semantic_match_device"] = "cpu"
 vlmap_cfg["semantic_match_clip_model"] = "ViT-B/32"
+vlmap_cfg["semantic_match_model_path"] = "checkpoints/clip-long/longclip-B.pt"
 vlmap_cfg["semantic_match_score_threshold"] = 0.20
 vlmap_cfg["semantic_match_top_k"] = 3
 vlmap_cfg["semantic_match_max_terms"] = 8

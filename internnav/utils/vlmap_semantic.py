@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -161,8 +162,14 @@ class VLMapSemanticShadow:
         self.config = dict(config)
         self.enabled = bool(self.config.get("semantic_match_enable", False))
         self.shadow_only = bool(self.config.get("semantic_match_shadow_only", True))
+        self.backend = str(self.config.get("semantic_match_backend", "auto")).lower()
         self.device_name = str(self.config.get("semantic_match_device", "cpu"))
         self.clip_model_name = str(self.config.get("semantic_match_clip_model", "ViT-B/32"))
+        self.longclip_model_path = str(
+            self.config.get("semantic_match_model_path")
+            or self.config.get("semantic_match_longclip_model_path")
+            or "checkpoints/clip-long/longclip-B.pt"
+        )
         self.score_threshold = float(self.config.get("semantic_match_score_threshold", 0.20))
         self.top_k = max(1, int(self.config.get("semantic_match_top_k", 3)))
         self.max_terms = max(1, int(self.config.get("semantic_match_max_terms", 8)))
@@ -174,9 +181,11 @@ class VLMapSemanticShadow:
 
         self._clip = None
         self._torch = None
+        self._tokenize = None
         self._model = None
         self._preprocess = None
         self._device = None
+        self._active_backend: Optional[str] = None
         self._disabled_reason: Optional[str] = None
         self._init_error_logged = False
         self._episode_meta: Dict[str, Any] = {}
@@ -318,6 +327,7 @@ class VLMapSemanticShadow:
             "status": "ok",
             "score_threshold": float(self.score_threshold),
             "clip_model": self.clip_model_name,
+            "backend": self._active_backend,
             "device": str(self._device),
             "top_match": top_term,
             "top_score": top_score,
@@ -429,15 +439,88 @@ class VLMapSemanticShadow:
         if self._disabled_reason:
             self._write_init_error_once()
             return False
+
+        backend_errors = []
+        if self.backend in ("auto", "longclip", "clip_long", "clip-long"):
+            loaded, error = self._try_load_longclip()
+            if loaded:
+                return True
+            backend_errors.append(error)
+            if self.backend in ("longclip", "clip_long", "clip-long"):
+                self._disabled_reason = error
+                self._write_init_error_once()
+                return False
+
+        if self.backend in ("auto", "openai_clip", "clip"):
+            loaded, error = self._try_load_openai_clip()
+            if loaded:
+                return True
+            backend_errors.append(error)
+
+        self._disabled_reason = "; ".join(str(item) for item in backend_errors if item) or (
+            f"unsupported semantic_match_backend={self.backend}"
+        )
+        self._write_init_error_once()
+        return False
+
+    def _resolve_longclip_model_path(self) -> Optional[str]:
+        raw_path = Path(os.path.expanduser(self.longclip_model_path))
+        candidates = [raw_path]
+        if not raw_path.is_absolute():
+            project_root = Path(__file__).resolve().parents[3]
+            candidates.append(project_root / raw_path)
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+    def _try_load_longclip(self) -> tuple[bool, str]:
+        try:
+            import torch  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional dependency
+            if self.strict:
+                raise
+            return False, f"torch import failed for LongCLIP: {exc}"
+
+        if self.device_name.startswith("cuda") and torch.cuda.is_available():
+            device = self.device_name
+        else:
+            device = "cpu"
+
+        model_path = self._resolve_longclip_model_path()
+        if model_path is None:
+            return False, f"LongCLIP checkpoint not found: {self.longclip_model_path}"
+
+        try:
+            from internnav.model.basemodel.LongCLIP.model import longclip  # type: ignore
+
+            model, preprocess = longclip.load(model_path)
+            model = model.to(device)
+            model.eval()
+        except Exception as exc:  # pragma: no cover - optional dependency/weights
+            if self.strict:
+                raise
+            return False, f"LongCLIP load failed: {exc}"
+
+        self._clip = longclip
+        self._torch = torch
+        self._tokenize = longclip.tokenize
+        self._model = model
+        self._preprocess = preprocess
+        self._device = device
+        self._active_backend = "longclip"
+        if self.verbose:
+            print(f"[VLMapSemantic] loaded LongCLIP from {model_path} on {device}")
+        return True, ""
+
+    def _try_load_openai_clip(self) -> tuple[bool, str]:
         try:
             import clip  # type: ignore
             import torch  # type: ignore
         except Exception as exc:  # pragma: no cover - optional dependency
             if self.strict:
                 raise
-            self._disabled_reason = f"CLIP import failed: {exc}"
-            self._write_init_error_once()
-            return False
+            return False, f"OpenAI CLIP import failed: {exc}"
 
         if self.device_name.startswith("cuda") and torch.cuda.is_available():
             device = self.device_name
@@ -449,25 +532,25 @@ class VLMapSemanticShadow:
         except Exception as exc:  # pragma: no cover - optional dependency/weights
             if self.strict:
                 raise
-            self._disabled_reason = f"CLIP load failed: {exc}"
-            self._write_init_error_once()
-            return False
+            return False, f"OpenAI CLIP load failed: {exc}"
 
         self._clip = clip
         self._torch = torch
+        self._tokenize = clip.tokenize
         self._model = model
         self._preprocess = preprocess
         self._device = device
+        self._active_backend = "openai_clip"
         if self.verbose:
-            print(f"[VLMapSemantic] loaded CLIP {self.clip_model_name} on {device}")
-        return True
+            print(f"[VLMapSemantic] loaded OpenAI CLIP {self.clip_model_name} on {device}")
+        return True, ""
 
     def _ensure_text_features(self) -> bool:
         if self._text_features is not None:
             return True
         if not self._landmarks:
             return False
-        if self._model is None or self._clip is None or self._torch is None:
+        if self._model is None or self._tokenize is None or self._torch is None:
             return False
         queries = [item["query"] for item in self._landmarks]
         prompts = []
@@ -480,7 +563,7 @@ class VLMapSemanticShadow:
             prompt_groups.append(len(group))
             prompts.extend(group)
         try:
-            tokens = self._clip.tokenize(prompts).to(self._device)
+            tokens = self._tokenize(prompts).to(self._device)
             with self._torch.no_grad():
                 feats = self._model.encode_text(tokens).float()
             feats = feats / feats.norm(dim=-1, keepdim=True)
