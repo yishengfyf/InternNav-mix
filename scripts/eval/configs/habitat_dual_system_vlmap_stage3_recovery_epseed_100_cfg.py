@@ -31,13 +31,13 @@ vlmap_cfg["waypoint_recovery_probe_distance"] = 0.60
 vlmap_cfg["waypoint_recovery_require_free_probe"] = True
 vlmap_cfg["waypoint_recovery_alignment_weight"] = 0.25
 vlmap_cfg["waypoint_recovery_max_turn_steps"] = 1
-vlmap_cfg["waypoint_recovery_candidate_angles_deg"] = [-30.0, 30.0]
+vlmap_cfg["waypoint_recovery_candidate_angles_deg"] = [-15.0, 15.0]
 
-vlmap_cfg["debug_dir"] = "./logs/habitat/compare_vlmap_stage3_100_recovery_epseed/vlmap_safety_debug"
+vlmap_cfg["debug_dir"] = "./logs/habitat/compare_vlmap_stage3_100_recovery_epseed_sync15/vlmap_safety_debug"
 vlmap_cfg["debug_max_snapshots"] = 45
 vlmap_cfg["debug_sample_total_snapshots"] = 25
 vlmap_cfg["debug_force_max_snapshots"] = 10
 vlmap_cfg["debug_force_max_snapshots_per_episode"] = 1
 
-eval_cfg.eval_settings["output_path"] = "./logs/habitat/compare_vlmap_stage3_100_recovery_epseed"
+eval_cfg.eval_settings["output_path"] = "./logs/habitat/compare_vlmap_stage3_100_recovery_epseed_sync15"
 eval_cfg.eval_settings["port"] = "2349"

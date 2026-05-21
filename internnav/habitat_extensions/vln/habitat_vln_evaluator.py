@@ -232,6 +232,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
         vlmap_safety_cfg.setdefault("camera_height", float(self._camera_height))
         vlmap_safety_cfg.setdefault("depth_scale", 1.0)
+        habitat_forward_step = float(getattr(self.config.habitat.simulator, "forward_step_size", 0.25))
+        habitat_turn_angle = float(getattr(self.config.habitat.simulator, "turn_angle", 15.0))
+        vlmap_safety_cfg["habitat_forward_step_size"] = habitat_forward_step
+        vlmap_safety_cfg["habitat_turn_angle_deg"] = habitat_turn_angle
+        if bool(vlmap_safety_cfg.get("sync_habitat_action_scale", True)):
+            vlmap_safety_cfg["forward_distance"] = habitat_forward_step
+            vlmap_safety_cfg["turn_angle_deg"] = habitat_turn_angle
         self.vlmap_safety = VLMapActionSafety(
             vlmap_safety_cfg,
             get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
@@ -509,6 +516,57 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 f"requery={decision.get('requery_required')}"
             )
         return dict(decision or {})
+
+    def _validate_local_actions_with_vlmap(
+        self,
+        local_actions,
+        observations: dict,
+        depth_m: np.ndarray,
+        rgb: Optional[np.ndarray] = None,
+        step_id: Optional[int] = None,
+        scene_id: Optional[str] = None,
+        episode_id: Optional[int] = None,
+        episode_index: Optional[int] = None,
+        episode_count: Optional[int] = None,
+        pixel_goal=None,
+    ):
+        if not hasattr(self, "vlmap_safety"):
+            return False, {}
+        validate = getattr(self.vlmap_safety, "validate_trajectory", None)
+        if validate is None:
+            return False, {}
+        safety_obs = {
+            "depth": depth_m,
+            "rgb": rgb,
+            "gps": observations.get("gps"),
+            "compass": observations.get("compass"),
+        }
+        if safety_obs["gps"] is None or safety_obs["compass"] is None:
+            return False, {}
+        context = {
+            "step_id": step_id,
+            "scene_id": scene_id,
+            "episode_id": episode_id,
+            "episode_index": episode_index,
+            "episode_count": episode_count,
+            "pixel_goal": pixel_goal,
+        }
+        decision = validate(safety_obs, local_actions, context=context)
+        if decision.get("would_reject"):
+            mode = "shadow" if decision.get("shadow_only") else "active"
+            print(
+                "[VLMapSafety][Habitat][Trajectory] "
+                f"{mode} reject candidate actions={decision.get('actions')} "
+                f"blocked={decision.get('blocked_steps')}/{decision.get('checked_forward_steps')} "
+                f"reason={decision.get('reject_reason')} "
+                f"suppressed={decision.get('reject_suppressed_reason')}"
+            )
+        if decision.get("reject_required"):
+            print(
+                "[VLMapSafety][Habitat][Trajectory] reject local trajectory; "
+                "clear current goal and request new S2 observation"
+            )
+        return bool(decision.get("reject_required")), dict(decision or {})
 
     def _format_vlmap_waypoint_feedback(self, pixel_goal, decision: dict) -> str:
         vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
@@ -869,6 +927,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             llm_outputs = ""
                             local_actions = []
                             action_seq = []
+                            vlmap_recovery_actions = []
                             action = None
                             forward_action = 0
                             draw_pixel_goal = False
@@ -901,6 +960,38 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         local_actions = action_list
                         if len(local_actions) >= MAX_LOCAL_STEPS:
                             local_actions = local_actions[:MAX_LOCAL_STEPS]
+                        (
+                            traj_reject_required,
+                            vlmap_traj_decision,
+                        ) = self._validate_local_actions_with_vlmap(
+                            local_actions,
+                            observations,
+                            current_depth_m,
+                            rgb=rgb,
+                            step_id=step_id,
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_index=episode_index,
+                            episode_count=episode_count,
+                            pixel_goal=pixel_goal,
+                        )
+                        if traj_reject_required:
+                            pixel_goal = None
+                            output_ids = None
+                            traj_latents = None
+                            pix_goal_image = None
+                            pix_goal_depth = None
+                            messages = []
+                            input_images = []
+                            llm_outputs = ""
+                            local_actions = []
+                            action_seq = []
+                            vlmap_recovery_actions = []
+                            action = None
+                            forward_action = 0
+                            draw_pixel_goal = False
+                            flag = False
+                            continue
 
                         action = local_actions[0]
                         if action == action_code.STOP:
@@ -943,6 +1034,38 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         local_actions = action_list
                         if len(local_actions) >= MAX_LOCAL_STEPS:
                             local_actions = local_actions[:MAX_LOCAL_STEPS]
+                        (
+                            traj_reject_required,
+                            vlmap_traj_decision,
+                        ) = self._validate_local_actions_with_vlmap(
+                            local_actions,
+                            observations,
+                            current_depth_m,
+                            rgb=rgb,
+                            step_id=step_id,
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_index=episode_index,
+                            episode_count=episode_count,
+                            pixel_goal=pixel_goal,
+                        )
+                        if traj_reject_required:
+                            pixel_goal = None
+                            output_ids = None
+                            traj_latents = None
+                            pix_goal_image = None
+                            pix_goal_depth = None
+                            messages = []
+                            input_images = []
+                            llm_outputs = ""
+                            local_actions = []
+                            action_seq = []
+                            vlmap_recovery_actions = []
+                            action = None
+                            forward_action = 0
+                            draw_pixel_goal = False
+                            flag = False
+                            continue
                         print("local_actions", local_actions)
                         action = local_actions.pop(0)
                     else:

@@ -149,6 +149,24 @@ class VLMapActionSafety:
             [-float(self.turn_angle_deg), float(self.turn_angle_deg)],
         )
         self.waypoint_recovery_candidate_angles_deg = [float(item) for item in recovery_angles]
+        self.traj_validation_enable = bool(self.config.get("traj_validation_enable", False))
+        self.traj_validation_shadow_only = bool(self.config.get("traj_validation_shadow_only", True))
+        self.traj_validation_horizon = max(1, int(self.config.get("traj_validation_horizon", 4)))
+        self.traj_validation_block_threshold = max(
+            1, int(self.config.get("traj_validation_block_threshold", 1))
+        )
+        self.traj_validation_max_rejects_per_episode = int(
+            self.config.get("traj_validation_max_rejects_per_episode", 2)
+        )
+        self.traj_validation_cooldown_steps = max(
+            0, int(self.config.get("traj_validation_cooldown_steps", 20))
+        )
+        self.traj_validation_forward_distance = float(
+            self.config.get("traj_validation_forward_distance", self.forward_distance)
+        )
+        self.traj_validation_turn_angle_deg = float(
+            self.config.get("traj_validation_turn_angle_deg", self.turn_angle_deg)
+        )
         self.debug = bool(self.config.get("debug", False))
         self.debug_root_dir = os.path.abspath(
             os.path.expanduser(str(self.config.get("debug_dir", "./logs/vlmap_safety_debug")))
@@ -199,8 +217,10 @@ class VLMapActionSafety:
         self._episode_budget_replan_count = 0
         self._episode_waypoint_requery_count = 0
         self._episode_waypoint_recovery_count = 0
+        self._episode_traj_reject_count = 0
         self._last_waypoint_requery_step: Optional[int] = None
         self._last_waypoint_recovery_step: Optional[int] = None
+        self._last_traj_reject_step: Optional[int] = None
         self._last_safety_turn_action: Optional[int] = None
         self._last_safety_turn_step: Optional[int] = None
         self._last_safety_turn_position: Optional[np.ndarray] = None
@@ -234,8 +254,10 @@ class VLMapActionSafety:
         self._episode_budget_replan_count = 0
         self._episode_waypoint_requery_count = 0
         self._episode_waypoint_recovery_count = 0
+        self._episode_traj_reject_count = 0
         self._last_waypoint_requery_step = None
         self._last_waypoint_recovery_step = None
+        self._last_traj_reject_step = None
         self._last_safety_turn_action = None
         self._last_safety_turn_step = None
         self._last_safety_turn_position = None
@@ -792,6 +814,206 @@ class VLMapActionSafety:
 
     def _wrap_angle(self, angle: float) -> float:
         return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+    def validate_trajectory(
+        self,
+        obs: Dict[str, Any],
+        actions,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        context = dict(context or {})
+        action_list = [int(item) for item in list(actions or [])]
+        decision: Dict[str, Any] = {
+            "enabled": bool(self.enabled and self.traj_validation_enable),
+            "valid": False,
+            "safe": True,
+            "would_reject": False,
+            "reject_required": False,
+            "shadow_only": bool(self.traj_validation_shadow_only),
+            "actions": action_list[: self.traj_validation_horizon],
+            "reason": None,
+        }
+        if not self.enabled or not self.traj_validation_enable or self.builder is None:
+            decision["reason"] = "disabled"
+            self._write_trajectory_event(obs, context, decision)
+            return decision
+
+        pose_tf = self._pose_from_obs(obs)
+        if pose_tf is None or "depth" not in obs:
+            decision["reason"] = "missing_pose_or_depth"
+            self._write_trajectory_event(obs, context, decision)
+            return decision
+
+        depth_m = self._prepare_depth(obs["depth"])
+        if depth_m is None:
+            decision["reason"] = "invalid_depth"
+            self._write_trajectory_event(obs, context, decision)
+            return decision
+
+        self._maybe_update(depth_m, pose_tf)
+        sim_row, sim_col, sim_yaw = self.builder.base_pose_to_grid(pose_tf)
+        start_grid = [int(sim_row), int(sim_col)]
+        step_details = []
+        checked_forward_steps = 0
+        blocked_steps = 0
+
+        for idx, action in enumerate(action_list[: self.traj_validation_horizon]):
+            if action == 0:
+                step_details.append(
+                    {
+                        "index": int(idx),
+                        "action": int(action),
+                        "type": "stop",
+                        "from": [int(sim_row), int(sim_col)],
+                        "yaw": float(sim_yaw),
+                    }
+                )
+                break
+            if action == self.forward_action:
+                next_row, next_col = self._probe_grid(
+                    sim_row,
+                    sim_col,
+                    sim_yaw,
+                    self.traj_validation_forward_distance,
+                )
+                free, stats = self._is_line_free((sim_row, sim_col), (next_row, next_col))
+                checked_forward_steps += 1
+                if not free:
+                    blocked_steps += 1
+                step_details.append(
+                    {
+                        "index": int(idx),
+                        "action": int(action),
+                        "type": "forward",
+                        "from": [int(sim_row), int(sim_col)],
+                        "to": [int(next_row), int(next_col)],
+                        "yaw": float(sim_yaw),
+                        "free": bool(free),
+                        "stats": stats,
+                    }
+                )
+                sim_row, sim_col = int(next_row), int(next_col)
+                if not free:
+                    break
+            elif action == self.left_action:
+                sim_yaw = self._wrap_angle(sim_yaw + math.radians(self.traj_validation_turn_angle_deg))
+                step_details.append(
+                    {
+                        "index": int(idx),
+                        "action": int(action),
+                        "type": "left",
+                        "grid": [int(sim_row), int(sim_col)],
+                        "yaw": float(sim_yaw),
+                    }
+                )
+            elif action == self.right_action:
+                sim_yaw = self._wrap_angle(sim_yaw - math.radians(self.traj_validation_turn_angle_deg))
+                step_details.append(
+                    {
+                        "index": int(idx),
+                        "action": int(action),
+                        "type": "right",
+                        "grid": [int(sim_row), int(sim_col)],
+                        "yaw": float(sim_yaw),
+                    }
+                )
+            else:
+                step_details.append(
+                    {
+                        "index": int(idx),
+                        "action": int(action),
+                        "type": "ignored",
+                        "grid": [int(sim_row), int(sim_col)],
+                        "yaw": float(sim_yaw),
+                    }
+                )
+
+        would_reject = checked_forward_steps > 0 and blocked_steps >= self.traj_validation_block_threshold
+        reject_required = False
+        reject_suppressed_reason = None
+        cooldown_remaining = 0
+        if would_reject and not self.traj_validation_shadow_only:
+            if (
+                self.traj_validation_max_rejects_per_episode >= 0
+                and self._episode_traj_reject_count >= self.traj_validation_max_rejects_per_episode
+            ):
+                reject_suppressed_reason = "episode_reject_budget"
+            else:
+                if self._last_traj_reject_step is not None:
+                    cooldown_remaining = max(
+                        0,
+                        int(self.traj_validation_cooldown_steps - (self._step - self._last_traj_reject_step)),
+                    )
+                if cooldown_remaining > 0:
+                    reject_suppressed_reason = "reject_cooldown"
+                else:
+                    reject_required = True
+                    self._episode_traj_reject_count += 1
+                    self._last_traj_reject_step = int(self._step)
+
+        decision.update(
+            {
+                "valid": True,
+                "safe": not bool(would_reject),
+                "would_reject": bool(would_reject),
+                "reject_required": bool(reject_required),
+                "reject_reason": "blocked_forward_rollout" if would_reject else None,
+                "reject_suppressed_reason": reject_suppressed_reason,
+                "reject_cooldown_remaining": int(cooldown_remaining),
+                "checked_forward_steps": int(checked_forward_steps),
+                "blocked_steps": int(blocked_steps),
+                "horizon": int(self.traj_validation_horizon),
+                "block_threshold": int(self.traj_validation_block_threshold),
+                "forward_distance": float(self.traj_validation_forward_distance),
+                "turn_angle_deg": float(self.traj_validation_turn_angle_deg),
+                "episode_traj_reject_count": int(self._episode_traj_reject_count),
+                "max_rejects_per_episode": int(self.traj_validation_max_rejects_per_episode),
+                "start_grid": start_grid,
+                "end_grid": [int(sim_row), int(sim_col)],
+                "end_yaw": float(sim_yaw),
+                "step_details": step_details,
+                "reason": "ok",
+            }
+        )
+        self._write_trajectory_event(obs, context, decision)
+        if self.verbose and would_reject:
+            mode = "shadow" if self.traj_validation_shadow_only else "active"
+            suffix = ""
+            if reject_required:
+                suffix = "; reject trajectory"
+            elif reject_suppressed_reason:
+                suffix = f"; suppress reject by {reject_suppressed_reason}"
+            print(
+                "[VLMapSafety][Trajectory] "
+                f"{mode} blocked rollout actions={decision['actions']} "
+                f"blocked={blocked_steps}/{checked_forward_steps}{suffix}"
+            )
+        return decision
+
+    def _write_trajectory_event(
+        self,
+        obs: Dict[str, Any],
+        context: Dict[str, Any],
+        decision: Dict[str, Any],
+    ) -> None:
+        if not self.debug:
+            return
+        debug_dir = self._get_debug_dir()
+        os.makedirs(debug_dir, exist_ok=True)
+        event = {
+            "scene_id": context.get("scene_id"),
+            "episode_id": context.get("episode_id"),
+            "episode_index": context.get("episode_index"),
+            "episode_count": context.get("episode_count"),
+            "eval_step": context.get("step_id"),
+            "safety_step": int(self._step),
+            "pixel_goal": self._jsonable(context.get("pixel_goal")),
+            "decision": self._jsonable(decision),
+            "gps": self._jsonable(obs.get("gps")),
+            "compass": self._jsonable(obs.get("compass")),
+        }
+        with open(os.path.join(debug_dir, "trajectory_events.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     def _init_builder(self, camera_intrinsic: np.ndarray) -> None:
         repo_path = self.config.get("vlmaps_repo") or self.config.get("vlmaps_root")
