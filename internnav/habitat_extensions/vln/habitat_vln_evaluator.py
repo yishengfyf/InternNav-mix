@@ -1271,6 +1271,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result["semantic_seen_count"] = semantic_summary.get("seen_count")
                 result["semantic_coverage"] = semantic_summary.get("coverage")
                 result["semantic_first_seen_step"] = semantic_summary.get("first_seen_step")
+                result["semantic_rank1_coverage"] = semantic_summary.get("rank1_coverage")
+                result["semantic_rank1_confident_coverage"] = semantic_summary.get(
+                    "rank1_confident_coverage"
+                )
+                result["semantic_relative_coverage"] = semantic_summary.get("relative_coverage")
+                result["semantic_mean_top_score"] = semantic_summary.get("mean_top_score")
+                result["semantic_max_top_score"] = semantic_summary.get("max_top_score")
+                result["semantic_mean_top_margin"] = semantic_summary.get("mean_top_margin")
+                result["semantic_top1_stability"] = semantic_summary.get("top1_stability")
+                result["semantic_top1_diversity"] = semantic_summary.get("top1_diversity")
+                coverage_by_threshold = semantic_summary.get("coverage_by_threshold") or {}
+                for threshold_key, coverage_value in coverage_by_threshold.items():
+                    result[f"semantic_coverage_at_{str(threshold_key).replace('.', '_')}"] = (
+                        coverage_value
+                    )
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
 

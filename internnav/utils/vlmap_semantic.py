@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -70,12 +71,20 @@ _ALIASES = {
     "appliance": "appliances",
     "appliances": "appliances",
     "armchair": "chair",
+    "arch": "door",
+    "arched doorway": "door",
+    "arched entry": "entryway",
+    "archway": "door",
     "balcony": "balcony",
     "bath": "bathtub",
+    "bath room": "bathroom",
     "bathroom": "bathroom",
     "bathtub": "bathtub",
     "bed": "bed",
+    "bed room": "bedroom",
     "bedroom": "bedroom",
+    "billiard room": "room",
+    "billiard table": "table",
     "blind": "blinds",
     "blinds": "blinds",
     "book shelf": "shelving",
@@ -87,22 +96,29 @@ _ALIASES = {
     "column": "column",
     "corridor": "corridor",
     "couch": "sofa",
+    "couches": "sofa",
+    "coutch": "sofa",
     "counter": "counter",
     "curtain": "curtain",
     "curtains": "curtain",
     "cushion": "cushion",
+    "dinning room": "dining room",
     "dining area": "dining area",
     "dining room": "dining room",
     "door": "door",
+    "doors": "door",
     "doorway": "door",
     "drawer": "chest_of_drawers",
     "drawers": "chest_of_drawers",
     "dresser": "chest_of_drawers",
+    "entrance": "entryway",
     "entryway": "entryway",
     "fireplace": "fireplace",
+    "foyer": "entryway",
     "gym equipment": "gym_equipment",
     "hall": "hall",
     "hallway": "hallway",
+    "island counter": "counter",
     "kitchen": "kitchen",
     "lamp": "lighting",
     "light": "lighting",
@@ -116,6 +132,7 @@ _ALIASES = {
     "picture": "picture",
     "plant": "plant",
     "plants": "plant",
+    "pool table": "table",
     "railing": "railing",
     "room": "room",
     "seat": "seating",
@@ -139,6 +156,9 @@ _ALIASES = {
     "window": "window",
     "windows": "window",
 }
+
+_ROOM_TERM_SET = set(_ROOM_TERMS)
+_OBJECT_TERM_SET = set(_MP3D_LANDMARKS)
 
 _QUERY_LABELS = {
     "board_panel": "board panel",
@@ -171,6 +191,18 @@ class VLMapSemanticShadow:
             or "checkpoints/clip-long/longclip-B.pt"
         )
         self.score_threshold = float(self.config.get("semantic_match_score_threshold", 0.20))
+        threshold_values = [self.score_threshold]
+        threshold_values.extend(
+            self._parse_float_list(
+                self.config.get(
+                    "semantic_match_score_thresholds",
+                    [0.25, 0.27, 0.29, 0.31],
+                )
+            )
+        )
+        self.score_thresholds = sorted({round(float(value), 6) for value in threshold_values})
+        self.relative_z_threshold = float(self.config.get("semantic_match_relative_z_threshold", 0.5))
+        self.margin_threshold = float(self.config.get("semantic_match_margin_threshold", 0.01))
         self.top_k = max(1, int(self.config.get("semantic_match_top_k", 3)))
         self.max_terms = max(1, int(self.config.get("semantic_match_max_terms", 8)))
         self.use_templates = bool(self.config.get("semantic_match_use_templates", True))
@@ -193,6 +225,15 @@ class VLMapSemanticShadow:
         self._text_features = None
         self._rolling_max: Dict[str, float] = {}
         self._first_seen_step: Dict[str, Optional[int]] = {}
+        self._rank1_counts: Dict[str, int] = {}
+        self._rank1_first_step: Dict[str, Optional[int]] = {}
+        self._rank1_confident_counts: Dict[str, int] = {}
+        self._rank1_confident_first_step: Dict[str, Optional[int]] = {}
+        self._relative_counts: Dict[str, int] = {}
+        self._relative_first_step: Dict[str, Optional[int]] = {}
+        self._top_sequence: List[str] = []
+        self._top_score_values: List[float] = []
+        self._top_margin_values: List[float] = []
         self._event_count = 0
 
     def set_debug_dir(self, debug_dir: Optional[str]) -> None:
@@ -218,6 +259,15 @@ class VLMapSemanticShadow:
         self._text_features = None
         self._rolling_max = {item["term"]: float("-inf") for item in self._landmarks}
         self._first_seen_step = {item["term"]: None for item in self._landmarks}
+        self._rank1_counts = {item["term"]: 0 for item in self._landmarks}
+        self._rank1_first_step = {item["term"]: None for item in self._landmarks}
+        self._rank1_confident_counts = {item["term"]: 0 for item in self._landmarks}
+        self._rank1_confident_first_step = {item["term"]: None for item in self._landmarks}
+        self._relative_counts = {item["term"]: 0 for item in self._landmarks}
+        self._relative_first_step = {item["term"]: None for item in self._landmarks}
+        self._top_sequence = []
+        self._top_score_values = []
+        self._top_margin_values = []
         self._event_count = 0
 
         event = {
@@ -287,7 +337,15 @@ class VLMapSemanticShadow:
         top_idx = int(order[0])
         top_score = float(scores_arr[top_idx])
         top_term = self._landmarks[top_idx]["term"]
+        top_margin_to_second = None if second_score is None else float(top_score - second_score)
+        score_mean = float(np.mean(scores_arr))
+        score_std = float(np.std(scores_arr))
+        rank1_confident = top_margin_to_second is None or top_margin_to_second >= self.margin_threshold
         threshold_hits = []
+        threshold_hits_by_threshold: Dict[str, List[str]] = {
+            self._threshold_key(threshold): [] for threshold in self.score_thresholds
+        }
+        relative_hits = []
         score_items = []
         eval_step = context.get("step_id")
         try:
@@ -295,11 +353,24 @@ class VLMapSemanticShadow:
         except (TypeError, ValueError):
             eval_step_int = None
 
+        self._rank1_counts[top_term] = self._rank1_counts.get(top_term, 0) + 1
+        if self._rank1_first_step.get(top_term) is None:
+            self._rank1_first_step[top_term] = eval_step_int
+        if rank1_confident:
+            self._rank1_confident_counts[top_term] = self._rank1_confident_counts.get(top_term, 0) + 1
+            if self._rank1_confident_first_step.get(top_term) is None:
+                self._rank1_confident_first_step[top_term] = eval_step_int
+        self._top_sequence.append(top_term)
+        self._top_score_values.append(top_score)
+        if top_margin_to_second is not None:
+            self._top_margin_values.append(top_margin_to_second)
+
         for rank, idx in enumerate(order, start=1):
             idx = int(idx)
             landmark = self._landmarks[idx]
             term = landmark["term"]
             score = float(scores_arr[idx])
+            score_z = float((score - score_mean) / score_std) if score_std > 1e-12 else 0.0
             if score > self._rolling_max.get(term, float("-inf")):
                 self._rolling_max[term] = score
             seen = score >= self.score_threshold
@@ -307,18 +378,32 @@ class VLMapSemanticShadow:
                 threshold_hits.append(term)
                 if self._first_seen_step.get(term) is None:
                     self._first_seen_step[term] = eval_step_int
+            for threshold in self.score_thresholds:
+                if score >= threshold:
+                    threshold_hits_by_threshold[self._threshold_key(threshold)].append(term)
+            relative_seen = bool(score_z >= self.relative_z_threshold or (len(order) == 1 and rank == 1))
+            if relative_seen:
+                relative_hits.append(term)
+                self._relative_counts[term] = self._relative_counts.get(term, 0) + 1
+                if self._relative_first_step.get(term) is None:
+                    self._relative_first_step[term] = eval_step_int
             item = {
                 "term": term,
+                "term_type": landmark.get("term_type", self._term_type(term)),
                 "query": landmark["query"],
                 "matched_phrase": landmark["matched_phrase"],
                 "score": score,
+                "score_z": score_z,
                 "rank": int(rank),
+                "is_rank1": bool(rank == 1),
                 "seen": bool(seen),
+                "relative_seen": bool(relative_seen),
                 "rolling_max": float(self._rolling_max.get(term, score)),
                 "margin_to_top": float(top_score - score),
             }
             if rank == 1 and second_score is not None:
-                item["top_margin_to_second"] = float(top_score - second_score)
+                item["top_margin_to_second"] = top_margin_to_second
+                item["rank1_confident"] = bool(rank1_confident)
             score_items.append(item)
 
         top_terms = [self._landmarks[int(idx)]["term"] for idx in order[: self.top_k]]
@@ -326,13 +411,25 @@ class VLMapSemanticShadow:
             **base_event,
             "status": "ok",
             "score_threshold": float(self.score_threshold),
+            "score_thresholds": self.score_thresholds,
             "clip_model": self.clip_model_name,
             "backend": self._active_backend,
             "device": str(self._device),
             "top_match": top_term,
             "top_score": top_score,
+            "rank1_term": top_term,
+            "rank1_score": top_score,
+            "score_mean": score_mean,
+            "score_std": score_std,
+            "top_margin_to_second": top_margin_to_second,
+            "rank1_margin_to_second": top_margin_to_second,
+            "margin_threshold": float(self.margin_threshold),
+            "rank1_confident": bool(rank1_confident),
+            "relative_z_threshold": float(self.relative_z_threshold),
             "top_terms": top_terms,
             "threshold_hits": threshold_hits,
+            "threshold_hits_by_threshold": threshold_hits_by_threshold,
+            "relative_hits": relative_hits,
             "scores": score_items,
             "rolling_max_by_term": {
                 key: None if value == float("-inf") else float(value)
@@ -350,7 +447,8 @@ class VLMapSemanticShadow:
             print(
                 "[VLMapSemantic] "
                 f"step={context.get('step_id')} top={top_term}:{top_score:.3f} "
-                f"hits={threshold_hits}"
+                f"margin={0.0 if top_margin_to_second is None else top_margin_to_second:.3f} "
+                f"rank1_conf={rank1_confident} hits={threshold_hits}"
             )
         return event
 
@@ -359,6 +457,12 @@ class VLMapSemanticShadow:
             return {}
         metrics = dict(metrics or {})
         terms = [item["term"] for item in self._landmarks]
+        term_type_by_term = {
+            item["term"]: item.get("term_type", self._term_type(item["term"]))
+            for item in self._landmarks
+        }
+        room_terms = [term for term in terms if term_type_by_term.get(term) == "room"]
+        object_terms = [term for term in terms if term_type_by_term.get(term) == "object"]
         max_score_by_term = {
             key: None if value == float("-inf") else float(value)
             for key, value in self._rolling_max.items()
@@ -368,9 +472,41 @@ class VLMapSemanticShadow:
             for term, score in max_score_by_term.items()
             if score is not None and score >= self.score_threshold
         ]
+        seen_by_threshold = {}
+        coverage_by_threshold = {}
+        room_coverage_by_threshold = {}
+        object_coverage_by_threshold = {}
+        for threshold in self.score_thresholds:
+            key = self._threshold_key(threshold)
+            seen_at_threshold = [
+                term
+                for term, score in max_score_by_term.items()
+                if score is not None and score >= threshold
+            ]
+            seen_by_threshold[key] = seen_at_threshold
+            coverage_by_threshold[key] = self._coverage(terms, seen_at_threshold)
+            room_coverage_by_threshold[key] = self._coverage(room_terms, seen_at_threshold)
+            object_coverage_by_threshold[key] = self._coverage(object_terms, seen_at_threshold)
+
+        rank1_terms = [term for term, count in self._rank1_counts.items() if count > 0]
+        rank1_confident_terms = [
+            term for term, count in self._rank1_confident_counts.items() if count > 0
+        ]
+        relative_terms = [term for term, count in self._relative_counts.items() if count > 0]
         first_seen_values = [
             step for step in self._first_seen_step.values() if step is not None
         ]
+        rank1_first_seen_values = [
+            step for step in self._rank1_first_step.values() if step is not None
+        ]
+        rank1_confident_first_seen_values = [
+            step for step in self._rank1_confident_first_step.values() if step is not None
+        ]
+        relative_first_seen_values = [
+            step for step in self._relative_first_step.values() if step is not None
+        ]
+        top1_stability = self._top1_stability()
+        top1_entropy = self._top1_entropy()
         summary = {
             "event_type": "episode_summary",
             **self._episode_meta,
@@ -382,16 +518,64 @@ class VLMapSemanticShadow:
             "os": metrics.get("oracle_success", metrics.get("os")),
             "ne": metrics.get("distance_to_goal", metrics.get("ne")),
             "landmark_terms": terms,
+            "landmark_type_by_term": term_type_by_term,
+            "room_terms": room_terms,
+            "object_terms": object_terms,
             "landmark_count": len(terms),
             "seen_terms": seen_terms,
             "seen_count": len(seen_terms),
             "coverage": (len(seen_terms) / len(terms)) if terms else 0.0,
+            "seen_by_threshold": seen_by_threshold,
+            "coverage_by_threshold": coverage_by_threshold,
+            "room_coverage_by_threshold": room_coverage_by_threshold,
+            "object_coverage_by_threshold": object_coverage_by_threshold,
             "first_seen_step": min(first_seen_values) if first_seen_values else None,
             "max_score_by_term": max_score_by_term,
             "first_seen_step_by_term": self._first_seen_step,
+            "rank1_terms": rank1_terms,
+            "rank1_count": len(rank1_terms),
+            "rank1_coverage": self._coverage(terms, rank1_terms),
+            "rank1_room_coverage": self._coverage(room_terms, rank1_terms),
+            "rank1_object_coverage": self._coverage(object_terms, rank1_terms),
+            "rank1_first_seen_step": (
+                min(rank1_first_seen_values) if rank1_first_seen_values else None
+            ),
+            "rank1_first_seen_step_by_term": self._rank1_first_step,
+            "rank1_counts_by_term": self._rank1_counts,
+            "rank1_confident_terms": rank1_confident_terms,
+            "rank1_confident_count": len(rank1_confident_terms),
+            "rank1_confident_coverage": self._coverage(terms, rank1_confident_terms),
+            "rank1_confident_room_coverage": self._coverage(room_terms, rank1_confident_terms),
+            "rank1_confident_object_coverage": self._coverage(object_terms, rank1_confident_terms),
+            "rank1_confident_first_seen_step": (
+                min(rank1_confident_first_seen_values)
+                if rank1_confident_first_seen_values
+                else None
+            ),
+            "rank1_confident_counts_by_term": self._rank1_confident_counts,
+            "relative_terms": relative_terms,
+            "relative_count": len(relative_terms),
+            "relative_coverage": self._coverage(terms, relative_terms),
+            "relative_room_coverage": self._coverage(room_terms, relative_terms),
+            "relative_object_coverage": self._coverage(object_terms, relative_terms),
+            "relative_first_seen_step": (
+                min(relative_first_seen_values) if relative_first_seen_values else None
+            ),
+            "relative_counts_by_term": self._relative_counts,
+            "semantic_top_sequence": self._top_sequence,
+            "mean_top_score": self._mean(self._top_score_values),
+            "max_top_score": max(self._top_score_values) if self._top_score_values else None,
+            "mean_top_margin": self._mean(self._top_margin_values),
+            "max_top_margin": max(self._top_margin_values) if self._top_margin_values else None,
+            "top1_stability": top1_stability,
+            "top1_diversity": len(set(self._top_sequence)),
+            "top1_entropy": top1_entropy,
+            "top1_transition_count": self._top1_transition_count(),
             "semantic_event_count": int(self._event_count),
             "disabled_reason": self._disabled_reason,
         }
+        for threshold_key, coverage in coverage_by_threshold.items():
+            summary[f"coverage_at_{threshold_key.replace('.', '_')}"] = coverage
         self._write_summary(summary)
         return summary
 
@@ -425,6 +609,7 @@ class VLMapSemanticShadow:
             landmarks.append(
                 {
                     "term": canonical,
+                    "term_type": self._term_type(canonical),
                     "query": query,
                     "matched_phrase": phrase,
                 }
@@ -432,6 +617,73 @@ class VLMapSemanticShadow:
             if len(landmarks) >= self.max_terms:
                 break
         return landmarks
+
+    def _term_type(self, term: str) -> str:
+        if term in _ROOM_TERM_SET:
+            return "room"
+        if term in _OBJECT_TERM_SET:
+            return "object"
+        return "other"
+
+    def _parse_float_list(self, raw_value: Any) -> List[float]:
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, str):
+            values = [item.strip() for item in raw_value.split(",")]
+        elif isinstance(raw_value, (list, tuple, set)):
+            values = list(raw_value)
+        else:
+            values = [raw_value]
+        parsed = []
+        for value in values:
+            if value in ("", None):
+                continue
+            try:
+                parsed.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return parsed
+
+    def _threshold_key(self, threshold: float) -> str:
+        return f"{float(threshold):.2f}"
+
+    def _coverage(self, terms: List[str], seen_terms: List[str]) -> float:
+        if not terms:
+            return 0.0
+        return len(set(terms) & set(seen_terms)) / len(set(terms))
+
+    def _mean(self, values: List[float]) -> Optional[float]:
+        return float(sum(values) / len(values)) if values else None
+
+    def _top1_stability(self) -> Optional[float]:
+        if not self._top_sequence:
+            return None
+        counts: Dict[str, int] = {}
+        for term in self._top_sequence:
+            counts[term] = counts.get(term, 0) + 1
+        return max(counts.values()) / len(self._top_sequence)
+
+    def _top1_entropy(self) -> Optional[float]:
+        if not self._top_sequence:
+            return None
+        counts: Dict[str, int] = {}
+        for term in self._top_sequence:
+            counts[term] = counts.get(term, 0) + 1
+        total = float(len(self._top_sequence))
+        entropy = 0.0
+        for count in counts.values():
+            prob = count / total
+            entropy -= prob * math.log(prob + 1e-12)
+        return float(entropy)
+
+    def _top1_transition_count(self) -> int:
+        if len(self._top_sequence) < 2:
+            return 0
+        return sum(
+            1
+            for previous, current in zip(self._top_sequence[:-1], self._top_sequence[1:])
+            if previous != current
+        )
 
     def _ensure_model(self) -> bool:
         if self._model is not None:

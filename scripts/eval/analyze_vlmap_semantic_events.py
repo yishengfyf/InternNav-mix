@@ -39,6 +39,32 @@ def _safe_mean(values: Iterable[Optional[float]]) -> Optional[float]:
     return sum(clean) / len(clean)
 
 
+def _success_split_mean(
+    summaries_by_key: Dict[str, Dict[str, Any]],
+    progress_by_key: Dict[str, Dict[str, Any]],
+    field: str,
+) -> Dict[str, Optional[float]]:
+    all_values = []
+    success_values = []
+    failure_values = []
+    for key, semantic in summaries_by_key.items():
+        value = semantic.get(field)
+        all_values.append(value)
+        progress_item = progress_by_key.get(key, {})
+        success = progress_item.get("success", semantic.get("success"))
+        if success is None:
+            continue
+        if float(success) >= 0.5:
+            success_values.append(value)
+        else:
+            failure_values.append(value)
+    return {
+        "mean": _safe_mean(all_values),
+        "success_mean": _safe_mean(success_values),
+        "failure_mean": _safe_mean(failure_values),
+    }
+
+
 def summarize(
     events: List[Dict[str, Any]],
     episode_summaries: Optional[List[Dict[str, Any]]] = None,
@@ -56,10 +82,19 @@ def summarize(
             "hit_events": 0,
             "top_matches": Counter(),
             "threshold_hits": Counter(),
+            "rank1_terms": Counter(),
+            "rank1_confident_terms": Counter(),
+            "relative_hits": Counter(),
         }
     )
     top_counter = Counter()
     hit_counter = Counter()
+    status_counter = Counter()
+    backend_counter = Counter()
+    device_counter = Counter()
+    rank1_counter = Counter()
+    rank1_confident_counter = Counter()
+    relative_counter = Counter()
 
     for event in match_events:
         key = _episode_key(event)
@@ -67,19 +102,32 @@ def summarize(
         item["scene_id"] = event.get("scene_id")
         item["episode_id"] = event.get("episode_id")
         item["events"] += 1
+        status_counter[event.get("status")] += 1
         if event.get("status") != "ok":
             continue
         item["ok_events"] += 1
+        backend_counter[event.get("backend")] += 1
+        device_counter[event.get("device")] += 1
         top_match = event.get("top_match")
         if top_match:
             item["top_matches"][top_match] += 1
             top_counter[top_match] += 1
+        rank1_term = event.get("rank1_term") or top_match
+        if rank1_term:
+            item["rank1_terms"][rank1_term] += 1
+            rank1_counter[rank1_term] += 1
+            if event.get("rank1_confident"):
+                item["rank1_confident_terms"][rank1_term] += 1
+                rank1_confident_counter[rank1_term] += 1
         hits = event.get("threshold_hits") or []
         if hits:
             item["hit_events"] += 1
         for hit in hits:
             item["threshold_hits"][hit] += 1
             hit_counter[hit] += 1
+        for hit in event.get("relative_hits") or []:
+            item["relative_hits"][hit] += 1
+            relative_counter[hit] += 1
 
     summaries_by_key = {}
     for summary in episode_summaries or []:
@@ -126,9 +174,69 @@ def summarize(
                 "hit_events": item["hit_events"],
                 "top_matches": dict(item["top_matches"].most_common(5)),
                 "threshold_hits": dict(item["threshold_hits"].most_common(5)),
+                "rank1_terms": dict(item["rank1_terms"].most_common(5)),
+                "rank1_confident_terms": dict(item["rank1_confident_terms"].most_common(5)),
+                "relative_hits": dict(item["relative_hits"].most_common(5)),
             }
         )
     top_episodes.sort(key=lambda item: (item["hit_events"], item["ok_events"]), reverse=True)
+
+    tracked_summary_fields = [
+        "rank1_coverage",
+        "rank1_confident_coverage",
+        "relative_coverage",
+        "rank1_room_coverage",
+        "rank1_object_coverage",
+        "rank1_confident_room_coverage",
+        "rank1_confident_object_coverage",
+        "relative_room_coverage",
+        "relative_object_coverage",
+        "mean_top_score",
+        "max_top_score",
+        "mean_top_margin",
+        "max_top_margin",
+        "top1_stability",
+        "top1_diversity",
+        "top1_entropy",
+        "top1_transition_count",
+        "rank1_first_seen_step",
+        "rank1_confident_first_seen_step",
+        "relative_first_seen_step",
+    ]
+    metric_splits = {
+        field: _success_split_mean(summaries_by_key, progress_by_key, field)
+        for field in tracked_summary_fields
+    }
+
+    threshold_keys = sorted(
+        {
+            threshold
+            for summary in summaries_by_key.values()
+            for threshold in (summary.get("coverage_by_threshold") or {}).keys()
+        },
+        key=lambda item: float(item),
+    )
+    coverage_by_threshold = {}
+    for threshold in threshold_keys:
+        field_values = []
+        success_values = []
+        failure_values = []
+        for key, semantic in summaries_by_key.items():
+            value = (semantic.get("coverage_by_threshold") or {}).get(threshold)
+            field_values.append(value)
+            progress_item = progress_by_key.get(key, {})
+            success = progress_item.get("success", semantic.get("success"))
+            if success is None:
+                continue
+            if float(success) >= 0.5:
+                success_values.append(value)
+            else:
+                failure_values.append(value)
+        coverage_by_threshold[threshold] = {
+            "mean": _safe_mean(field_values),
+            "success_mean": _safe_mean(success_values),
+            "failure_mean": _safe_mean(failure_values),
+        }
 
     return {
         "total_events": len(events),
@@ -136,6 +244,9 @@ def summarize(
         "ok_match_events": len(ok_events),
         "no_landmark_events": len(no_landmark_events),
         "init_error_count": len(init_errors),
+        "status_counts": dict(status_counter.most_common()),
+        "backend_counts": dict(backend_counter.most_common()),
+        "device_counts": dict(device_counter.most_common()),
         "episode_count_from_events": len(per_episode),
         "episode_summary_count": len(summary_keys),
         "progress_episode_count": len(progress_keys),
@@ -148,8 +259,22 @@ def summarize(
         "failure_mean_seen_count": _safe_mean(failure_seen_counts),
         "success_mean_first_seen_step": _safe_mean(success_first_seen),
         "failure_mean_first_seen_step": _safe_mean(failure_first_seen),
+        "coverage_by_threshold": coverage_by_threshold,
+        "rank1_mean_coverage": metric_splits["rank1_coverage"]["mean"],
+        "rank1_success_mean_coverage": metric_splits["rank1_coverage"]["success_mean"],
+        "rank1_failure_mean_coverage": metric_splits["rank1_coverage"]["failure_mean"],
+        "rank1_confident_mean_coverage": metric_splits["rank1_confident_coverage"]["mean"],
+        "rank1_confident_success_mean_coverage": metric_splits["rank1_confident_coverage"]["success_mean"],
+        "rank1_confident_failure_mean_coverage": metric_splits["rank1_confident_coverage"]["failure_mean"],
+        "relative_mean_coverage": metric_splits["relative_coverage"]["mean"],
+        "relative_success_mean_coverage": metric_splits["relative_coverage"]["success_mean"],
+        "relative_failure_mean_coverage": metric_splits["relative_coverage"]["failure_mean"],
+        "summary_metric_splits": metric_splits,
         "top_match_counts": dict(top_counter.most_common(20)),
         "threshold_hit_counts": dict(hit_counter.most_common(20)),
+        "rank1_counts": dict(rank1_counter.most_common(20)),
+        "rank1_confident_counts": dict(rank1_confident_counter.most_common(20)),
+        "relative_hit_counts": dict(relative_counter.most_common(20)),
         "top_hit_episodes": top_episodes[:20],
     }
 
