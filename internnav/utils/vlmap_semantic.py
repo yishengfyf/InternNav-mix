@@ -467,8 +467,17 @@ class VLMapSemanticShadow:
         raw_path = Path(os.path.expanduser(self.longclip_model_path))
         candidates = [raw_path]
         if not raw_path.is_absolute():
-            project_root = Path(__file__).resolve().parents[3]
+            project_root = Path(__file__).resolve().parents[2]
             candidates.append(project_root / raw_path)
+            candidates.append(
+                project_root
+                / "internnav"
+                / "model"
+                / "basemodel"
+                / "LongCLIP"
+                / "checkpoints"
+                / raw_path.name
+            )
         for candidate in candidates:
             if candidate.exists():
                 return str(candidate)
@@ -494,8 +503,7 @@ class VLMapSemanticShadow:
         try:
             from internnav.model.basemodel.LongCLIP.model import longclip  # type: ignore
 
-            model, preprocess = longclip.load(model_path)
-            model = model.to(device)
+            model, preprocess = longclip.load(model_path, device=device)
             model.eval()
         except Exception as exc:  # pragma: no cover - optional dependency/weights
             if self.strict:
