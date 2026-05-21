@@ -117,6 +117,38 @@ class VLMapActionSafety:
         self.waypoint_requery_cooldown_steps = max(
             0, int(self.config.get("waypoint_requery_cooldown_steps", 40))
         )
+        self.waypoint_recovery_enable = bool(self.config.get("waypoint_recovery_enable", False))
+        self.waypoint_recovery_on_block = bool(self.config.get("waypoint_recovery_on_block", True))
+        self.waypoint_recovery_on_high_risk = bool(self.config.get("waypoint_recovery_on_high_risk", True))
+        self.waypoint_recovery_risk_threshold = float(
+            self.config.get("waypoint_recovery_risk_threshold", self.waypoint_requery_risk_threshold)
+        )
+        self.waypoint_recovery_min_checked_cells = int(
+            self.config.get("waypoint_recovery_min_checked_cells", self.waypoint_requery_min_checked_cells)
+        )
+        self.max_waypoint_recoveries_per_episode = int(
+            self.config.get("max_waypoint_recoveries_per_episode", 2)
+        )
+        self.waypoint_recovery_cooldown_steps = max(
+            0, int(self.config.get("waypoint_recovery_cooldown_steps", 20))
+        )
+        self.waypoint_recovery_probe_distance = float(
+            self.config.get("waypoint_recovery_probe_distance", max(0.45, self.forward_distance * 2.0))
+        )
+        self.waypoint_recovery_require_free_probe = bool(
+            self.config.get("waypoint_recovery_require_free_probe", True)
+        )
+        self.waypoint_recovery_alignment_weight = float(
+            self.config.get("waypoint_recovery_alignment_weight", 0.25)
+        )
+        self.waypoint_recovery_max_turn_steps = max(
+            1, int(self.config.get("waypoint_recovery_max_turn_steps", 1))
+        )
+        recovery_angles = self.config.get(
+            "waypoint_recovery_candidate_angles_deg",
+            [-float(self.turn_angle_deg), float(self.turn_angle_deg)],
+        )
+        self.waypoint_recovery_candidate_angles_deg = [float(item) for item in recovery_angles]
         self.debug = bool(self.config.get("debug", False))
         self.debug_root_dir = os.path.abspath(
             os.path.expanduser(str(self.config.get("debug_dir", "./logs/vlmap_safety_debug")))
@@ -166,7 +198,9 @@ class VLMapActionSafety:
         self._episode_budget_suppressed_count = 0
         self._episode_budget_replan_count = 0
         self._episode_waypoint_requery_count = 0
+        self._episode_waypoint_recovery_count = 0
         self._last_waypoint_requery_step: Optional[int] = None
+        self._last_waypoint_recovery_step: Optional[int] = None
         self._last_safety_turn_action: Optional[int] = None
         self._last_safety_turn_step: Optional[int] = None
         self._last_safety_turn_position: Optional[np.ndarray] = None
@@ -199,7 +233,9 @@ class VLMapActionSafety:
         self._episode_budget_suppressed_count = 0
         self._episode_budget_replan_count = 0
         self._episode_waypoint_requery_count = 0
+        self._episode_waypoint_recovery_count = 0
         self._last_waypoint_requery_step = None
+        self._last_waypoint_recovery_step = None
         self._last_safety_turn_action = None
         self._last_safety_turn_step = None
         self._last_safety_turn_position = None
@@ -487,6 +523,13 @@ class VLMapActionSafety:
         requery_reason = None
         requery_suppressed_reason = None
         requery_cooldown_remaining = 0
+        recovery_required = False
+        recovery_candidate = False
+        recovery_reason = None
+        recovery_suppressed_reason = None
+        recovery_cooldown_remaining = 0
+        recovery_actions = []
+        recovery_probe = None
         if self.waypoint_requery_enable and not self.waypoint_shadow_only:
             if (not path_free) and self.waypoint_requery_on_block:
                 requery_candidate = True
@@ -520,6 +563,52 @@ class VLMapActionSafety:
                         requery_required = True
                         self._episode_waypoint_requery_count += 1
                         self._last_waypoint_requery_step = int(self._step)
+
+        if self.waypoint_recovery_enable and not self.waypoint_shadow_only:
+            if (not path_free) and self.waypoint_recovery_on_block:
+                recovery_candidate = True
+                recovery_reason = "blocked"
+            elif (
+                self.waypoint_recovery_on_high_risk
+                and risk_checked >= self.waypoint_recovery_min_checked_cells
+                and risk_score >= self.waypoint_recovery_risk_threshold
+            ):
+                recovery_candidate = True
+                recovery_reason = "high_risk"
+
+            if recovery_candidate:
+                if (
+                    self.max_waypoint_recoveries_per_episode >= 0
+                    and self._episode_waypoint_recovery_count >= self.max_waypoint_recoveries_per_episode
+                ):
+                    recovery_suppressed_reason = "episode_recovery_budget"
+                else:
+                    if self._last_waypoint_recovery_step is not None:
+                        recovery_cooldown_remaining = max(
+                            0,
+                            int(
+                                self.waypoint_recovery_cooldown_steps
+                                - (self._step - self._last_waypoint_recovery_step)
+                            ),
+                        )
+                    if recovery_cooldown_remaining > 0:
+                        recovery_suppressed_reason = "recovery_cooldown"
+                    else:
+                        recovery_probe = self._propose_waypoint_recovery_actions(start, goal, pose_tf)
+                        recovery_actions = [
+                            int(item)
+                            for item in recovery_probe.get("actions", [])
+                            if int(item) in (self.left_action, self.right_action)
+                        ]
+                        if recovery_actions:
+                            recovery_required = True
+                            self._episode_waypoint_recovery_count += 1
+                            self._last_waypoint_recovery_step = int(self._step)
+                        else:
+                            recovery_suppressed_reason = recovery_probe.get(
+                                "suppressed_reason",
+                                "no_safe_recovery_candidate",
+                            )
         decision.update(
             {
                 "valid": True,
@@ -538,6 +627,18 @@ class VLMapActionSafety:
                 "waypoint_requery_cooldown_remaining": int(requery_cooldown_remaining),
                 "episode_waypoint_requery_count": int(self._episode_waypoint_requery_count),
                 "max_waypoint_requeries_per_episode": int(self.max_waypoint_requeries_per_episode),
+                "waypoint_recovery_enable": bool(self.waypoint_recovery_enable),
+                "waypoint_recovery_candidate": bool(recovery_candidate),
+                "waypoint_recovery_required": bool(recovery_required),
+                "waypoint_recovery_reason": recovery_reason,
+                "waypoint_recovery_suppressed_reason": recovery_suppressed_reason,
+                "waypoint_recovery_actions": recovery_actions,
+                "waypoint_recovery_probe": recovery_probe,
+                "waypoint_recovery_risk_threshold": float(self.waypoint_recovery_risk_threshold),
+                "waypoint_recovery_min_checked_cells": int(self.waypoint_recovery_min_checked_cells),
+                "waypoint_recovery_cooldown_remaining": int(recovery_cooldown_remaining),
+                "episode_waypoint_recovery_count": int(self._episode_waypoint_recovery_count),
+                "max_waypoint_recoveries_per_episode": int(self.max_waypoint_recoveries_per_episode),
                 "start_grid": [int(start[0]), int(start[1])],
                 "goal_grid": [int(goal[0]), int(goal[1])],
                 "depth_m": float(waypoint["depth_m"]),
@@ -567,14 +668,32 @@ class VLMapActionSafety:
             "waypoint_requery_reason": requery_reason,
             "waypoint_requery_suppressed_reason": requery_suppressed_reason,
             "episode_waypoint_requery_count": int(self._episode_waypoint_requery_count),
+            "waypoint_recovery_candidate": bool(recovery_candidate),
+            "waypoint_recovery_required": bool(recovery_required),
+            "waypoint_recovery_reason": recovery_reason,
+            "waypoint_recovery_suppressed_reason": recovery_suppressed_reason,
+            "waypoint_recovery_actions": recovery_actions,
+            "waypoint_recovery_probe": recovery_probe,
+            "episode_waypoint_recovery_count": int(self._episode_waypoint_recovery_count),
         }
         self._write_waypoint_event(obs, context, pose_tf, decision, probe_info)
         self.last_waypoint_decision = decision
-        if self.verbose and (not path_free or high_risk or requery_required or requery_suppressed_reason):
+        if self.verbose and (
+            not path_free
+            or high_risk
+            or requery_required
+            or requery_suppressed_reason
+            or recovery_required
+            or recovery_suppressed_reason
+        ):
             mode = "shadow" if self.waypoint_shadow_only else "active"
             status = "blocked" if not path_free else "high-risk"
             suffix = ""
-            if requery_required:
+            if recovery_required:
+                suffix = f"; queue recovery actions {recovery_actions} by {recovery_reason}"
+            elif recovery_suppressed_reason is not None:
+                suffix = f"; suppress recovery by {recovery_suppressed_reason}"
+            elif requery_required:
                 suffix = f"; request S2 requery by {requery_reason}"
             elif requery_suppressed_reason is not None:
                 suffix = f"; suppress requery by {requery_suppressed_reason}"
@@ -586,6 +705,93 @@ class VLMapActionSafety:
                 f"{suffix}"
             )
         return decision
+
+    def _propose_waypoint_recovery_actions(
+        self,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        pose_tf: np.ndarray,
+    ) -> Dict[str, Any]:
+        row, col, yaw = self.builder.base_pose_to_grid(pose_tf)
+        cs = float(self.builder.cs)
+        target_dx = (int(start[0]) - int(goal[0])) * cs
+        target_dy = (int(start[1]) - int(goal[1])) * cs
+        target_rel_angle = self._wrap_angle(math.atan2(target_dy, target_dx) - yaw)
+        turn_angle = max(1e-6, abs(float(self.turn_angle_deg)))
+
+        candidates = []
+        seen_actions = set()
+        for angle_deg in self.waypoint_recovery_candidate_angles_deg:
+            if abs(angle_deg) < 1e-6:
+                continue
+            sign = 1.0 if angle_deg > 0 else -1.0
+            turn_steps = int(math.ceil(abs(angle_deg) / turn_angle))
+            turn_steps = max(1, min(self.waypoint_recovery_max_turn_steps, turn_steps))
+            actual_angle_deg = sign * turn_steps * turn_angle
+            action = self.left_action if actual_angle_deg > 0 else self.right_action
+            action_key = (int(action), int(turn_steps))
+            if action_key in seen_actions:
+                continue
+            seen_actions.add(action_key)
+
+            probe_yaw = yaw + math.radians(actual_angle_deg)
+            probe_grid = self._probe_grid(
+                row,
+                col,
+                probe_yaw,
+                self.waypoint_recovery_probe_distance,
+            )
+            free, stats = self._is_line_free((row, col), probe_grid)
+            blocked_fraction = float(stats.get("blocked_fraction", 0.0))
+            angle_error = abs(self._wrap_angle(math.radians(actual_angle_deg) - target_rel_angle))
+            score = (
+                blocked_fraction * 2.0
+                + (0.0 if free else 1.0)
+                + self.waypoint_recovery_alignment_weight * (angle_error / math.pi)
+                + 0.05 * (turn_steps - 1)
+            )
+            candidates.append(
+                {
+                    "action": int(action),
+                    "turn_steps": int(turn_steps),
+                    "angle_deg": float(actual_angle_deg),
+                    "probe_grid": [int(probe_grid[0]), int(probe_grid[1])],
+                    "free": bool(free),
+                    "stats": stats,
+                    "angle_error_rad": float(angle_error),
+                    "score": float(score),
+                }
+            )
+
+        eligible = [
+            item
+            for item in candidates
+            if item["free"] or not self.waypoint_recovery_require_free_probe
+        ]
+        if not eligible:
+            return {
+                "actions": [],
+                "suppressed_reason": "no_safe_recovery_candidate",
+                "start_grid": [int(start[0]), int(start[1])],
+                "goal_grid": [int(goal[0]), int(goal[1])],
+                "target_rel_angle_rad": float(target_rel_angle),
+                "candidates": candidates,
+            }
+
+        best = min(eligible, key=lambda item: item["score"])
+        return {
+            "actions": [int(best["action"])] * int(best["turn_steps"]),
+            "selected": best,
+            "start_grid": [int(start[0]), int(start[1])],
+            "goal_grid": [int(goal[0]), int(goal[1])],
+            "target_rel_angle_rad": float(target_rel_angle),
+            "probe_distance": float(self.waypoint_recovery_probe_distance),
+            "require_free_probe": bool(self.waypoint_recovery_require_free_probe),
+            "candidates": candidates,
+        }
+
+    def _wrap_angle(self, angle: float) -> float:
+        return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
 
     def _init_builder(self, camera_intrinsic: np.ndarray) -> None:
         repo_path = self.config.get("vlmaps_repo") or self.config.get("vlmaps_root")
@@ -1561,6 +1767,12 @@ class VLMapActionSafety:
             )
         if probe_info is not None and probe_info.get("waypoint_goal") is not None:
             stats = probe_info.get("waypoint_stats") or {}
+            recovery_actions = probe_info.get("waypoint_recovery_actions") or []
+            recovery_suffix = ""
+            if recovery_actions:
+                recovery_suffix = f" rec={recovery_actions}"
+            elif probe_info.get("waypoint_recovery_suppressed_reason"):
+                recovery_suffix = f" rec_sup={probe_info.get('waypoint_recovery_suppressed_reason')}"
             turn_text = (
                 f"WP={probe_info.get('waypoint_path_free')} "
                 f"risk={probe_info.get('waypoint_high_risk')} "
@@ -1568,6 +1780,7 @@ class VLMapActionSafety:
                 f"d={probe_info.get('waypoint_depth_m', 0.0):.2f} "
                 f"B={stats.get('blocked', '?')}/{stats.get('checked', '?')}"
                 f"@{stats.get('blocked_fraction', 0.0):.2f}"
+                f"{recovery_suffix}"
             )
         elif probe_info is not None:
             turn_text = (

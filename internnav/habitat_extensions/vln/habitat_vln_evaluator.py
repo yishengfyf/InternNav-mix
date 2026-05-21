@@ -473,6 +473,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "camera_pitch_deg": float(camera_pitch_deg),
         }
         decision = evaluate(safety_obs, pixel_goal, context=context)
+        if decision.get("waypoint_recovery_required"):
+            print(
+                "[VLMapSafety][Habitat][Waypoint] queue VLMap recovery "
+                f"for pixel goal {pixel_goal}; "
+                f"reason={decision.get('waypoint_recovery_reason')} "
+                f"actions={decision.get('waypoint_recovery_actions')} "
+                f"risk={decision.get('waypoint_risk_score')}"
+            )
+        elif decision.get("waypoint_recovery_suppressed_reason"):
+            print(
+                "[VLMapSafety][Habitat][Waypoint] suppress VLMap recovery "
+                f"for pixel goal {pixel_goal}; "
+                f"reason={decision.get('waypoint_recovery_suppressed_reason')} "
+                f"risk={decision.get('waypoint_risk_score')}"
+            )
         if decision.get("requery_required"):
             print(
                 "[VLMapSafety][Habitat][Waypoint] request S2 requery "
@@ -809,6 +824,34 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         _, _, lookup_done, _ = self.env.step(action_code.LOOKUP)
                         observations, _, lookup_done_2, _ = self.env.step(action_code.LOOKUP)
                         done = done or lookup_done or lookup_done_2
+                        if vlmap_waypoint_decision.get("waypoint_recovery_required"):
+                            recovery_actions = [
+                                int(item)
+                                for item in vlmap_waypoint_decision.get("waypoint_recovery_actions", [])
+                                if int(item) in (action_code.LEFT, action_code.RIGHT)
+                            ]
+                            if recovery_actions:
+                                rejected_goal_grid = self._vlmap_goal_grid_from_decision(vlmap_waypoint_decision)
+                                if rejected_goal_grid is not None:
+                                    rejected_vlmap_goal_grids.append(rejected_goal_grid)
+                                vlmap_recovery_actions = recovery_actions
+                                pixel_goal = None
+                                output_ids = None
+                                messages = []
+                                input_images = []
+                                llm_outputs = ""
+                                local_actions = []
+                                action_seq = []
+                                action = None
+                                forward_action = 0
+                                draw_pixel_goal = False
+                                flag = False
+                                print(
+                                    "[VLMapSafety][Habitat][Waypoint] "
+                                    f"clear current goal and run VLMap recovery actions {vlmap_recovery_actions}"
+                                )
+                                continue
+
                         if vlmap_waypoint_decision.get("requery_required"):
                             # Drop every state tied to the rejected waypoint. Without
                             # clearing both messages and input_images, the next Qwen-VL
