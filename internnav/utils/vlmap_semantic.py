@@ -129,6 +129,8 @@ _ALIASES = {
     "office": "office",
     "painting": "picture",
     "patio": "patio",
+    "photo": "picture",
+    "photograph": "picture",
     "picture": "picture",
     "plant": "plant",
     "plants": "plant",
@@ -203,6 +205,29 @@ class VLMapSemanticShadow:
         self.score_thresholds = sorted({round(float(value), 6) for value in threshold_values})
         self.relative_z_threshold = float(self.config.get("semantic_match_relative_z_threshold", 0.5))
         self.margin_threshold = float(self.config.get("semantic_match_margin_threshold", 0.01))
+        self.confidence_policy_enable = bool(
+            self.config.get("semantic_confidence_policy_enable", False)
+        )
+        self.confidence_policy_shadow_only = bool(
+            self.config.get("semantic_confidence_policy_shadow_only", True)
+        )
+        self.high_conf_score_threshold = float(
+            self.config.get("semantic_high_conf_score_threshold", 0.31)
+        )
+        self.low_conf_score_threshold = float(
+            self.config.get("semantic_low_conf_score_threshold", 0.29)
+        )
+        self.low_conf_streak_threshold = max(
+            1, int(self.config.get("semantic_low_conf_streak_threshold", 3))
+        )
+        self.requery_min_step = int(self.config.get("semantic_requery_min_step", 20))
+        self.requery_min_events = max(1, int(self.config.get("semantic_requery_min_events", 3)))
+        self.requery_max_per_episode = max(
+            0, int(self.config.get("semantic_requery_max_per_episode", 1))
+        )
+        self.requery_require_no_high_conf = bool(
+            self.config.get("semantic_requery_require_no_high_conf", True)
+        )
         self.top_k = max(1, int(self.config.get("semantic_match_top_k", 3)))
         self.max_terms = max(1, int(self.config.get("semantic_match_max_terms", 8)))
         self.use_templates = bool(self.config.get("semantic_match_use_templates", True))
@@ -234,6 +259,13 @@ class VLMapSemanticShadow:
         self._top_sequence: List[str] = []
         self._top_score_values: List[float] = []
         self._top_margin_values: List[float] = []
+        self._high_conf_count = 0
+        self._first_high_conf_step: Optional[int] = None
+        self._low_conf_streak = 0
+        self._max_low_conf_streak = 0
+        self._confidence_would_requery_count = 0
+        self._first_confidence_would_requery_step: Optional[int] = None
+        self._confidence_would_requery_reasons: List[str] = []
         self._event_count = 0
 
     def set_debug_dir(self, debug_dir: Optional[str]) -> None:
@@ -268,6 +300,13 @@ class VLMapSemanticShadow:
         self._top_sequence = []
         self._top_score_values = []
         self._top_margin_values = []
+        self._high_conf_count = 0
+        self._first_high_conf_step = None
+        self._low_conf_streak = 0
+        self._max_low_conf_streak = 0
+        self._confidence_would_requery_count = 0
+        self._first_confidence_would_requery_step = None
+        self._confidence_would_requery_reasons = []
         self._event_count = 0
 
         event = {
@@ -365,6 +404,25 @@ class VLMapSemanticShadow:
         if top_margin_to_second is not None:
             self._top_margin_values.append(top_margin_to_second)
 
+        event_index = self._event_count + 1
+        high_conf_semantic = bool(top_score >= self.high_conf_score_threshold)
+        low_conf_semantic = bool(top_score < self.low_conf_score_threshold)
+        if high_conf_semantic:
+            self._high_conf_count += 1
+            if self._first_high_conf_step is None:
+                self._first_high_conf_step = eval_step_int
+        if low_conf_semantic:
+            self._low_conf_streak += 1
+        else:
+            self._low_conf_streak = 0
+        self._max_low_conf_streak = max(self._max_low_conf_streak, self._low_conf_streak)
+        confidence_decision = self._evaluate_confidence_policy(
+            event_index=event_index,
+            eval_step=eval_step_int,
+            high_conf_seen=self._high_conf_count > 0,
+            low_conf_streak=self._low_conf_streak,
+        )
+
         for rank, idx in enumerate(order, start=1):
             idx = int(idx)
             landmark = self._landmarks[idx]
@@ -426,6 +484,21 @@ class VLMapSemanticShadow:
             "margin_threshold": float(self.margin_threshold),
             "rank1_confident": bool(rank1_confident),
             "relative_z_threshold": float(self.relative_z_threshold),
+            "high_conf_semantic": high_conf_semantic,
+            "high_conf_score_threshold": float(self.high_conf_score_threshold),
+            "high_conf_seen": bool(self._high_conf_count > 0),
+            "high_conf_event_count": int(self._high_conf_count),
+            "first_high_conf_step": self._first_high_conf_step,
+            "low_conf_semantic": low_conf_semantic,
+            "low_conf_score_threshold": float(self.low_conf_score_threshold),
+            "low_conf_streak": int(self._low_conf_streak),
+            "max_low_conf_streak": int(self._max_low_conf_streak),
+            "confidence_policy_enable": bool(self.confidence_policy_enable),
+            "confidence_policy_shadow_only": bool(self.confidence_policy_shadow_only),
+            "confidence_would_requery": bool(confidence_decision["would_requery"]),
+            "confidence_would_requery_reason": confidence_decision["reason"],
+            "confidence_would_requery_count": int(self._confidence_would_requery_count),
+            "first_confidence_would_requery_step": self._first_confidence_would_requery_step,
             "top_terms": top_terms,
             "threshold_hits": threshold_hits,
             "threshold_hits_by_threshold": threshold_hits_by_threshold,
@@ -448,7 +521,8 @@ class VLMapSemanticShadow:
                 "[VLMapSemantic] "
                 f"step={context.get('step_id')} top={top_term}:{top_score:.3f} "
                 f"margin={0.0 if top_margin_to_second is None else top_margin_to_second:.3f} "
-                f"rank1_conf={rank1_confident} hits={threshold_hits}"
+                f"rank1_conf={rank1_confident} high_conf={high_conf_semantic} "
+                f"would_requery={confidence_decision['would_requery']} hits={threshold_hits}"
             )
         return event
 
@@ -507,6 +581,9 @@ class VLMapSemanticShadow:
         ]
         top1_stability = self._top1_stability()
         top1_entropy = self._top1_entropy()
+        high_conf_step_fraction = (
+            self._high_conf_count / self._event_count if self._event_count else 0.0
+        )
         summary = {
             "event_type": "episode_summary",
             **self._episode_meta,
@@ -567,6 +644,20 @@ class VLMapSemanticShadow:
             "max_top_score": max(self._top_score_values) if self._top_score_values else None,
             "mean_top_margin": self._mean(self._top_margin_values),
             "max_top_margin": max(self._top_margin_values) if self._top_margin_values else None,
+            "high_conf_score_threshold": float(self.high_conf_score_threshold),
+            "high_conf_seen": bool(self._high_conf_count > 0),
+            "high_conf_event_count": int(self._high_conf_count),
+            "high_conf_step_fraction": float(high_conf_step_fraction),
+            "first_high_conf_step": self._first_high_conf_step,
+            "low_conf_score_threshold": float(self.low_conf_score_threshold),
+            "max_low_conf_streak": int(self._max_low_conf_streak),
+            "final_low_conf_streak": int(self._low_conf_streak),
+            "confidence_policy_enable": bool(self.confidence_policy_enable),
+            "confidence_policy_shadow_only": bool(self.confidence_policy_shadow_only),
+            "confidence_would_requery": bool(self._confidence_would_requery_count > 0),
+            "confidence_would_requery_count": int(self._confidence_would_requery_count),
+            "first_confidence_would_requery_step": self._first_confidence_would_requery_step,
+            "confidence_would_requery_reasons": self._confidence_would_requery_reasons,
             "top1_stability": top1_stability,
             "top1_diversity": len(set(self._top_sequence)),
             "top1_entropy": top1_entropy,
@@ -617,6 +708,39 @@ class VLMapSemanticShadow:
             if len(landmarks) >= self.max_terms:
                 break
         return landmarks
+
+    def _evaluate_confidence_policy(
+        self,
+        *,
+        event_index: int,
+        eval_step: Optional[int],
+        high_conf_seen: bool,
+        low_conf_streak: int,
+    ) -> Dict[str, Any]:
+        reason = None
+        would_requery = False
+        if not self.confidence_policy_enable:
+            return {"would_requery": False, "reason": "disabled"}
+        if self.requery_max_per_episode == 0:
+            return {"would_requery": False, "reason": "max_per_episode_zero"}
+        if self._confidence_would_requery_count >= self.requery_max_per_episode:
+            return {"would_requery": False, "reason": "max_per_episode_reached"}
+        if event_index < self.requery_min_events:
+            return {"would_requery": False, "reason": "too_few_events"}
+        if eval_step is None or eval_step <= self.requery_min_step:
+            return {"would_requery": False, "reason": "too_early"}
+        if self.requery_require_no_high_conf and high_conf_seen:
+            return {"would_requery": False, "reason": "high_conf_seen"}
+        if low_conf_streak < self.low_conf_streak_threshold:
+            return {"would_requery": False, "reason": "low_conf_streak_too_short"}
+
+        would_requery = True
+        reason = "low_conf_streak_without_high_conf"
+        self._confidence_would_requery_count += 1
+        if self._first_confidence_would_requery_step is None:
+            self._first_confidence_would_requery_step = eval_step
+        self._confidence_would_requery_reasons.append(reason)
+        return {"would_requery": would_requery, "reason": reason}
 
     def _term_type(self, term: str) -> str:
         if term in _ROOM_TERM_SET:

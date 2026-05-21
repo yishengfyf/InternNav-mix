@@ -1279,6 +1279,28 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result["semantic_mean_top_score"] = semantic_summary.get("mean_top_score")
                 result["semantic_max_top_score"] = semantic_summary.get("max_top_score")
                 result["semantic_mean_top_margin"] = semantic_summary.get("mean_top_margin")
+                result["semantic_high_conf_seen"] = semantic_summary.get("high_conf_seen")
+                result["semantic_high_conf_event_count"] = semantic_summary.get(
+                    "high_conf_event_count"
+                )
+                result["semantic_high_conf_step_fraction"] = semantic_summary.get(
+                    "high_conf_step_fraction"
+                )
+                result["semantic_first_high_conf_step"] = semantic_summary.get(
+                    "first_high_conf_step"
+                )
+                result["semantic_max_low_conf_streak"] = semantic_summary.get(
+                    "max_low_conf_streak"
+                )
+                result["semantic_confidence_would_requery"] = semantic_summary.get(
+                    "confidence_would_requery"
+                )
+                result["semantic_confidence_would_requery_count"] = semantic_summary.get(
+                    "confidence_would_requery_count"
+                )
+                result["semantic_first_confidence_would_requery_step"] = semantic_summary.get(
+                    "first_confidence_would_requery_step"
+                )
                 result["semantic_top1_stability"] = semantic_summary.get("top1_stability")
                 result["semantic_top1_diversity"] = semantic_summary.get("top1_diversity")
                 coverage_by_threshold = semantic_summary.get("coverage_by_threshold") or {}

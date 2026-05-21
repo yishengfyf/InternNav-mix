@@ -65,6 +65,32 @@ def _success_split_mean(
     }
 
 
+def _success_split_values(
+    values_by_key: Dict[str, Optional[float]],
+    summaries_by_key: Dict[str, Dict[str, Any]],
+    progress_by_key: Dict[str, Dict[str, Any]],
+) -> Dict[str, Optional[float]]:
+    all_values = []
+    success_values = []
+    failure_values = []
+    for key, semantic in summaries_by_key.items():
+        value = values_by_key.get(key)
+        all_values.append(value)
+        progress_item = progress_by_key.get(key, {})
+        success = progress_item.get("success", semantic.get("success"))
+        if success is None:
+            continue
+        if float(success) >= 0.5:
+            success_values.append(value)
+        else:
+            failure_values.append(value)
+    return {
+        "mean": _safe_mean(all_values),
+        "success_mean": _safe_mean(success_values),
+        "failure_mean": _safe_mean(failure_values),
+    }
+
+
 def summarize(
     events: List[Dict[str, Any]],
     episode_summaries: Optional[List[Dict[str, Any]]] = None,
@@ -199,6 +225,14 @@ def summarize(
         "top1_diversity",
         "top1_entropy",
         "top1_transition_count",
+        "high_conf_seen",
+        "high_conf_event_count",
+        "high_conf_step_fraction",
+        "first_high_conf_step",
+        "max_low_conf_streak",
+        "confidence_would_requery",
+        "confidence_would_requery_count",
+        "first_confidence_would_requery_step",
         "rank1_first_seen_step",
         "rank1_confident_first_seen_step",
         "relative_first_seen_step",
@@ -238,6 +272,81 @@ def summarize(
             "failure_mean": _safe_mean(failure_values),
         }
 
+    relative_coverage_by_z_threshold = {}
+    for z_threshold in (0.5, 1.0, 1.5):
+        seen_by_key = defaultdict(set)
+        for event in ok_events:
+            key = _episode_key(event)
+            scores = event.get("scores") or []
+            for score_item in scores:
+                score_z = score_item.get("score_z")
+                is_single_rank1 = len(scores) == 1 and score_item.get("rank") == 1
+                if is_single_rank1 or (
+                    score_z is not None and float(score_z) >= z_threshold
+                ):
+                    seen_by_key[key].add(score_item.get("term"))
+        coverage_values = {}
+        for key, semantic in summaries_by_key.items():
+            terms = set(semantic.get("landmark_terms") or [])
+            seen = {term for term in seen_by_key.get(key, set()) if term}
+            coverage_values[key] = (len(terms & seen) / len(terms)) if terms else 0.0
+        relative_coverage_by_z_threshold[f"{z_threshold:.1f}"] = _success_split_values(
+            coverage_values, summaries_by_key, progress_by_key
+        )
+
+    transition_rate_values = {}
+    for key, semantic in summaries_by_key.items():
+        event_count = semantic.get("semantic_event_count") or 0
+        transition_count = semantic.get("top1_transition_count")
+        if transition_count is None:
+            transition_rate_values[key] = None
+        elif event_count and event_count > 1:
+            transition_rate_values[key] = float(transition_count) / float(event_count - 1)
+        else:
+            transition_rate_values[key] = 0.0
+    transition_rate_split = _success_split_values(
+        transition_rate_values, summaries_by_key, progress_by_key
+    )
+
+    success_total = 0
+    failure_total = 0
+    triggered_success = 0
+    triggered_failure = 0
+    triggered_total = 0
+    for key, semantic in summaries_by_key.items():
+        progress_item = progress_by_key.get(key, {})
+        success = progress_item.get("success", semantic.get("success"))
+        if success is None:
+            continue
+        triggered = bool(semantic.get("confidence_would_requery"))
+        if float(success) >= 0.5:
+            success_total += 1
+            if triggered:
+                triggered_success += 1
+        else:
+            failure_total += 1
+            if triggered:
+                triggered_failure += 1
+        if triggered:
+            triggered_total += 1
+
+    confidence_policy_stats = {
+        "triggered_episode_count": triggered_total,
+        "triggered_success_count": triggered_success,
+        "triggered_failure_count": triggered_failure,
+        "success_episode_count": success_total,
+        "failure_episode_count": failure_total,
+        "failure_precision": (
+            triggered_failure / triggered_total if triggered_total else None
+        ),
+        "failure_recall": (
+            triggered_failure / failure_total if failure_total else None
+        ),
+        "success_false_positive_rate": (
+            triggered_success / success_total if success_total else None
+        ),
+    }
+
     return {
         "total_events": len(events),
         "semantic_match_events": len(match_events),
@@ -269,6 +378,9 @@ def summarize(
         "relative_mean_coverage": metric_splits["relative_coverage"]["mean"],
         "relative_success_mean_coverage": metric_splits["relative_coverage"]["success_mean"],
         "relative_failure_mean_coverage": metric_splits["relative_coverage"]["failure_mean"],
+        "relative_coverage_by_z_threshold": relative_coverage_by_z_threshold,
+        "transition_rate": transition_rate_split,
+        "confidence_policy_stats": confidence_policy_stats,
         "summary_metric_splits": metric_splits,
         "top_match_counts": dict(top_counter.most_common(20)),
         "threshold_hit_counts": dict(hit_counter.most_common(20)),
