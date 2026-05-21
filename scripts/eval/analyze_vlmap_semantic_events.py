@@ -1,0 +1,192 @@
+import argparse
+import json
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+
+def _read_json_records(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        data = json.loads(text)
+        if not isinstance(data, list):
+            raise ValueError(f"Expected a JSON list in {path}")
+        return data
+    records = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON at {path}:{lineno}") from exc
+    return records
+
+
+def _episode_key(record: Dict[str, Any]) -> str:
+    return f"{record.get('scene_id')}|{record.get('episode_id')}"
+
+
+def _safe_mean(values: Iterable[Optional[float]]) -> Optional[float]:
+    clean = [float(value) for value in values if value is not None]
+    if not clean:
+        return None
+    return sum(clean) / len(clean)
+
+
+def summarize(
+    events: List[Dict[str, Any]],
+    episode_summaries: Optional[List[Dict[str, Any]]] = None,
+    progress: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    match_events = [event for event in events if event.get("event_type") == "semantic_match"]
+    ok_events = [event for event in match_events if event.get("status") == "ok"]
+    no_landmark_events = [event for event in match_events if event.get("status") == "no_landmarks"]
+    init_errors = [event for event in events if event.get("event_type") == "semantic_init_error"]
+
+    per_episode = defaultdict(
+        lambda: {
+            "events": 0,
+            "ok_events": 0,
+            "hit_events": 0,
+            "top_matches": Counter(),
+            "threshold_hits": Counter(),
+        }
+    )
+    top_counter = Counter()
+    hit_counter = Counter()
+
+    for event in match_events:
+        key = _episode_key(event)
+        item = per_episode[key]
+        item["scene_id"] = event.get("scene_id")
+        item["episode_id"] = event.get("episode_id")
+        item["events"] += 1
+        if event.get("status") != "ok":
+            continue
+        item["ok_events"] += 1
+        top_match = event.get("top_match")
+        if top_match:
+            item["top_matches"][top_match] += 1
+            top_counter[top_match] += 1
+        hits = event.get("threshold_hits") or []
+        if hits:
+            item["hit_events"] += 1
+        for hit in hits:
+            item["threshold_hits"][hit] += 1
+            hit_counter[hit] += 1
+
+    summaries_by_key = {}
+    for summary in episode_summaries or []:
+        summaries_by_key[_episode_key(summary)] = summary
+
+    progress_by_key = {}
+    for item in progress or []:
+        progress_by_key[_episode_key(item)] = item
+
+    summary_keys = set(summaries_by_key)
+    progress_keys = set(progress_by_key)
+    success_coverages = []
+    failure_coverages = []
+    success_first_seen = []
+    failure_first_seen = []
+    success_seen_counts = []
+    failure_seen_counts = []
+
+    for key, semantic in summaries_by_key.items():
+        progress_item = progress_by_key.get(key, {})
+        success = progress_item.get("success", semantic.get("success"))
+        coverage = semantic.get("coverage")
+        seen_count = semantic.get("seen_count")
+        first_seen_step = semantic.get("first_seen_step")
+        if success is None:
+            continue
+        if float(success) >= 0.5:
+            success_coverages.append(coverage)
+            success_seen_counts.append(seen_count)
+            success_first_seen.append(first_seen_step)
+        else:
+            failure_coverages.append(coverage)
+            failure_seen_counts.append(seen_count)
+            failure_first_seen.append(first_seen_step)
+
+    top_episodes = []
+    for key, item in per_episode.items():
+        top_episodes.append(
+            {
+                "scene_id": item.get("scene_id"),
+                "episode_id": item.get("episode_id"),
+                "events": item["events"],
+                "ok_events": item["ok_events"],
+                "hit_events": item["hit_events"],
+                "top_matches": dict(item["top_matches"].most_common(5)),
+                "threshold_hits": dict(item["threshold_hits"].most_common(5)),
+            }
+        )
+    top_episodes.sort(key=lambda item: (item["hit_events"], item["ok_events"]), reverse=True)
+
+    return {
+        "total_events": len(events),
+        "semantic_match_events": len(match_events),
+        "ok_match_events": len(ok_events),
+        "no_landmark_events": len(no_landmark_events),
+        "init_error_count": len(init_errors),
+        "episode_count_from_events": len(per_episode),
+        "episode_summary_count": len(summary_keys),
+        "progress_episode_count": len(progress_keys),
+        "matched_progress_episode_count": len(summary_keys & progress_keys),
+        "mean_coverage": _safe_mean(item.get("coverage") for item in summaries_by_key.values()),
+        "mean_seen_count": _safe_mean(item.get("seen_count") for item in summaries_by_key.values()),
+        "success_mean_coverage": _safe_mean(success_coverages),
+        "failure_mean_coverage": _safe_mean(failure_coverages),
+        "success_mean_seen_count": _safe_mean(success_seen_counts),
+        "failure_mean_seen_count": _safe_mean(failure_seen_counts),
+        "success_mean_first_seen_step": _safe_mean(success_first_seen),
+        "failure_mean_first_seen_step": _safe_mean(failure_first_seen),
+        "top_match_counts": dict(top_counter.most_common(20)),
+        "threshold_hit_counts": dict(hit_counter.most_common(20)),
+        "top_hit_episodes": top_episodes[:20],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Summarize VLMap semantic shadow logs.")
+    parser.add_argument("--events", type=Path, help="Path to semantic_events.jsonl")
+    parser.add_argument("--summary", type=Path, help="Path to semantic_episode_summary.jsonl")
+    parser.add_argument("--run-dir", type=Path, help="Directory containing semantic logs")
+    parser.add_argument("--progress", type=Path, help="Optional progress.json/jsonl for success correlation")
+    parser.add_argument("--output", type=Path, help="Optional path to write summary JSON")
+    args = parser.parse_args()
+
+    events_path = args.events
+    if events_path is None:
+        if args.run_dir is None:
+            parser.error("Provide --events or --run-dir")
+        events_path = args.run_dir / "semantic_events.jsonl"
+
+    summary_path = args.summary
+    if summary_path is None and args.run_dir is not None:
+        summary_path = args.run_dir / "semantic_episode_summary.jsonl"
+
+    progress_path = args.progress
+    if progress_path is None and args.run_dir is not None:
+        candidate = args.run_dir / "progress.json"
+        if candidate.exists():
+            progress_path = candidate
+
+    events = _read_json_records(events_path)
+    episode_summaries = _read_json_records(summary_path) if summary_path else []
+    progress = _read_json_records(progress_path) if progress_path and progress_path.exists() else []
+    payload = json.dumps(summarize(events, episode_summaries, progress), indent=2, ensure_ascii=False)
+    print(payload)
+    if args.output:
+        args.output.write_text(payload + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

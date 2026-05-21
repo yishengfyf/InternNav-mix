@@ -45,6 +45,7 @@ from internnav.habitat_extensions.vln.utils import (
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 from internnav.utils.vlmap_safety import VLMapActionSafety
+from internnav.utils.vlmap_semantic import VLMapSemanticShadow
 
 # Import for Habitat registry side effects — do not remove
 import internnav.habitat_extensions.vln.measures  # noqa: F401 # isort: skip
@@ -248,6 +249,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._vlmap_log_stderr = None
         self._vlmap_run_dir = None
         self._setup_vlmap_run_logging()
+        self.vlmap_semantic = VLMapSemanticShadow(vlmap_safety_cfg)
+        self.vlmap_semantic.set_debug_dir(self._get_vlmap_run_dir())
 
     def eval_action(self):
         """
@@ -568,6 +571,49 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
         return bool(decision.get("reject_required")), dict(decision or {})
 
+    def _evaluate_semantic_match_with_vlmap(
+        self,
+        semantic_image,
+        instruction: str,
+        pixel_goal,
+        observations: dict,
+        step_id: Optional[int] = None,
+        scene_id: Optional[str] = None,
+        episode_id: Optional[int] = None,
+        episode_index: Optional[int] = None,
+        episode_count: Optional[int] = None,
+        observation_source: str = "current",
+    ) -> dict:
+        if not hasattr(self, "vlmap_semantic"):
+            return {}
+        context = {
+            "step_id": step_id,
+            "scene_id": scene_id,
+            "episode_id": episode_id,
+            "episode_index": episode_index,
+            "episode_count": episode_count,
+            "instruction": instruction,
+            "pixel_goal": pixel_goal,
+            "observation_source": observation_source,
+            "gps": observations.get("gps"),
+            "compass": observations.get("compass"),
+        }
+        decision = self.vlmap_semantic.match_observation(semantic_image, context=context)
+        if decision.get("status") == "ok" and decision.get("top_match"):
+            print(
+                "[VLMapSemantic][Habitat] "
+                f"top={decision.get('top_match')} "
+                f"score={float(decision.get('top_score', 0.0)):.3f} "
+                f"hits={decision.get('threshold_hits', [])}"
+            )
+        elif decision.get("status") in ("model_unavailable", "score_error", "text_feature_unavailable"):
+            print(
+                "[VLMapSemantic][Habitat] "
+                f"status={decision.get('status')} "
+                f"reason={decision.get('disabled_reason')}"
+            )
+        return dict(decision or {})
+
     def _format_vlmap_waypoint_feedback(self, pixel_goal, decision: dict) -> str:
         vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
         if not bool(vlmap_safety_cfg.get("waypoint_requery_feedback_enable", True)):
@@ -677,6 +723,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             print("episode start", episode_instruction)
             self.vlmap_safety.reset()
             self._vlmap_last_nav_action = None
+            self.vlmap_semantic.reset_episode(
+                instruction=episode_instruction,
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_index=episode_index,
+                episode_count=episode_count,
+            )
 
             # save first frame per rank to validate sim quality
             os.makedirs(os.path.join(self.output_path, f'check_sim_{self.epoch}'), exist_ok=True)
@@ -842,6 +895,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                         pixel_goal = [int(coord[1]), int(coord[0])]
                         draw_pixel_goal = True
+
+                        semantic_image = input_images[-1] if input_images else image
+                        semantic_source = "look_down" if action == action_code.LOOKDOWN else "forward"
+                        self._evaluate_semantic_match_with_vlmap(
+                            semantic_image,
+                            episode_instruction,
+                            pixel_goal,
+                            observations,
+                            step_id=step_id,
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_index=episode_index,
+                            episode_count=episode_count,
+                            observation_source=semantic_source,
+                        )
 
                         # Stage 2 VLMap advisor: check the S2 waypoint before asking
                         # NextDiT/System1 to turn it into local trajectory actions.
@@ -1185,6 +1253,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
                 f"ne: {metrics['distance_to_goal']}"
             )
+            semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
 
             # Write per-episode progress.json entry (still per-rank)
             result = {
@@ -1197,6 +1266,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
             }
+            if semantic_summary:
+                result["semantic_landmark_count"] = semantic_summary.get("landmark_count")
+                result["semantic_seen_count"] = semantic_summary.get("seen_count")
+                result["semantic_coverage"] = semantic_summary.get("coverage")
+                result["semantic_first_seen_step"] = semantic_summary.get("first_seen_step")
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
 
