@@ -233,6 +233,11 @@ def summarize(
         "confidence_would_requery",
         "confidence_would_requery_count",
         "first_confidence_would_requery_step",
+        "stagnation_would_requery",
+        "stagnation_would_requery_count",
+        "first_stagnation_would_requery_step",
+        "stagnation_min_recent_unique_count",
+        "stagnation_low_diversity_window_count",
         "rank1_first_seen_step",
         "rank1_confident_first_seen_step",
         "relative_first_seen_step",
@@ -308,44 +313,87 @@ def summarize(
         transition_rate_values, summaries_by_key, progress_by_key
     )
 
-    success_total = 0
-    failure_total = 0
-    triggered_success = 0
-    triggered_failure = 0
-    triggered_total = 0
-    for key, semantic in summaries_by_key.items():
-        progress_item = progress_by_key.get(key, {})
-        success = progress_item.get("success", semantic.get("success"))
-        if success is None:
-            continue
-        triggered = bool(semantic.get("confidence_would_requery"))
-        if float(success) >= 0.5:
-            success_total += 1
-            if triggered:
-                triggered_success += 1
-        else:
-            failure_total += 1
-            if triggered:
-                triggered_failure += 1
-        if triggered:
-            triggered_total += 1
+    def _policy_stats(trigger_field: str) -> Dict[str, Any]:
+        success_total = 0
+        failure_total = 0
+        triggered_success = 0
+        triggered_failure = 0
+        triggered_total = 0
+        severe_failure_total = 0
+        triggered_severe_failure = 0
+        high_quality_success_total = 0
+        triggered_high_quality_success = 0
+        for key, semantic in summaries_by_key.items():
+            progress_item = progress_by_key.get(key, {})
+            success = progress_item.get("success", semantic.get("success"))
+            if success is None:
+                continue
+            triggered = bool(semantic.get(trigger_field))
+            spl = progress_item.get("spl", semantic.get("spl"))
+            ne = progress_item.get("ne", semantic.get("ne"))
+            steps = progress_item.get("steps", semantic.get("steps"))
+            is_success = float(success) >= 0.5
+            is_severe_failure = False
+            if not is_success:
+                ne_severe = ne is not None and float(ne) > 8.0
+                step_severe = steps is not None and float(steps) > 120.0
+                is_severe_failure = ne_severe or step_severe
+            is_high_quality_success = (
+                is_success and spl is not None and float(spl) >= 0.85
+            )
 
-    confidence_policy_stats = {
-        "triggered_episode_count": triggered_total,
-        "triggered_success_count": triggered_success,
-        "triggered_failure_count": triggered_failure,
-        "success_episode_count": success_total,
-        "failure_episode_count": failure_total,
-        "failure_precision": (
-            triggered_failure / triggered_total if triggered_total else None
-        ),
-        "failure_recall": (
-            triggered_failure / failure_total if failure_total else None
-        ),
-        "success_false_positive_rate": (
-            triggered_success / success_total if success_total else None
-        ),
-    }
+            if is_success:
+                success_total += 1
+                if triggered:
+                    triggered_success += 1
+                if is_high_quality_success:
+                    high_quality_success_total += 1
+                    if triggered:
+                        triggered_high_quality_success += 1
+            else:
+                failure_total += 1
+                if triggered:
+                    triggered_failure += 1
+                if is_severe_failure:
+                    severe_failure_total += 1
+                    if triggered:
+                        triggered_severe_failure += 1
+            if triggered:
+                triggered_total += 1
+
+        return {
+            "triggered_episode_count": triggered_total,
+            "triggered_success_count": triggered_success,
+            "triggered_failure_count": triggered_failure,
+            "success_episode_count": success_total,
+            "failure_episode_count": failure_total,
+            "failure_precision": (
+                triggered_failure / triggered_total if triggered_total else None
+            ),
+            "failure_recall": (
+                triggered_failure / failure_total if failure_total else None
+            ),
+            "success_false_positive_rate": (
+                triggered_success / success_total if success_total else None
+            ),
+            "severe_failure_episode_count": severe_failure_total,
+            "triggered_severe_failure_count": triggered_severe_failure,
+            "severe_failure_recall": (
+                triggered_severe_failure / severe_failure_total
+                if severe_failure_total
+                else None
+            ),
+            "high_quality_success_episode_count": high_quality_success_total,
+            "triggered_high_quality_success_count": triggered_high_quality_success,
+            "high_quality_success_false_positive_rate": (
+                triggered_high_quality_success / high_quality_success_total
+                if high_quality_success_total
+                else None
+            ),
+        }
+
+    confidence_policy_stats = _policy_stats("confidence_would_requery")
+    stagnation_policy_stats = _policy_stats("stagnation_would_requery")
 
     return {
         "total_events": len(events),
@@ -381,6 +429,7 @@ def summarize(
         "relative_coverage_by_z_threshold": relative_coverage_by_z_threshold,
         "transition_rate": transition_rate_split,
         "confidence_policy_stats": confidence_policy_stats,
+        "stagnation_policy_stats": stagnation_policy_stats,
         "summary_metric_splits": metric_splits,
         "top_match_counts": dict(top_counter.most_common(20)),
         "threshold_hit_counts": dict(hit_counter.most_common(20)),

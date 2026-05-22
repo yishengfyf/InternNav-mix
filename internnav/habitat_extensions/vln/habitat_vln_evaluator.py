@@ -606,6 +606,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 f"score={float(decision.get('top_score', 0.0)):.3f} "
                 f"hits={decision.get('threshold_hits', [])}"
             )
+            if decision.get("stagnation_would_requery"):
+                mode = "active" if decision.get("stagnation_requery_required") else "shadow"
+                print(
+                    "[VLMapSemantic][Habitat][Stagnation] "
+                    f"{mode} would re-observe; "
+                    f"unique={decision.get('stagnation_recent_unique_count')} "
+                    f"recent={decision.get('stagnation_recent_terms')}"
+                )
         elif decision.get("status") in ("model_unavailable", "score_error", "text_feature_unavailable"):
             print(
                 "[VLMapSemantic][Habitat] "
@@ -898,7 +906,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                         semantic_image = input_images[-1] if input_images else image
                         semantic_source = "look_down" if action == action_code.LOOKDOWN else "forward"
-                        self._evaluate_semantic_match_with_vlmap(
+                        semantic_decision = self._evaluate_semantic_match_with_vlmap(
                             semantic_image,
                             episode_instruction,
                             pixel_goal,
@@ -950,6 +958,30 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         _, _, lookup_done, _ = self.env.step(action_code.LOOKUP)
                         observations, _, lookup_done_2, _ = self.env.step(action_code.LOOKUP)
                         done = done or lookup_done or lookup_done_2
+                        if semantic_decision.get("stagnation_requery_required"):
+                            pixel_goal = None
+                            output_ids = None
+                            traj_latents = None
+                            pix_goal_image = None
+                            pix_goal_depth = None
+                            messages = []
+                            input_images = []
+                            llm_outputs = ""
+                            local_actions = []
+                            action_seq = []
+                            vlmap_recovery_actions = []
+                            pending_vlmap_waypoint_feedback = ""
+                            action = None
+                            forward_action = 0
+                            draw_pixel_goal = False
+                            flag = False
+                            print(
+                                "[VLMapSemantic][Habitat][Stagnation] "
+                                "clear current goal and re-observe with S2; "
+                                f"reason={semantic_decision.get('stagnation_would_requery_reason')} "
+                                f"recent={semantic_decision.get('stagnation_recent_terms')}"
+                            )
+                            continue
                         if vlmap_waypoint_decision.get("waypoint_recovery_required"):
                             recovery_actions = [
                                 int(item)
@@ -1300,6 +1332,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["semantic_first_confidence_would_requery_step"] = semantic_summary.get(
                     "first_confidence_would_requery_step"
+                )
+                result["semantic_stagnation_would_requery"] = semantic_summary.get(
+                    "stagnation_would_requery"
+                )
+                result["semantic_stagnation_would_requery_count"] = semantic_summary.get(
+                    "stagnation_would_requery_count"
+                )
+                result["semantic_first_stagnation_would_requery_step"] = semantic_summary.get(
+                    "first_stagnation_would_requery_step"
+                )
+                result["semantic_stagnation_min_recent_unique_count"] = semantic_summary.get(
+                    "stagnation_min_recent_unique_count"
+                )
+                result["semantic_stagnation_low_diversity_window_count"] = semantic_summary.get(
+                    "stagnation_low_diversity_window_count"
                 )
                 result["semantic_top1_stability"] = semantic_summary.get("top1_stability")
                 result["semantic_top1_diversity"] = semantic_summary.get("top1_diversity")

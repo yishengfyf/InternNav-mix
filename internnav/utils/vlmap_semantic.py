@@ -228,6 +228,30 @@ class VLMapSemanticShadow:
         self.requery_require_no_high_conf = bool(
             self.config.get("semantic_requery_require_no_high_conf", True)
         )
+        self.stagnation_policy_enable = bool(
+            self.config.get("semantic_stagnation_policy_enable", False)
+        )
+        self.stagnation_policy_shadow_only = bool(
+            self.config.get("semantic_stagnation_policy_shadow_only", True)
+        )
+        self.stagnation_window = max(
+            2, int(self.config.get("semantic_stagnation_window", 5))
+        )
+        self.stagnation_unique_threshold = max(
+            1, int(self.config.get("semantic_stagnation_unique_threshold", 2))
+        )
+        self.stagnation_min_step = int(
+            self.config.get("semantic_stagnation_min_step", 30)
+        )
+        self.stagnation_min_events = max(
+            1, int(self.config.get("semantic_stagnation_min_events", 8))
+        )
+        self.stagnation_require_no_high_conf = bool(
+            self.config.get("semantic_stagnation_require_no_high_conf", True)
+        )
+        self.stagnation_max_per_episode = max(
+            0, int(self.config.get("semantic_stagnation_max_per_episode", 1))
+        )
         self.top_k = max(1, int(self.config.get("semantic_match_top_k", 3)))
         self.max_terms = max(1, int(self.config.get("semantic_match_max_terms", 8)))
         self.use_templates = bool(self.config.get("semantic_match_use_templates", True))
@@ -266,6 +290,10 @@ class VLMapSemanticShadow:
         self._confidence_would_requery_count = 0
         self._first_confidence_would_requery_step: Optional[int] = None
         self._confidence_would_requery_reasons: List[str] = []
+        self._stagnation_would_requery_count = 0
+        self._first_stagnation_would_requery_step: Optional[int] = None
+        self._stagnation_would_requery_reasons: List[str] = []
+        self._stagnation_recent_unique_counts: List[int] = []
         self._event_count = 0
 
     def set_debug_dir(self, debug_dir: Optional[str]) -> None:
@@ -307,6 +335,10 @@ class VLMapSemanticShadow:
         self._confidence_would_requery_count = 0
         self._first_confidence_would_requery_step = None
         self._confidence_would_requery_reasons = []
+        self._stagnation_would_requery_count = 0
+        self._first_stagnation_would_requery_step = None
+        self._stagnation_would_requery_reasons = []
+        self._stagnation_recent_unique_counts = []
         self._event_count = 0
 
         event = {
@@ -422,6 +454,11 @@ class VLMapSemanticShadow:
             high_conf_seen=self._high_conf_count > 0,
             low_conf_streak=self._low_conf_streak,
         )
+        stagnation_decision = self._evaluate_stagnation_policy(
+            event_index=event_index,
+            eval_step=eval_step_int,
+            high_conf_seen=self._high_conf_count > 0,
+        )
 
         for rank, idx in enumerate(order, start=1):
             idx = int(idx)
@@ -499,6 +536,21 @@ class VLMapSemanticShadow:
             "confidence_would_requery_reason": confidence_decision["reason"],
             "confidence_would_requery_count": int(self._confidence_would_requery_count),
             "first_confidence_would_requery_step": self._first_confidence_would_requery_step,
+            "stagnation_policy_enable": bool(self.stagnation_policy_enable),
+            "stagnation_policy_shadow_only": bool(self.stagnation_policy_shadow_only),
+            "stagnation_window": int(self.stagnation_window),
+            "stagnation_unique_threshold": int(self.stagnation_unique_threshold),
+            "stagnation_recent_terms": stagnation_decision["recent_terms"],
+            "stagnation_recent_unique_count": stagnation_decision["recent_unique_count"],
+            "stagnation_detected": bool(stagnation_decision["would_requery"]),
+            "stagnation_would_requery": bool(stagnation_decision["would_requery"]),
+            "stagnation_requery_required": bool(
+                stagnation_decision["would_requery"]
+                and not self.stagnation_policy_shadow_only
+            ),
+            "stagnation_would_requery_reason": stagnation_decision["reason"],
+            "stagnation_would_requery_count": int(self._stagnation_would_requery_count),
+            "first_stagnation_would_requery_step": self._first_stagnation_would_requery_step,
             "top_terms": top_terms,
             "threshold_hits": threshold_hits,
             "threshold_hits_by_threshold": threshold_hits_by_threshold,
@@ -522,7 +574,9 @@ class VLMapSemanticShadow:
                 f"step={context.get('step_id')} top={top_term}:{top_score:.3f} "
                 f"margin={0.0 if top_margin_to_second is None else top_margin_to_second:.3f} "
                 f"rank1_conf={rank1_confident} high_conf={high_conf_semantic} "
-                f"would_requery={confidence_decision['would_requery']} hits={threshold_hits}"
+                f"confidence_requery={confidence_decision['would_requery']} "
+                f"stagnation_requery={stagnation_decision['would_requery']} "
+                f"hits={threshold_hits}"
             )
         return event
 
@@ -581,6 +635,12 @@ class VLMapSemanticShadow:
         ]
         top1_stability = self._top1_stability()
         top1_entropy = self._top1_entropy()
+        stagnation_min_recent_unique_count = self._min_recent_unique_count(
+            self.stagnation_window
+        )
+        stagnation_low_diversity_window_count = self._low_diversity_window_count(
+            self.stagnation_window, self.stagnation_unique_threshold
+        )
         high_conf_step_fraction = (
             self._high_conf_count / self._event_count if self._event_count else 0.0
         )
@@ -658,6 +718,19 @@ class VLMapSemanticShadow:
             "confidence_would_requery_count": int(self._confidence_would_requery_count),
             "first_confidence_would_requery_step": self._first_confidence_would_requery_step,
             "confidence_would_requery_reasons": self._confidence_would_requery_reasons,
+            "stagnation_policy_enable": bool(self.stagnation_policy_enable),
+            "stagnation_policy_shadow_only": bool(self.stagnation_policy_shadow_only),
+            "stagnation_window": int(self.stagnation_window),
+            "stagnation_unique_threshold": int(self.stagnation_unique_threshold),
+            "stagnation_min_step": int(self.stagnation_min_step),
+            "stagnation_min_events": int(self.stagnation_min_events),
+            "stagnation_require_no_high_conf": bool(self.stagnation_require_no_high_conf),
+            "stagnation_would_requery": bool(self._stagnation_would_requery_count > 0),
+            "stagnation_would_requery_count": int(self._stagnation_would_requery_count),
+            "first_stagnation_would_requery_step": self._first_stagnation_would_requery_step,
+            "stagnation_would_requery_reasons": self._stagnation_would_requery_reasons,
+            "stagnation_min_recent_unique_count": stagnation_min_recent_unique_count,
+            "stagnation_low_diversity_window_count": int(stagnation_low_diversity_window_count),
             "top1_stability": top1_stability,
             "top1_diversity": len(set(self._top_sequence)),
             "top1_entropy": top1_entropy,
@@ -742,6 +815,87 @@ class VLMapSemanticShadow:
         self._confidence_would_requery_reasons.append(reason)
         return {"would_requery": would_requery, "reason": reason}
 
+    def _evaluate_stagnation_policy(
+        self,
+        *,
+        event_index: int,
+        eval_step: Optional[int],
+        high_conf_seen: bool,
+    ) -> Dict[str, Any]:
+        recent_terms = list(self._top_sequence[-self.stagnation_window :])
+        recent_unique_count = len(set(recent_terms))
+        if len(recent_terms) >= self.stagnation_window:
+            self._stagnation_recent_unique_counts.append(recent_unique_count)
+
+        if not self.stagnation_policy_enable:
+            return {
+                "would_requery": False,
+                "reason": "disabled",
+                "recent_terms": recent_terms,
+                "recent_unique_count": recent_unique_count,
+            }
+        if self.stagnation_max_per_episode == 0:
+            return {
+                "would_requery": False,
+                "reason": "max_per_episode_zero",
+                "recent_terms": recent_terms,
+                "recent_unique_count": recent_unique_count,
+            }
+        if self._stagnation_would_requery_count >= self.stagnation_max_per_episode:
+            return {
+                "would_requery": False,
+                "reason": "max_per_episode_reached",
+                "recent_terms": recent_terms,
+                "recent_unique_count": recent_unique_count,
+            }
+        if event_index < self.stagnation_min_events:
+            return {
+                "would_requery": False,
+                "reason": "too_few_events",
+                "recent_terms": recent_terms,
+                "recent_unique_count": recent_unique_count,
+            }
+        if len(recent_terms) < self.stagnation_window:
+            return {
+                "would_requery": False,
+                "reason": "window_not_full",
+                "recent_terms": recent_terms,
+                "recent_unique_count": recent_unique_count,
+            }
+        if eval_step is None or eval_step <= self.stagnation_min_step:
+            return {
+                "would_requery": False,
+                "reason": "too_early",
+                "recent_terms": recent_terms,
+                "recent_unique_count": recent_unique_count,
+            }
+        if self.stagnation_require_no_high_conf and high_conf_seen:
+            return {
+                "would_requery": False,
+                "reason": "high_conf_seen",
+                "recent_terms": recent_terms,
+                "recent_unique_count": recent_unique_count,
+            }
+        if recent_unique_count > self.stagnation_unique_threshold:
+            return {
+                "would_requery": False,
+                "reason": "semantic_progress_not_stagnated",
+                "recent_terms": recent_terms,
+                "recent_unique_count": recent_unique_count,
+            }
+
+        reason = "semantic_stagnation"
+        self._stagnation_would_requery_count += 1
+        if self._first_stagnation_would_requery_step is None:
+            self._first_stagnation_would_requery_step = eval_step
+        self._stagnation_would_requery_reasons.append(reason)
+        return {
+            "would_requery": True,
+            "reason": reason,
+            "recent_terms": recent_terms,
+            "recent_unique_count": recent_unique_count,
+        }
+
     def _term_type(self, term: str) -> str:
         if term in _ROOM_TERM_SET:
             return "room"
@@ -807,6 +961,24 @@ class VLMapSemanticShadow:
             1
             for previous, current in zip(self._top_sequence[:-1], self._top_sequence[1:])
             if previous != current
+        )
+
+    def _min_recent_unique_count(self, window: int) -> Optional[int]:
+        if len(self._top_sequence) < window:
+            return None
+        values = [
+            len(set(self._top_sequence[start : start + window]))
+            for start in range(0, len(self._top_sequence) - window + 1)
+        ]
+        return min(values) if values else None
+
+    def _low_diversity_window_count(self, window: int, unique_threshold: int) -> int:
+        if len(self._top_sequence) < window:
+            return 0
+        return sum(
+            1
+            for start in range(0, len(self._top_sequence) - window + 1)
+            if len(set(self._top_sequence[start : start + window])) <= unique_threshold
         )
 
     def _ensure_model(self) -> bool:
