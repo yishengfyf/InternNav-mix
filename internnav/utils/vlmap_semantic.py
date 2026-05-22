@@ -234,6 +234,9 @@ class VLMapSemanticShadow:
         self.stagnation_policy_shadow_only = bool(
             self.config.get("semantic_stagnation_policy_shadow_only", True)
         )
+        self.stagnation_intervention = str(
+            self.config.get("semantic_stagnation_intervention", "reobserve")
+        ).lower()
         self.stagnation_window = max(
             2, int(self.config.get("semantic_stagnation_window", 5))
         )
@@ -459,6 +462,20 @@ class VLMapSemanticShadow:
             eval_step=eval_step_int,
             high_conf_seen=self._high_conf_count > 0,
         )
+        stagnation_active = bool(
+            stagnation_decision["would_requery"]
+            and not self.stagnation_policy_shadow_only
+        )
+        stagnation_requery_required = bool(
+            stagnation_active
+            and self.stagnation_intervention
+            in ("reobserve", "hard_reobserve", "requery")
+        )
+        stagnation_hint_required = bool(
+            stagnation_active
+            and self.stagnation_intervention
+            in ("prompt_hint", "hint", "soft_hint", "delayed_prompt_hint")
+        )
 
         for rank, idx in enumerate(order, start=1):
             idx = int(idx)
@@ -538,16 +555,15 @@ class VLMapSemanticShadow:
             "first_confidence_would_requery_step": self._first_confidence_would_requery_step,
             "stagnation_policy_enable": bool(self.stagnation_policy_enable),
             "stagnation_policy_shadow_only": bool(self.stagnation_policy_shadow_only),
+            "stagnation_intervention": self.stagnation_intervention,
             "stagnation_window": int(self.stagnation_window),
             "stagnation_unique_threshold": int(self.stagnation_unique_threshold),
             "stagnation_recent_terms": stagnation_decision["recent_terms"],
             "stagnation_recent_unique_count": stagnation_decision["recent_unique_count"],
             "stagnation_detected": bool(stagnation_decision["would_requery"]),
             "stagnation_would_requery": bool(stagnation_decision["would_requery"]),
-            "stagnation_requery_required": bool(
-                stagnation_decision["would_requery"]
-                and not self.stagnation_policy_shadow_only
-            ),
+            "stagnation_requery_required": stagnation_requery_required,
+            "stagnation_hint_required": stagnation_hint_required,
             "stagnation_would_requery_reason": stagnation_decision["reason"],
             "stagnation_would_requery_count": int(self._stagnation_would_requery_count),
             "first_stagnation_would_requery_step": self._first_stagnation_would_requery_step,
@@ -720,6 +736,7 @@ class VLMapSemanticShadow:
             "confidence_would_requery_reasons": self._confidence_would_requery_reasons,
             "stagnation_policy_enable": bool(self.stagnation_policy_enable),
             "stagnation_policy_shadow_only": bool(self.stagnation_policy_shadow_only),
+            "stagnation_intervention": self.stagnation_intervention,
             "stagnation_window": int(self.stagnation_window),
             "stagnation_unique_threshold": int(self.stagnation_unique_threshold),
             "stagnation_min_step": int(self.stagnation_min_step),

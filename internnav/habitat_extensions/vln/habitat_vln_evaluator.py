@@ -607,10 +607,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 f"hits={decision.get('threshold_hits', [])}"
             )
             if decision.get("stagnation_would_requery"):
-                mode = "active" if decision.get("stagnation_requery_required") else "shadow"
+                if decision.get("stagnation_requery_required"):
+                    mode = "active-reobserve"
+                elif decision.get("stagnation_hint_required"):
+                    mode = "active-hint"
+                else:
+                    mode = "shadow"
                 print(
                     "[VLMapSemantic][Habitat][Stagnation] "
-                    f"{mode} would re-observe; "
+                    f"{mode} triggered; "
                     f"unique={decision.get('stagnation_recent_unique_count')} "
                     f"recent={decision.get('stagnation_recent_terms')}"
                 )
@@ -655,6 +660,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "Select a different waypoint on visible open floor, away from furniture, walls, "
             "doorframes, and narrow obstacle bands. Do not repeat the rejected waypoint. "
             "Still output only the next waypoint coordinates or STOP."
+        )
+
+    def _format_vlmap_semantic_stagnation_hint(self, decision: dict) -> str:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        configured_hint = vlmap_safety_cfg.get("semantic_stagnation_prompt_hint")
+        if configured_hint:
+            return str(configured_hint)
+        return (
+            "Navigation note: your recent observations look similar. "
+            "Re-check the instruction and choose a waypoint that makes progress "
+            "toward the next landmark. Output only the next waypoint coordinates or STOP."
         )
 
     def _vlmap_goal_grid_from_decision(self, decision: dict):
@@ -769,6 +785,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             local_actions = []
             vlmap_recovery_actions = []
             pending_vlmap_waypoint_feedback = ""
+            pending_vlmap_semantic_hint = ""
+            semantic_hint_set_count = 0
+            semantic_hint_injected_count = 0
+            semantic_hint_detection_step = None
+            semantic_hint_injection_step = None
+            semantic_hint_not_injected_reason = None
             rejected_vlmap_goal_grids = []
 
             done = False
@@ -862,6 +884,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             f"{pending_vlmap_waypoint_feedback}"
                         )
                         pending_vlmap_waypoint_feedback = ""
+
+                    if pending_vlmap_semantic_hint:
+                        sources[0]["value"] += f" {pending_vlmap_semantic_hint}"
+                        semantic_hint_injected_count += 1
+                        if semantic_hint_injection_step is None:
+                            semantic_hint_injection_step = step_id
+                        print(
+                            "[VLMapSemantic][Habitat][Stagnation] inject S2 hint: "
+                            f"{pending_vlmap_semantic_hint}"
+                        )
+                        pending_vlmap_semantic_hint = ""
+                        semantic_hint_not_injected_reason = None
 
                     prompt = self._select_s2_prompt_prefix() + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
@@ -958,6 +992,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         _, _, lookup_done, _ = self.env.step(action_code.LOOKUP)
                         observations, _, lookup_done_2, _ = self.env.step(action_code.LOOKUP)
                         done = done or lookup_done or lookup_done_2
+                        if semantic_decision.get("stagnation_hint_required"):
+                            if not pending_vlmap_semantic_hint:
+                                pending_vlmap_semantic_hint = (
+                                    self._format_vlmap_semantic_stagnation_hint(semantic_decision)
+                                )
+                                semantic_hint_set_count += 1
+                                if semantic_hint_detection_step is None:
+                                    semantic_hint_detection_step = step_id
+                                semantic_hint_not_injected_reason = "pending_next_s2_query"
+                                print(
+                                    "[VLMapSemantic][Habitat][Stagnation] "
+                                    "queue delayed S2 hint; "
+                                    f"reason={semantic_decision.get('stagnation_would_requery_reason')} "
+                                    f"recent={semantic_decision.get('stagnation_recent_terms')}"
+                                )
                         if semantic_decision.get("stagnation_requery_required"):
                             pixel_goal = None
                             output_ids = None
@@ -971,6 +1020,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             action_seq = []
                             vlmap_recovery_actions = []
                             pending_vlmap_waypoint_feedback = ""
+                            pending_vlmap_semantic_hint = ""
                             action = None
                             forward_action = 0
                             draw_pixel_goal = False
@@ -1285,6 +1335,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
                 f"ne: {metrics['distance_to_goal']}"
             )
+            if pending_vlmap_semantic_hint and semantic_hint_not_injected_reason == "pending_next_s2_query":
+                semantic_hint_not_injected_reason = "episode_ended"
             semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
 
             # Write per-episode progress.json entry (still per-rank)
@@ -1347,6 +1399,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["semantic_stagnation_low_diversity_window_count"] = semantic_summary.get(
                     "stagnation_low_diversity_window_count"
+                )
+                result["semantic_stagnation_hint_set_count"] = semantic_hint_set_count
+                result["semantic_stagnation_hint_injected_count"] = semantic_hint_injected_count
+                result["semantic_first_stagnation_hint_detection_step"] = (
+                    semantic_hint_detection_step
+                )
+                result["semantic_first_stagnation_hint_injection_step"] = (
+                    semantic_hint_injection_step
+                )
+                result["semantic_stagnation_hint_pending_at_end"] = bool(
+                    pending_vlmap_semantic_hint
+                )
+                result["semantic_stagnation_hint_not_injected_reason"] = (
+                    semantic_hint_not_injected_reason
                 )
                 result["semantic_top1_stability"] = semantic_summary.get("top1_stability")
                 result["semantic_top1_diversity"] = semantic_summary.get("top1_diversity")

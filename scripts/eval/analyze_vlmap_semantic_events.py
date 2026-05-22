@@ -395,6 +395,67 @@ def summarize(
     confidence_policy_stats = _policy_stats("confidence_would_requery")
     stagnation_policy_stats = _policy_stats("stagnation_would_requery")
 
+    def _progress_count_stats(count_field: str) -> Dict[str, Any]:
+        triggered_total = 0
+        triggered_success = 0
+        triggered_failure = 0
+        success_total = 0
+        failure_total = 0
+        for key, progress_item in progress_by_key.items():
+            semantic = summaries_by_key.get(key, {})
+            success = progress_item.get("success", semantic.get("success"))
+            if success is None:
+                continue
+            triggered = int(progress_item.get(count_field, 0) or 0) > 0
+            if float(success) >= 0.5:
+                success_total += 1
+                if triggered:
+                    triggered_success += 1
+            else:
+                failure_total += 1
+                if triggered:
+                    triggered_failure += 1
+            if triggered:
+                triggered_total += 1
+        return {
+            "triggered_episode_count": triggered_total,
+            "triggered_success_count": triggered_success,
+            "triggered_failure_count": triggered_failure,
+            "success_episode_count": success_total,
+            "failure_episode_count": failure_total,
+            "failure_precision": (
+                triggered_failure / triggered_total if triggered_total else None
+            ),
+            "failure_recall": (
+                triggered_failure / failure_total if failure_total else None
+            ),
+            "success_false_positive_rate": (
+                triggered_success / success_total if success_total else None
+            ),
+        }
+
+    hint_delay_values = []
+    hint_not_injected_reasons = Counter()
+    hint_pending_at_end_count = 0
+    for item in progress_by_key.values():
+        detection_step = item.get("semantic_first_stagnation_hint_detection_step")
+        injection_step = item.get("semantic_first_stagnation_hint_injection_step")
+        if detection_step is not None and injection_step is not None:
+            hint_delay_values.append(float(injection_step) - float(detection_step))
+        if item.get("semantic_stagnation_hint_pending_at_end"):
+            hint_pending_at_end_count += 1
+        reason = item.get("semantic_stagnation_hint_not_injected_reason")
+        if reason:
+            hint_not_injected_reasons[str(reason)] += 1
+
+    stagnation_hint_stats = {
+        "hint_set": _progress_count_stats("semantic_stagnation_hint_set_count"),
+        "hint_injected": _progress_count_stats("semantic_stagnation_hint_injected_count"),
+        "mean_detection_to_injection_steps": _safe_mean(hint_delay_values),
+        "pending_at_end_count": hint_pending_at_end_count,
+        "not_injected_reasons": dict(hint_not_injected_reasons.most_common()),
+    }
+
     return {
         "total_events": len(events),
         "semantic_match_events": len(match_events),
@@ -430,6 +491,7 @@ def summarize(
         "transition_rate": transition_rate_split,
         "confidence_policy_stats": confidence_policy_stats,
         "stagnation_policy_stats": stagnation_policy_stats,
+        "stagnation_hint_stats": stagnation_hint_stats,
         "summary_metric_splits": metric_splits,
         "top_match_counts": dict(top_counter.most_common(20)),
         "threshold_hit_counts": dict(hit_counter.most_common(20)),
