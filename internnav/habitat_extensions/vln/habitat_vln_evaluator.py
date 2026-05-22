@@ -673,6 +673,178 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "toward the next landmark. Output only the next waypoint coordinates or STOP."
         )
 
+    def _get_s2_candidate_probe_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "enable": bool(vlmap_safety_cfg.get("s2_candidate_probe_enable", False)),
+            "count": max(0, int(vlmap_safety_cfg.get("s2_candidate_count", 3))),
+            "temperature": float(vlmap_safety_cfg.get("s2_candidate_temperature", 0.7)),
+            "top_p": float(vlmap_safety_cfg.get("s2_candidate_top_p", 0.9)),
+            "min_pixel_distance": float(vlmap_safety_cfg.get("s2_candidate_min_pixel_distance", 50.0)),
+            "max_queries_per_episode": int(vlmap_safety_cfg.get("s2_candidate_max_queries_per_episode", 0)),
+            "max_new_tokens": int(vlmap_safety_cfg.get("s2_candidate_max_new_tokens", 128)),
+        }
+
+    def _parse_s2_candidate_output(self, text: str, image_width: Optional[int] = None) -> dict:
+        text = "" if text is None else str(text)
+        upper_text = text.upper()
+        numbers = [int(item) for item in re.findall(r"\d+", text)]
+        result = {
+            "text": text,
+            "valid": False,
+            "is_stop": "STOP" in upper_text,
+            "pixel_goal": None,
+            "direction_bucket": "stop" if "STOP" in upper_text else "invalid",
+            "number_count": len(numbers),
+        }
+        if len(numbers) < 2:
+            return result
+
+        # Match the existing evaluator convention: model text "row col" becomes
+        # pixel_goal [col, row].
+        pixel_goal = [int(numbers[1]), int(numbers[0])]
+        result["valid"] = True
+        result["pixel_goal"] = pixel_goal
+        width = int(image_width or getattr(self.model_args, "resize_w", 384) or 384)
+        if pixel_goal[0] < width / 3:
+            result["direction_bucket"] = "left"
+        elif pixel_goal[0] > 2 * width / 3:
+            result["direction_bucket"] = "right"
+        else:
+            result["direction_bucket"] = "center"
+        return result
+
+    def _s2_candidate_pairwise_distances(self, candidates: list) -> list:
+        valid_goals = [item.get("pixel_goal") for item in candidates if item.get("valid")]
+        distances = []
+        for idx, goal_a in enumerate(valid_goals):
+            for goal_b in valid_goals[idx + 1 :]:
+                distances.append(
+                    float(np.hypot(float(goal_a[0]) - float(goal_b[0]), float(goal_a[1]) - float(goal_b[1])))
+                )
+        return distances
+
+    def _s2_candidate_unique_count(self, candidates: list, min_pixel_distance: float) -> int:
+        representatives = []
+        for item in candidates:
+            if not item.get("valid"):
+                continue
+            goal = item.get("pixel_goal")
+            if all(
+                float(np.hypot(float(goal[0]) - float(rep[0]), float(goal[1]) - float(rep[1])))
+                >= min_pixel_distance
+                for rep in representatives
+            ):
+                representatives.append(goal)
+        return len(representatives)
+
+    def _capture_torch_rng_state(self) -> dict:
+        state = {"cpu": torch.random.get_rng_state()}
+        if torch.cuda.is_available():
+            state["cuda_all"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _restore_torch_rng_state(self, state: dict) -> None:
+        cpu_state = state.get("cpu")
+        if cpu_state is not None:
+            torch.random.set_rng_state(cpu_state)
+        cuda_state = state.get("cuda_all")
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)
+
+    def _write_s2_candidate_probe_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "s2_candidate_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _probe_s2_candidate_diversity(
+        self,
+        inputs,
+        input_token_length: int,
+        greedy_text: str,
+        scene_id: str,
+        episode_id: int,
+        episode_index: int,
+        episode_count: int,
+        step_id: int,
+        query_index: int,
+        instruction: str,
+    ) -> dict:
+        cfg = self._get_s2_candidate_probe_cfg()
+        if not cfg["enable"] or cfg["count"] <= 0:
+            return {}
+
+        rng_state = self._capture_torch_rng_state()
+        candidates = []
+        try:
+            with torch.no_grad():
+                for candidate_index in range(cfg["count"]):
+                    sampled_output_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=cfg["max_new_tokens"],
+                        do_sample=True,
+                        temperature=cfg["temperature"],
+                        top_p=cfg["top_p"],
+                        use_cache=True,
+                        past_key_values=None,
+                        return_dict_in_generate=True,
+                    ).sequences
+                    candidate_text = self.processor.tokenizer.decode(
+                        sampled_output_ids[0][input_token_length:], skip_special_tokens=True
+                    )
+                    candidate = self._parse_s2_candidate_output(
+                        candidate_text,
+                        image_width=getattr(self.model_args, "resize_w", 384),
+                    )
+                    candidate["candidate_index"] = candidate_index
+                    candidates.append(candidate)
+        finally:
+            # The active System1 generator samples trajectories with torch RNG.
+            # Restore state so this shadow-only probe does not alter behavior.
+            self._restore_torch_rng_state(rng_state)
+
+        distances = self._s2_candidate_pairwise_distances(candidates)
+        valid_candidate_count = sum(1 for item in candidates if item.get("valid"))
+        unique_candidate_count = self._s2_candidate_unique_count(candidates, cfg["min_pixel_distance"])
+        direction_buckets = [item.get("direction_bucket") for item in candidates]
+        event = {
+            "event_type": "s2_candidate_probe",
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "episode_index": int(episode_index),
+            "episode_count": int(episode_count),
+            "step_id": int(step_id),
+            "query_index": int(query_index),
+            "instruction": instruction,
+            "candidate_count": int(cfg["count"]),
+            "valid_candidate_count": int(valid_candidate_count),
+            "unique_candidate_count": int(unique_candidate_count),
+            "min_pixel_distance": float(cfg["min_pixel_distance"]),
+            "max_pairwise_pixel_distance": float(max(distances)) if distances else 0.0,
+            "mean_pairwise_pixel_distance": float(np.mean(distances)) if distances else 0.0,
+            "direction_buckets": direction_buckets,
+            "unique_direction_bucket_count": len(set(direction_buckets)),
+            "greedy": self._parse_s2_candidate_output(
+                greedy_text,
+                image_width=getattr(self.model_args, "resize_w", 384),
+            ),
+            "candidates": candidates,
+        }
+        self._write_s2_candidate_probe_event(event)
+        print(
+            "[S2CandidateProbe] "
+            f"query={query_index} valid={valid_candidate_count}/{cfg['count']} "
+            f"unique={unique_candidate_count} "
+            f"max_dist={event['max_pairwise_pixel_distance']:.1f} "
+            f"buckets={direction_buckets}"
+        )
+        return event
+
     def _vlmap_goal_grid_from_decision(self, decision: dict):
         goal_grid = decision.get("goal_grid")
         if goal_grid is None:
@@ -792,6 +964,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             semantic_hint_injection_step = None
             semantic_hint_not_injected_reason = None
             rejected_vlmap_goal_grids = []
+            s2_candidate_probe_s2_query_count = 0
+            s2_candidate_probe_event_count = 0
+            s2_candidate_probe_skipped_query_count = 0
+            s2_candidate_probe_valid_query_count = 0
+            s2_candidate_probe_diverse_query_count = 0
+            s2_candidate_probe_valid_candidate_sum = 0
+            s2_candidate_probe_unique_candidate_sum = 0
+            s2_candidate_probe_mean_pairwise_distance_sum = 0.0
+            s2_candidate_probe_max_pairwise_distance = 0.0
 
             done = False
             flag = False
@@ -930,6 +1111,59 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
                     print('step_id:', step_id, 'output text:', llm_outputs)
+
+                    s2_candidate_probe_s2_query_count += 1
+                    s2_candidate_probe_cfg = self._get_s2_candidate_probe_cfg()
+                    s2_candidate_probe_max_queries = int(
+                        s2_candidate_probe_cfg.get("max_queries_per_episode", 0) or 0
+                    )
+                    if s2_candidate_probe_cfg.get("enable"):
+                        if (
+                            s2_candidate_probe_max_queries <= 0
+                            or s2_candidate_probe_event_count < s2_candidate_probe_max_queries
+                        ):
+                            candidate_probe_event = self._probe_s2_candidate_diversity(
+                                inputs,
+                                inputs.input_ids.shape[1],
+                                llm_outputs,
+                                scene_id,
+                                episode_id,
+                                episode_index,
+                                episode_count,
+                                step_id,
+                                s2_candidate_probe_s2_query_count,
+                                episode_instruction,
+                            )
+                            if candidate_probe_event:
+                                s2_candidate_probe_event_count += 1
+                                valid_candidate_count = int(
+                                    candidate_probe_event.get("valid_candidate_count", 0) or 0
+                                )
+                                unique_candidate_count = int(
+                                    candidate_probe_event.get("unique_candidate_count", 0) or 0
+                                )
+                                max_pairwise_distance = float(
+                                    candidate_probe_event.get("max_pairwise_pixel_distance", 0.0) or 0.0
+                                )
+                                mean_pairwise_distance = float(
+                                    candidate_probe_event.get("mean_pairwise_pixel_distance", 0.0) or 0.0
+                                )
+                                min_pixel_distance = float(
+                                    candidate_probe_event.get("min_pixel_distance", 50.0) or 50.0
+                                )
+                                s2_candidate_probe_valid_candidate_sum += valid_candidate_count
+                                s2_candidate_probe_unique_candidate_sum += unique_candidate_count
+                                s2_candidate_probe_mean_pairwise_distance_sum += mean_pairwise_distance
+                                s2_candidate_probe_max_pairwise_distance = max(
+                                    s2_candidate_probe_max_pairwise_distance,
+                                    max_pairwise_distance,
+                                )
+                                if valid_candidate_count >= 2:
+                                    s2_candidate_probe_valid_query_count += 1
+                                if max_pairwise_distance >= min_pixel_distance:
+                                    s2_candidate_probe_diverse_query_count += 1
+                        else:
+                            s2_candidate_probe_skipped_query_count += 1
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
                         forward_action = 0
@@ -1421,6 +1655,37 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     result[f"semantic_coverage_at_{str(threshold_key).replace('.', '_')}"] = (
                         coverage_value
                     )
+            s2_probe_cfg = self._get_s2_candidate_probe_cfg()
+            if s2_probe_cfg.get("enable"):
+                result["s2_candidate_probe_s2_query_count"] = s2_candidate_probe_s2_query_count
+                result["s2_candidate_probe_event_count"] = s2_candidate_probe_event_count
+                result["s2_candidate_probe_skipped_query_count"] = (
+                    s2_candidate_probe_skipped_query_count
+                )
+                result["s2_candidate_probe_valid_query_count"] = (
+                    s2_candidate_probe_valid_query_count
+                )
+                result["s2_candidate_probe_diverse_query_count"] = (
+                    s2_candidate_probe_diverse_query_count
+                )
+                result["s2_candidate_probe_valid_query_ratio"] = (
+                    s2_candidate_probe_valid_query_count / max(1, s2_candidate_probe_event_count)
+                )
+                result["s2_candidate_probe_diverse_query_ratio"] = (
+                    s2_candidate_probe_diverse_query_count / max(1, s2_candidate_probe_event_count)
+                )
+                result["s2_candidate_probe_mean_valid_candidate_count"] = (
+                    s2_candidate_probe_valid_candidate_sum / max(1, s2_candidate_probe_event_count)
+                )
+                result["s2_candidate_probe_mean_unique_candidate_count"] = (
+                    s2_candidate_probe_unique_candidate_sum / max(1, s2_candidate_probe_event_count)
+                )
+                result["s2_candidate_probe_mean_pairwise_pixel_distance"] = (
+                    s2_candidate_probe_mean_pairwise_distance_sum / max(1, s2_candidate_probe_event_count)
+                )
+                result["s2_candidate_probe_max_pairwise_pixel_distance"] = (
+                    s2_candidate_probe_max_pairwise_distance
+                )
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
 
