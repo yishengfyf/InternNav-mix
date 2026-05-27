@@ -209,6 +209,19 @@ class VLMapActionSafety:
         self.map_validation_save_ply = bool(self.config.get("map_validation_save_ply", True))
         self.map_validation_save_topdown = bool(self.config.get("map_validation_save_topdown", True))
         self.map_validation_save_rgb_depth = bool(self.config.get("map_validation_save_rgb_depth", False))
+        self.map_validation_save_rgb_point_ply = bool(
+            self.config.get("map_validation_save_rgb_point_ply", False)
+        )
+        self.map_validation_save_rgb_scene_ply = bool(
+            self.config.get("map_validation_save_rgb_scene_ply", self.map_validation_save_rgb_point_ply)
+        )
+        self.map_validation_rgb_point_sample_rate = max(
+            1,
+            int(self.config.get("map_validation_rgb_point_sample_rate", self.map_validation_depth_sample_rate)),
+        )
+        self.map_validation_rgb_scene_max_points = int(
+            self.config.get("map_validation_rgb_scene_max_points", self.map_validation_max_points)
+        )
         map_validation_dir = self.config.get("map_validation_dir")
         self.map_validation_dir = (
             os.path.abspath(os.path.expanduser(str(map_validation_dir)))
@@ -226,6 +239,7 @@ class VLMapActionSafety:
         self._debug_waypoint_risk_snapshots = 0
         self._map_validation_saved_snapshots = 0
         self._map_validation_pose_trace = []
+        self._map_validation_rgb_point_trace = []
         self._debug_forced_episode_counts = {}
         self._debug_selected_episode_indices = None
         self._debug_episode_snapshot_counts = {}
@@ -287,6 +301,7 @@ class VLMapActionSafety:
         self.last_waypoint_decision = {}
         self._map_validation_saved_snapshots = 0
         self._map_validation_pose_trace = []
+        self._map_validation_rgb_point_trace = []
         if self.builder is not None:
             self.builder.reset()
 
@@ -1181,23 +1196,47 @@ class VLMapActionSafety:
         )
         seen_points = self.builder.seen_cell_points(max_points=self.map_validation_max_points)
 
-        paths = {"npz": None, "ply": None, "topdown": None, "rgb": None, "depth": None, "observation": None}
+        rgb_points = None
+        rgb_point_colors = None
+        if self.map_validation_save_rgb_point_ply and obs.get("rgb") is not None:
+            rgb_points, rgb_point_colors = self._map_validation_rgb_points(
+                depth_m=depth_m,
+                rgb=obs.get("rgb"),
+                pose_tf=pose_tf,
+                sample_rate=self.map_validation_rgb_point_sample_rate,
+            )
+            if rgb_points is not None and rgb_point_colors is not None and rgb_points.size:
+                self._map_validation_rgb_point_trace.append((rgb_points, rgb_point_colors))
+
+        paths = {
+            "npz": None,
+            "ply": None,
+            "rgb_point_ply": None,
+            "rgb_scene_ply": None,
+            "topdown": None,
+            "rgb": None,
+            "depth": None,
+            "observation": None,
+        }
         if self.map_validation_save_npz:
             npz_path = os.path.join(validation_dir, f"{prefix}.npz")
-            np.savez_compressed(
-                npz_path,
-                current_depth_points=current_points.astype(np.float32, copy=False),
-                occupied_voxel_points=occupied_points.astype(np.float32, copy=False),
-                obstacle_voxel_points=obstacle_points.astype(np.float32, copy=False),
-                seen_cell_points=seen_points.astype(np.float32, copy=False),
-                relative_pose=rel_pose.astype(np.float32, copy=False),
-                pose_trace=np.asarray(
+            npz_payload = {
+                "current_depth_points": current_points.astype(np.float32, copy=False),
+                "occupied_voxel_points": occupied_points.astype(np.float32, copy=False),
+                "obstacle_voxel_points": obstacle_points.astype(np.float32, copy=False),
+                "seen_cell_points": seen_points.astype(np.float32, copy=False),
+                "relative_pose": rel_pose.astype(np.float32, copy=False),
+                "pose_trace": np.asarray(
                     [[p["x"], p["y"], p["z"], p["yaw"]] for p in self._map_validation_pose_trace],
                     dtype=np.float32,
                 ),
-                gps=np.asarray(obs.get("gps", []), dtype=np.float32),
-                compass=np.asarray(obs.get("compass", []), dtype=np.float32),
-            )
+                "gps": np.asarray(obs.get("gps", []), dtype=np.float32),
+                "compass": np.asarray(obs.get("compass", []), dtype=np.float32),
+            }
+            if rgb_points is not None and rgb_point_colors is not None:
+                npz_payload["current_depth_rgb_points"] = rgb_points.astype(np.float32, copy=False)
+                npz_payload["current_depth_rgb_colors"] = rgb_point_colors.astype(np.uint8, copy=False)
+            np.savez_compressed(npz_path, **npz_payload)
             paths["npz"] = npz_path
 
         if self.map_validation_save_ply:
@@ -1211,6 +1250,25 @@ class VLMapActionSafety:
                 pose_trace=self._map_validation_pose_trace,
             )
             paths["ply"] = ply_path
+
+        if self.map_validation_save_rgb_point_ply and rgb_points is not None and rgb_point_colors is not None:
+            rgb_point_ply_path = os.path.join(validation_dir, f"{prefix}_rgb_points.ply")
+            self._write_rgb_points_ply(
+                rgb_point_ply_path,
+                points=rgb_points,
+                colors=rgb_point_colors,
+                pose_trace=self._map_validation_pose_trace,
+            )
+            paths["rgb_point_ply"] = rgb_point_ply_path
+
+        if self.map_validation_save_rgb_scene_ply and self._map_validation_rgb_point_trace:
+            rgb_scene_ply_path = os.path.join(validation_dir, f"{prefix}_rgb_scene.ply")
+            self._write_rgb_scene_ply(
+                rgb_scene_ply_path,
+                point_trace=self._map_validation_rgb_point_trace,
+                pose_trace=self._map_validation_pose_trace,
+            )
+            paths["rgb_scene_ply"] = rgb_scene_ply_path
 
         if self.map_validation_save_topdown:
             topdown_path = os.path.join(validation_dir, f"{prefix}_topdown.png")
@@ -1246,6 +1304,10 @@ class VLMapActionSafety:
             "gps": self._jsonable(obs.get("gps")),
             "compass": self._jsonable(obs.get("compass")),
             "current_depth_point_count": int(current_points.shape[0]),
+            "current_depth_rgb_point_count": 0 if rgb_points is None else int(rgb_points.shape[0]),
+            "accumulated_depth_rgb_point_count": int(
+                sum(points.shape[0] for points, _ in self._map_validation_rgb_point_trace)
+            ),
             "occupied_voxel_point_count": int(occupied_points.shape[0]),
             "obstacle_voxel_point_count": int(obstacle_points.shape[0]),
             "seen_cell_point_count": int(seen_points.shape[0]),
@@ -1263,6 +1325,125 @@ class VLMapActionSafety:
             return points
         ids = np.linspace(0, points.shape[0] - 1, int(max_points)).astype(np.int64)
         return points[ids]
+
+    def _subsample_points_and_colors(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        max_points: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        points = np.asarray(points, dtype=np.float32)
+        colors = np.asarray(colors, dtype=np.uint8)
+        if max_points < 0 or points.shape[0] <= max_points:
+            return points, colors
+        ids = np.linspace(0, points.shape[0] - 1, int(max_points)).astype(np.int64)
+        return points[ids], colors[ids]
+
+    def _map_validation_rgb_points(
+        self,
+        depth_m: np.ndarray,
+        rgb: Any,
+        pose_tf: np.ndarray,
+        sample_rate: int,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if self.builder is None or getattr(self.builder, "camera_intrinsic", None) is None:
+            return None, None
+
+        depth_arr = np.asarray(depth_m)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        if depth_arr.ndim != 2:
+            return None, None
+        depth_arr = depth_arr.astype(np.float32, copy=False)
+
+        rgb_arr = np.asarray(rgb)
+        if rgb_arr.ndim != 3:
+            return None, None
+        if rgb_arr.shape[2] > 3:
+            rgb_arr = rgb_arr[:, :, :3]
+        if np.issubdtype(rgb_arr.dtype, np.floating):
+            finite = rgb_arr[np.isfinite(rgb_arr)]
+            if finite.size and float(np.nanmax(finite)) <= 1.5:
+                rgb_arr = rgb_arr * 255.0
+        rgb_arr = np.nan_to_num(rgb_arr, nan=0.0, posinf=255.0, neginf=0.0)
+        rgb_arr = np.clip(rgb_arr, 0, 255).astype(np.uint8)
+
+        height, width = depth_arr.shape
+        intrinsic = np.asarray(self.builder.camera_intrinsic, dtype=np.float32)
+        cam_mat_inv = np.linalg.inv(intrinsic)
+        yy, xx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+        xx = xx.reshape((1, -1)).astype(np.float32) + 0.5
+        yy = yy.reshape((1, -1)).astype(np.float32) + 0.5
+        zz = depth_arr.reshape((1, -1))
+        points_2d = np.vstack([xx, yy, np.ones_like(xx)])
+        pc = cam_mat_inv @ points_2d
+        pc = pc * zz
+
+        min_depth = float(self.builder.config.min_depth)
+        max_depth = float(self.builder.config.max_depth)
+        mask = (pc[2, :] > min_depth) & (pc[2, :] < max_depth)
+        ids = np.arange(pc.shape[1])
+        ids = ids[:: max(1, int(sample_rate))]
+        valid_ids = ids[mask[ids]]
+        if valid_ids.size == 0:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+
+        rel_base_tf = self.builder._relative_base_tf(pose_tf)
+        cam_pose_tf = rel_base_tf @ self.builder.cam_to_base_tf
+        pc_homo = np.vstack([pc[:, valid_ids], np.ones((1, valid_ids.size), dtype=pc.dtype)])
+        points = (cam_pose_tf @ pc_homo)[:3, :].T.astype(np.float32, copy=False)
+
+        depth_rows = valid_ids // width
+        depth_cols = valid_ids % width
+        rgb_h, rgb_w = rgb_arr.shape[:2]
+        rgb_rows = np.clip(((depth_rows.astype(np.float32) + 0.5) * rgb_h / height), 0, rgb_h - 1).astype(np.int32)
+        rgb_cols = np.clip(((depth_cols.astype(np.float32) + 0.5) * rgb_w / width), 0, rgb_w - 1).astype(np.int32)
+        colors = rgb_arr[rgb_rows, rgb_cols, :3].astype(np.uint8, copy=False)
+        return points, colors
+
+    def _write_rgb_points_ply(
+        self,
+        path: str,
+        points: np.ndarray,
+        colors: np.ndarray,
+        pose_trace: list,
+    ) -> None:
+        points, colors = self._subsample_points_and_colors(points, colors, self.map_validation_max_points)
+        trace_points = np.asarray([[p["x"], p["y"], 0.05] for p in pose_trace], dtype=np.float32)
+        total = points.shape[0] + trace_points.shape[0] + (1 if trace_points.size else 0)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {total}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write("end_header\n")
+            for (x, y, z), (r, g, b) in zip(points, colors):
+                f.write(f"{x:.4f} {y:.4f} {z:.4f} {int(r)} {int(g)} {int(b)}\n")
+            for x, y, z in trace_points:
+                f.write(f"{x:.4f} {y:.4f} {z:.4f} 50 150 255\n")
+            if trace_points.size:
+                x, y, z = trace_points[-1]
+                f.write(f"{x:.4f} {y:.4f} {z:.4f} 255 230 40\n")
+
+    def _write_rgb_scene_ply(
+        self,
+        path: str,
+        point_trace: list,
+        pose_trace: list,
+    ) -> None:
+        points = np.concatenate([item[0] for item in point_trace], axis=0)
+        colors = np.concatenate([item[1] for item in point_trace], axis=0)
+        points, colors = self._subsample_points_and_colors(
+            points,
+            colors,
+            self.map_validation_rgb_scene_max_points,
+        )
+        self._write_rgb_points_ply(path, points, colors, pose_trace)
 
     def _write_map_validation_ply(
         self,
