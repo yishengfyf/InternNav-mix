@@ -208,6 +208,7 @@ class VLMapActionSafety:
         self.map_validation_save_npz = bool(self.config.get("map_validation_save_npz", True))
         self.map_validation_save_ply = bool(self.config.get("map_validation_save_ply", True))
         self.map_validation_save_topdown = bool(self.config.get("map_validation_save_topdown", True))
+        self.map_validation_save_rgb_depth = bool(self.config.get("map_validation_save_rgb_depth", False))
         map_validation_dir = self.config.get("map_validation_dir")
         self.map_validation_dir = (
             os.path.abspath(os.path.expanduser(str(map_validation_dir)))
@@ -1180,7 +1181,7 @@ class VLMapActionSafety:
         )
         seen_points = self.builder.seen_cell_points(max_points=self.map_validation_max_points)
 
-        paths = {"npz": None, "ply": None, "topdown": None}
+        paths = {"npz": None, "ply": None, "topdown": None, "rgb": None, "depth": None, "observation": None}
         if self.map_validation_save_npz:
             npz_path = os.path.join(validation_dir, f"{prefix}.npz")
             np.savez_compressed(
@@ -1220,6 +1221,17 @@ class VLMapActionSafety:
                 pose_trace=self._map_validation_pose_trace,
             )
             paths["topdown"] = topdown_path
+
+        if self.map_validation_save_rgb_depth:
+            rgb_path, depth_path, observation_path = self._write_map_validation_observation_images(
+                validation_dir,
+                prefix,
+                obs=obs,
+                depth_m=depth_m,
+            )
+            paths["rgb"] = rgb_path
+            paths["depth"] = depth_path
+            paths["observation"] = observation_path
 
         event = {
             "event_type": "map_validation_snapshot",
@@ -1344,6 +1356,70 @@ class VLMapActionSafety:
         )
         draw.line([agent_xy, heading_xy], fill=(255, 230, 40), width=3)
         image.save(path)
+
+    def _write_map_validation_observation_images(
+        self,
+        validation_dir: str,
+        prefix: str,
+        obs: Dict[str, Any],
+        depth_m: np.ndarray,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        try:
+            from PIL import Image, ImageDraw
+        except Exception as exc:
+            if not self._debug_import_warned:
+                print(f"[VLMapSafety] map validation observation export disabled because PIL import failed: {exc}")
+                self._debug_import_warned = True
+            return None, None, None
+
+        rgb_path = None
+        depth_path = None
+        observation_path = None
+        panels = []
+
+        rgb = obs.get("rgb")
+        if rgb is not None:
+            rgb_arr = np.asarray(rgb)
+            if rgb_arr.ndim == 3:
+                if rgb_arr.shape[2] > 3:
+                    rgb_arr = rgb_arr[:, :, :3]
+                if np.issubdtype(rgb_arr.dtype, np.floating) and np.nanmax(rgb_arr) <= 1.5:
+                    rgb_arr = rgb_arr * 255.0
+                rgb_arr = np.nan_to_num(rgb_arr, nan=0.0, posinf=255.0, neginf=0.0)
+                rgb_arr = np.clip(rgb_arr, 0, 255).astype(np.uint8)
+                rgb_image = Image.fromarray(rgb_arr, mode="RGB")
+                rgb_path = os.path.join(validation_dir, f"{prefix}_rgb.png")
+                rgb_image.save(rgb_path)
+                panels.append(self._add_label(rgb_image.resize((320, 320)), "RGB observation", Image, ImageDraw))
+
+        depth_arr = np.asarray(depth_m)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        if depth_arr.ndim == 2:
+            depth_arr = depth_arr.astype(np.float32, copy=False)
+            max_depth = float(self.config.get("debug_depth_max", self.config.get("max_depth", 6.0)))
+            depth_vis = np.nan_to_num(depth_arr, nan=max_depth, posinf=max_depth, neginf=0.0)
+            depth_vis = np.clip(depth_vis / max(max_depth, 1e-6), 0.0, 1.0)
+            depth_vis = (255 * (1.0 - depth_vis)).astype(np.uint8)
+            depth_image = Image.fromarray(depth_vis, mode="L")
+            depth_path = os.path.join(validation_dir, f"{prefix}_depth.png")
+            depth_image.save(depth_path)
+            panels.append(
+                self._add_label(depth_image.convert("RGB").resize((320, 320)), "Depth, near=bright", Image, ImageDraw)
+            )
+
+        if panels:
+            height = max(img.height for img in panels)
+            width = sum(img.width for img in panels)
+            canvas = Image.new("RGB", (width, height), (20, 20, 20))
+            offset = 0
+            for img in panels:
+                canvas.paste(img, (offset, 0))
+                offset += img.width
+            observation_path = os.path.join(validation_dir, f"{prefix}_observation.png")
+            canvas.save(observation_path)
+
+        return rgb_path, depth_path, observation_path
 
     def _prepare_depth(self, depth: Any) -> Optional[np.ndarray]:
         if depth is None:
