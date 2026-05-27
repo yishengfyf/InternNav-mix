@@ -197,6 +197,23 @@ class VLMapActionSafety:
         )
         self.debug_crop_radius_cells = int(self.config.get("debug_crop_radius_cells", 80))
         self.debug_cell_scale = max(1, int(self.config.get("debug_cell_scale", 3)))
+        self.map_validation_enable = bool(self.config.get("map_validation_enable", False))
+        self.map_validation_every_updates = max(1, int(self.config.get("map_validation_every_updates", 1)))
+        self.map_validation_max_snapshots = int(self.config.get("map_validation_max_snapshots", 20))
+        self.map_validation_depth_sample_rate = max(
+            1,
+            int(self.config.get("map_validation_depth_sample_rate", self.config.get("depth_sample_rate", 80))),
+        )
+        self.map_validation_max_points = int(self.config.get("map_validation_max_points", 200000))
+        self.map_validation_save_npz = bool(self.config.get("map_validation_save_npz", True))
+        self.map_validation_save_ply = bool(self.config.get("map_validation_save_ply", True))
+        self.map_validation_save_topdown = bool(self.config.get("map_validation_save_topdown", True))
+        map_validation_dir = self.config.get("map_validation_dir")
+        self.map_validation_dir = (
+            os.path.abspath(os.path.expanduser(str(map_validation_dir)))
+            if map_validation_dir
+            else None
+        )
         self._last_update_position: Optional[np.ndarray] = None
         self._step = 0
         self._disabled_reason: Optional[str] = None
@@ -206,6 +223,8 @@ class VLMapActionSafety:
         self._debug_forced_snapshots = 0
         self._debug_waypoint_forced_snapshots = 0
         self._debug_waypoint_risk_snapshots = 0
+        self._map_validation_saved_snapshots = 0
+        self._map_validation_pose_trace = []
         self._debug_forced_episode_counts = {}
         self._debug_selected_episode_indices = None
         self._debug_episode_snapshot_counts = {}
@@ -265,6 +284,8 @@ class VLMapActionSafety:
         self._cluster_seq = 0
         self.last_decision = {}
         self.last_waypoint_decision = {}
+        self._map_validation_saved_snapshots = 0
+        self._map_validation_pose_trace = []
         if self.builder is not None:
             self.builder.reset()
 
@@ -312,7 +333,7 @@ class VLMapActionSafety:
             "budget_suppressed_reason": None,
         }
 
-        self._maybe_update(obs["depth"], pose_tf)
+        self._maybe_update(obs["depth"], pose_tf, obs=obs)
         if not self.action_safety_enable:
             self.last_decision = {
                 "input_action": original_action,
@@ -518,7 +539,7 @@ class VLMapActionSafety:
             self.last_waypoint_decision = decision
             return decision
 
-        self._maybe_update(depth_m, pose_tf)
+        self._maybe_update(depth_m, pose_tf, obs=obs)
         waypoint = self._pixel_goal_to_grid(
             pixel_goal=pixel_goal,
             depth_m=depth_m,
@@ -850,7 +871,7 @@ class VLMapActionSafety:
             self._write_trajectory_event(obs, context, decision)
             return decision
 
-        self._maybe_update(depth_m, pose_tf)
+        self._maybe_update(depth_m, pose_tf, obs=obs)
         sim_row, sim_col, sim_yaw = self.builder.base_pose_to_grid(pose_tf)
         start_grid = [int(sim_row), int(sim_col)]
         step_details = []
@@ -1081,7 +1102,7 @@ class VLMapActionSafety:
 
         return None
 
-    def _maybe_update(self, depth: np.ndarray, pose_tf: np.ndarray) -> None:
+    def _maybe_update(self, depth: np.ndarray, pose_tf: np.ndarray, obs: Optional[Dict[str, Any]] = None) -> None:
         self._step += 1
         if self._step % self.update_every_steps != 0:
             return
@@ -1099,6 +1120,230 @@ class VLMapActionSafety:
         updated = self.builder.update(depth_m, pose_tf)
         if updated:
             self._last_update_position = position
+            self._maybe_save_map_validation_snapshot(depth_m, pose_tf, obs)
+
+    def _maybe_save_map_validation_snapshot(
+        self,
+        depth_m: np.ndarray,
+        pose_tf: np.ndarray,
+        obs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self.map_validation_enable or self.builder is None:
+            return
+        if self.map_validation_max_snapshots >= 0 and (
+            self._map_validation_saved_snapshots >= self.map_validation_max_snapshots
+        ):
+            return
+        update_count = int(getattr(self.builder, "update_count", 0))
+        if update_count <= 0 or update_count % self.map_validation_every_updates != 0:
+            return
+
+        obs = obs or {}
+        context = obs.get("debug_context", {}) or {}
+        scene_id = str(context.get("scene_id", "scene")).replace(os.sep, "_")
+        episode_id = context.get("episode_id", "unknown")
+        eval_step = int(context.get("step_id", self._step))
+        debug_dir = self._get_debug_dir()
+        validation_dir = self.map_validation_dir or os.path.join(debug_dir, "map_validation")
+        os.makedirs(validation_dir, exist_ok=True)
+        prefix = (
+            f"{scene_id}_ep{episode_id}_step{eval_step:05d}_"
+            f"safe{self._step:05d}_upd{update_count:04d}"
+        )
+
+        rel_pose = self.builder._relative_base_tf(pose_tf)
+        row, col, yaw = self.builder.base_pose_to_grid(pose_tf)
+        pose_entry = {
+            "x": float(rel_pose[0, 3]),
+            "y": float(rel_pose[1, 3]),
+            "z": float(rel_pose[2, 3]),
+            "row": int(row),
+            "col": int(col),
+            "yaw": float(yaw),
+            "safety_step": int(self._step),
+            "eval_step": int(eval_step),
+        }
+        self._map_validation_pose_trace.append(pose_entry)
+
+        current_points = self.builder.depth_to_relative_points(
+            depth_m,
+            pose_tf,
+            sample_rate=self.map_validation_depth_sample_rate,
+        )
+        occupied_points = self.builder.occupied_voxel_points(
+            obstacle_only=False,
+            max_points=self.map_validation_max_points,
+        )
+        obstacle_points = self.builder.occupied_voxel_points(
+            obstacle_only=True,
+            max_points=self.map_validation_max_points,
+        )
+        seen_points = self.builder.seen_cell_points(max_points=self.map_validation_max_points)
+
+        paths = {"npz": None, "ply": None, "topdown": None}
+        if self.map_validation_save_npz:
+            npz_path = os.path.join(validation_dir, f"{prefix}.npz")
+            np.savez_compressed(
+                npz_path,
+                current_depth_points=current_points.astype(np.float32, copy=False),
+                occupied_voxel_points=occupied_points.astype(np.float32, copy=False),
+                obstacle_voxel_points=obstacle_points.astype(np.float32, copy=False),
+                seen_cell_points=seen_points.astype(np.float32, copy=False),
+                relative_pose=rel_pose.astype(np.float32, copy=False),
+                pose_trace=np.asarray(
+                    [[p["x"], p["y"], p["z"], p["yaw"]] for p in self._map_validation_pose_trace],
+                    dtype=np.float32,
+                ),
+                gps=np.asarray(obs.get("gps", []), dtype=np.float32),
+                compass=np.asarray(obs.get("compass", []), dtype=np.float32),
+            )
+            paths["npz"] = npz_path
+
+        if self.map_validation_save_ply:
+            ply_path = os.path.join(validation_dir, f"{prefix}.ply")
+            self._write_map_validation_ply(
+                ply_path,
+                current_points=current_points,
+                occupied_points=occupied_points,
+                obstacle_points=obstacle_points,
+                seen_points=seen_points,
+                pose_trace=self._map_validation_pose_trace,
+            )
+            paths["ply"] = ply_path
+
+        if self.map_validation_save_topdown:
+            topdown_path = os.path.join(validation_dir, f"{prefix}_topdown.png")
+            self._write_map_validation_topdown(
+                topdown_path,
+                pose_tf=pose_tf,
+                current_points=current_points,
+                pose_trace=self._map_validation_pose_trace,
+            )
+            paths["topdown"] = topdown_path
+
+        event = {
+            "event_type": "map_validation_snapshot",
+            "scene_id": context.get("scene_id"),
+            "episode_id": context.get("episode_id"),
+            "episode_index": context.get("episode_index"),
+            "episode_count": context.get("episode_count"),
+            "eval_step": eval_step,
+            "safety_step": int(self._step),
+            "update_count": update_count,
+            "pose": pose_entry,
+            "gps": self._jsonable(obs.get("gps")),
+            "compass": self._jsonable(obs.get("compass")),
+            "current_depth_point_count": int(current_points.shape[0]),
+            "occupied_voxel_point_count": int(occupied_points.shape[0]),
+            "obstacle_voxel_point_count": int(obstacle_points.shape[0]),
+            "seen_cell_point_count": int(seen_points.shape[0]),
+            "grid_size": int(self.builder.gs),
+            "cell_size": float(self.builder.cs),
+            "paths": paths,
+        }
+        with open(os.path.join(validation_dir, "map_validation_events.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        self._map_validation_saved_snapshots += 1
+
+    def _subsample_points(self, points: np.ndarray, max_points: int) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float32)
+        if max_points < 0 or points.shape[0] <= max_points:
+            return points
+        ids = np.linspace(0, points.shape[0] - 1, int(max_points)).astype(np.int64)
+        return points[ids]
+
+    def _write_map_validation_ply(
+        self,
+        path: str,
+        current_points: np.ndarray,
+        occupied_points: np.ndarray,
+        obstacle_points: np.ndarray,
+        seen_points: np.ndarray,
+        pose_trace: list,
+    ) -> None:
+        max_points = max(1, self.map_validation_max_points)
+        groups = [
+            (self._subsample_points(seen_points, max_points // 4), (90, 90, 90)),
+            (self._subsample_points(occupied_points, max_points // 2), (210, 210, 210)),
+            (self._subsample_points(obstacle_points, max_points // 2), (230, 60, 60)),
+            (self._subsample_points(current_points, max_points // 2), (40, 220, 80)),
+        ]
+        trace_points = np.asarray([[p["x"], p["y"], 0.05] for p in pose_trace], dtype=np.float32)
+        if trace_points.size:
+            groups.append((trace_points, (50, 150, 255)))
+            current_pose = trace_points[-1:]
+            groups.append((current_pose, (255, 230, 40)))
+
+        total = sum(points.shape[0] for points, _ in groups)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {total}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write("end_header\n")
+            for points, color in groups:
+                for x, y, z in np.asarray(points, dtype=np.float32):
+                    f.write(f"{x:.4f} {y:.4f} {z:.4f} {color[0]} {color[1]} {color[2]}\n")
+
+    def _write_map_validation_topdown(
+        self,
+        path: str,
+        pose_tf: np.ndarray,
+        current_points: np.ndarray,
+        pose_trace: list,
+    ) -> None:
+        try:
+            from PIL import Image, ImageDraw
+        except Exception as exc:
+            if not self._debug_import_warned:
+                print(f"[VLMapSafety] map validation topdown disabled because PIL import failed: {exc}")
+                self._debug_import_warned = True
+            return
+
+        obstacle_map = self.builder.get_obstacle_map()
+        seen = getattr(self.builder, "seen", None)
+        image_arr = np.full((self.builder.gs, self.builder.gs, 3), 35, dtype=np.uint8)
+        if seen is not None:
+            image_arr[seen & obstacle_map] = np.array([235, 235, 235], dtype=np.uint8)
+            image_arr[seen & ~obstacle_map] = np.array([230, 55, 55], dtype=np.uint8)
+        else:
+            image_arr[obstacle_map] = np.array([235, 235, 235], dtype=np.uint8)
+            image_arr[~obstacle_map] = np.array([230, 55, 55], dtype=np.uint8)
+
+        for x, y, _ in self._subsample_points(current_points, 5000):
+            row = int(self.builder.gs / 2 - x / self.builder.cs)
+            col = int(self.builder.gs / 2 - y / self.builder.cs)
+            if 0 <= row < self.builder.gs and 0 <= col < self.builder.gs:
+                image_arr[row, col] = np.array([40, 220, 80], dtype=np.uint8)
+
+        image = Image.fromarray(image_arr, mode="RGB")
+        draw = ImageDraw.Draw(image)
+
+        def to_xy_from_pose(item: Dict[str, Any]) -> Tuple[int, int]:
+            return int(item["col"]), int(item["row"])
+
+        if len(pose_trace) >= 2:
+            trace_xy = [to_xy_from_pose(item) for item in pose_trace]
+            draw.line(trace_xy, fill=(50, 150, 255), width=2)
+
+        row, col, yaw = self.builder.base_pose_to_grid(pose_tf)
+        agent_xy = (int(col), int(row))
+        heading_len = max(8, int(0.8 / self.builder.cs))
+        heading_xy = (
+            int(col - heading_len * math.sin(yaw)),
+            int(row - heading_len * math.cos(yaw)),
+        )
+        draw.ellipse(
+            [agent_xy[0] - 5, agent_xy[1] - 5, agent_xy[0] + 5, agent_xy[1] + 5],
+            fill=(255, 230, 40),
+        )
+        draw.line([agent_xy, heading_xy], fill=(255, 230, 40), width=3)
+        image.save(path)
 
     def _prepare_depth(self, depth: Any) -> Optional[np.ndarray]:
         if depth is None:
