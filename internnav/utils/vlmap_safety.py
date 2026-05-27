@@ -887,7 +887,8 @@ class VLMapActionSafety:
             self._write_trajectory_event(obs, context, decision)
             return decision
 
-        self._maybe_update(depth_m, pose_tf, obs=obs)
+        if not bool(context.get("skip_map_update", False)):
+            self._maybe_update(depth_m, pose_tf, obs=obs)
         sim_row, sim_col, sim_yaw = self.builder.base_pose_to_grid(pose_tf)
         start_grid = [int(sim_row), int(sim_col)]
         step_details = []
@@ -1033,7 +1034,7 @@ class VLMapActionSafety:
         context: Dict[str, Any],
         decision: Dict[str, Any],
     ) -> None:
-        if not self.debug:
+        if not self.debug or bool(context.get("suppress_trajectory_event", False)):
             return
         debug_dir = self._get_debug_dir()
         os.makedirs(debug_dir, exist_ok=True)
