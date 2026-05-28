@@ -857,6 +857,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 vlmap_safety_cfg.get("nextdit_candidate_min_endpoint_grid_distance", 4.0)
             ),
             "action_horizon": max(1, int(vlmap_safety_cfg.get("nextdit_candidate_action_horizon", MAX_LOCAL_STEPS))),
+            "active_enable": bool(vlmap_safety_cfg.get("nextdit_candidate_active_enable", False)),
+            "active_max_interventions_per_episode": int(
+                vlmap_safety_cfg.get("nextdit_candidate_active_max_interventions_per_episode", 2)
+            ),
+            "active_require_current_reject": bool(
+                vlmap_safety_cfg.get("nextdit_candidate_active_require_current_reject", True)
+            ),
         }
 
     def _write_nextdit_candidate_probe_event(self, event: dict) -> None:
@@ -866,6 +873,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "nextdit_candidate_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _write_nextdit_active_rerank_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "nextdit_active_rerank_events.jsonl")
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
@@ -894,21 +911,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             actions = []
         return self._normalize_candidate_actions(actions, horizon=horizon)
 
+    def _trajectory_blocked_fraction_sum(self, decision: dict) -> float:
+        blocked_fraction_sum = 0.0
+        for step in (decision or {}).get("step_details", []) or []:
+            stats = step.get("stats") or {}
+            blocked_fraction_sum += float(stats.get("blocked_fraction", 0.0) or 0.0)
+        return float(blocked_fraction_sum)
+
+    def _trajectory_obstacle_score(self, decision: dict) -> float:
+        if not decision or not decision.get("valid"):
+            return float("inf")
+        return (
+            (1000.0 if decision.get("would_reject") else 0.0)
+            + 100.0 * int(decision.get("blocked_steps", 0) or 0)
+            + self._trajectory_blocked_fraction_sum(decision)
+        )
+
     def _trajectory_decision_score(self, decision: dict) -> float:
         if not decision or not decision.get("valid"):
             return float("inf")
         checked = int(decision.get("checked_forward_steps", 0) or 0)
-        blocked = int(decision.get("blocked_steps", 0) or 0)
-        blocked_fraction_sum = 0.0
-        for step in decision.get("step_details", []) or []:
-            stats = step.get("stats") or {}
-            blocked_fraction_sum += float(stats.get("blocked_fraction", 0.0) or 0.0)
-        return (
-            (1000.0 if decision.get("would_reject") else 0.0)
-            + 100.0 * blocked
-            + 1.0 * blocked_fraction_sum
-            - 0.01 * checked
-        )
+        return self._trajectory_obstacle_score(decision) - 0.01 * checked
 
     def _unique_action_sequence_count(self, candidates: list) -> int:
         return len({tuple(item.get("actions") or []) for item in candidates})
@@ -945,7 +968,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         pixel_goal,
     ) -> dict:
         cfg = self._get_nextdit_candidate_probe_cfg()
-        if not cfg["enable"] or dp_actions is None:
+        if not (cfg["enable"] or cfg["active_enable"]) or dp_actions is None:
             return {}
         if not hasattr(dp_actions, "shape") or len(dp_actions.shape) < 3:
             return {}
@@ -989,6 +1012,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "candidate_index": int(candidate_index),
                     "actions": actions,
                     "score": float(self._trajectory_decision_score(decision)),
+                    "obstacle_score": float(self._trajectory_obstacle_score(decision)),
                     "decision": decision,
                 }
             )
@@ -998,6 +1022,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         current_actions = self._normalize_candidate_actions(current_actions, horizon=horizon)
         current_score = float(self._trajectory_decision_score(current_decision))
+        current_obstacle_score = float(self._trajectory_obstacle_score(current_decision))
         selected = min(candidates, key=lambda item: item["score"])
         safer_candidate_count = sum(1 for item in candidates if item["score"] + 1e-6 < current_score)
         would_reject_count = sum(1 for item in candidates if item.get("decision", {}).get("would_reject"))
@@ -1015,11 +1040,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "action_horizon": int(horizon),
             "current_actions": current_actions,
             "current_score": current_score,
+            "current_obstacle_score": current_obstacle_score,
             "current_would_reject": bool((current_decision or {}).get("would_reject")),
             "current_decision": current_decision,
             "selected_candidate_index": int(selected["candidate_index"]),
             "selected_actions": selected["actions"],
             "selected_score": float(selected["score"]),
+            "selected_obstacle_score": float(selected["obstacle_score"]),
             "selected_differs_from_current": bool(selected["actions"] != current_actions),
             "safer_candidate_count": int(safer_candidate_count),
             "current_rank": int(current_rank),
@@ -1043,6 +1070,213 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             f"diff={event['selected_differs_from_current']}"
         )
         return event
+
+    def _nextdit_active_probe_needed(self, current_decision: dict, active_intervention_count: int) -> bool:
+        cfg = self._get_nextdit_candidate_probe_cfg()
+        if not cfg.get("active_enable"):
+            return False
+        max_interventions = int(cfg.get("active_max_interventions_per_episode", 2))
+        if max_interventions >= 0 and active_intervention_count >= max_interventions:
+            return False
+        if cfg.get("active_require_current_reject", True) and not bool(
+            (current_decision or {}).get("would_reject")
+        ):
+            return False
+        return True
+
+    def _select_nextdit_active_candidate(self, event: dict):
+        cfg = self._get_nextdit_candidate_probe_cfg()
+        if cfg.get("active_require_current_reject", True) and not bool(
+            event.get("current_would_reject")
+        ):
+            return None, "current_not_reject"
+
+        current_obstacle_score = float(event.get("current_obstacle_score", float("inf")))
+        eligible = []
+        for item in event.get("candidates") or []:
+            decision = item.get("decision") or {}
+            if not decision.get("valid"):
+                continue
+            if decision.get("would_reject"):
+                continue
+            obstacle_score = float(item.get("obstacle_score", self._trajectory_obstacle_score(decision)))
+            if obstacle_score + 1e-6 >= current_obstacle_score:
+                continue
+            eligible.append(item)
+
+        if not eligible:
+            return None, "no_nonreject_improving_candidate"
+
+        def candidate_key(item):
+            decision = item.get("decision") or {}
+            obstacle_score = float(item.get("obstacle_score", self._trajectory_obstacle_score(decision)))
+            checked = int(decision.get("checked_forward_steps", 0) or 0)
+            return (obstacle_score, -checked, int(item.get("candidate_index", 0)))
+
+        return min(eligible, key=candidate_key), "selected"
+
+    def _maybe_apply_nextdit_active_candidate(
+        self,
+        event: dict,
+        *,
+        active_intervention_count: int,
+    ) -> dict:
+        cfg = self._get_nextdit_candidate_probe_cfg()
+        status = {
+            "considered": False,
+            "applied": False,
+            "reason": "disabled",
+        }
+        if not cfg.get("active_enable") or not event:
+            return status
+
+        max_interventions = int(cfg.get("active_max_interventions_per_episode", 2))
+        if max_interventions >= 0 and active_intervention_count >= max_interventions:
+            status["reason"] = "episode_intervention_budget"
+            return status
+        if cfg.get("active_require_current_reject", True) and not bool(event.get("current_would_reject")):
+            status["reason"] = "current_not_reject"
+            return status
+
+        status["considered"] = True
+        horizon = int(event.get("action_horizon", cfg.get("action_horizon", MAX_LOCAL_STEPS)))
+        current_actions = self._normalize_candidate_actions(event.get("current_actions"), horizon=horizon)
+        selected, reason = self._select_nextdit_active_candidate(event)
+        if selected is None:
+            active_event = {
+                "event_type": "nextdit_active_rerank",
+                "scene_id": event.get("scene_id"),
+                "episode_id": event.get("episode_id"),
+                "episode_index": event.get("episode_index"),
+                "episode_count": event.get("episode_count"),
+                "step_id": event.get("step_id"),
+                "query_index": event.get("query_index"),
+                "active_intervention_index": int(active_intervention_count + 1),
+                "active_intervention_budget": int(max_interventions),
+                "action_horizon": int(horizon),
+                "current_actions": current_actions,
+                "current_score": event.get("current_score"),
+                "current_obstacle_score": event.get("current_obstacle_score"),
+                "current_decision": event.get("current_decision"),
+                "selected_candidate_index": None,
+                "selected_actions": None,
+                "selected_score": None,
+                "selected_obstacle_score": None,
+                "selected_decision": None,
+                "selected_differs_from_current": False,
+                "candidate_count": event.get("candidate_count"),
+                "would_reject_candidate_count": event.get("would_reject_candidate_count"),
+                "unique_action_sequence_count": event.get("unique_action_sequence_count"),
+                "unique_endpoint_count": event.get("unique_endpoint_count"),
+                "applied": False,
+                "reason": reason,
+            }
+            self._write_nextdit_active_rerank_event(active_event)
+            status.update(active_event)
+            return status
+
+        selected_actions = self._normalize_candidate_actions(selected.get("actions"), horizon=horizon)
+        active_event = {
+            "event_type": "nextdit_active_rerank",
+            "scene_id": event.get("scene_id"),
+            "episode_id": event.get("episode_id"),
+            "episode_index": event.get("episode_index"),
+            "episode_count": event.get("episode_count"),
+            "step_id": event.get("step_id"),
+            "query_index": event.get("query_index"),
+            "active_intervention_index": int(active_intervention_count + 1),
+            "active_intervention_budget": int(max_interventions),
+            "action_horizon": int(horizon),
+            "current_actions": current_actions,
+            "current_score": event.get("current_score"),
+            "current_obstacle_score": event.get("current_obstacle_score"),
+            "current_decision": event.get("current_decision"),
+            "selected_candidate_index": int(selected.get("candidate_index", -1)),
+            "selected_actions": selected_actions,
+            "selected_score": selected.get("score"),
+            "selected_obstacle_score": selected.get("obstacle_score"),
+            "selected_decision": selected.get("decision"),
+            "selected_differs_from_current": bool(selected_actions != current_actions),
+            "candidate_count": event.get("candidate_count"),
+            "would_reject_candidate_count": event.get("would_reject_candidate_count"),
+            "unique_action_sequence_count": event.get("unique_action_sequence_count"),
+            "unique_endpoint_count": event.get("unique_endpoint_count"),
+            "applied": True,
+            "reason": reason,
+        }
+        self._write_nextdit_active_rerank_event(active_event)
+        print(
+            "[NextDiTActiveRerank] "
+            f"episode={event.get('episode_id')} step={event.get('step_id')} "
+            f"candidate={active_event['selected_candidate_index']} "
+            f"current={current_actions} selected={selected_actions} "
+            f"score={active_event['current_obstacle_score']}->{active_event['selected_obstacle_score']}"
+        )
+        status.update(active_event)
+        status["applied"] = True
+        return status
+
+    def _run_nextdit_candidate_probe_or_active(
+        self,
+        dp_actions,
+        current_actions: list,
+        current_decision: dict,
+        observations: dict,
+        depth_m: np.ndarray,
+        rgb: Optional[np.ndarray],
+        *,
+        scene_id: str,
+        episode_id: int,
+        episode_index: int,
+        episode_count: int,
+        step_id: int,
+        query_index: int,
+        pixel_goal,
+        probe_event_count: int,
+        active_intervention_count: int,
+    ):
+        cfg = self._get_nextdit_candidate_probe_cfg()
+        probe_enabled = bool(cfg.get("enable"))
+        active_needed = self._nextdit_active_probe_needed(current_decision, active_intervention_count)
+        if not (probe_enabled or active_needed):
+            return {}, {}, False
+
+        max_events = int(cfg.get("max_events_per_episode", 0) or 0)
+        should_record_probe = probe_enabled and (
+            max_events <= 0 or probe_event_count < max_events
+        )
+        if not should_record_probe and not active_needed:
+            return {}, {}, True
+
+        event = self._probe_nextdit_trajectory_candidates(
+            dp_actions,
+            current_actions,
+            current_decision,
+            observations,
+            depth_m,
+            rgb,
+            scene_id=scene_id,
+            episode_id=episode_id,
+            episode_index=episode_index,
+            episode_count=episode_count,
+            step_id=step_id,
+            query_index=query_index,
+            pixel_goal=pixel_goal,
+        )
+        active_status = {}
+        if active_needed:
+            if event:
+                active_status = self._maybe_apply_nextdit_active_candidate(
+                    event,
+                    active_intervention_count=active_intervention_count,
+                )
+            else:
+                active_status = {
+                    "considered": True,
+                    "applied": False,
+                    "reason": "candidate_event_unavailable",
+                }
+        return event, active_status, False
 
     def _vlmap_goal_grid_from_decision(self, decision: dict):
         goal_grid = decision.get("goal_grid")
@@ -1181,6 +1415,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             nextdit_candidate_probe_selected_diff_count = 0
             nextdit_candidate_probe_current_reject_count = 0
             nextdit_candidate_probe_would_reject_candidate_sum = 0
+            nextdit_candidate_active_considered_count = 0
+            nextdit_candidate_active_intervention_count = 0
+            nextdit_candidate_active_changed_count = 0
+            nextdit_candidate_active_no_candidate_count = 0
 
             done = False
             flag = False
@@ -1569,52 +1807,66 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             pixel_goal=pixel_goal,
                         )
                         nextdit_probe_cfg = self._get_nextdit_candidate_probe_cfg()
-                        if nextdit_probe_cfg.get("enable"):
-                            nextdit_probe_max_events = int(
-                                nextdit_probe_cfg.get("max_events_per_episode", 0) or 0
+                        nextdit_query_index = (
+                            nextdit_candidate_probe_event_count
+                            + nextdit_candidate_probe_skipped_count
+                            + nextdit_candidate_active_considered_count
+                            + 1
+                        )
+                        nextdit_probe_event, nextdit_active_status, nextdit_probe_skipped = (
+                            self._run_nextdit_candidate_probe_or_active(
+                                nextdit_probe_dp_actions,
+                                local_actions,
+                                vlmap_traj_decision,
+                                observations,
+                                current_depth_m,
+                                rgb,
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                episode_index=episode_index,
+                                episode_count=episode_count,
+                                step_id=step_id,
+                                query_index=nextdit_query_index,
+                                pixel_goal=pixel_goal,
+                                probe_event_count=nextdit_candidate_probe_event_count,
+                                active_intervention_count=nextdit_candidate_active_intervention_count,
                             )
-                            if nextdit_probe_max_events <= 0 or (
-                                nextdit_candidate_probe_event_count < nextdit_probe_max_events
-                            ):
-                                nextdit_probe_event = self._probe_nextdit_trajectory_candidates(
-                                    nextdit_probe_dp_actions,
-                                    local_actions,
-                                    vlmap_traj_decision,
-                                    observations,
-                                    current_depth_m,
-                                    rgb,
-                                    scene_id=scene_id,
-                                    episode_id=episode_id,
-                                    episode_index=episode_index,
-                                    episode_count=episode_count,
-                                    step_id=step_id,
-                                    query_index=nextdit_candidate_probe_event_count
-                                    + nextdit_candidate_probe_skipped_count
-                                    + 1,
-                                    pixel_goal=pixel_goal,
+                        )
+                        if nextdit_probe_skipped:
+                            nextdit_candidate_probe_skipped_count += 1
+                        if nextdit_probe_cfg.get("enable") and nextdit_probe_event:
+                            nextdit_candidate_probe_event_count += 1
+                            nextdit_candidate_probe_candidate_sum += int(
+                                nextdit_probe_event.get("candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_probe_unique_action_sum += int(
+                                nextdit_probe_event.get("unique_action_sequence_count", 0) or 0
+                            )
+                            nextdit_candidate_probe_unique_endpoint_sum += int(
+                                nextdit_probe_event.get("unique_endpoint_count", 0) or 0
+                            )
+                            nextdit_candidate_probe_would_reject_candidate_sum += int(
+                                nextdit_probe_event.get("would_reject_candidate_count", 0) or 0
+                            )
+                            if int(nextdit_probe_event.get("safer_candidate_count", 0) or 0) > 0:
+                                nextdit_candidate_probe_safer_event_count += 1
+                            if nextdit_probe_event.get("selected_differs_from_current"):
+                                nextdit_candidate_probe_selected_diff_count += 1
+                            if nextdit_probe_event.get("current_would_reject"):
+                                nextdit_candidate_probe_current_reject_count += 1
+                        if nextdit_active_status.get("considered"):
+                            nextdit_candidate_active_considered_count += 1
+                            if nextdit_active_status.get("applied"):
+                                nextdit_candidate_active_intervention_count += 1
+                                if nextdit_active_status.get("selected_differs_from_current"):
+                                    nextdit_candidate_active_changed_count += 1
+                                local_actions = list(nextdit_active_status.get("selected_actions") or local_actions)
+                                vlmap_traj_decision = dict(
+                                    nextdit_active_status.get("selected_decision") or vlmap_traj_decision
                                 )
-                                if nextdit_probe_event:
-                                    nextdit_candidate_probe_event_count += 1
-                                    nextdit_candidate_probe_candidate_sum += int(
-                                        nextdit_probe_event.get("candidate_count", 0) or 0
-                                    )
-                                    nextdit_candidate_probe_unique_action_sum += int(
-                                        nextdit_probe_event.get("unique_action_sequence_count", 0) or 0
-                                    )
-                                    nextdit_candidate_probe_unique_endpoint_sum += int(
-                                        nextdit_probe_event.get("unique_endpoint_count", 0) or 0
-                                    )
-                                    nextdit_candidate_probe_would_reject_candidate_sum += int(
-                                        nextdit_probe_event.get("would_reject_candidate_count", 0) or 0
-                                    )
-                                    if int(nextdit_probe_event.get("safer_candidate_count", 0) or 0) > 0:
-                                        nextdit_candidate_probe_safer_event_count += 1
-                                    if nextdit_probe_event.get("selected_differs_from_current"):
-                                        nextdit_candidate_probe_selected_diff_count += 1
-                                    if nextdit_probe_event.get("current_would_reject"):
-                                        nextdit_candidate_probe_current_reject_count += 1
+                                traj_reject_required = False
                             else:
-                                nextdit_candidate_probe_skipped_count += 1
+                                nextdit_candidate_active_no_candidate_count += 1
                         if traj_reject_required:
                             pixel_goal = None
                             output_ids = None
@@ -1691,52 +1943,66 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             pixel_goal=pixel_goal,
                         )
                         nextdit_probe_cfg = self._get_nextdit_candidate_probe_cfg()
-                        if nextdit_probe_cfg.get("enable"):
-                            nextdit_probe_max_events = int(
-                                nextdit_probe_cfg.get("max_events_per_episode", 0) or 0
+                        nextdit_query_index = (
+                            nextdit_candidate_probe_event_count
+                            + nextdit_candidate_probe_skipped_count
+                            + nextdit_candidate_active_considered_count
+                            + 1
+                        )
+                        nextdit_probe_event, nextdit_active_status, nextdit_probe_skipped = (
+                            self._run_nextdit_candidate_probe_or_active(
+                                nextdit_probe_dp_actions,
+                                local_actions,
+                                vlmap_traj_decision,
+                                observations,
+                                current_depth_m,
+                                rgb,
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                episode_index=episode_index,
+                                episode_count=episode_count,
+                                step_id=step_id,
+                                query_index=nextdit_query_index,
+                                pixel_goal=pixel_goal,
+                                probe_event_count=nextdit_candidate_probe_event_count,
+                                active_intervention_count=nextdit_candidate_active_intervention_count,
                             )
-                            if nextdit_probe_max_events <= 0 or (
-                                nextdit_candidate_probe_event_count < nextdit_probe_max_events
-                            ):
-                                nextdit_probe_event = self._probe_nextdit_trajectory_candidates(
-                                    nextdit_probe_dp_actions,
-                                    local_actions,
-                                    vlmap_traj_decision,
-                                    observations,
-                                    current_depth_m,
-                                    rgb,
-                                    scene_id=scene_id,
-                                    episode_id=episode_id,
-                                    episode_index=episode_index,
-                                    episode_count=episode_count,
-                                    step_id=step_id,
-                                    query_index=nextdit_candidate_probe_event_count
-                                    + nextdit_candidate_probe_skipped_count
-                                    + 1,
-                                    pixel_goal=pixel_goal,
+                        )
+                        if nextdit_probe_skipped:
+                            nextdit_candidate_probe_skipped_count += 1
+                        if nextdit_probe_cfg.get("enable") and nextdit_probe_event:
+                            nextdit_candidate_probe_event_count += 1
+                            nextdit_candidate_probe_candidate_sum += int(
+                                nextdit_probe_event.get("candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_probe_unique_action_sum += int(
+                                nextdit_probe_event.get("unique_action_sequence_count", 0) or 0
+                            )
+                            nextdit_candidate_probe_unique_endpoint_sum += int(
+                                nextdit_probe_event.get("unique_endpoint_count", 0) or 0
+                            )
+                            nextdit_candidate_probe_would_reject_candidate_sum += int(
+                                nextdit_probe_event.get("would_reject_candidate_count", 0) or 0
+                            )
+                            if int(nextdit_probe_event.get("safer_candidate_count", 0) or 0) > 0:
+                                nextdit_candidate_probe_safer_event_count += 1
+                            if nextdit_probe_event.get("selected_differs_from_current"):
+                                nextdit_candidate_probe_selected_diff_count += 1
+                            if nextdit_probe_event.get("current_would_reject"):
+                                nextdit_candidate_probe_current_reject_count += 1
+                        if nextdit_active_status.get("considered"):
+                            nextdit_candidate_active_considered_count += 1
+                            if nextdit_active_status.get("applied"):
+                                nextdit_candidate_active_intervention_count += 1
+                                if nextdit_active_status.get("selected_differs_from_current"):
+                                    nextdit_candidate_active_changed_count += 1
+                                local_actions = list(nextdit_active_status.get("selected_actions") or local_actions)
+                                vlmap_traj_decision = dict(
+                                    nextdit_active_status.get("selected_decision") or vlmap_traj_decision
                                 )
-                                if nextdit_probe_event:
-                                    nextdit_candidate_probe_event_count += 1
-                                    nextdit_candidate_probe_candidate_sum += int(
-                                        nextdit_probe_event.get("candidate_count", 0) or 0
-                                    )
-                                    nextdit_candidate_probe_unique_action_sum += int(
-                                        nextdit_probe_event.get("unique_action_sequence_count", 0) or 0
-                                    )
-                                    nextdit_candidate_probe_unique_endpoint_sum += int(
-                                        nextdit_probe_event.get("unique_endpoint_count", 0) or 0
-                                    )
-                                    nextdit_candidate_probe_would_reject_candidate_sum += int(
-                                        nextdit_probe_event.get("would_reject_candidate_count", 0) or 0
-                                    )
-                                    if int(nextdit_probe_event.get("safer_candidate_count", 0) or 0) > 0:
-                                        nextdit_candidate_probe_safer_event_count += 1
-                                    if nextdit_probe_event.get("selected_differs_from_current"):
-                                        nextdit_candidate_probe_selected_diff_count += 1
-                                    if nextdit_probe_event.get("current_would_reject"):
-                                        nextdit_candidate_probe_current_reject_count += 1
+                                traj_reject_required = False
                             else:
-                                nextdit_candidate_probe_skipped_count += 1
+                                nextdit_candidate_active_no_candidate_count += 1
                         if traj_reject_required:
                             pixel_goal = None
                             output_ids = None
@@ -2023,6 +2289,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["nextdit_candidate_probe_current_reject_count"] = (
                     nextdit_candidate_probe_current_reject_count
+                )
+            if nextdit_probe_cfg.get("active_enable"):
+                result["nextdit_candidate_active_considered_count"] = (
+                    nextdit_candidate_active_considered_count
+                )
+                result["nextdit_candidate_active_intervention_count"] = (
+                    nextdit_candidate_active_intervention_count
+                )
+                result["nextdit_candidate_active_changed_count"] = (
+                    nextdit_candidate_active_changed_count
+                )
+                result["nextdit_candidate_active_no_candidate_count"] = (
+                    nextdit_candidate_active_no_candidate_count
+                )
+                result["nextdit_candidate_active_intervention_ratio"] = (
+                    nextdit_candidate_active_intervention_count
+                    / max(1, nextdit_candidate_active_considered_count)
                 )
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
