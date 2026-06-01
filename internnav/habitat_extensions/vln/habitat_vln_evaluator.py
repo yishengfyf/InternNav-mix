@@ -44,6 +44,7 @@ from internnav.habitat_extensions.vln.utils import (
 )
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
+from internnav.utils.sparse_occ_memory import SparseOccSemanticMemory
 from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
 
@@ -251,6 +252,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._setup_vlmap_run_logging()
         self.vlmap_semantic = VLMapSemanticShadow(vlmap_safety_cfg)
         self.vlmap_semantic.set_debug_dir(self._get_vlmap_run_dir())
+        self.occ_memory = SparseOccSemanticMemory(
+            vlmap_safety_cfg,
+            get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
+        )
+        self.occ_memory.set_debug_dir(self._get_vlmap_run_dir())
 
     def eval_action(self):
         """
@@ -1359,6 +1365,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 episode_index=episode_index,
                 episode_count=episode_count,
             )
+            self.occ_memory.reset_episode(
+                instruction=episode_instruction,
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_index=episode_index,
+                episode_count=episode_count,
+            )
 
             # save first frame per rank to validate sim quality
             os.makedirs(os.path.join(self.output_path, f'check_sim_{self.epoch}'), exist_ok=True)
@@ -1435,6 +1448,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 depth = depth * (self._max_depth - self._min_depth) + self._min_depth
                 current_depth_m = depth.copy()
                 depth = current_depth_m * 1000
+                self.occ_memory.update_observation(
+                    {
+                        "rgb": rgb,
+                        "depth": current_depth_m,
+                        "gps": observations.get("gps"),
+                        "compass": observations.get("compass"),
+                    },
+                    current_depth_m,
+                    rgb=rgb,
+                    context={
+                        "step_id": step_id,
+                        "scene_id": scene_id,
+                        "episode_id": episode_id,
+                        "episode_index": episode_index,
+                        "episode_count": episode_count,
+                    },
+                )
 
                 image = Image.fromarray(rgb).convert('RGB')
                 save_raw_image = image.copy()
@@ -1632,6 +1662,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_count=episode_count,
                             observation_source=semantic_source,
                         )
+                        self.occ_memory.record_semantic(semantic_decision)
 
                         # Stage 2 VLMap advisor: check the S2 waypoint before asking
                         # NextDiT/System1 to turn it into local trajectory actions.
@@ -1648,6 +1679,39 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_count=episode_count,
                             camera_pitch_deg=waypoint_camera_pitch_deg,
                         )
+                        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+                        depth_h, depth_w = current_depth_m.shape[:2]
+                        occ_waypoint_decision = self.occ_memory.evaluate_waypoint(
+                            pixel_goal,
+                            {
+                                "gps": observations.get("gps"),
+                                "compass": observations.get("compass"),
+                            },
+                            current_depth_m,
+                            context={
+                                "step_id": step_id,
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "episode_index": episode_index,
+                                "episode_count": episode_count,
+                                "image_width": int(
+                                    vlmap_safety_cfg.get("waypoint_source_image_width") or depth_w
+                                ),
+                                "image_height": int(
+                                    vlmap_safety_cfg.get("waypoint_source_image_height") or depth_h
+                                ),
+                                "s2_pixel_goal": pixel_goal,
+                                "vlmap_waypoint_valid": vlmap_waypoint_decision.get("valid"),
+                                "vlmap_waypoint_reason": vlmap_waypoint_decision.get("reason"),
+                            },
+                        )
+                        if occ_waypoint_decision.get("valid") and occ_waypoint_decision.get("goal_state") != "free":
+                            print(
+                                "[OccMemory][Habitat][Waypoint] "
+                                f"goal_state={occ_waypoint_decision.get('goal_state')} "
+                                f"frontier_m={occ_waypoint_decision.get('frontier_distance_m')} "
+                                f"revisit={occ_waypoint_decision.get('points_to_revisited_region')}"
+                            )
                         repeated_goal_match = self._match_rejected_vlmap_goal(
                             vlmap_waypoint_decision, rejected_vlmap_goal_grids
                         )
@@ -2142,6 +2206,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if pending_vlmap_semantic_hint and semantic_hint_not_injected_reason == "pending_next_s2_query":
                 semantic_hint_not_injected_reason = "episode_ended"
             semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
+            occ_memory_summary = self.occ_memory.finish_episode(metrics=metrics, steps=step_id)
 
             # Write per-episode progress.json entry (still per-rank)
             result = {
@@ -2225,6 +2290,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     result[f"semantic_coverage_at_{str(threshold_key).replace('.', '_')}"] = (
                         coverage_value
                     )
+            if occ_memory_summary:
+                result["occ_memory_update_count"] = occ_memory_summary.get("update_count")
+                result["occ_memory_occupied_voxel_count"] = occ_memory_summary.get("occupied_voxel_count")
+                result["occ_memory_free_voxel_count"] = occ_memory_summary.get("free_voxel_count")
+                result["occ_memory_occupied_cell_count"] = occ_memory_summary.get("occupied_cell_count")
+                result["occ_memory_free_cell_count"] = occ_memory_summary.get("free_cell_count")
+                result["occ_memory_frontier_count"] = occ_memory_summary.get("frontier_count")
+                result["occ_memory_pose_count"] = occ_memory_summary.get("pose_count")
+                result["occ_memory_keyframe_count"] = occ_memory_summary.get("keyframe_count")
+                result["occ_memory_semantic_event_count"] = occ_memory_summary.get("semantic_event_count")
+                result["occ_memory_waypoint_probe_count"] = occ_memory_summary.get("waypoint_probe_count")
+                result["occ_memory_waypoint_mean_frontier_distance_m"] = (
+                    occ_memory_summary.get("waypoint_mean_frontier_distance_m")
+                )
+                waypoint_state_counts = occ_memory_summary.get("waypoint_goal_state_counts") or {}
+                for state_key, state_count in waypoint_state_counts.items():
+                    result[f"occ_memory_waypoint_goal_{state_key}_count"] = state_count
+                result["occ_memory_bev_snapshot_count"] = occ_memory_summary.get("bev_snapshot_count")
             s2_probe_cfg = self._get_s2_candidate_probe_cfg()
             if s2_probe_cfg.get("enable"):
                 result["s2_candidate_probe_s2_query_count"] = s2_candidate_probe_s2_query_count
