@@ -114,6 +114,19 @@ class SparseOccMemoryConfig:
     max_bev_snapshots: int = 12
     bev_crop_radius_cells: int = 140
     bev_cell_scale: int = 3
+    validation_enable: bool = False
+    validation_every_updates: int = 20
+    validation_max_snapshots: int = 4
+    validation_current_depth_sample_rate: int = 8
+    validation_max_current_points: int = 120000
+    validation_max_memory_points: int = 160000
+    validation_max_occupied_points: int = 80000
+    validation_max_free_points: int = 50000
+    validation_max_frontier_points: int = 20000
+    validation_save_rgb_depth: bool = True
+    validation_save_current_rgb_ply: bool = True
+    validation_save_memory_ply: bool = True
+    validation_save_final_memory_ply: bool = True
     verbose: bool = False
 
 
@@ -205,6 +218,8 @@ class SparseOccSemanticMemory:
         self.last_pose_grid: Optional[Tuple[int, int]] = None
         self.last_keyframe_xy: Optional[np.ndarray] = None
         self.saved_bev_count = 0
+        self.saved_validation_count = 0
+        self.saved_validation_final_count = 0
         self.last_semantic_decision: Dict[str, Any] = {}
         event = {
             "event_type": "occ_memory_episode_start",
@@ -270,7 +285,7 @@ class SparseOccSemanticMemory:
         )
         self._maybe_add_keyframe(context, rel_base_tf, pose_row, pose_col, pose_yaw)
 
-        cam_points, _ = _depth_to_points(
+        cam_points, point_ids = _depth_to_points(
             depth,
             self.camera_intrinsic,
             min_depth=float(self.config.min_depth),
@@ -292,6 +307,7 @@ class SparseOccSemanticMemory:
                 int(self.config.raycast_max_points_per_update),
             ).astype(np.int64)
             cam_points = cam_points[ids]
+            point_ids = point_ids[ids]
 
         cam_points_h = np.concatenate(
             [cam_points, np.ones((cam_points.shape[0], 1), dtype=np.float32)],
@@ -341,6 +357,14 @@ class SparseOccSemanticMemory:
         )
         self._write_event(event)
         self._maybe_write_bev_snapshot(context)
+        self._maybe_write_validation_snapshot(
+            context,
+            rgb=rgb,
+            depth=depth,
+            cam_pose_tf=cam_pose_tf,
+            world_points=world_points,
+            point_ids=point_ids,
+        )
         return event
 
     def record_semantic(self, decision: Dict[str, Any]) -> None:
@@ -436,6 +460,8 @@ class SparseOccSemanticMemory:
             dist = event.get("frontier_distance_m")
             if dist is not None:
                 frontier_distances.append(float(dist))
+        if self.config.validation_enable and self.config.validation_save_final_memory_ply:
+            self._write_final_validation_snapshot({"step_id": steps, "final": True})
         summary = {
             "event_type": "occ_memory_episode_summary",
             **self.episode_meta,
@@ -458,6 +484,8 @@ class SparseOccSemanticMemory:
                 float(np.mean(frontier_distances)) if frontier_distances else None
             ),
             "bev_snapshot_count": int(self.saved_bev_count),
+            "validation_snapshot_count": int(self.saved_validation_count),
+            "validation_final_snapshot_count": int(self.saved_validation_final_count),
         }
         self._write_event(summary)
         self._write_summary(summary)
@@ -746,6 +774,380 @@ class SparseOccSemanticMemory:
         path = os.path.join(out_dir, f"bev_ep{self.episode_meta.get('episode_id')}_{step_text}_{suffix}.png")
         img.save(path)
         self.saved_bev_count += 1
+
+    def _maybe_write_validation_snapshot(
+        self,
+        context: Dict[str, Any],
+        *,
+        rgb: Optional[np.ndarray],
+        depth: np.ndarray,
+        cam_pose_tf: np.ndarray,
+        world_points: np.ndarray,
+        point_ids: np.ndarray,
+    ) -> None:
+        if not self.config.validation_enable or not self.debug_dir:
+            return
+        if self.config.validation_max_snapshots >= 0 and self.saved_validation_count >= self.config.validation_max_snapshots:
+            return
+        every = max(1, int(self.config.validation_every_updates))
+        if self.update_count <= 0 or self.update_count % every != 0:
+            return
+        self._write_validation_snapshot(
+            context,
+            rgb=rgb,
+            depth=depth,
+            cam_pose_tf=cam_pose_tf,
+            world_points=world_points,
+            point_ids=point_ids,
+        )
+
+    def _write_validation_snapshot(
+        self,
+        context: Dict[str, Any],
+        *,
+        rgb: Optional[np.ndarray],
+        depth: np.ndarray,
+        cam_pose_tf: np.ndarray,
+        world_points: np.ndarray,
+        point_ids: np.ndarray,
+    ) -> None:
+        out_dir = self._validation_dir()
+        if out_dir is None:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        suffix = self._validation_suffix(context, self.saved_validation_count)
+        paths: Dict[str, str] = {}
+        depth_shape = self._depth_shape(depth)
+
+        if self.config.validation_save_rgb_depth:
+            image_paths = self._write_validation_images(out_dir, suffix, rgb, depth)
+            paths.update(image_paths)
+
+        current_points = None
+        current_colors = None
+        if self.config.validation_save_current_rgb_ply:
+            current_points, current_colors = self._current_rgb_point_cloud(
+                rgb,
+                depth,
+                cam_pose_tf,
+                fallback_world_points=world_points,
+                fallback_point_ids=point_ids,
+                fallback_depth_shape=depth_shape,
+            )
+            current_ply_path = os.path.join(out_dir, f"{suffix}_current_rgb_cloud.ply")
+            self._write_point_cloud_ply(current_ply_path, current_points, current_colors)
+            paths["current_rgb_cloud_ply"] = current_ply_path
+
+        memory_stats: Dict[str, Any] = {}
+        if self.config.validation_save_memory_ply:
+            memory_ply_path = os.path.join(out_dir, f"{suffix}_memory_cloud.ply")
+            memory_stats = self._write_memory_ply_snapshot(memory_ply_path)
+            paths["memory_cloud_ply"] = memory_ply_path
+
+        event = {
+            "event_type": "occ_memory_validation_snapshot",
+            **self.episode_meta,
+            **context,
+            "snapshot_index": int(self.saved_validation_count),
+            "update_count": int(self.update_count),
+            "paths": paths,
+            "current_rgb_point_count": 0 if current_points is None else int(current_points.shape[0]),
+            **memory_stats,
+        }
+        self.saved_validation_count += 1
+        self._write_event(event)
+
+    def _write_final_validation_snapshot(self, context: Dict[str, Any]) -> None:
+        if not self.debug_dir or not self.config.validation_save_memory_ply:
+            return
+        out_dir = self._validation_dir()
+        if out_dir is None:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        suffix = self._validation_suffix(context, self.saved_validation_final_count, final=True)
+        memory_ply_path = os.path.join(out_dir, f"{suffix}_memory_cloud.ply")
+        memory_stats = self._write_memory_ply_snapshot(memory_ply_path)
+        event = {
+            "event_type": "occ_memory_validation_final_snapshot",
+            **self.episode_meta,
+            **context,
+            "snapshot_index": int(self.saved_validation_final_count),
+            "update_count": int(self.update_count),
+            "paths": {"memory_cloud_ply": memory_ply_path},
+            **memory_stats,
+        }
+        self.saved_validation_final_count += 1
+        self._write_event(event)
+
+    def _validation_dir(self) -> Optional[str]:
+        if not self.debug_dir:
+            return None
+        return os.path.join(self.debug_dir, "occ_memory", "validation")
+
+    def _validation_suffix(self, context: Dict[str, Any], index: int, *, final: bool = False) -> str:
+        episode = self.episode_meta.get("episode_id")
+        if episode is None:
+            episode = self.episode_meta.get("episode_index", "unknown")
+        step = context.get("step_id")
+        step_text = "end" if step is None else str(step)
+        tag = "final" if final else f"{int(index):03d}"
+        return f"ep{episode}_step{step_text}_{tag}"
+
+    def _write_validation_images(
+        self,
+        out_dir: str,
+        suffix: str,
+        rgb: Optional[np.ndarray],
+        depth: np.ndarray,
+    ) -> Dict[str, str]:
+        try:
+            from PIL import Image
+        except Exception:
+            return {}
+        paths: Dict[str, str] = {}
+        if rgb is not None:
+            rgb_arr = np.asarray(rgb)
+            if rgb_arr.ndim == 3 and rgb_arr.shape[-1] >= 3:
+                rgb_arr = rgb_arr[..., :3]
+                if rgb_arr.dtype != np.uint8:
+                    rgb_arr = np.clip(rgb_arr, 0, 255).astype(np.uint8)
+                rgb_path = os.path.join(out_dir, f"{suffix}_rgb.png")
+                Image.fromarray(rgb_arr, mode="RGB").save(rgb_path)
+                paths["rgb"] = rgb_path
+        depth_arr = self._depth_2d(depth)
+        if depth_arr.size:
+            valid = np.isfinite(depth_arr) & (depth_arr > 0.0)
+            if np.any(valid):
+                clipped = np.clip(depth_arr, float(self.config.min_depth), float(self.config.max_depth))
+                denom = max(1e-6, float(self.config.max_depth) - float(self.config.min_depth))
+                vis = ((clipped - float(self.config.min_depth)) / denom * 255.0).astype(np.uint8)
+                vis[~valid] = 0
+                depth_vis_path = os.path.join(out_dir, f"{suffix}_depth_vis.png")
+                Image.fromarray(vis, mode="L").save(depth_vis_path)
+                paths["depth_vis"] = depth_vis_path
+                depth_mm = np.zeros_like(depth_arr, dtype=np.uint16)
+                depth_mm[valid] = np.clip(depth_arr[valid] * 1000.0, 0, 65535).astype(np.uint16)
+                depth_mm_path = os.path.join(out_dir, f"{suffix}_depth_mm.png")
+                Image.fromarray(depth_mm, mode="I;16").save(depth_mm_path)
+                paths["depth_mm"] = depth_mm_path
+        return paths
+
+    def _current_rgb_point_cloud(
+        self,
+        rgb: Optional[np.ndarray],
+        depth: np.ndarray,
+        cam_pose_tf: np.ndarray,
+        *,
+        fallback_world_points: np.ndarray,
+        fallback_point_ids: np.ndarray,
+        fallback_depth_shape: Tuple[int, int],
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        if self.camera_intrinsic is not None:
+            cam_points, point_ids = _depth_to_points(
+                depth,
+                self.camera_intrinsic,
+                min_depth=float(self.config.min_depth),
+                max_depth=float(self.config.max_depth),
+                sample_rate=int(self.config.validation_current_depth_sample_rate),
+            )
+            if cam_points.shape[0] > 0:
+                if (
+                    int(self.config.validation_max_current_points) > 0
+                    and cam_points.shape[0] > int(self.config.validation_max_current_points)
+                ):
+                    ids = np.linspace(
+                        0,
+                        cam_points.shape[0] - 1,
+                        int(self.config.validation_max_current_points),
+                    ).astype(np.int64)
+                    cam_points = cam_points[ids]
+                    point_ids = point_ids[ids]
+                cam_points_h = np.concatenate(
+                    [cam_points, np.ones((cam_points.shape[0], 1), dtype=np.float32)],
+                    axis=1,
+                )
+                points = (cam_pose_tf @ cam_points_h.T).T[:, :3]
+                colors = self._rgb_colors_for_point_ids(rgb, point_ids, self._depth_shape(depth))
+                return points.astype(np.float32, copy=False), colors
+
+        points = np.asarray(fallback_world_points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            points = np.zeros((0, 3), dtype=np.float32)
+        colors = self._rgb_colors_for_point_ids(rgb, np.asarray(fallback_point_ids), fallback_depth_shape)
+        if colors is not None and colors.shape[0] != points.shape[0]:
+            colors = None
+        return points, colors
+
+    def _write_memory_ply_snapshot(self, path: str) -> Dict[str, Any]:
+        points, colors, stats = self._memory_point_cloud()
+        self._write_point_cloud_ply(path, points, colors)
+        stats["memory_cloud_point_count"] = int(points.shape[0])
+        stats["memory_cloud_ply_exists"] = bool(os.path.exists(path))
+        return stats
+
+    def _memory_point_cloud(self) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        occ_keys = self._sample_items(list(self.occ_counts.keys()), int(self.config.validation_max_occupied_points))
+        free_keys = self._sample_items(list(self.free_counts.keys()), int(self.config.validation_max_free_points))
+        frontier_cells = self.get_frontier_cells(sample_limit=int(self.config.validation_max_frontier_points))
+
+        point_parts = []
+        color_parts = []
+        occ_points = self._grid_keys_to_points(occ_keys)
+        if occ_points.shape[0] > 0:
+            point_parts.append(occ_points)
+            color_parts.append(np.tile(np.array([[220, 72, 62]], dtype=np.uint8), (occ_points.shape[0], 1)))
+        free_points = self._grid_keys_to_points(free_keys)
+        if free_points.shape[0] > 0:
+            point_parts.append(free_points)
+            color_parts.append(np.tile(np.array([[45, 155, 120]], dtype=np.uint8), (free_points.shape[0], 1)))
+        frontier_points = self._cell_keys_to_points(frontier_cells, z=0.05)
+        if frontier_points.shape[0] > 0:
+            point_parts.append(frontier_points)
+            color_parts.append(np.tile(np.array([[240, 205, 65]], dtype=np.uint8), (frontier_points.shape[0], 1)))
+        pose_points = self._pose_trace_points()
+        if pose_points.shape[0] > 0:
+            point_parts.append(pose_points)
+            color_parts.append(np.tile(np.array([[90, 160, 245]], dtype=np.uint8), (pose_points.shape[0], 1)))
+        keyframe_points = self._keyframe_points()
+        if keyframe_points.shape[0] > 0:
+            point_parts.append(keyframe_points)
+            color_parts.append(np.tile(np.array([[255, 255, 255]], dtype=np.uint8), (keyframe_points.shape[0], 1)))
+
+        if point_parts:
+            points = np.concatenate(point_parts, axis=0).astype(np.float32, copy=False)
+            colors = np.concatenate(color_parts, axis=0).astype(np.uint8, copy=False)
+        else:
+            points = np.zeros((0, 3), dtype=np.float32)
+            colors = np.zeros((0, 3), dtype=np.uint8)
+
+        max_points = int(self.config.validation_max_memory_points)
+        if max_points > 0 and points.shape[0] > max_points:
+            ids = np.linspace(0, points.shape[0] - 1, max_points).astype(np.int64)
+            points = points[ids]
+            colors = colors[ids]
+
+        stats = {
+            "memory_occ_point_count": int(occ_points.shape[0]),
+            "memory_free_point_count": int(free_points.shape[0]),
+            "memory_frontier_point_count": int(frontier_points.shape[0]),
+            "memory_pose_point_count": int(pose_points.shape[0]),
+            "memory_keyframe_point_count": int(keyframe_points.shape[0]),
+        }
+        return points, colors, stats
+
+    def _rgb_colors_for_point_ids(
+        self,
+        rgb: Optional[np.ndarray],
+        point_ids: np.ndarray,
+        depth_shape: Tuple[int, int],
+    ) -> Optional[np.ndarray]:
+        if rgb is None or point_ids is None:
+            return None
+        rgb_arr = np.asarray(rgb)
+        if rgb_arr.ndim != 3 or rgb_arr.shape[-1] < 3:
+            return None
+        depth_h, depth_w = depth_shape
+        if depth_h <= 0 or depth_w <= 0:
+            return None
+        ids = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        if ids.size == 0:
+            return np.zeros((0, 3), dtype=np.uint8)
+        rows = ids // int(depth_w)
+        cols = ids % int(depth_w)
+        rgb_h, rgb_w = rgb_arr.shape[:2]
+        rr = np.clip((rows.astype(np.float32) * rgb_h / depth_h).astype(np.int64), 0, rgb_h - 1)
+        cc = np.clip((cols.astype(np.float32) * rgb_w / depth_w).astype(np.int64), 0, rgb_w - 1)
+        colors = rgb_arr[rr, cc, :3]
+        if colors.dtype != np.uint8:
+            colors = np.clip(colors, 0, 255).astype(np.uint8)
+        return colors
+
+    def _grid_keys_to_points(self, keys: List[Tuple[int, int, int]]) -> np.ndarray:
+        if not keys:
+            return np.zeros((0, 3), dtype=np.float32)
+        arr = np.asarray(keys, dtype=np.float32)
+        x = (self.gs / 2.0 - arr[:, 0]) * self.cs
+        y = (self.gs / 2.0 - arr[:, 1]) * self.cs
+        z = (arr[:, 2] + 0.5) * self.cs
+        return np.stack([x, y, z], axis=1).astype(np.float32, copy=False)
+
+    def _cell_keys_to_points(self, cells: List[Tuple[int, int]], *, z: float = 0.0) -> np.ndarray:
+        if not cells:
+            return np.zeros((0, 3), dtype=np.float32)
+        arr = np.asarray(cells, dtype=np.float32)
+        x = (self.gs / 2.0 - arr[:, 0]) * self.cs
+        y = (self.gs / 2.0 - arr[:, 1]) * self.cs
+        z_arr = np.full_like(x, float(z), dtype=np.float32)
+        return np.stack([x, y, z_arr], axis=1).astype(np.float32, copy=False)
+
+    def _pose_trace_points(self) -> np.ndarray:
+        if not self.pose_trace:
+            return np.zeros((0, 3), dtype=np.float32)
+        points = [[item["x"], item["y"], 0.08] for item in self.pose_trace]
+        return np.asarray(points, dtype=np.float32)
+
+    def _keyframe_points(self) -> np.ndarray:
+        if not self.keyframes:
+            return np.zeros((0, 3), dtype=np.float32)
+        points = [[item["x"], item["y"], 0.14] for item in self.keyframes]
+        return np.asarray(points, dtype=np.float32)
+
+    def _sample_items(self, items: List[Any], limit: int) -> List[Any]:
+        if limit < 0 or len(items) <= limit:
+            return items
+        if limit == 0:
+            return []
+        ids = np.linspace(0, len(items) - 1, int(limit)).astype(np.int64)
+        return [items[int(i)] for i in ids]
+
+    def _write_point_cloud_ply(
+        self,
+        path: str,
+        points: np.ndarray,
+        colors: Optional[np.ndarray] = None,
+    ) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            points = np.zeros((0, 3), dtype=np.float32)
+        if colors is None:
+            colors = np.full((points.shape[0], 3), 220, dtype=np.uint8)
+        else:
+            colors = np.asarray(colors)
+            if colors.ndim != 2 or colors.shape[1] < 3 or colors.shape[0] != points.shape[0]:
+                colors = np.full((points.shape[0], 3), 220, dtype=np.uint8)
+            else:
+                colors = np.clip(colors[:, :3], 0, 255).astype(np.uint8)
+        with open(path, "w", encoding="ascii") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {int(points.shape[0])}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write("end_header\n")
+            for point, color in zip(points, colors):
+                f.write(
+                    f"{float(point[0]):.5f} {float(point[1]):.5f} {float(point[2]):.5f} "
+                    f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+                )
+
+    def _depth_2d(self, depth: np.ndarray) -> np.ndarray:
+        depth_arr = np.asarray(depth)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        if depth_arr.ndim != 2:
+            return np.zeros((0, 0), dtype=np.float32)
+        return depth_arr.astype(np.float32, copy=False)
+
+    def _depth_shape(self, depth: np.ndarray) -> Tuple[int, int]:
+        depth_arr = self._depth_2d(depth)
+        if depth_arr.ndim != 2:
+            return 0, 0
+        return int(depth_arr.shape[0]), int(depth_arr.shape[1])
 
     def _write_event(self, event: Dict[str, Any]) -> None:
         if not self.debug_dir:

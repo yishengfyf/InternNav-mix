@@ -2308,6 +2308,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 for state_key, state_count in waypoint_state_counts.items():
                     result[f"occ_memory_waypoint_goal_{state_key}_count"] = state_count
                 result["occ_memory_bev_snapshot_count"] = occ_memory_summary.get("bev_snapshot_count")
+                result["occ_memory_validation_snapshot_count"] = (
+                    occ_memory_summary.get("validation_snapshot_count")
+                )
+                result["occ_memory_validation_final_snapshot_count"] = (
+                    occ_memory_summary.get("validation_final_snapshot_count")
+                )
             s2_probe_cfg = self._get_s2_candidate_probe_cfg()
             if s2_probe_cfg.get("enable"):
                 result["s2_candidate_probe_s2_query_count"] = s2_candidate_probe_s2_query_count
