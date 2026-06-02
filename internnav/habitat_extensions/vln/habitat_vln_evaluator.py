@@ -2307,6 +2307,71 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 waypoint_state_counts = occ_memory_summary.get("waypoint_goal_state_counts") or {}
                 for state_key, state_count in waypoint_state_counts.items():
                     result[f"occ_memory_waypoint_goal_{state_key}_count"] = state_count
+                waypoint_direction_counts = occ_memory_summary.get("waypoint_direction_counts") or {}
+                for direction_key, direction_count in waypoint_direction_counts.items():
+                    result[f"occ_memory_waypoint_direction_{direction_key}_count"] = direction_count
+                final_frontier_counts = occ_memory_summary.get("final_frontier_direction_counts") or {}
+                for direction_key, direction_count in final_frontier_counts.items():
+                    result[f"occ_memory_final_frontier_{direction_key}_count"] = direction_count
+                dead_zone_frontier_counts = (
+                    occ_memory_summary.get("semantic_dead_zone_frontier_direction_counts") or {}
+                )
+                for direction_key, direction_count in dead_zone_frontier_counts.items():
+                    result[f"occ_memory_dead_zone_frontier_{direction_key}_count"] = direction_count
+                result["occ_memory_semantic_high_conf_event_count"] = (
+                    occ_memory_summary.get("semantic_high_conf_event_count")
+                )
+                result["occ_memory_semantic_high_conf_keyframe_count"] = (
+                    occ_memory_summary.get("semantic_high_conf_keyframe_count")
+                )
+                result["occ_memory_waypoint_frontier_alignment_count"] = (
+                    occ_memory_summary.get("waypoint_frontier_alignment_count")
+                )
+                result["occ_memory_waypoint_frontier_alignment_ratio"] = (
+                    occ_memory_summary.get("waypoint_frontier_alignment_ratio")
+                )
+                result["occ_memory_waypoint_high_conf_alignment_count"] = (
+                    occ_memory_summary.get("waypoint_high_conf_alignment_count")
+                )
+                result["occ_memory_waypoint_high_conf_alignment_ratio"] = (
+                    occ_memory_summary.get("waypoint_high_conf_alignment_ratio")
+                )
+                result["occ_memory_semantic_dead_zone_waypoint_count"] = (
+                    occ_memory_summary.get("semantic_dead_zone_waypoint_count")
+                )
+                result["occ_memory_semantic_dead_zone_waypoint_ratio"] = (
+                    occ_memory_summary.get("semantic_dead_zone_waypoint_ratio")
+                )
+                result["occ_memory_semantic_first_dead_zone_waypoint_step"] = (
+                    occ_memory_summary.get("semantic_first_dead_zone_waypoint_step")
+                )
+                result["occ_memory_semantic_dead_zone_mean_score"] = (
+                    occ_memory_summary.get("semantic_dead_zone_mean_score")
+                )
+                result["occ_memory_semantic_dead_zone_max_score"] = (
+                    occ_memory_summary.get("semantic_dead_zone_max_score")
+                )
+                result["occ_memory_semantic_dead_zone_with_frontier_count"] = (
+                    occ_memory_summary.get("semantic_dead_zone_with_frontier_count")
+                )
+                result["occ_memory_final_frontier_total_count_for_direction"] = (
+                    occ_memory_summary.get("final_frontier_total_count_for_direction")
+                )
+                result["occ_memory_final_frontier_sampled_count_for_direction"] = (
+                    occ_memory_summary.get("final_frontier_sampled_count_for_direction")
+                )
+                result["occ_memory_final_frontier_sample_fraction_for_direction"] = (
+                    occ_memory_summary.get("final_frontier_sample_fraction_for_direction")
+                )
+                result["occ_memory_final_frontier_dominant_direction"] = (
+                    occ_memory_summary.get("final_frontier_dominant_direction")
+                )
+                result["occ_memory_final_frontier_dominant_angle_deg"] = (
+                    occ_memory_summary.get("final_frontier_dominant_angle_deg")
+                )
+                result["occ_memory_final_frontier_direction_entropy"] = (
+                    occ_memory_summary.get("final_frontier_direction_entropy")
+                )
                 result["occ_memory_bev_snapshot_count"] = occ_memory_summary.get("bev_snapshot_count")
                 result["occ_memory_validation_snapshot_count"] = (
                     occ_memory_summary.get("validation_snapshot_count")
