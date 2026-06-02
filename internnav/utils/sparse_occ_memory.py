@@ -422,6 +422,48 @@ class SparseOccSemanticMemory:
             self.keyframes[-1]["last_semantic_step_id"] = step_id
         self._write_event(event)
 
+    def record_guidance_event(
+        self,
+        *,
+        action: str,
+        context: Optional[Dict[str, Any]] = None,
+        decision: Optional[Dict[str, Any]] = None,
+        hint: str = "",
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        event = {
+            "event_type": "occ_memory_guidance",
+            **self.episode_meta,
+            **dict(context or {}),
+            "enabled": bool(self.enabled),
+            "action": action,
+            "reason": reason,
+            "hint": hint,
+        }
+        if decision:
+            event.update(
+                {
+                    "semantic_dead_zone": decision.get("semantic_dead_zone"),
+                    "semantic_dead_zone_score": decision.get("semantic_dead_zone_score"),
+                    "semantic_recent_high_conf_count": decision.get("semantic_recent_high_conf_count"),
+                    "semantic_recent_terms": decision.get("semantic_recent_terms"),
+                    "frontier_dominant_direction": decision.get("frontier_dominant_direction"),
+                    "frontier_dominant_angle_deg": decision.get("frontier_dominant_angle_deg"),
+                    "frontier_dominant_count": decision.get("frontier_dominant_count"),
+                    "frontier_direction_counts": decision.get("frontier_direction_counts"),
+                    "waypoint_direction_bucket": decision.get("waypoint_direction_bucket"),
+                    "waypoint_direction_angle_deg": decision.get("waypoint_direction_angle_deg"),
+                    "waypoint_aligns_with_dominant_frontier": decision.get(
+                        "waypoint_aligns_with_dominant_frontier"
+                    ),
+                    "goal_state": decision.get("goal_state"),
+                    "goal_grid": decision.get("goal_grid"),
+                    "start_grid": decision.get("start_grid"),
+                }
+            )
+        self._write_event(event)
+        return event
+
     def evaluate_waypoint(
         self,
         pixel_goal: Any,

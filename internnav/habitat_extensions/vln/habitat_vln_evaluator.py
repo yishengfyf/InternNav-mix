@@ -679,6 +679,87 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "toward the next landmark. Output only the next waypoint coordinates or STOP."
         )
 
+    def _get_occ_memory_guidance_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "enable": bool(vlmap_safety_cfg.get("occ_memory_guidance_enable", False)),
+            "shadow_only": bool(vlmap_safety_cfg.get("occ_memory_guidance_shadow_only", True)),
+            "min_dead_zone_score": float(vlmap_safety_cfg.get("occ_memory_guidance_min_dead_zone_score", 0.65)),
+            "require_no_recent_high_conf": bool(
+                vlmap_safety_cfg.get("occ_memory_guidance_require_no_recent_high_conf", True)
+            ),
+            "min_frontier_count": max(1, int(vlmap_safety_cfg.get("occ_memory_guidance_min_frontier_count", 1))),
+            "cooldown_steps": max(0, int(vlmap_safety_cfg.get("occ_memory_guidance_cooldown_steps", 24))),
+            "max_hints_per_episode": int(vlmap_safety_cfg.get("occ_memory_guidance_max_hints_per_episode", 2)),
+            "requery_on_trigger": bool(vlmap_safety_cfg.get("occ_memory_guidance_requery_on_trigger", False)),
+            "prompt_hint": vlmap_safety_cfg.get("occ_memory_guidance_prompt_hint"),
+        }
+
+    def _format_occ_memory_guidance_hint(self, decision: dict) -> str:
+        cfg = self._get_occ_memory_guidance_cfg()
+        configured_hint = cfg.get("prompt_hint")
+        direction = str(decision.get("frontier_dominant_direction") or "unknown")
+        direction_text = {
+            "front": "ahead of you",
+            "left": "to your left",
+            "right": "to your right",
+            "back": "behind you, so consider turning around or choosing a visible side opening",
+        }.get(direction, "toward a different visible opening")
+        recent_terms = decision.get("semantic_recent_terms") or []
+        recent_text = ", ".join(str(item) for item in recent_terms[-3:]) if recent_terms else "similar views"
+        frontier_count = int(decision.get("frontier_dominant_count", 0) or 0)
+        score = float(decision.get("semantic_dead_zone_score", 0.0) or 0.0)
+        if configured_hint:
+            try:
+                return str(configured_hint).format(
+                    direction=direction,
+                    direction_text=direction_text,
+                    recent_terms=recent_text,
+                    frontier_count=frontier_count,
+                    dead_zone_score=score,
+                )
+            except Exception:
+                return str(configured_hint)
+        return (
+            "Navigation memory hint: your recent observations are semantically repetitive "
+            f"({recent_text}) and the current waypoint is in a low-confidence semantic zone "
+            f"(score {score:.2f}). The sparse 3D memory shows the largest nearby unexplored "
+            f"frontier is {direction_text} ({frontier_count} frontier cells). "
+            "Use this only if it matches the instruction: choose a visible waypoint toward "
+            "open floor, a doorway, or an unexplored opening in that direction, and avoid "
+            "continuing through the same semantic area. Output only the next waypoint "
+            "coordinates or STOP."
+        )
+
+    def _occ_memory_guidance_trigger_reason(
+        self,
+        decision: dict,
+        *,
+        step_id: int,
+        hint_set_count: int,
+        last_hint_step: Optional[int],
+    ) -> tuple[bool, str]:
+        cfg = self._get_occ_memory_guidance_cfg()
+        if not cfg.get("enable"):
+            return False, "disabled"
+        if not decision or not decision.get("valid"):
+            return False, "invalid_waypoint_probe"
+        score = float(decision.get("semantic_dead_zone_score", 0.0) or 0.0)
+        if not decision.get("semantic_dead_zone") or score < float(cfg["min_dead_zone_score"]):
+            return False, "not_dead_zone"
+        if cfg["require_no_recent_high_conf"] and int(decision.get("semantic_recent_high_conf_count", 0) or 0) > 0:
+            return False, "recent_high_conf_semantic"
+        if int(decision.get("frontier_dominant_count", 0) or 0) < int(cfg["min_frontier_count"]):
+            return False, "no_dominant_frontier"
+        if decision.get("frontier_dominant_direction") == "back":
+            return False, "frontier_only_behind"
+        max_hints = int(cfg["max_hints_per_episode"])
+        if max_hints >= 0 and int(hint_set_count) >= max_hints:
+            return False, "max_hints_per_episode"
+        if last_hint_step is not None and int(step_id) - int(last_hint_step) < int(cfg["cooldown_steps"]):
+            return False, "cooldown"
+        return True, "semantic_dead_zone_with_frontier"
+
     def _get_s2_candidate_probe_cfg(self) -> dict:
         vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
         return {
@@ -1404,11 +1485,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             vlmap_recovery_actions = []
             pending_vlmap_waypoint_feedback = ""
             pending_vlmap_semantic_hint = ""
+            pending_occ_memory_guidance_hint = ""
             semantic_hint_set_count = 0
             semantic_hint_injected_count = 0
             semantic_hint_detection_step = None
             semantic_hint_injection_step = None
             semantic_hint_not_injected_reason = None
+            occ_memory_guidance_trigger_count = 0
+            occ_memory_guidance_hint_set_count = 0
+            occ_memory_guidance_hint_injected_count = 0
+            occ_memory_guidance_requery_count = 0
+            occ_memory_guidance_shadow_skip_count = 0
+            occ_memory_guidance_blocked_count = 0
+            occ_memory_guidance_detection_step = None
+            occ_memory_guidance_injection_step = None
+            occ_memory_guidance_last_set_step = None
+            occ_memory_guidance_not_injected_reason = None
             rejected_vlmap_goal_grids = []
             s2_candidate_probe_s2_query_count = 0
             s2_candidate_probe_event_count = 0
@@ -1541,6 +1633,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             f"{pending_vlmap_waypoint_feedback}"
                         )
                         pending_vlmap_waypoint_feedback = ""
+
+                    if pending_occ_memory_guidance_hint:
+                        sources[0]["value"] += f" {pending_occ_memory_guidance_hint}"
+                        occ_memory_guidance_hint_injected_count += 1
+                        if occ_memory_guidance_injection_step is None:
+                            occ_memory_guidance_injection_step = step_id
+                        self.occ_memory.record_guidance_event(
+                            action="injected",
+                            hint=pending_occ_memory_guidance_hint,
+                            context={
+                                "step_id": step_id,
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "episode_index": episode_index,
+                                "episode_count": episode_count,
+                            },
+                        )
+                        print(
+                            "[OccMemory][Habitat][Guidance] inject S2 hint: "
+                            f"{pending_occ_memory_guidance_hint}"
+                        )
+                        pending_occ_memory_guidance_hint = ""
+                        occ_memory_guidance_not_injected_reason = None
 
                     if pending_vlmap_semantic_hint:
                         sources[0]["value"] += f" {pending_vlmap_semantic_hint}"
@@ -1776,6 +1891,107 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 f"recent={semantic_decision.get('stagnation_recent_terms')}"
                             )
                             continue
+                        guidance_cfg = self._get_occ_memory_guidance_cfg()
+                        guidance_context = {
+                            "step_id": step_id,
+                            "scene_id": scene_id,
+                            "episode_id": episode_id,
+                            "episode_index": episode_index,
+                            "episode_count": episode_count,
+                        }
+                        guidance_should_trigger, guidance_reason = self._occ_memory_guidance_trigger_reason(
+                            occ_waypoint_decision,
+                            step_id=step_id,
+                            hint_set_count=occ_memory_guidance_hint_set_count,
+                            last_hint_step=occ_memory_guidance_last_set_step,
+                        )
+                        dead_zone_candidate = bool(
+                            guidance_cfg.get("enable")
+                            and occ_waypoint_decision.get("valid")
+                            and occ_waypoint_decision.get("semantic_dead_zone")
+                        )
+                        if guidance_should_trigger:
+                            occ_memory_guidance_trigger_count += 1
+                            occ_memory_guidance_hint = self._format_occ_memory_guidance_hint(occ_waypoint_decision)
+                            self.occ_memory.record_guidance_event(
+                                action="triggered",
+                                hint=occ_memory_guidance_hint,
+                                reason=guidance_reason,
+                                decision=occ_waypoint_decision,
+                                context=guidance_context,
+                            )
+                            if guidance_cfg.get("shadow_only"):
+                                occ_memory_guidance_shadow_skip_count += 1
+                                self.occ_memory.record_guidance_event(
+                                    action="shadow_skip",
+                                    hint=occ_memory_guidance_hint,
+                                    reason="shadow_only",
+                                    decision=occ_waypoint_decision,
+                                    context=guidance_context,
+                                )
+                            elif pending_occ_memory_guidance_hint:
+                                occ_memory_guidance_blocked_count += 1
+                                occ_memory_guidance_not_injected_reason = "already_pending"
+                                self.occ_memory.record_guidance_event(
+                                    action="blocked",
+                                    hint=occ_memory_guidance_hint,
+                                    reason="already_pending",
+                                    decision=occ_waypoint_decision,
+                                    context=guidance_context,
+                                )
+                            else:
+                                pending_occ_memory_guidance_hint = occ_memory_guidance_hint
+                                occ_memory_guidance_hint_set_count += 1
+                                occ_memory_guidance_last_set_step = step_id
+                                if occ_memory_guidance_detection_step is None:
+                                    occ_memory_guidance_detection_step = step_id
+                                occ_memory_guidance_not_injected_reason = "pending_next_s2_query"
+                                self.occ_memory.record_guidance_event(
+                                    action="queued",
+                                    hint=occ_memory_guidance_hint,
+                                    reason=guidance_reason,
+                                    decision=occ_waypoint_decision,
+                                    context=guidance_context,
+                                )
+                                print(
+                                    "[OccMemory][Habitat][Guidance] queue S2 hint; "
+                                    f"reason={guidance_reason} "
+                                    f"frontier={occ_waypoint_decision.get('frontier_dominant_direction')} "
+                                    f"score={occ_waypoint_decision.get('semantic_dead_zone_score')}"
+                                )
+                                if guidance_cfg.get("requery_on_trigger"):
+                                    occ_memory_guidance_requery_count += 1
+                                    pixel_goal = None
+                                    output_ids = None
+                                    traj_latents = None
+                                    pix_goal_image = None
+                                    pix_goal_depth = None
+                                    messages = []
+                                    input_images = []
+                                    llm_outputs = ""
+                                    local_actions = []
+                                    action_seq = []
+                                    vlmap_recovery_actions = []
+                                    pending_vlmap_waypoint_feedback = ""
+                                    pending_vlmap_semantic_hint = ""
+                                    action = None
+                                    forward_action = 0
+                                    draw_pixel_goal = False
+                                    flag = False
+                                    occ_memory_guidance_not_injected_reason = "pending_immediate_requery"
+                                    print(
+                                        "[OccMemory][Habitat][Guidance] "
+                                        "clear current goal and requery S2 with memory hint"
+                                    )
+                                    continue
+                        elif dead_zone_candidate:
+                            occ_memory_guidance_blocked_count += 1
+                            self.occ_memory.record_guidance_event(
+                                action="blocked",
+                                reason=guidance_reason,
+                                decision=occ_waypoint_decision,
+                                context=guidance_context,
+                            )
                         if vlmap_waypoint_decision.get("waypoint_recovery_required"):
                             recovery_actions = [
                                 int(item)
@@ -2205,6 +2421,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
             if pending_vlmap_semantic_hint and semantic_hint_not_injected_reason == "pending_next_s2_query":
                 semantic_hint_not_injected_reason = "episode_ended"
+            if pending_occ_memory_guidance_hint and occ_memory_guidance_not_injected_reason in (
+                "pending_next_s2_query",
+                "pending_immediate_requery",
+            ):
+                occ_memory_guidance_not_injected_reason = "episode_ended"
             semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
             occ_memory_summary = self.occ_memory.finish_episode(metrics=metrics, steps=step_id)
 
@@ -2290,6 +2511,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     result[f"semantic_coverage_at_{str(threshold_key).replace('.', '_')}"] = (
                         coverage_value
                     )
+            result["occ_memory_guidance_trigger_count"] = occ_memory_guidance_trigger_count
+            result["occ_memory_guidance_hint_set_count"] = occ_memory_guidance_hint_set_count
+            result["occ_memory_guidance_hint_injected_count"] = occ_memory_guidance_hint_injected_count
+            result["occ_memory_guidance_requery_count"] = occ_memory_guidance_requery_count
+            result["occ_memory_guidance_shadow_skip_count"] = occ_memory_guidance_shadow_skip_count
+            result["occ_memory_guidance_blocked_count"] = occ_memory_guidance_blocked_count
+            result["occ_memory_guidance_first_detection_step"] = occ_memory_guidance_detection_step
+            result["occ_memory_guidance_first_injection_step"] = occ_memory_guidance_injection_step
+            result["occ_memory_guidance_pending_at_end"] = bool(pending_occ_memory_guidance_hint)
+            result["occ_memory_guidance_not_injected_reason"] = occ_memory_guidance_not_injected_reason
             if occ_memory_summary:
                 result["occ_memory_update_count"] = occ_memory_summary.get("update_count")
                 result["occ_memory_occupied_voxel_count"] = occ_memory_summary.get("occupied_voxel_count")
