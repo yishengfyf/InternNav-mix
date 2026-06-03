@@ -769,6 +769,157 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return False, "cooldown"
         return True, "semantic_dead_zone_with_frontier"
 
+    def _get_occ_memory_candidate_probe_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "enable": bool(vlmap_safety_cfg.get("occ_memory_candidate_probe_enable", False)),
+            "selection_enable": bool(
+                vlmap_safety_cfg.get("occ_memory_candidate_selection_enable", False)
+            ),
+            "selection_max_queries_per_episode": int(
+                vlmap_safety_cfg.get("occ_memory_candidate_selection_max_queries_per_episode", 2)
+            ),
+            "selection_max_new_tokens": int(
+                vlmap_safety_cfg.get("occ_memory_candidate_selection_max_new_tokens", 32)
+            ),
+        }
+
+    def _format_occ_memory_candidate_selection_prompt(self, candidate_event: dict) -> str:
+        candidates = candidate_event.get("candidates") or []
+        lines = [
+            "Sparse 3D memory proposes several candidate navigation targets.",
+            "Choose the single candidate that best matches the instruction and makes spatial progress.",
+            "If none of the candidates are useful, answer NONE.",
+            "Answer only one token: A, B, C, D, or NONE.",
+        ]
+        current_state = candidate_event.get("current_waypoint_goal_state")
+        current_dead_zone = candidate_event.get("current_waypoint_semantic_dead_zone")
+        if current_state is not None or current_dead_zone is not None:
+            lines.append(
+                "Current S2 waypoint memory status: "
+                f"geometry={current_state}, semantic_dead_zone={current_dead_zone}."
+            )
+        for item in candidates:
+            label = item.get("candidate_id")
+            semantic = item.get("semantic_evidence") or {}
+            semantic_text = ""
+            if semantic.get("semantic_top_match"):
+                semantic_text = (
+                    f", semantic={semantic.get('semantic_top_match')} "
+                    f"score={semantic.get('semantic_top_score')}"
+                )
+            angle_to_current = item.get("angle_to_current_waypoint_deg")
+            angle_text = "unknown" if angle_to_current is None else f"{float(angle_to_current):.1f}deg"
+            lines.append(
+                f"{label}: type={item.get('candidate_type')}, "
+                f"direction={item.get('direction_bucket')} "
+                f"angle={float(item.get('direction_angle_deg') or 0.0):.1f}deg, "
+                f"distance={float(item.get('distance_m') or 0.0):.2f}m, "
+                f"geometry={item.get('goal_state')}, "
+                f"frontier_progress={float(item.get('frontier_progress_score') or 0.0):.2f}, "
+                f"revisit_risk={float(item.get('revisit_risk') or 0.0):.2f}, "
+                f"angle_to_original={angle_text}"
+                f"{semantic_text}."
+            )
+        return " ".join(lines)
+
+    def _parse_occ_memory_candidate_choice_output(self, text: str, candidates: list) -> dict:
+        text = "" if text is None else str(text)
+        upper_text = text.upper()
+        labels = {
+            str(item.get("candidate_id")).upper(): item
+            for item in candidates
+            if item.get("candidate_id")
+        }
+        if re.search(r"\bNONE\b", upper_text):
+            return {
+                "valid": True,
+                "none": True,
+                "choice": None,
+                "selected_candidate": None,
+                "reason": "none",
+            }
+        for label in re.findall(r"\b([A-Z])\b", upper_text):
+            if label in labels:
+                return {
+                    "valid": True,
+                    "none": False,
+                    "choice": label,
+                    "selected_candidate": labels[label],
+                    "reason": "matched_label",
+                }
+        return {
+            "valid": False,
+            "none": False,
+            "choice": None,
+            "selected_candidate": None,
+            "reason": "no_candidate_label",
+        }
+
+    def _run_occ_memory_candidate_selection_probe(
+        self,
+        *,
+        base_prompt_body: str,
+        input_images: list,
+        messages_prefix: Optional[list],
+        candidate_event: dict,
+        context: dict,
+    ) -> dict:
+        cfg = self._get_occ_memory_candidate_probe_cfg()
+        candidates = candidate_event.get("candidates") or []
+        candidate_prompt = self._format_occ_memory_candidate_selection_prompt(candidate_event)
+        selection_images = list(input_images)
+        candidate_bev_path = candidate_event.get("candidate_bev_path")
+        image_prompt = DEFAULT_IMAGE_TOKEN
+        if candidate_bev_path and os.path.exists(candidate_bev_path):
+            try:
+                with Image.open(candidate_bev_path) as bev_img:
+                    selection_images.append(bev_img.convert("RGB").copy())
+                image_prompt = f"{DEFAULT_IMAGE_TOKEN} {DEFAULT_IMAGE_TOKEN}"
+                candidate_prompt += (
+                    " The next image is the current RGB observation. "
+                    "The final image is a top-down sparse memory map with candidates marked A-D."
+                )
+            except Exception:
+                pass
+        prompt_instruction = f"{base_prompt_body} {candidate_prompt} {image_prompt}."
+        rng_state = self._capture_torch_rng_state()
+        event = {
+            "status": "ok",
+            "output": "",
+            "valid": False,
+            "none": False,
+            "choice": None,
+            "reason": None,
+            "selected_candidate": None,
+            "candidate_bev_path": candidate_bev_path,
+        }
+        try:
+            output = self._generate_s2_text_from_prompt_instruction(
+                prompt_instruction,
+                selection_images,
+                messages_prefix=messages_prefix,
+                max_new_tokens=int(cfg.get("selection_max_new_tokens", 32) or 32),
+            )
+            parse = self._parse_occ_memory_candidate_choice_output(output, candidates)
+            event.update({"output": output, **parse})
+        except Exception as exc:
+            event.update(
+                {
+                    "status": "error",
+                    "reason": "exception",
+                    "error": str(exc),
+                }
+            )
+        finally:
+            self._restore_torch_rng_state(rng_state)
+        self.occ_memory.record_candidate_selection_event(
+            candidate_event=candidate_event,
+            selection=event,
+            context=context,
+        )
+        return event
+
     def _get_s2_candidate_probe_cfg(self) -> dict:
         vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
         return {
@@ -1656,6 +1807,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             occ_memory_guidance_counterfactual_direction_changed_count = 0
             occ_memory_guidance_counterfactual_left_right_follow_count = 0
             occ_memory_guidance_counterfactual_pixel_shift_sum = 0.0
+            occ_memory_candidate_probe_event_count = 0
+            occ_memory_candidate_probe_valid_event_count = 0
+            occ_memory_candidate_probe_skipped_count = 0
+            occ_memory_candidate_probe_candidate_sum = 0
+            occ_memory_candidate_probe_geometry_safe_sum = 0
+            occ_memory_candidate_probe_active_gate_safe_sum = 0
+            occ_memory_candidate_probe_current_aligned_sum = 0
+            occ_memory_candidate_selection_query_count = 0
+            occ_memory_candidate_selection_valid_count = 0
+            occ_memory_candidate_selection_none_count = 0
+            occ_memory_candidate_selection_active_gate_safe_count = 0
+            occ_memory_candidate_selection_current_aligned_count = 0
+            occ_memory_candidate_selection_error_count = 0
             rejected_vlmap_goal_grids = []
             s2_candidate_probe_s2_query_count = 0
             s2_candidate_probe_event_count = 0
@@ -1977,6 +2141,78 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 "vlmap_waypoint_reason": vlmap_waypoint_decision.get("reason"),
                             },
                         )
+                        candidate_probe_cfg = self._get_occ_memory_candidate_probe_cfg()
+                        if candidate_probe_cfg.get("enable"):
+                            candidate_context = {
+                                "step_id": step_id,
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "episode_index": episode_index,
+                                "episode_count": episode_count,
+                                "s2_pixel_goal": pixel_goal,
+                                "s2_output": llm_outputs,
+                                "vlmap_waypoint_valid": vlmap_waypoint_decision.get("valid"),
+                                "vlmap_waypoint_reason": vlmap_waypoint_decision.get("reason"),
+                                "occ_waypoint_valid": occ_waypoint_decision.get("valid"),
+                                "occ_waypoint_reason": occ_waypoint_decision.get("reason"),
+                            }
+                            candidate_event = self.occ_memory.generate_query_candidates(
+                                obs={
+                                    "gps": observations.get("gps"),
+                                    "compass": observations.get("compass"),
+                                },
+                                current_waypoint_decision=occ_waypoint_decision,
+                                context=candidate_context,
+                            )
+                            if candidate_event.get("reason") == "max_events_per_episode":
+                                occ_memory_candidate_probe_skipped_count += 1
+                            elif candidate_event.get("enabled"):
+                                occ_memory_candidate_probe_event_count += 1
+                                if candidate_event.get("valid"):
+                                    occ_memory_candidate_probe_valid_event_count += 1
+                                occ_memory_candidate_probe_candidate_sum += int(
+                                    candidate_event.get("candidate_count", 0) or 0
+                                )
+                                occ_memory_candidate_probe_geometry_safe_sum += int(
+                                    candidate_event.get("candidate_geometry_safe_count", 0) or 0
+                                )
+                                occ_memory_candidate_probe_active_gate_safe_sum += int(
+                                    candidate_event.get("candidate_active_gate_safe_count", 0) or 0
+                                )
+                                occ_memory_candidate_probe_current_aligned_sum += int(
+                                    candidate_event.get("candidate_current_aligned_count", 0) or 0
+                                )
+                                selection_max_queries = int(
+                                    candidate_probe_cfg.get("selection_max_queries_per_episode", 2) or 0
+                                )
+                                selection_allowed = (
+                                    bool(candidate_probe_cfg.get("selection_enable"))
+                                    and bool(candidate_event.get("valid"))
+                                    and (
+                                        selection_max_queries <= 0
+                                        or occ_memory_candidate_selection_query_count < selection_max_queries
+                                    )
+                                )
+                                if selection_allowed:
+                                    selection_event = self._run_occ_memory_candidate_selection_probe(
+                                        base_prompt_body=s2_prompt_body_before_final_prompt,
+                                        input_images=input_images,
+                                        messages_prefix=s2_counterfactual_messages_prefix,
+                                        candidate_event=candidate_event,
+                                        context=candidate_context,
+                                    )
+                                    occ_memory_candidate_selection_query_count += 1
+                                    if selection_event.get("status") == "error":
+                                        occ_memory_candidate_selection_error_count += 1
+                                    if selection_event.get("valid"):
+                                        occ_memory_candidate_selection_valid_count += 1
+                                    if selection_event.get("none"):
+                                        occ_memory_candidate_selection_none_count += 1
+                                    selected_candidate = selection_event.get("selected_candidate") or {}
+                                    if selected_candidate.get("active_gate_safe"):
+                                        occ_memory_candidate_selection_active_gate_safe_count += 1
+                                    if selected_candidate.get("aligned_with_current_waypoint"):
+                                        occ_memory_candidate_selection_current_aligned_count += 1
                         if occ_waypoint_decision.get("valid") and occ_waypoint_decision.get("goal_state") != "free":
                             print(
                                 "[OccMemory][Habitat][Waypoint] "
@@ -2739,6 +2975,59 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
             else:
                 result["occ_memory_guidance_counterfactual_mean_pixel_shift"] = None
+            candidate_probe_cfg = self._get_occ_memory_candidate_probe_cfg()
+            if candidate_probe_cfg.get("enable"):
+                result["occ_memory_candidate_probe_event_count"] = (
+                    occ_memory_candidate_probe_event_count
+                )
+                result["occ_memory_candidate_probe_valid_event_count"] = (
+                    occ_memory_candidate_probe_valid_event_count
+                )
+                result["occ_memory_candidate_probe_skipped_count"] = (
+                    occ_memory_candidate_probe_skipped_count
+                )
+                result["occ_memory_candidate_probe_valid_event_ratio"] = (
+                    occ_memory_candidate_probe_valid_event_count
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_candidate_count"] = (
+                    occ_memory_candidate_probe_candidate_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_geometry_safe_count"] = (
+                    occ_memory_candidate_probe_geometry_safe_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_active_gate_safe_count"] = (
+                    occ_memory_candidate_probe_active_gate_safe_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_current_aligned_count"] = (
+                    occ_memory_candidate_probe_current_aligned_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_selection_query_count"] = (
+                    occ_memory_candidate_selection_query_count
+                )
+                result["occ_memory_candidate_selection_valid_count"] = (
+                    occ_memory_candidate_selection_valid_count
+                )
+                result["occ_memory_candidate_selection_none_count"] = (
+                    occ_memory_candidate_selection_none_count
+                )
+                result["occ_memory_candidate_selection_error_count"] = (
+                    occ_memory_candidate_selection_error_count
+                )
+                result["occ_memory_candidate_selection_valid_ratio"] = (
+                    occ_memory_candidate_selection_valid_count
+                    / max(1, occ_memory_candidate_selection_query_count)
+                )
+                result["occ_memory_candidate_selection_active_gate_safe_count"] = (
+                    occ_memory_candidate_selection_active_gate_safe_count
+                )
+                result["occ_memory_candidate_selection_current_aligned_count"] = (
+                    occ_memory_candidate_selection_current_aligned_count
+                )
             if occ_memory_summary:
                 result["occ_memory_update_count"] = occ_memory_summary.get("update_count")
                 result["occ_memory_occupied_voxel_count"] = occ_memory_summary.get("occupied_voxel_count")
@@ -2750,6 +3039,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result["occ_memory_keyframe_count"] = occ_memory_summary.get("keyframe_count")
                 result["occ_memory_semantic_event_count"] = occ_memory_summary.get("semantic_event_count")
                 result["occ_memory_waypoint_probe_count"] = occ_memory_summary.get("waypoint_probe_count")
+                result["occ_memory_candidate_probe_summary_event_count"] = (
+                    occ_memory_summary.get("candidate_probe_event_count")
+                )
+                result["occ_memory_candidate_probe_summary_valid_event_count"] = (
+                    occ_memory_summary.get("candidate_probe_valid_event_count")
+                )
+                result["occ_memory_candidate_probe_summary_mean_candidate_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_candidate_count")
+                )
+                result["occ_memory_candidate_selection_summary_event_count"] = (
+                    occ_memory_summary.get("candidate_selection_event_count")
+                )
+                result["occ_memory_candidate_selection_summary_valid_count"] = (
+                    occ_memory_summary.get("candidate_selection_valid_count")
+                )
                 result["occ_memory_waypoint_mean_frontier_distance_m"] = (
                     occ_memory_summary.get("waypoint_mean_frontier_distance_m")
                 )
@@ -2762,6 +3066,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 final_frontier_counts = occ_memory_summary.get("final_frontier_direction_counts") or {}
                 for direction_key, direction_count in final_frontier_counts.items():
                     result[f"occ_memory_final_frontier_{direction_key}_count"] = direction_count
+                candidate_type_counts = occ_memory_summary.get("candidate_probe_type_counts") or {}
+                for type_key, type_count in candidate_type_counts.items():
+                    result[f"occ_memory_candidate_type_{type_key}_count"] = type_count
+                candidate_direction_counts = occ_memory_summary.get("candidate_probe_direction_counts") or {}
+                for direction_key, direction_count in candidate_direction_counts.items():
+                    result[f"occ_memory_candidate_direction_{direction_key}_count"] = direction_count
                 dead_zone_frontier_counts = (
                     occ_memory_summary.get("semantic_dead_zone_frontier_direction_counts") or {}
                 )
@@ -2822,6 +3132,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     occ_memory_summary.get("final_frontier_direction_entropy")
                 )
                 result["occ_memory_bev_snapshot_count"] = occ_memory_summary.get("bev_snapshot_count")
+                result["occ_memory_candidate_bev_snapshot_count"] = (
+                    occ_memory_summary.get("candidate_bev_snapshot_count")
+                )
                 result["occ_memory_validation_snapshot_count"] = (
                     occ_memory_summary.get("validation_snapshot_count")
                 )

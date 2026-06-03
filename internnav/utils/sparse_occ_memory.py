@@ -118,6 +118,17 @@ class SparseOccMemoryConfig:
     attribution_dead_zone_unique_threshold: int = 2
     attribution_dead_zone_score_threshold: float = 0.65
     attribution_direction_match_degrees: float = 45.0
+    candidate_probe_enable: bool = False
+    candidate_probe_max_candidates: int = 4
+    candidate_probe_max_events_per_episode: int = 12
+    candidate_probe_frontier_sample_limit: int = 5000
+    candidate_probe_free_sample_limit: int = 5000
+    candidate_probe_min_distance_m: float = 0.75
+    candidate_probe_max_distance_m: float = 4.0
+    candidate_probe_min_separation_m: float = 0.50
+    candidate_probe_exclude_back_frontier: bool = True
+    candidate_probe_save_bev: bool = True
+    candidate_probe_max_bev_snapshots: int = 12
     save_bev: bool = True
     bev_every_updates: int = 20
     max_bev_snapshots: int = 12
@@ -216,6 +227,8 @@ class SparseOccSemanticMemory:
         self.keyframes: List[Dict[str, Any]] = []
         self.semantic_events: List[Dict[str, Any]] = []
         self.waypoint_events: List[Dict[str, Any]] = []
+        self.candidate_probe_events: List[Dict[str, Any]] = []
+        self.candidate_selection_events: List[Dict[str, Any]] = []
         self.init_base_tf: Optional[np.ndarray] = None
         self.inv_init_base_tf: Optional[np.ndarray] = None
         self.update_count = 0
@@ -227,6 +240,7 @@ class SparseOccSemanticMemory:
         self.last_pose_grid: Optional[Tuple[int, int]] = None
         self.last_keyframe_xy: Optional[np.ndarray] = None
         self.saved_bev_count = 0
+        self.saved_candidate_bev_count = 0
         self.saved_validation_count = 0
         self.saved_validation_final_count = 0
         self.last_semantic_decision: Dict[str, Any] = {}
@@ -583,6 +597,393 @@ class SparseOccSemanticMemory:
         self._write_event(event)
         return event
 
+    def generate_query_candidates(
+        self,
+        *,
+        obs: Optional[Dict[str, Any]] = None,
+        current_waypoint_decision: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Generate sparse 3D memory candidates for V10 shadow probes.
+
+        This is deliberately a query interface, not an action interface: it
+        records candidate points that a downstream model could choose from, but
+        it never changes navigation state.
+        """
+        context = dict(context or {})
+        decision = dict(current_waypoint_decision or {})
+        event = {
+            "event_type": "occ_memory_query_candidates",
+            **self.episode_meta,
+            **context,
+            "enabled": bool(self.enabled and self.config.candidate_probe_enable),
+            "valid": False,
+            "reason": None,
+        }
+        if not self.enabled or not self.config.candidate_probe_enable:
+            event["reason"] = "disabled"
+            return event
+        max_events = int(self.config.candidate_probe_max_events_per_episode)
+        if max_events >= 0 and len(self.candidate_probe_events) >= max_events:
+            event["reason"] = "max_events_per_episode"
+            self._write_event(event)
+            return event
+        pose_state = self._current_pose_state(obs or {})
+        if pose_state is None:
+            event["reason"] = "missing_pose_or_memory"
+            self._write_event(event)
+            return event
+        start_grid = pose_state["grid"]
+        yaw = float(pose_state["yaw"])
+        current_angle = decision.get("waypoint_direction_angle_deg")
+        current_goal_grid = decision.get("goal_grid")
+        raw_candidates: List[Dict[str, Any]] = []
+        raw_candidates.extend(
+            self._frontier_query_candidates(
+                start_grid,
+                yaw,
+                current_angle=current_angle,
+                current_goal_grid=current_goal_grid,
+            )
+        )
+        semantic_candidate = self._semantic_query_candidate(
+            start_grid,
+            yaw,
+            current_angle=current_angle,
+            current_goal_grid=current_goal_grid,
+        )
+        if semantic_candidate is not None:
+            raw_candidates.append(semantic_candidate)
+        raw_candidates.extend(
+            self._open_floor_query_candidates(
+                start_grid,
+                yaw,
+                current_angle=current_angle,
+                current_goal_grid=current_goal_grid,
+            )
+        )
+        candidates = self._select_query_candidates(raw_candidates)
+        for idx, item in enumerate(candidates):
+            item["candidate_index"] = int(idx)
+            item["candidate_id"] = chr(ord("A") + idx)
+        candidate_types: Dict[str, int] = defaultdict(int)
+        direction_counts: Dict[str, int] = defaultdict(int)
+        geometry_safe_count = 0
+        active_gate_safe_count = 0
+        current_aligned_count = 0
+        for item in candidates:
+            candidate_types[str(item.get("candidate_type", "unknown"))] += 1
+            direction_counts[str(item.get("direction_bucket", "unknown"))] += 1
+            if item.get("geometry_safe"):
+                geometry_safe_count += 1
+            if item.get("active_gate_safe"):
+                active_gate_safe_count += 1
+            if item.get("aligned_with_current_waypoint"):
+                current_aligned_count += 1
+        bev_path = None
+        if self.config.candidate_probe_save_bev and candidates:
+            bev_path = self._write_candidate_bev_snapshot(candidates, context)
+        event.update(
+            {
+                "valid": bool(candidates),
+                "reason": "ok" if candidates else "no_candidates",
+                "start_grid": [int(start_grid[0]), int(start_grid[1])],
+                "start_yaw": yaw,
+                "current_waypoint_goal_grid": self._jsonable(current_goal_grid),
+                "current_waypoint_direction_angle_deg": current_angle,
+                "current_waypoint_direction_bucket": decision.get("waypoint_direction_bucket"),
+                "current_waypoint_goal_state": decision.get("goal_state"),
+                "current_waypoint_semantic_dead_zone": decision.get("semantic_dead_zone"),
+                "current_waypoint_semantic_dead_zone_score": decision.get("semantic_dead_zone_score"),
+                "raw_candidate_count": int(len(raw_candidates)),
+                "candidate_count": int(len(candidates)),
+                "candidate_type_counts": dict(candidate_types),
+                "candidate_direction_counts": dict(direction_counts),
+                "candidate_geometry_safe_count": int(geometry_safe_count),
+                "candidate_active_gate_safe_count": int(active_gate_safe_count),
+                "candidate_current_aligned_count": int(current_aligned_count),
+                "candidate_best_score": (
+                    float(candidates[0].get("score", 0.0)) if candidates else None
+                ),
+                "candidate_bev_path": bev_path,
+                "candidates": candidates,
+            }
+        )
+        self.candidate_probe_events.append(event)
+        self._write_event(event)
+        return event
+
+    def record_candidate_selection_event(
+        self,
+        *,
+        candidate_event: Dict[str, Any],
+        selection: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        event = {
+            "event_type": "occ_memory_candidate_selection",
+            **self.episode_meta,
+            **dict(context or {}),
+            "enabled": bool(self.enabled and self.config.candidate_probe_enable),
+            "candidate_event_valid": bool(candidate_event.get("valid")),
+            "candidate_count": int(candidate_event.get("candidate_count", 0) or 0),
+            "selection_status": selection.get("status"),
+            "selection_output": selection.get("output"),
+            "selection_valid": bool(selection.get("valid")),
+            "selection_none": bool(selection.get("none")),
+            "selection_choice": selection.get("choice"),
+            "selection_reason": selection.get("reason"),
+            "selected_candidate": selection.get("selected_candidate"),
+        }
+        self.candidate_selection_events.append(event)
+        self._write_event(event)
+        return event
+
+    def _current_pose_state(self, obs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if self.pose_trace:
+            pose = self.pose_trace[-1]
+            return {
+                "grid": [int(pose["row"]), int(pose["col"])],
+                "xy": [float(pose["x"]), float(pose["y"])],
+                "yaw": float(pose["yaw"]),
+            }
+        pose_tf = self._pose_from_obs(obs)
+        if pose_tf is None:
+            return None
+        if self.config.center_on_first_pose and self.init_base_tf is None:
+            return None
+        rel_base_tf = self._relative_base_tf(pose_tf)
+        row, col, yaw = self._pose_to_grid(rel_base_tf)
+        return {
+            "grid": [int(row), int(col)],
+            "xy": [float(rel_base_tf[0, 3]), float(rel_base_tf[1, 3])],
+            "yaw": float(yaw),
+        }
+
+    def _frontier_query_candidates(
+        self,
+        start_grid: Iterable[int],
+        yaw: float,
+        *,
+        current_angle: Any,
+        current_goal_grid: Any,
+    ) -> List[Dict[str, Any]]:
+        best_by_bucket: Dict[str, Dict[str, Any]] = {}
+        frontiers = self.get_frontier_cells(
+            sample_limit=int(self.config.candidate_probe_frontier_sample_limit)
+        )
+        for cell in frontiers:
+            candidate = self._build_query_candidate(
+                cell,
+                "frontier",
+                start_grid,
+                yaw,
+                current_angle=current_angle,
+                current_goal_grid=current_goal_grid,
+                source_score=1.0,
+            )
+            if candidate is None:
+                continue
+            bucket = str(candidate.get("direction_bucket"))
+            if self.config.candidate_probe_exclude_back_frontier and bucket == "back":
+                continue
+            previous = best_by_bucket.get(bucket)
+            if previous is None or float(candidate["score"]) > float(previous["score"]):
+                best_by_bucket[bucket] = candidate
+        return list(best_by_bucket.values())
+
+    def _open_floor_query_candidates(
+        self,
+        start_grid: Iterable[int],
+        yaw: float,
+        *,
+        current_angle: Any,
+        current_goal_grid: Any,
+    ) -> List[Dict[str, Any]]:
+        cells = [cell for cell in self.free2d_counts.keys() if cell not in self.occ2d_counts]
+        limit = int(self.config.candidate_probe_free_sample_limit)
+        if limit > 0 and len(cells) > limit:
+            ids = np.linspace(0, len(cells) - 1, limit).astype(np.int64)
+            cells = [cells[int(idx)] for idx in ids]
+        best_by_bucket: Dict[str, Dict[str, Any]] = {}
+        for cell in cells:
+            candidate = self._build_query_candidate(
+                cell,
+                "open_floor",
+                start_grid,
+                yaw,
+                current_angle=current_angle,
+                current_goal_grid=current_goal_grid,
+                source_score=0.25,
+            )
+            if candidate is None:
+                continue
+            bucket = str(candidate.get("direction_bucket"))
+            if bucket == "back":
+                continue
+            previous = best_by_bucket.get(bucket)
+            if previous is None or float(candidate["score"]) > float(previous["score"]):
+                best_by_bucket[bucket] = candidate
+        return list(best_by_bucket.values())
+
+    def _semantic_query_candidate(
+        self,
+        start_grid: Iterable[int],
+        yaw: float,
+        *,
+        current_angle: Any,
+        current_goal_grid: Any,
+    ) -> Optional[Dict[str, Any]]:
+        nearest = self._nearest_semantic_keyframe(start_grid, yaw, high_conf_only=True)
+        if not nearest or not nearest.get("grid"):
+            return None
+        return self._build_query_candidate(
+            nearest["grid"],
+            "semantic_keyframe",
+            start_grid,
+            yaw,
+            current_angle=current_angle,
+            current_goal_grid=current_goal_grid,
+            source_score=0.75,
+            semantic=nearest,
+        )
+
+    def _build_query_candidate(
+        self,
+        cell: Iterable[int],
+        candidate_type: str,
+        start_grid: Iterable[int],
+        yaw: float,
+        *,
+        current_angle: Any,
+        current_goal_grid: Any,
+        source_score: float,
+        semantic: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        row, col = [int(v) for v in list(cell)[:2]]
+        direction = self._direction_to_cell(start_grid, [row, col], yaw)
+        distance_m = float(direction.get("distance_m", 0.0) or 0.0)
+        if distance_m < float(self.config.candidate_probe_min_distance_m):
+            return None
+        if distance_m > float(self.config.candidate_probe_max_distance_m):
+            return None
+        state = self._cell_state(row, col)
+        if state == "occupied":
+            geometry_score = -2.0
+        elif state == "free":
+            geometry_score = 0.50
+        else:
+            geometry_score = 0.10
+        visit_count = self._nearby_visit_count([row, col], int(self.config.waypoint_revisit_radius_cells))
+        revisit_risk = min(1.0, float(visit_count) / 3.0)
+        if candidate_type == "frontier":
+            frontier_distance_cells = 0.0
+        elif candidate_type == "open_floor":
+            frontier_distance_cells = None
+        else:
+            frontier_distance_cells = self._nearest_frontier_distance([row, col])
+        frontier_distance_m = (
+            None if frontier_distance_cells is None else float(frontier_distance_cells * self.cs)
+        )
+        frontier_progress_score = 0.0
+        if candidate_type == "frontier":
+            frontier_progress_score = 1.0
+        elif frontier_distance_m is not None and frontier_distance_m <= 0.50:
+            frontier_progress_score = 0.35
+        bucket = str(direction.get("bucket") or "unknown")
+        direction_score = {
+            "front": 0.35,
+            "left": 0.20,
+            "right": 0.20,
+            "same": -0.50,
+            "back": -0.35,
+        }.get(bucket, 0.0)
+        angle = direction.get("angle_deg")
+        angle_to_current = None
+        intent_alignment_score = None
+        aligned_with_current = False
+        try:
+            angle_to_current = self._angle_distance_degrees(float(angle), float(current_angle))
+            intent_alignment_score = max(0.0, 1.0 - float(angle_to_current) / 180.0)
+            aligned_with_current = self._directions_aligned(angle, current_angle)
+        except (TypeError, ValueError):
+            pass
+        distance_to_current_goal_m = None
+        try:
+            current_xy = self._grid_to_xy(current_goal_grid)
+            candidate_xy = self._grid_to_xy([row, col])
+            distance_to_current_goal_m = float(np.linalg.norm(candidate_xy - current_xy))
+        except Exception:
+            pass
+        semantic_evidence_score = 0.0
+        if semantic is not None:
+            semantic_evidence_score = 1.0
+        preferred_distance_m = 2.0
+        distance_score = -0.08 * abs(distance_m - preferred_distance_m)
+        score = (
+            float(source_score)
+            + geometry_score
+            + frontier_progress_score
+            + direction_score
+            + 0.30 * float(intent_alignment_score or 0.0)
+            + 0.35 * semantic_evidence_score
+            + distance_score
+            - 0.65 * revisit_risk
+        )
+        geometry_safe = state != "occupied"
+        return {
+            "candidate_type": str(candidate_type),
+            "grid": [int(row), int(col)],
+            "xy": [float(v) for v in self._grid_to_xy([row, col]).tolist()],
+            "goal_state": state,
+            "geometry_safe": bool(geometry_safe),
+            "active_gate_safe": bool(geometry_safe and bucket != "back"),
+            "direction_bucket": bucket,
+            "direction_angle_deg": angle,
+            "distance_m": distance_m,
+            "frontier_distance_m": frontier_distance_m,
+            "frontier_progress_score": float(frontier_progress_score),
+            "nearby_visit_count": int(visit_count),
+            "revisit_risk": float(revisit_risk),
+            "points_to_revisited_region": bool(visit_count > 0),
+            "angle_to_current_waypoint_deg": angle_to_current,
+            "intent_alignment_score": intent_alignment_score,
+            "aligned_with_current_waypoint": bool(aligned_with_current),
+            "distance_to_current_waypoint_m": distance_to_current_goal_m,
+            "semantic_evidence": semantic,
+            "score": float(score),
+        }
+
+    def _select_query_candidates(self, raw_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        max_candidates = max(0, int(self.config.candidate_probe_max_candidates))
+        if max_candidates <= 0:
+            return []
+        ordered = sorted(
+            raw_candidates,
+            key=lambda item: (
+                bool(item.get("active_gate_safe")),
+                bool(item.get("geometry_safe")),
+                float(item.get("score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        selected: List[Dict[str, Any]] = []
+        min_sep = max(0.0, float(self.config.candidate_probe_min_separation_m))
+        for candidate in ordered:
+            if len(selected) >= max_candidates:
+                break
+            xy = np.asarray(candidate.get("xy", [0.0, 0.0])[:2], dtype=np.float32)
+            too_close = False
+            for existing in selected:
+                other_xy = np.asarray(existing.get("xy", [0.0, 0.0])[:2], dtype=np.float32)
+                if float(np.linalg.norm(xy - other_xy)) < min_sep:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+            selected.append(candidate)
+        return selected
+
     def finish_episode(self, *, metrics: Optional[Dict[str, Any]] = None, steps: Optional[int] = None) -> Dict[str, Any]:
         if not self.enabled:
             return {}
@@ -626,6 +1027,40 @@ class SparseOccSemanticMemory:
                     dead_zone_with_frontier_count += 1
                     if frontier_direction:
                         dead_zone_frontier_direction_counts[str(frontier_direction)] += 1
+        candidate_event_count = len(self.candidate_probe_events)
+        candidate_valid_event_count = 0
+        candidate_count_sum = 0
+        candidate_geometry_safe_sum = 0
+        candidate_active_gate_safe_sum = 0
+        candidate_current_aligned_sum = 0
+        candidate_type_counts: Dict[str, int] = defaultdict(int)
+        candidate_direction_counts: Dict[str, int] = defaultdict(int)
+        for event in self.candidate_probe_events:
+            if event.get("valid"):
+                candidate_valid_event_count += 1
+            candidate_count_sum += int(event.get("candidate_count", 0) or 0)
+            candidate_geometry_safe_sum += int(event.get("candidate_geometry_safe_count", 0) or 0)
+            candidate_active_gate_safe_sum += int(event.get("candidate_active_gate_safe_count", 0) or 0)
+            candidate_current_aligned_sum += int(event.get("candidate_current_aligned_count", 0) or 0)
+            for key, value in (event.get("candidate_type_counts") or {}).items():
+                candidate_type_counts[str(key)] += int(value or 0)
+            for key, value in (event.get("candidate_direction_counts") or {}).items():
+                candidate_direction_counts[str(key)] += int(value or 0)
+        selection_event_count = len(self.candidate_selection_events)
+        selection_valid_count = 0
+        selection_none_count = 0
+        selection_active_gate_safe_count = 0
+        selection_current_aligned_count = 0
+        for event in self.candidate_selection_events:
+            if event.get("selection_valid"):
+                selection_valid_count += 1
+            if event.get("selection_none"):
+                selection_none_count += 1
+            selected = event.get("selected_candidate") or {}
+            if selected.get("active_gate_safe"):
+                selection_active_gate_safe_count += 1
+            if selected.get("aligned_with_current_waypoint"):
+                selection_current_aligned_count += 1
         if self.config.validation_enable and self.config.validation_save_final_memory_ply:
             self._write_final_validation_snapshot({"step_id": steps, "final": True})
         final_frontier_summary = {}
@@ -656,6 +1091,27 @@ class SparseOccSemanticMemory:
             "semantic_high_conf_event_count": int(len(high_conf_events)),
             "semantic_high_conf_keyframe_count": int(len(high_conf_keyframes)),
             "waypoint_probe_count": int(len(self.waypoint_events)),
+            "candidate_probe_event_count": int(candidate_event_count),
+            "candidate_probe_valid_event_count": int(candidate_valid_event_count),
+            "candidate_probe_mean_candidate_count": (
+                float(candidate_count_sum / candidate_event_count) if candidate_event_count else None
+            ),
+            "candidate_probe_mean_geometry_safe_count": (
+                float(candidate_geometry_safe_sum / candidate_event_count) if candidate_event_count else None
+            ),
+            "candidate_probe_mean_active_gate_safe_count": (
+                float(candidate_active_gate_safe_sum / candidate_event_count) if candidate_event_count else None
+            ),
+            "candidate_probe_mean_current_aligned_count": (
+                float(candidate_current_aligned_sum / candidate_event_count) if candidate_event_count else None
+            ),
+            "candidate_probe_type_counts": dict(candidate_type_counts),
+            "candidate_probe_direction_counts": dict(candidate_direction_counts),
+            "candidate_selection_event_count": int(selection_event_count),
+            "candidate_selection_valid_count": int(selection_valid_count),
+            "candidate_selection_none_count": int(selection_none_count),
+            "candidate_selection_active_gate_safe_count": int(selection_active_gate_safe_count),
+            "candidate_selection_current_aligned_count": int(selection_current_aligned_count),
             "waypoint_goal_state_counts": dict(waypoint_state_counts),
             "waypoint_mean_frontier_distance_m": (
                 float(np.mean(frontier_distances)) if frontier_distances else None
@@ -695,6 +1151,7 @@ class SparseOccSemanticMemory:
             "final_frontier_dominant_angle_deg": final_frontier_summary.get("dominant_angle_deg"),
             "final_frontier_direction_entropy": final_frontier_summary.get("direction_entropy"),
             "bev_snapshot_count": int(self.saved_bev_count),
+            "candidate_bev_snapshot_count": int(self.saved_candidate_bev_count),
             "validation_snapshot_count": int(self.saved_validation_count),
             "validation_final_snapshot_count": int(self.saved_validation_final_count),
         }
@@ -1066,6 +1523,8 @@ class SparseOccSemanticMemory:
         direction = self._direction_to_xy(start_xy, [float(best.get("x", 0.0)), float(best.get("y", 0.0))], yaw)
         return {
             "step_id": best.get("step_id"),
+            "grid": [int(best.get("row", 0)), int(best.get("col", 0))],
+            "xy": [float(best.get("x", 0.0)), float(best.get("y", 0.0))],
             "semantic_top_match": best.get("semantic_top_match"),
             "semantic_top_score": best.get("semantic_top_score"),
             "distance_m": best_dist,
@@ -1274,6 +1733,100 @@ class SparseOccSemanticMemory:
         path = os.path.join(out_dir, f"bev_ep{self.episode_meta.get('episode_id')}_{step_text}_{suffix}.png")
         img.save(path)
         self.saved_bev_count += 1
+
+    def _write_candidate_bev_snapshot(
+        self,
+        candidates: List[Dict[str, Any]],
+        context: Dict[str, Any],
+    ) -> Optional[str]:
+        if not self.debug_dir:
+            return None
+        if (
+            self.config.candidate_probe_max_bev_snapshots >= 0
+            and self.saved_candidate_bev_count >= self.config.candidate_probe_max_bev_snapshots
+        ):
+            return None
+        try:
+            from PIL import Image, ImageDraw
+        except Exception:
+            return None
+        out_dir = os.path.join(self.debug_dir, "occ_memory", "candidates")
+        os.makedirs(out_dir, exist_ok=True)
+        center = self.last_pose_grid or (self.gs // 2, self.gs // 2)
+        radius = max(10, int(self.config.bev_crop_radius_cells))
+        scale = max(1, int(self.config.bev_cell_scale))
+        r0 = max(0, int(center[0]) - radius)
+        r1 = min(self.gs, int(center[0]) + radius + 1)
+        c0 = max(0, int(center[1]) - radius)
+        c1 = min(self.gs, int(center[1]) + radius + 1)
+        h = max(1, r1 - r0)
+        w = max(1, c1 - c0)
+        image = np.zeros((h, w, 3), dtype=np.uint8)
+        image[:, :] = np.array([28, 28, 30], dtype=np.uint8)
+        for row, col in self.free2d_counts.keys():
+            if r0 <= row < r1 and c0 <= col < c1:
+                image[row - r0, col - c0] = np.array([42, 95, 66], dtype=np.uint8)
+        for row, col in self.occ2d_counts.keys():
+            if r0 <= row < r1 and c0 <= col < c1:
+                image[row - r0, col - c0] = np.array([205, 72, 62], dtype=np.uint8)
+        for row, col in self.get_frontier_cells(sample_limit=4000):
+            if r0 <= row < r1 and c0 <= col < c1:
+                image[row - r0, col - c0] = np.array([235, 195, 71], dtype=np.uint8)
+        img = Image.fromarray(image, mode="RGB").resize((w * scale, h * scale), resample=Image.NEAREST)
+        draw = ImageDraw.Draw(img)
+
+        def to_xy(row: int, col: int) -> Tuple[int, int]:
+            return int((col - c0) * scale + scale / 2), int((row - r0) * scale + scale / 2)
+
+        if len(self.pose_trace) >= 2:
+            pts = [
+                to_xy(item["row"], item["col"])
+                for item in self.pose_trace
+                if r0 <= item["row"] < r1 and c0 <= item["col"] < c1
+            ]
+            if len(pts) >= 2:
+                draw.line(pts, fill=(95, 160, 245), width=max(1, scale))
+        if self.last_pose_grid is not None:
+            x, y = to_xy(self.last_pose_grid[0], self.last_pose_grid[1])
+            rad = max(4, scale + 2)
+            draw.ellipse((x - rad, y - rad, x + rad, y + rad), fill=(255, 255, 255))
+        color_by_type = {
+            "frontier": (255, 225, 80),
+            "semantic_keyframe": (240, 105, 255),
+            "open_floor": (90, 220, 225),
+        }
+        for candidate in candidates:
+            grid = candidate.get("grid") or []
+            if len(grid) < 2:
+                continue
+            row, col = int(grid[0]), int(grid[1])
+            if not (r0 <= row < r1 and c0 <= col < c1):
+                continue
+            x, y = to_xy(row, col)
+            label = str(candidate.get("candidate_id") or "?")
+            color = color_by_type.get(str(candidate.get("candidate_type")), (255, 255, 255))
+            rad = max(7, scale * 3)
+            draw.ellipse((x - rad, y - rad, x + rad, y + rad), fill=color, outline=(0, 0, 0), width=2)
+            draw.text((x - 3, y - 6), label, fill=(0, 0, 0))
+        label = (
+            f"V10 candidates={len(candidates)} "
+            f"occ={len(self.occ2d_counts)} free={len(self.free2d_counts)} "
+            f"frontier={len(self.get_frontier_cells(sample_limit=0))}"
+        )
+        draw.rectangle((0, 0, max(320, len(label) * 7), 18), fill=(18, 18, 18))
+        draw.text((4, 3), label, fill=(240, 240, 240))
+        step = context.get("step_id")
+        step_text = "none" if step is None else str(step)
+        path = os.path.join(
+            out_dir,
+            (
+                f"candidates_ep{self.episode_meta.get('episode_id')}_"
+                f"step{step_text}_{self.saved_candidate_bev_count:03d}.png"
+            ),
+        )
+        img.save(path)
+        self.saved_candidate_bev_count += 1
+        return path
 
     def _maybe_write_validation_snapshot(
         self,
