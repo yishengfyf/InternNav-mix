@@ -693,6 +693,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "max_hints_per_episode": int(vlmap_safety_cfg.get("occ_memory_guidance_max_hints_per_episode", 2)),
             "requery_on_trigger": bool(vlmap_safety_cfg.get("occ_memory_guidance_requery_on_trigger", False)),
             "prompt_hint": vlmap_safety_cfg.get("occ_memory_guidance_prompt_hint"),
+            "counterfactual_enable": bool(
+                vlmap_safety_cfg.get("occ_memory_guidance_counterfactual_enable", False)
+            ),
+            "counterfactual_max_queries_per_episode": int(
+                vlmap_safety_cfg.get("occ_memory_guidance_counterfactual_max_queries_per_episode", 2)
+            ),
+            "counterfactual_pixel_shift_threshold": float(
+                vlmap_safety_cfg.get("occ_memory_guidance_counterfactual_pixel_shift_threshold", 40.0)
+            ),
         }
 
     def _format_occ_memory_guidance_hint(self, decision: dict) -> str:
@@ -838,6 +847,146 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         cuda_state = state.get("cuda_all")
         if cuda_state is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(cuda_state)
+
+    def _generate_s2_text_from_prompt_instruction(
+        self,
+        prompt_instruction: str,
+        input_images: list,
+        *,
+        messages_prefix: Optional[list] = None,
+        max_new_tokens: int = 128,
+    ) -> str:
+        parts = split_and_clean(prompt_instruction)
+        content = []
+        input_img_id = 0
+        for part in parts:
+            if part == DEFAULT_IMAGE_TOKEN:
+                if input_img_id >= len(input_images):
+                    raise ValueError(
+                        "S2 prompt contains more image tokens than provided images: "
+                        f"{len(input_images)} images"
+                    )
+                content.append({"type": "image", "image": input_images[input_img_id]})
+                input_img_id += 1
+            else:
+                content.append({"type": "text", "text": part})
+
+        messages = list(messages_prefix or [])
+        messages.append({"role": "user", "content": content})
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                past_key_values=None,
+                return_dict_in_generate=True,
+            ).sequences
+
+        return self.processor.tokenizer.decode(
+            output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
+        )
+
+    def _run_occ_memory_guidance_counterfactual(
+        self,
+        *,
+        base_prompt_body: str,
+        final_prompt: str,
+        input_images: list,
+        messages_prefix: Optional[list],
+        base_output: str,
+        hint: str,
+        decision: dict,
+        context: dict,
+        image_width: int,
+    ) -> dict:
+        cfg = self._get_occ_memory_guidance_cfg()
+        threshold = float(cfg.get("counterfactual_pixel_shift_threshold", 40.0) or 40.0)
+        event = {
+            "counterfactual_status": "ok",
+            "counterfactual_base_output": base_output,
+        }
+        rng_state = self._capture_torch_rng_state()
+        try:
+            hinted_prompt_instruction = f"{base_prompt_body} {hint} {final_prompt}."
+            hinted_output = self._generate_s2_text_from_prompt_instruction(
+                hinted_prompt_instruction,
+                input_images,
+                messages_prefix=messages_prefix,
+                max_new_tokens=128,
+            )
+        except Exception as exc:
+            hinted_output = ""
+            event["counterfactual_status"] = "error"
+            event["counterfactual_error"] = str(exc)
+        finally:
+            self._restore_torch_rng_state(rng_state)
+
+        base_parse = self._parse_s2_candidate_output(base_output, image_width=image_width)
+        hinted_parse = self._parse_s2_candidate_output(hinted_output, image_width=image_width)
+        event.update(
+            {
+                "counterfactual_hinted_output": hinted_output,
+                "counterfactual_base_valid": bool(base_parse.get("valid")),
+                "counterfactual_hinted_valid": bool(hinted_parse.get("valid")),
+                "counterfactual_base_is_stop": bool(base_parse.get("is_stop")),
+                "counterfactual_hinted_is_stop": bool(hinted_parse.get("is_stop")),
+                "counterfactual_base_pixel_goal": base_parse.get("pixel_goal"),
+                "counterfactual_hinted_pixel_goal": hinted_parse.get("pixel_goal"),
+                "counterfactual_base_image_direction": base_parse.get("direction_bucket"),
+                "counterfactual_hinted_image_direction": hinted_parse.get("direction_bucket"),
+            }
+        )
+
+        if base_parse.get("valid") and hinted_parse.get("valid"):
+            base_goal = base_parse["pixel_goal"]
+            hinted_goal = hinted_parse["pixel_goal"]
+            dx = float(hinted_goal[0]) - float(base_goal[0])
+            dy = float(hinted_goal[1]) - float(base_goal[1])
+            pixel_shift = float(np.hypot(dx, dy))
+            frontier_direction = str(decision.get("frontier_dominant_direction") or "unknown")
+            if frontier_direction == "right":
+                follows_hint = dx >= threshold
+            elif frontier_direction == "left":
+                follows_hint = dx <= -threshold
+            else:
+                follows_hint = None
+            event.update(
+                {
+                    "counterfactual_pixel_shift": pixel_shift,
+                    "counterfactual_pixel_dx": dx,
+                    "counterfactual_pixel_dy": dy,
+                    "counterfactual_changed_pixel": pixel_shift >= threshold,
+                    "counterfactual_changed_image_direction": (
+                        base_parse.get("direction_bucket") != hinted_parse.get("direction_bucket")
+                    ),
+                    "counterfactual_follows_left_right_hint": follows_hint,
+                }
+            )
+        else:
+            event.update(
+                {
+                    "counterfactual_pixel_shift": None,
+                    "counterfactual_pixel_dx": None,
+                    "counterfactual_pixel_dy": None,
+                    "counterfactual_changed_pixel": False,
+                    "counterfactual_changed_image_direction": False,
+                    "counterfactual_follows_left_right_hint": None,
+                }
+            )
+
+        self.occ_memory.record_guidance_event(
+            action="counterfactual",
+            hint=hint,
+            reason="shadow_steerability_probe",
+            decision=decision,
+            context=context,
+            extra=event,
+        )
+        return event
 
     def _write_s2_candidate_probe_event(self, event: dict) -> None:
         run_dir = self._get_vlmap_run_dir()
@@ -1501,6 +1650,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             occ_memory_guidance_injection_step = None
             occ_memory_guidance_last_set_step = None
             occ_memory_guidance_not_injected_reason = None
+            occ_memory_guidance_counterfactual_count = 0
+            occ_memory_guidance_counterfactual_valid_count = 0
+            occ_memory_guidance_counterfactual_changed_count = 0
+            occ_memory_guidance_counterfactual_direction_changed_count = 0
+            occ_memory_guidance_counterfactual_left_right_follow_count = 0
+            occ_memory_guidance_counterfactual_pixel_shift_sum = 0.0
             rejected_vlmap_goal_grids = []
             s2_candidate_probe_s2_query_count = 0
             s2_candidate_probe_event_count = 0
@@ -1669,9 +1824,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         pending_vlmap_semantic_hint = ""
                         semantic_hint_not_injected_reason = None
 
+                    s2_prompt_body_before_final_prompt = copy.deepcopy(sources[0]["value"])
                     prompt = self._select_s2_prompt_prefix() + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
+                    s2_counterfactual_messages_prefix = list(messages)
                     parts = split_and_clean(prompt_instruction)
 
                     content = []
@@ -1920,6 +2077,47 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 decision=occ_waypoint_decision,
                                 context=guidance_context,
                             )
+                            counterfactual_max_queries = int(
+                                guidance_cfg.get("counterfactual_max_queries_per_episode", 2) or 0
+                            )
+                            counterfactual_allowed = (
+                                bool(guidance_cfg.get("counterfactual_enable"))
+                                and (
+                                    counterfactual_max_queries <= 0
+                                    or occ_memory_guidance_counterfactual_count < counterfactual_max_queries
+                                )
+                            )
+                            if counterfactual_allowed:
+                                counterfactual_event = self._run_occ_memory_guidance_counterfactual(
+                                    base_prompt_body=s2_prompt_body_before_final_prompt,
+                                    final_prompt=prompt,
+                                    input_images=input_images,
+                                    messages_prefix=s2_counterfactual_messages_prefix,
+                                    base_output=llm_outputs,
+                                    hint=occ_memory_guidance_hint,
+                                    decision=occ_waypoint_decision,
+                                    context=guidance_context,
+                                    image_width=int(self.model_args.resize_w),
+                                )
+                                occ_memory_guidance_counterfactual_count += 1
+                                if counterfactual_event.get("counterfactual_hinted_valid"):
+                                    occ_memory_guidance_counterfactual_valid_count += 1
+                                if counterfactual_event.get("counterfactual_changed_pixel"):
+                                    occ_memory_guidance_counterfactual_changed_count += 1
+                                if counterfactual_event.get("counterfactual_changed_image_direction"):
+                                    occ_memory_guidance_counterfactual_direction_changed_count += 1
+                                if counterfactual_event.get("counterfactual_follows_left_right_hint"):
+                                    occ_memory_guidance_counterfactual_left_right_follow_count += 1
+                                pixel_shift = counterfactual_event.get("counterfactual_pixel_shift")
+                                if isinstance(pixel_shift, (int, float)):
+                                    occ_memory_guidance_counterfactual_pixel_shift_sum += float(pixel_shift)
+                                print(
+                                    "[OccMemory][Habitat][Guidance] counterfactual S2 hint; "
+                                    f"status={counterfactual_event.get('counterfactual_status')} "
+                                    f"base={counterfactual_event.get('counterfactual_base_pixel_goal')} "
+                                    f"hinted={counterfactual_event.get('counterfactual_hinted_pixel_goal')} "
+                                    f"shift={counterfactual_event.get('counterfactual_pixel_shift')}"
+                                )
                             if guidance_cfg.get("shadow_only"):
                                 occ_memory_guidance_shadow_skip_count += 1
                                 self.occ_memory.record_guidance_event(
@@ -2521,6 +2719,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result["occ_memory_guidance_first_injection_step"] = occ_memory_guidance_injection_step
             result["occ_memory_guidance_pending_at_end"] = bool(pending_occ_memory_guidance_hint)
             result["occ_memory_guidance_not_injected_reason"] = occ_memory_guidance_not_injected_reason
+            result["occ_memory_guidance_counterfactual_count"] = occ_memory_guidance_counterfactual_count
+            result["occ_memory_guidance_counterfactual_valid_count"] = (
+                occ_memory_guidance_counterfactual_valid_count
+            )
+            result["occ_memory_guidance_counterfactual_changed_count"] = (
+                occ_memory_guidance_counterfactual_changed_count
+            )
+            result["occ_memory_guidance_counterfactual_direction_changed_count"] = (
+                occ_memory_guidance_counterfactual_direction_changed_count
+            )
+            result["occ_memory_guidance_counterfactual_left_right_follow_count"] = (
+                occ_memory_guidance_counterfactual_left_right_follow_count
+            )
+            if occ_memory_guidance_counterfactual_valid_count > 0:
+                result["occ_memory_guidance_counterfactual_mean_pixel_shift"] = (
+                    occ_memory_guidance_counterfactual_pixel_shift_sum
+                    / float(occ_memory_guidance_counterfactual_valid_count)
+                )
+            else:
+                result["occ_memory_guidance_counterfactual_mean_pixel_shift"] = None
             if occ_memory_summary:
                 result["occ_memory_update_count"] = occ_memory_summary.get("update_count")
                 result["occ_memory_occupied_voxel_count"] = occ_memory_summary.get("occupied_voxel_count")

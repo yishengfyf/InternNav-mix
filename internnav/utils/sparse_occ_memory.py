@@ -430,6 +430,7 @@ class SparseOccSemanticMemory:
         decision: Optional[Dict[str, Any]] = None,
         hint: str = "",
         reason: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         event = {
             "event_type": "occ_memory_guidance",
@@ -461,6 +462,8 @@ class SparseOccSemanticMemory:
                     "start_grid": decision.get("start_grid"),
                 }
             )
+        if extra:
+            event.update(extra)
         self._write_event(event)
         return event
 
