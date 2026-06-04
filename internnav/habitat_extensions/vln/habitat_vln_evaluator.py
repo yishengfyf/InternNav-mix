@@ -782,9 +782,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "selection_max_new_tokens": int(
                 vlmap_safety_cfg.get("occ_memory_candidate_selection_max_new_tokens", 32)
             ),
+            "selection_parse_coordinates": bool(
+                vlmap_safety_cfg.get("occ_memory_candidate_selection_parse_coordinates", False)
+            ),
+            "selection_coordinate_threshold_px": float(
+                vlmap_safety_cfg.get("occ_memory_candidate_selection_coordinate_threshold_px", 90.0)
+            ),
         }
 
     def _format_occ_memory_candidate_selection_prompt(self, candidate_event: dict) -> str:
+        cfg = self._get_occ_memory_candidate_probe_cfg()
         candidates = candidate_event.get("candidates") or []
         lines = [
             "Sparse 3D memory proposes several candidate navigation targets.",
@@ -792,6 +799,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "If none of the candidates are useful, answer NONE.",
             "Answer only one token: A, B, C, D, or NONE.",
         ]
+        if cfg.get("selection_parse_coordinates"):
+            lines[-1] = (
+                "Answer A, B, C, D, or NONE. If you prefer pointing on the final top-down memory map, "
+                "output one coordinate on that final map."
+            )
         current_state = candidate_event.get("current_waypoint_goal_state")
         current_dead_zone = candidate_event.get("current_waypoint_semantic_dead_zone")
         if current_state is not None or current_dead_zone is not None:
@@ -806,7 +818,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if semantic.get("semantic_top_match"):
                 semantic_text = (
                     f", semantic={semantic.get('semantic_top_match')} "
-                    f"score={semantic.get('semantic_top_score')}"
+                    f"score={semantic.get('semantic_top_score')} "
+                    f"instruction_relevance={float(item.get('semantic_relevance_score') or 0.0):.2f} "
+                    f"novelty={float(item.get('semantic_novelty_score') or 0.0):.2f}"
                 )
             angle_to_current = item.get("angle_to_current_waypoint_deg")
             angle_text = "unknown" if angle_to_current is None else f"{float(angle_to_current):.1f}deg"
@@ -817,6 +831,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 f"distance={float(item.get('distance_m') or 0.0):.2f}m, "
                 f"geometry={item.get('goal_state')}, "
                 f"frontier_progress={float(item.get('frontier_progress_score') or 0.0):.2f}, "
+                f"topology_novelty={float(item.get('topology_novelty_score') or 0.0):.2f}, "
                 f"revisit_risk={float(item.get('revisit_risk') or 0.0):.2f}, "
                 f"angle_to_original={angle_text}"
                 f"{semantic_text}."
@@ -824,6 +839,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         return " ".join(lines)
 
     def _parse_occ_memory_candidate_choice_output(self, text: str, candidates: list) -> dict:
+        cfg = self._get_occ_memory_candidate_probe_cfg()
         text = "" if text is None else str(text)
         upper_text = text.upper()
         labels = {
@@ -848,6 +864,80 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "selected_candidate": labels[label],
                     "reason": "matched_label",
                 }
+        if cfg.get("selection_parse_coordinates"):
+            numbers = [int(item) for item in re.findall(r"\d+", text)]
+            if len(numbers) >= 2:
+                # Existing S2 waypoint convention is "row col"; test both
+                # conventions against BEV candidate centers and keep the closer
+                # one because this is only a shadow parser.
+                raw_a = [float(numbers[1]), float(numbers[0])]
+                raw_b = [float(numbers[0]), float(numbers[1])]
+                best = None
+                best_distance = None
+                best_convention = None
+                for convention, point in (("row_col", raw_a), ("x_y", raw_b)):
+                    for item in candidates:
+                        bev_pixel = item.get("bev_pixel")
+                        if not bev_pixel or len(bev_pixel) < 2:
+                            continue
+                        dist = float(
+                            np.hypot(
+                                float(point[0]) - float(bev_pixel[0]),
+                                float(point[1]) - float(bev_pixel[1]),
+                            )
+                        )
+                        if best_distance is None or dist < best_distance:
+                            best = item
+                            best_distance = dist
+                            best_convention = convention
+                threshold = float(cfg.get("selection_coordinate_threshold_px", 90.0) or 90.0)
+                if best is not None and best_distance is not None and best_distance <= threshold:
+                    return {
+                        "valid": True,
+                        "none": False,
+                        "choice": best.get("candidate_id"),
+                        "selected_candidate": best,
+                        "reason": "nearest_bev_coordinate",
+                        "coordinate_numbers": numbers[:2],
+                        "coordinate_distance_px": best_distance,
+                        "coordinate_convention": best_convention,
+                        "coordinate_threshold_px": threshold,
+                    }
+                return {
+                    "valid": False,
+                    "none": False,
+                    "choice": None,
+                    "selected_candidate": None,
+                    "reason": "coordinate_too_far",
+                    "coordinate_numbers": numbers[:2],
+                    "coordinate_distance_px": best_distance,
+                    "coordinate_threshold_px": threshold,
+                }
+            arrow_direction = None
+            if "←" in text:
+                arrow_direction = "left"
+            elif "→" in text:
+                arrow_direction = "right"
+            elif "↑" in text:
+                arrow_direction = "front"
+            elif "↓" in text:
+                arrow_direction = "back"
+            if arrow_direction:
+                options = [
+                    item
+                    for item in candidates
+                    if item.get("direction_bucket") == arrow_direction
+                ]
+                if options:
+                    selected = max(options, key=lambda item: float(item.get("score", 0.0) or 0.0))
+                    return {
+                        "valid": True,
+                        "none": False,
+                        "choice": selected.get("candidate_id"),
+                        "selected_candidate": selected,
+                        "reason": "direction_token",
+                        "direction_token": arrow_direction,
+                    }
         return {
             "valid": False,
             "none": False,
@@ -1820,6 +1910,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             occ_memory_candidate_selection_active_gate_safe_count = 0
             occ_memory_candidate_selection_current_aligned_count = 0
             occ_memory_candidate_selection_error_count = 0
+            occ_memory_candidate_selection_label_count = 0
+            occ_memory_candidate_selection_coordinate_count = 0
+            occ_memory_candidate_selection_direction_count = 0
+            occ_memory_candidate_selection_semanticized_count = 0
+            occ_memory_candidate_selection_instruction_relevant_count = 0
             rejected_vlmap_goal_grids = []
             s2_candidate_probe_s2_query_count = 0
             s2_candidate_probe_event_count = 0
@@ -2206,6 +2301,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                         occ_memory_candidate_selection_error_count += 1
                                     if selection_event.get("valid"):
                                         occ_memory_candidate_selection_valid_count += 1
+                                        reason = selection_event.get("reason")
+                                        if reason == "matched_label":
+                                            occ_memory_candidate_selection_label_count += 1
+                                        elif reason == "nearest_bev_coordinate":
+                                            occ_memory_candidate_selection_coordinate_count += 1
+                                        elif reason == "direction_token":
+                                            occ_memory_candidate_selection_direction_count += 1
                                     if selection_event.get("none"):
                                         occ_memory_candidate_selection_none_count += 1
                                     selected_candidate = selection_event.get("selected_candidate") or {}
@@ -2213,6 +2315,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                         occ_memory_candidate_selection_active_gate_safe_count += 1
                                     if selected_candidate.get("aligned_with_current_waypoint"):
                                         occ_memory_candidate_selection_current_aligned_count += 1
+                                    if selected_candidate.get("semanticized_candidate"):
+                                        occ_memory_candidate_selection_semanticized_count += 1
+                                    if selected_candidate.get("instruction_relevant"):
+                                        occ_memory_candidate_selection_instruction_relevant_count += 1
                         if occ_waypoint_decision.get("valid") and occ_waypoint_decision.get("goal_state") != "free":
                             print(
                                 "[OccMemory][Habitat][Waypoint] "
@@ -3018,6 +3124,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result["occ_memory_candidate_selection_error_count"] = (
                     occ_memory_candidate_selection_error_count
                 )
+                result["occ_memory_candidate_selection_label_count"] = (
+                    occ_memory_candidate_selection_label_count
+                )
+                result["occ_memory_candidate_selection_coordinate_count"] = (
+                    occ_memory_candidate_selection_coordinate_count
+                )
+                result["occ_memory_candidate_selection_direction_count"] = (
+                    occ_memory_candidate_selection_direction_count
+                )
                 result["occ_memory_candidate_selection_valid_ratio"] = (
                     occ_memory_candidate_selection_valid_count
                     / max(1, occ_memory_candidate_selection_query_count)
@@ -3027,6 +3142,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["occ_memory_candidate_selection_current_aligned_count"] = (
                     occ_memory_candidate_selection_current_aligned_count
+                )
+                result["occ_memory_candidate_selection_semanticized_count"] = (
+                    occ_memory_candidate_selection_semanticized_count
+                )
+                result["occ_memory_candidate_selection_instruction_relevant_count"] = (
+                    occ_memory_candidate_selection_instruction_relevant_count
                 )
             if occ_memory_summary:
                 result["occ_memory_update_count"] = occ_memory_summary.get("update_count")
@@ -3048,12 +3169,28 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result["occ_memory_candidate_probe_summary_mean_candidate_count"] = (
                     occ_memory_summary.get("candidate_probe_mean_candidate_count")
                 )
+                result["occ_memory_candidate_probe_summary_mean_semantic_evidence_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_semantic_evidence_count")
+                )
+                result["occ_memory_candidate_probe_summary_mean_instruction_relevant_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_instruction_relevant_count")
+                )
+                result["occ_memory_candidate_probe_summary_mean_semanticized_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_semanticized_count")
+                )
                 result["occ_memory_candidate_selection_summary_event_count"] = (
                     occ_memory_summary.get("candidate_selection_event_count")
                 )
                 result["occ_memory_candidate_selection_summary_valid_count"] = (
                     occ_memory_summary.get("candidate_selection_valid_count")
                 )
+                candidate_selection_reason_counts = (
+                    occ_memory_summary.get("candidate_selection_reason_counts") or {}
+                )
+                for reason_key, reason_count in candidate_selection_reason_counts.items():
+                    result[f"occ_memory_candidate_selection_reason_{reason_key}_count"] = (
+                        reason_count
+                    )
                 result["occ_memory_waypoint_mean_frontier_distance_m"] = (
                     occ_memory_summary.get("waypoint_mean_frontier_distance_m")
                 )

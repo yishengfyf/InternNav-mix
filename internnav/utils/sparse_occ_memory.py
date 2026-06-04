@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -127,6 +128,16 @@ class SparseOccMemoryConfig:
     candidate_probe_max_distance_m: float = 4.0
     candidate_probe_min_separation_m: float = 0.50
     candidate_probe_exclude_back_frontier: bool = True
+    candidate_probe_semantic_enable: bool = False
+    candidate_probe_semantic_high_conf_only: bool = False
+    candidate_probe_semantic_min_score: float = 0.20
+    candidate_probe_semantic_max_candidates: int = 3
+    candidate_probe_semantic_bind_radius_m: float = 2.50
+    candidate_probe_semantic_direction_match_degrees: float = 75.0
+    candidate_probe_semantic_frontier_min_relevance: float = 0.15
+    candidate_probe_semantic_score_weight: float = 0.90
+    candidate_probe_semantic_novelty_weight: float = 0.45
+    candidate_probe_topology_novelty_weight: float = 0.35
     candidate_probe_save_bev: bool = True
     candidate_probe_max_bev_snapshots: int = 12
     save_bev: bool = True
@@ -637,6 +648,7 @@ class SparseOccSemanticMemory:
         yaw = float(pose_state["yaw"])
         current_angle = decision.get("waypoint_direction_angle_deg")
         current_goal_grid = decision.get("goal_grid")
+        semantic_nodes = self._semantic_memory_nodes(start_grid, yaw)
         raw_candidates: List[Dict[str, Any]] = []
         raw_candidates.extend(
             self._frontier_query_candidates(
@@ -644,22 +656,25 @@ class SparseOccSemanticMemory:
                 yaw,
                 current_angle=current_angle,
                 current_goal_grid=current_goal_grid,
+                semantic_nodes=semantic_nodes,
             )
         )
-        semantic_candidate = self._semantic_query_candidate(
-            start_grid,
-            yaw,
-            current_angle=current_angle,
-            current_goal_grid=current_goal_grid,
+        raw_candidates.extend(
+            self._semantic_query_candidates(
+                start_grid,
+                yaw,
+                current_angle=current_angle,
+                current_goal_grid=current_goal_grid,
+                semantic_nodes=semantic_nodes,
+            )
         )
-        if semantic_candidate is not None:
-            raw_candidates.append(semantic_candidate)
         raw_candidates.extend(
             self._open_floor_query_candidates(
                 start_grid,
                 yaw,
                 current_angle=current_angle,
                 current_goal_grid=current_goal_grid,
+                semantic_nodes=semantic_nodes,
             )
         )
         candidates = self._select_query_candidates(raw_candidates)
@@ -671,6 +686,9 @@ class SparseOccSemanticMemory:
         geometry_safe_count = 0
         active_gate_safe_count = 0
         current_aligned_count = 0
+        semantic_evidence_count = 0
+        instruction_relevant_count = 0
+        semanticized_count = 0
         for item in candidates:
             candidate_types[str(item.get("candidate_type", "unknown"))] += 1
             direction_counts[str(item.get("direction_bucket", "unknown"))] += 1
@@ -680,6 +698,12 @@ class SparseOccSemanticMemory:
                 active_gate_safe_count += 1
             if item.get("aligned_with_current_waypoint"):
                 current_aligned_count += 1
+            if item.get("semantic_evidence"):
+                semantic_evidence_count += 1
+            if item.get("instruction_relevant"):
+                instruction_relevant_count += 1
+            if item.get("semanticized_candidate"):
+                semanticized_count += 1
         bev_path = None
         if self.config.candidate_probe_save_bev and candidates:
             bev_path = self._write_candidate_bev_snapshot(candidates, context)
@@ -702,6 +726,11 @@ class SparseOccSemanticMemory:
                 "candidate_geometry_safe_count": int(geometry_safe_count),
                 "candidate_active_gate_safe_count": int(active_gate_safe_count),
                 "candidate_current_aligned_count": int(current_aligned_count),
+                "candidate_semantic_evidence_count": int(semantic_evidence_count),
+                "candidate_instruction_relevant_count": int(instruction_relevant_count),
+                "candidate_semanticized_count": int(semanticized_count),
+                "semantic_memory_node_count": int(len(semantic_nodes)),
+                "instruction_terms": self._instruction_terms(),
                 "candidate_best_score": (
                     float(candidates[0].get("score", 0.0)) if candidates else None
                 ),
@@ -733,6 +762,10 @@ class SparseOccSemanticMemory:
             "selection_none": bool(selection.get("none")),
             "selection_choice": selection.get("choice"),
             "selection_reason": selection.get("reason"),
+            "selection_coordinate_numbers": selection.get("coordinate_numbers"),
+            "selection_coordinate_distance_px": selection.get("coordinate_distance_px"),
+            "selection_coordinate_convention": selection.get("coordinate_convention"),
+            "selection_direction_token": selection.get("direction_token"),
             "selected_candidate": selection.get("selected_candidate"),
         }
         self.candidate_selection_events.append(event)
@@ -767,12 +800,14 @@ class SparseOccSemanticMemory:
         *,
         current_angle: Any,
         current_goal_grid: Any,
+        semantic_nodes: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         best_by_bucket: Dict[str, Dict[str, Any]] = {}
         frontiers = self.get_frontier_cells(
             sample_limit=int(self.config.candidate_probe_frontier_sample_limit)
         )
         for cell in frontiers:
+            semantic = self._semantic_evidence_for_cell(cell, start_grid, yaw, semantic_nodes)
             candidate = self._build_query_candidate(
                 cell,
                 "frontier",
@@ -781,6 +816,7 @@ class SparseOccSemanticMemory:
                 current_angle=current_angle,
                 current_goal_grid=current_goal_grid,
                 source_score=1.0,
+                semantic=semantic,
             )
             if candidate is None:
                 continue
@@ -799,6 +835,7 @@ class SparseOccSemanticMemory:
         *,
         current_angle: Any,
         current_goal_grid: Any,
+        semantic_nodes: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         cells = [cell for cell in self.free2d_counts.keys() if cell not in self.occ2d_counts]
         limit = int(self.config.candidate_probe_free_sample_limit)
@@ -807,6 +844,7 @@ class SparseOccSemanticMemory:
             cells = [cells[int(idx)] for idx in ids]
         best_by_bucket: Dict[str, Dict[str, Any]] = {}
         for cell in cells:
+            semantic = self._semantic_evidence_for_cell(cell, start_grid, yaw, semantic_nodes)
             candidate = self._build_query_candidate(
                 cell,
                 "open_floor",
@@ -815,6 +853,7 @@ class SparseOccSemanticMemory:
                 current_angle=current_angle,
                 current_goal_grid=current_goal_grid,
                 source_score=0.25,
+                semantic=semantic,
             )
             if candidate is None:
                 continue
@@ -826,27 +865,267 @@ class SparseOccSemanticMemory:
                 best_by_bucket[bucket] = candidate
         return list(best_by_bucket.values())
 
-    def _semantic_query_candidate(
+    def _semantic_query_candidates(
         self,
         start_grid: Iterable[int],
         yaw: float,
         *,
         current_angle: Any,
         current_goal_grid: Any,
+        semantic_nodes: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not self.config.candidate_probe_semantic_enable:
+            return []
+        max_items = max(0, int(self.config.candidate_probe_semantic_max_candidates))
+        if max_items <= 0:
+            return []
+        candidates = []
+        for node in sorted(
+            semantic_nodes,
+            key=lambda item: float(item.get("semantic_candidate_score", 0.0) or 0.0),
+            reverse=True,
+        ):
+            if not node.get("grid"):
+                continue
+            candidate = self._build_query_candidate(
+                node["grid"],
+                "semantic_keyframe",
+                start_grid,
+                yaw,
+                current_angle=current_angle,
+                current_goal_grid=current_goal_grid,
+                source_score=0.75,
+                semantic=node,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+            if len(candidates) >= max_items:
+                break
+        return candidates
+
+    def _semantic_memory_nodes(self, start_grid: Iterable[int], yaw: float) -> List[Dict[str, Any]]:
+        if not self.config.candidate_probe_semantic_enable:
+            return []
+        min_score = float(self.config.candidate_probe_semantic_min_score)
+        high_conf_only = bool(self.config.candidate_probe_semantic_high_conf_only)
+        instruction_terms = set(self._instruction_terms())
+        nodes: List[Dict[str, Any]] = []
+        seen = set()
+        sources = []
+        for event in self.semantic_events:
+            sources.append(("semantic_event", event))
+        for node in self.keyframes:
+            sources.append(("keyframe", node))
+        for source_type, item in sources:
+            term = item.get("top_match") or item.get("semantic_top_match")
+            if not term:
+                continue
+            score = item.get("top_score")
+            if score is None:
+                score = item.get("semantic_top_score")
+            try:
+                score_float = float(score)
+            except (TypeError, ValueError):
+                score_float = 0.0
+            high_conf = bool(item.get("high_conf_semantic"))
+            if high_conf_only and not high_conf:
+                continue
+            if score_float < min_score and not high_conf:
+                continue
+            grid = item.get("pose_grid") or item.get("grid")
+            if grid is None and item.get("row") is not None and item.get("col") is not None:
+                grid = [item.get("row"), item.get("col")]
+            if not grid or len(grid) < 2:
+                continue
+            row, col = int(grid[0]), int(grid[1])
+            key = (row, col, str(term), source_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            direction = self._direction_to_cell(start_grid, [row, col], yaw)
+            relevance = self._semantic_instruction_relevance(term, instruction_terms)
+            recent_novelty = self._semantic_recent_novelty(term)
+            confidence_score = min(1.0, max(0.0, (score_float - min_score) / max(1e-6, 0.35 - min_score)))
+            semantic_candidate_score = (
+                1.20 * relevance
+                + 0.45 * confidence_score
+                + (0.25 if high_conf else 0.0)
+                + 0.25 * recent_novelty
+                - 0.03 * float(direction.get("distance_m", 0.0) or 0.0)
+            )
+            xy = self._grid_to_xy([row, col])
+            nodes.append(
+                {
+                    "source_type": source_type,
+                    "step_id": item.get("step_id"),
+                    "grid": [int(row), int(col)],
+                    "xy": [float(xy[0]), float(xy[1])],
+                    "semantic_top_match": str(term),
+                    "semantic_top_score": score_float,
+                    "semantic_top_margin": item.get("top_margin") or item.get("semantic_top_margin"),
+                    "high_conf_semantic": high_conf,
+                    "instruction_relevance": float(relevance),
+                    "semantic_recent_novelty": float(recent_novelty),
+                    "semantic_candidate_score": float(semantic_candidate_score),
+                    "distance_m": direction.get("distance_m"),
+                    "direction_bucket": direction.get("bucket"),
+                    "direction_angle_deg": direction.get("angle_deg"),
+                }
+            )
+        return nodes
+
+    def _semantic_evidence_for_cell(
+        self,
+        cell: Iterable[int],
+        start_grid: Iterable[int],
+        yaw: float,
+        semantic_nodes: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        nearest = self._nearest_semantic_keyframe(start_grid, yaw, high_conf_only=True)
-        if not nearest or not nearest.get("grid"):
+        if not semantic_nodes:
             return None
-        return self._build_query_candidate(
-            nearest["grid"],
-            "semantic_keyframe",
-            start_grid,
-            yaw,
-            current_angle=current_angle,
-            current_goal_grid=current_goal_grid,
-            source_score=0.75,
-            semantic=nearest,
+        candidate_direction = self._direction_to_cell(start_grid, cell, yaw)
+        candidate_angle = candidate_direction.get("angle_deg")
+        candidate_xy = self._grid_to_xy(cell)
+        bind_radius = max(0.0, float(self.config.candidate_probe_semantic_bind_radius_m))
+        direction_threshold = max(
+            1.0,
+            min(180.0, float(self.config.candidate_probe_semantic_direction_match_degrees)),
         )
+        best = None
+        best_score = None
+        for node in semantic_nodes:
+            node_xy = np.asarray(node.get("xy", [0.0, 0.0])[:2], dtype=np.float32)
+            spatial_distance = float(np.linalg.norm(candidate_xy - node_xy))
+            node_angle = node.get("direction_angle_deg")
+            angle_distance = None
+            direction_aligned = False
+            try:
+                angle_distance = self._angle_distance_degrees(float(candidate_angle), float(node_angle))
+                direction_aligned = angle_distance <= direction_threshold
+            except (TypeError, ValueError):
+                pass
+            nearby = spatial_distance <= bind_radius
+            if not nearby and not direction_aligned:
+                continue
+            relevance = float(node.get("instruction_relevance", 0.0) or 0.0)
+            novelty = float(node.get("semantic_recent_novelty", 0.0) or 0.0)
+            semantic_score = float(node.get("semantic_candidate_score", 0.0) or 0.0)
+            bind_score = (
+                semantic_score
+                + 0.45 * relevance
+                + 0.20 * novelty
+                + (0.25 if nearby else 0.0)
+                + (0.20 if direction_aligned else 0.0)
+                - 0.04 * spatial_distance
+                - 0.002 * float(angle_distance if angle_distance is not None else 90.0)
+            )
+            if best_score is None or bind_score > best_score:
+                best_score = bind_score
+                best = dict(node)
+                best["bind_score"] = float(bind_score)
+                best["bind_spatial_distance_m"] = float(spatial_distance)
+                best["bind_angle_distance_deg"] = angle_distance
+                best["bind_nearby"] = bool(nearby)
+                best["bind_direction_aligned"] = bool(direction_aligned)
+        return best
+
+    def _instruction_terms(self) -> List[str]:
+        instruction = str(self.episode_meta.get("instruction") or "").lower()
+        stopwords = {
+            "a",
+            "an",
+            "and",
+            "are",
+            "at",
+            "by",
+            "go",
+            "in",
+            "into",
+            "is",
+            "keep",
+            "left",
+            "right",
+            "of",
+            "on",
+            "past",
+            "room",
+            "straight",
+            "the",
+            "then",
+            "to",
+            "toward",
+            "under",
+            "wait",
+            "walk",
+            "with",
+        }
+        tokens = [
+            token
+            for token in re.findall(r"[a-z0-9]+", instruction)
+            if len(token) >= 3 and token not in stopwords
+        ]
+        phrases = []
+        common_phrases = (
+            "living room",
+            "dining room",
+            "bedroom",
+            "bathroom",
+            "kitchen",
+            "hallway",
+            "entrance",
+            "balcony",
+            "stairs",
+            "staircase",
+            "doorway",
+            "archway",
+            "office",
+            "closet",
+            "corridor",
+        )
+        for phrase in common_phrases:
+            if phrase in instruction:
+                phrases.append(phrase)
+        return sorted(set(tokens + phrases))
+
+    def _semantic_instruction_relevance(self, term: Any, instruction_terms: Iterable[str]) -> float:
+        term_text = str(term or "").lower()
+        if not term_text:
+            return 0.0
+        term_tokens = set(re.findall(r"[a-z0-9]+", term_text))
+        terms = set(str(item).lower() for item in instruction_terms if item)
+        if not terms:
+            return 0.0
+        if term_text in terms:
+            return 1.0
+        for phrase in terms:
+            if " " in phrase and (phrase in term_text or term_text in phrase):
+                return 1.0
+        overlap = term_tokens.intersection(terms)
+        if overlap:
+            return min(1.0, float(len(overlap)) / max(1.0, float(len(term_tokens))))
+        for token in term_tokens:
+            if any(token in phrase or phrase in token for phrase in terms):
+                return 0.5
+        return 0.0
+
+    def _semantic_recent_novelty(self, term: Any) -> float:
+        term_text = str(term or "")
+        if not term_text:
+            return 0.0
+        window = max(1, int(self.config.attribution_recent_semantic_window))
+        recent_terms = [
+            str(event.get("top_match"))
+            for event in self.semantic_events[-window:]
+            if event.get("top_match")
+        ]
+        if not recent_terms:
+            return 0.5
+        if term_text not in recent_terms:
+            return 1.0
+        unique_count = len(set(recent_terms))
+        if unique_count <= int(self.config.attribution_dead_zone_unique_threshold):
+            return 0.0
+        return 0.25
 
     def _build_query_candidate(
         self,
@@ -915,9 +1194,36 @@ class SparseOccSemanticMemory:
             distance_to_current_goal_m = float(np.linalg.norm(candidate_xy - current_xy))
         except Exception:
             pass
-        semantic_evidence_score = 0.0
+        semantic_relevance_score = 0.0
+        semantic_novelty_score = 0.0
+        semantic_confidence_score = 0.0
+        semantic_bind_score = 0.0
+        instruction_relevant = False
         if semantic is not None:
-            semantic_evidence_score = 1.0
+            semantic_relevance_score = float(semantic.get("instruction_relevance", 0.0) or 0.0)
+            semantic_novelty_score = float(semantic.get("semantic_recent_novelty", 0.0) or 0.0)
+            semantic_bind_score = float(semantic.get("bind_score", 0.0) or 0.0)
+            try:
+                semantic_score = float(semantic.get("semantic_top_score", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                semantic_score = 0.0
+            min_score = float(self.config.candidate_probe_semantic_min_score)
+            semantic_confidence_score = min(
+                1.0,
+                max(0.0, (semantic_score - min_score) / max(1e-6, 0.35 - min_score)),
+            )
+            instruction_relevant = bool(semantic_relevance_score > 0.0)
+        semanticized_candidate = bool(
+            semantic is not None
+            and (
+                semantic_relevance_score >= float(self.config.candidate_probe_semantic_frontier_min_relevance)
+                or bool(semantic.get("high_conf_semantic"))
+                or candidate_type == "semantic_keyframe"
+            )
+        )
+        if candidate_type == "frontier" and semanticized_candidate:
+            candidate_type = "semantic_frontier"
+        topology_novelty_score = float(frontier_progress_score * (1.0 - revisit_risk))
         preferred_distance_m = 2.0
         distance_score = -0.08 * abs(distance_m - preferred_distance_m)
         score = (
@@ -926,7 +1232,14 @@ class SparseOccSemanticMemory:
             + frontier_progress_score
             + direction_score
             + 0.30 * float(intent_alignment_score or 0.0)
-            + 0.35 * semantic_evidence_score
+            + float(self.config.candidate_probe_semantic_score_weight)
+            * (
+                0.70 * semantic_relevance_score
+                + 0.20 * semantic_confidence_score
+                + 0.10 * min(1.0, max(0.0, semantic_bind_score))
+            )
+            + float(self.config.candidate_probe_semantic_novelty_weight) * semantic_novelty_score
+            + float(self.config.candidate_probe_topology_novelty_weight) * topology_novelty_score
             + distance_score
             - 0.65 * revisit_risk
         )
@@ -943,6 +1256,7 @@ class SparseOccSemanticMemory:
             "distance_m": distance_m,
             "frontier_distance_m": frontier_distance_m,
             "frontier_progress_score": float(frontier_progress_score),
+            "topology_novelty_score": float(topology_novelty_score),
             "nearby_visit_count": int(visit_count),
             "revisit_risk": float(revisit_risk),
             "points_to_revisited_region": bool(visit_count > 0),
@@ -951,6 +1265,12 @@ class SparseOccSemanticMemory:
             "aligned_with_current_waypoint": bool(aligned_with_current),
             "distance_to_current_waypoint_m": distance_to_current_goal_m,
             "semantic_evidence": semantic,
+            "semanticized_candidate": bool(semanticized_candidate),
+            "instruction_relevant": bool(instruction_relevant),
+            "semantic_relevance_score": float(semantic_relevance_score),
+            "semantic_novelty_score": float(semantic_novelty_score),
+            "semantic_confidence_score": float(semantic_confidence_score),
+            "semantic_bind_score": float(semantic_bind_score),
             "score": float(score),
         }
 
@@ -1033,6 +1353,9 @@ class SparseOccSemanticMemory:
         candidate_geometry_safe_sum = 0
         candidate_active_gate_safe_sum = 0
         candidate_current_aligned_sum = 0
+        candidate_semantic_evidence_sum = 0
+        candidate_instruction_relevant_sum = 0
+        candidate_semanticized_sum = 0
         candidate_type_counts: Dict[str, int] = defaultdict(int)
         candidate_direction_counts: Dict[str, int] = defaultdict(int)
         for event in self.candidate_probe_events:
@@ -1042,6 +1365,11 @@ class SparseOccSemanticMemory:
             candidate_geometry_safe_sum += int(event.get("candidate_geometry_safe_count", 0) or 0)
             candidate_active_gate_safe_sum += int(event.get("candidate_active_gate_safe_count", 0) or 0)
             candidate_current_aligned_sum += int(event.get("candidate_current_aligned_count", 0) or 0)
+            candidate_semantic_evidence_sum += int(event.get("candidate_semantic_evidence_count", 0) or 0)
+            candidate_instruction_relevant_sum += int(
+                event.get("candidate_instruction_relevant_count", 0) or 0
+            )
+            candidate_semanticized_sum += int(event.get("candidate_semanticized_count", 0) or 0)
             for key, value in (event.get("candidate_type_counts") or {}).items():
                 candidate_type_counts[str(key)] += int(value or 0)
             for key, value in (event.get("candidate_direction_counts") or {}).items():
@@ -1051,11 +1379,15 @@ class SparseOccSemanticMemory:
         selection_none_count = 0
         selection_active_gate_safe_count = 0
         selection_current_aligned_count = 0
+        selection_reason_counts: Dict[str, int] = defaultdict(int)
         for event in self.candidate_selection_events:
             if event.get("selection_valid"):
                 selection_valid_count += 1
             if event.get("selection_none"):
                 selection_none_count += 1
+            reason = event.get("selection_reason")
+            if reason:
+                selection_reason_counts[str(reason)] += 1
             selected = event.get("selected_candidate") or {}
             if selected.get("active_gate_safe"):
                 selection_active_gate_safe_count += 1
@@ -1105,6 +1437,15 @@ class SparseOccSemanticMemory:
             "candidate_probe_mean_current_aligned_count": (
                 float(candidate_current_aligned_sum / candidate_event_count) if candidate_event_count else None
             ),
+            "candidate_probe_mean_semantic_evidence_count": (
+                float(candidate_semantic_evidence_sum / candidate_event_count) if candidate_event_count else None
+            ),
+            "candidate_probe_mean_instruction_relevant_count": (
+                float(candidate_instruction_relevant_sum / candidate_event_count) if candidate_event_count else None
+            ),
+            "candidate_probe_mean_semanticized_count": (
+                float(candidate_semanticized_sum / candidate_event_count) if candidate_event_count else None
+            ),
             "candidate_probe_type_counts": dict(candidate_type_counts),
             "candidate_probe_direction_counts": dict(candidate_direction_counts),
             "candidate_selection_event_count": int(selection_event_count),
@@ -1112,6 +1453,7 @@ class SparseOccSemanticMemory:
             "candidate_selection_none_count": int(selection_none_count),
             "candidate_selection_active_gate_safe_count": int(selection_active_gate_safe_count),
             "candidate_selection_current_aligned_count": int(selection_current_aligned_count),
+            "candidate_selection_reason_counts": dict(selection_reason_counts),
             "waypoint_goal_state_counts": dict(waypoint_state_counts),
             "waypoint_mean_frontier_distance_m": (
                 float(np.mean(frontier_distances)) if frontier_distances else None
@@ -1792,10 +2134,13 @@ class SparseOccSemanticMemory:
             draw.ellipse((x - rad, y - rad, x + rad, y + rad), fill=(255, 255, 255))
         color_by_type = {
             "frontier": (255, 225, 80),
+            "semantic_frontier": (255, 160, 80),
             "semantic_keyframe": (240, 105, 255),
             "open_floor": (90, 220, 225),
         }
         for candidate in candidates:
+            candidate["bev_pixel"] = None
+            candidate["bev_image_size"] = [int(w * scale), int(h * scale)]
             grid = candidate.get("grid") or []
             if len(grid) < 2:
                 continue
@@ -1803,6 +2148,7 @@ class SparseOccSemanticMemory:
             if not (r0 <= row < r1 and c0 <= col < c1):
                 continue
             x, y = to_xy(row, col)
+            candidate["bev_pixel"] = [int(x), int(y)]
             label = str(candidate.get("candidate_id") or "?")
             color = color_by_type.get(str(candidate.get("candidate_type")), (255, 255, 255))
             rad = max(7, scale * 3)
