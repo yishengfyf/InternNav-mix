@@ -811,6 +811,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "Current S2 waypoint memory status: "
                 f"geometry={current_state}, semantic_dead_zone={current_dead_zone}."
             )
+        if candidate_event.get("goal_progress_enabled"):
+            sequence = candidate_event.get("goal_progress_landmark_sequence") or []
+            completed = candidate_event.get("goal_progress_completed_landmarks") or []
+            next_landmark = candidate_event.get("goal_progress_next_landmark")
+            lines.append(
+                "Goal progress memory: "
+                f"ordered_landmarks={sequence}, completed={completed}, next={next_landmark}."
+            )
         for item in candidates:
             label = item.get("candidate_id")
             semantic = item.get("semantic_evidence") or {}
@@ -820,7 +828,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     f", semantic={semantic.get('semantic_top_match')} "
                     f"score={semantic.get('semantic_top_score')} "
                     f"instruction_relevance={float(item.get('semantic_relevance_score') or 0.0):.2f} "
-                    f"novelty={float(item.get('semantic_novelty_score') or 0.0):.2f}"
+                    f"novelty={float(item.get('semantic_novelty_score') or 0.0):.2f} "
+                    f"landmark_status={item.get('landmark_status')} "
+                    f"matched_landmark={item.get('matched_landmark')} "
+                    f"next_relevance={float(item.get('next_landmark_relevance') or 0.0):.2f} "
+                    f"completed_penalty={float(item.get('completed_landmark_penalty') or 0.0):.2f} "
+                    f"repeated_penalty={float(item.get('repeated_semantic_penalty') or 0.0):.2f}"
                 )
             angle_to_current = item.get("angle_to_current_waypoint_deg")
             angle_text = "unknown" if angle_to_current is None else f"{float(angle_to_current):.1f}deg"
@@ -1904,6 +1917,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             occ_memory_candidate_probe_geometry_safe_sum = 0
             occ_memory_candidate_probe_active_gate_safe_sum = 0
             occ_memory_candidate_probe_current_aligned_sum = 0
+            occ_memory_candidate_probe_next_landmark_relevant_sum = 0
+            occ_memory_candidate_probe_completed_landmark_sum = 0
+            occ_memory_candidate_probe_repeated_semantic_sum = 0
+            occ_memory_candidate_probe_unknown_target_frontier_bonus_sum = 0
             occ_memory_candidate_selection_query_count = 0
             occ_memory_candidate_selection_valid_count = 0
             occ_memory_candidate_selection_none_count = 0
@@ -1915,6 +1932,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             occ_memory_candidate_selection_direction_count = 0
             occ_memory_candidate_selection_semanticized_count = 0
             occ_memory_candidate_selection_instruction_relevant_count = 0
+            occ_memory_candidate_selection_next_landmark_relevant_count = 0
+            occ_memory_candidate_selection_completed_landmark_count = 0
+            occ_memory_candidate_selection_repeated_semantic_count = 0
             rejected_vlmap_goal_grids = []
             s2_candidate_probe_s2_query_count = 0
             s2_candidate_probe_event_count = 0
@@ -2277,6 +2297,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 occ_memory_candidate_probe_current_aligned_sum += int(
                                     candidate_event.get("candidate_current_aligned_count", 0) or 0
                                 )
+                                occ_memory_candidate_probe_next_landmark_relevant_sum += int(
+                                    candidate_event.get("candidate_next_landmark_relevant_count", 0) or 0
+                                )
+                                occ_memory_candidate_probe_completed_landmark_sum += int(
+                                    candidate_event.get("candidate_completed_landmark_count", 0) or 0
+                                )
+                                occ_memory_candidate_probe_repeated_semantic_sum += int(
+                                    candidate_event.get("candidate_repeated_semantic_count", 0) or 0
+                                )
+                                occ_memory_candidate_probe_unknown_target_frontier_bonus_sum += int(
+                                    candidate_event.get(
+                                        "candidate_unknown_target_frontier_bonus_count", 0
+                                    ) or 0
+                                )
                                 selection_max_queries = int(
                                     candidate_probe_cfg.get("selection_max_queries_per_episode", 2) or 0
                                 )
@@ -2319,6 +2353,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                         occ_memory_candidate_selection_semanticized_count += 1
                                     if selected_candidate.get("instruction_relevant"):
                                         occ_memory_candidate_selection_instruction_relevant_count += 1
+                                    if float(selected_candidate.get("next_landmark_relevance", 0.0) or 0.0) > 0.0:
+                                        occ_memory_candidate_selection_next_landmark_relevant_count += 1
+                                    if float(selected_candidate.get("completed_landmark_penalty", 0.0) or 0.0) > 0.0:
+                                        occ_memory_candidate_selection_completed_landmark_count += 1
+                                    if float(selected_candidate.get("repeated_semantic_penalty", 0.0) or 0.0) > 0.0:
+                                        occ_memory_candidate_selection_repeated_semantic_count += 1
                         if occ_waypoint_decision.get("valid") and occ_waypoint_decision.get("goal_state") != "free":
                             print(
                                 "[OccMemory][Habitat][Waypoint] "
@@ -3112,6 +3152,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     occ_memory_candidate_probe_current_aligned_sum
                     / max(1, occ_memory_candidate_probe_event_count)
                 )
+                result["occ_memory_candidate_probe_mean_next_landmark_relevant_count"] = (
+                    occ_memory_candidate_probe_next_landmark_relevant_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_completed_landmark_count"] = (
+                    occ_memory_candidate_probe_completed_landmark_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_repeated_semantic_count"] = (
+                    occ_memory_candidate_probe_repeated_semantic_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_unknown_target_frontier_bonus_count"] = (
+                    occ_memory_candidate_probe_unknown_target_frontier_bonus_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
                 result["occ_memory_candidate_selection_query_count"] = (
                     occ_memory_candidate_selection_query_count
                 )
@@ -3149,6 +3205,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result["occ_memory_candidate_selection_instruction_relevant_count"] = (
                     occ_memory_candidate_selection_instruction_relevant_count
                 )
+                result["occ_memory_candidate_selection_next_landmark_relevant_count"] = (
+                    occ_memory_candidate_selection_next_landmark_relevant_count
+                )
+                result["occ_memory_candidate_selection_completed_landmark_count"] = (
+                    occ_memory_candidate_selection_completed_landmark_count
+                )
+                result["occ_memory_candidate_selection_repeated_semantic_count"] = (
+                    occ_memory_candidate_selection_repeated_semantic_count
+                )
             if occ_memory_summary:
                 result["occ_memory_update_count"] = occ_memory_summary.get("update_count")
                 result["occ_memory_occupied_voxel_count"] = occ_memory_summary.get("occupied_voxel_count")
@@ -3178,11 +3243,32 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result["occ_memory_candidate_probe_summary_mean_semanticized_count"] = (
                     occ_memory_summary.get("candidate_probe_mean_semanticized_count")
                 )
+                result["occ_memory_candidate_probe_summary_mean_next_landmark_relevant_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_next_landmark_relevant_count")
+                )
+                result["occ_memory_candidate_probe_summary_mean_completed_landmark_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_completed_landmark_count")
+                )
+                result["occ_memory_candidate_probe_summary_mean_repeated_semantic_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_repeated_semantic_count")
+                )
+                result[
+                    "occ_memory_candidate_probe_summary_mean_unknown_target_frontier_bonus_count"
+                ] = occ_memory_summary.get("candidate_probe_mean_unknown_target_frontier_bonus_count")
                 result["occ_memory_candidate_selection_summary_event_count"] = (
                     occ_memory_summary.get("candidate_selection_event_count")
                 )
                 result["occ_memory_candidate_selection_summary_valid_count"] = (
                     occ_memory_summary.get("candidate_selection_valid_count")
+                )
+                result["occ_memory_candidate_selection_summary_next_landmark_relevant_count"] = (
+                    occ_memory_summary.get("candidate_selection_next_landmark_relevant_count")
+                )
+                result["occ_memory_candidate_selection_summary_completed_landmark_count"] = (
+                    occ_memory_summary.get("candidate_selection_completed_landmark_count")
+                )
+                result["occ_memory_candidate_selection_summary_repeated_semantic_count"] = (
+                    occ_memory_summary.get("candidate_selection_repeated_semantic_count")
                 )
                 candidate_selection_reason_counts = (
                     occ_memory_summary.get("candidate_selection_reason_counts") or {}

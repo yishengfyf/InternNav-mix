@@ -10,6 +10,158 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+_GOAL_PROGRESS_LANDMARK_ALIASES = {
+    "appliance": "appliances",
+    "appliances": "appliances",
+    "armchair": "chair",
+    "arch": "door",
+    "arched doorway": "door",
+    "arched entry": "entryway",
+    "archway": "door",
+    "balcony": "balcony",
+    "bath": "bathtub",
+    "bath room": "bathroom",
+    "bathroom": "bathroom",
+    "bathtub": "bathtub",
+    "bed": "bed",
+    "bed room": "bedroom",
+    "bedroom": "bedroom",
+    "blind": "blinds",
+    "blinds": "blinds",
+    "book shelf": "shelving",
+    "bookshelf": "shelving",
+    "cabinet": "cabinet",
+    "chair": "chair",
+    "chairs": "chair",
+    "closet": "closet",
+    "column": "column",
+    "corridor": "corridor",
+    "couch": "sofa",
+    "couches": "sofa",
+    "counter": "counter",
+    "curtain": "curtain",
+    "curtains": "curtain",
+    "cushion": "cushion",
+    "dinning room": "dining room",
+    "dining area": "dining area",
+    "dining room": "dining room",
+    "door": "door",
+    "doors": "door",
+    "doorway": "door",
+    "drawer": "chest_of_drawers",
+    "drawers": "chest_of_drawers",
+    "dresser": "chest_of_drawers",
+    "entrance": "entryway",
+    "entryway": "entryway",
+    "fireplace": "fireplace",
+    "foyer": "entryway",
+    "hall": "hall",
+    "hallway": "hallway",
+    "island counter": "counter",
+    "kitchen": "kitchen",
+    "lamp": "lighting",
+    "light": "lighting",
+    "lighting": "lighting",
+    "living area": "living area",
+    "living room": "living room",
+    "mirror": "mirror",
+    "office": "office",
+    "painting": "picture",
+    "patio": "patio",
+    "photo": "picture",
+    "photograph": "picture",
+    "picture": "picture",
+    "plant": "plant",
+    "plants": "plant",
+    "railing": "railing",
+    "room": "room",
+    "seat": "seating",
+    "seating": "seating",
+    "shelf": "shelving",
+    "shelves": "shelving",
+    "shelving": "shelving",
+    "shower": "shower",
+    "sink": "sink",
+    "sofa": "sofa",
+    "stair": "stairs",
+    "staircase": "stairs",
+    "stairs": "stairs",
+    "table": "table",
+    "tables": "table",
+    "television": "tv_monitor",
+    "toilet": "toilet",
+    "towel": "towel",
+    "tv": "tv_monitor",
+    "window": "window",
+    "windows": "window",
+}
+
+_GOAL_PROGRESS_LANDMARK_TERMS = (
+    "appliances",
+    "bathroom",
+    "bathtub",
+    "bed",
+    "bedroom",
+    "blinds",
+    "cabinet",
+    "chair",
+    "chest_of_drawers",
+    "closet",
+    "column",
+    "corridor",
+    "counter",
+    "curtain",
+    "cushion",
+    "dining area",
+    "dining room",
+    "door",
+    "entryway",
+    "fireplace",
+    "hall",
+    "hallway",
+    "kitchen",
+    "lighting",
+    "living area",
+    "living room",
+    "mirror",
+    "office",
+    "patio",
+    "balcony",
+    "picture",
+    "plant",
+    "railing",
+    "room",
+    "seating",
+    "shelving",
+    "shower",
+    "sink",
+    "sofa",
+    "stairs",
+    "table",
+    "toilet",
+    "towel",
+    "tv_monitor",
+    "window",
+)
+
+_GOAL_PROGRESS_SPECIFIC_ROOMS = {
+    "bathroom",
+    "bedroom",
+    "closet",
+    "corridor",
+    "dining area",
+    "dining room",
+    "entryway",
+    "hall",
+    "hallway",
+    "kitchen",
+    "living area",
+    "living room",
+    "office",
+    "patio",
+    "balcony",
+}
+
 
 def _as_intrinsic3(intrinsic: np.ndarray) -> np.ndarray:
     intrinsic = np.asarray(intrinsic, dtype=np.float32)
@@ -138,6 +290,13 @@ class SparseOccMemoryConfig:
     candidate_probe_semantic_score_weight: float = 0.90
     candidate_probe_semantic_novelty_weight: float = 0.45
     candidate_probe_topology_novelty_weight: float = 0.35
+    candidate_probe_goal_progress_enable: bool = False
+    candidate_probe_goal_progress_next_weight: float = 1.20
+    candidate_probe_goal_progress_completed_penalty: float = 0.80
+    candidate_probe_goal_progress_repeated_penalty: float = 0.55
+    candidate_probe_goal_progress_seen_score_threshold: float = 0.25
+    candidate_probe_goal_progress_high_conf_bonus: float = 0.25
+    candidate_probe_goal_progress_unknown_target_bonus: float = 0.20
     candidate_probe_save_bev: bool = True
     candidate_probe_max_bev_snapshots: int = 12
     save_bev: bool = True
@@ -648,7 +807,12 @@ class SparseOccSemanticMemory:
         yaw = float(pose_state["yaw"])
         current_angle = decision.get("waypoint_direction_angle_deg")
         current_goal_grid = decision.get("goal_grid")
-        semantic_nodes = self._semantic_memory_nodes(start_grid, yaw)
+        goal_progress_state = self._semantic_goal_progress_state()
+        semantic_nodes = self._semantic_memory_nodes(
+            start_grid,
+            yaw,
+            goal_progress_state=goal_progress_state,
+        )
         raw_candidates: List[Dict[str, Any]] = []
         raw_candidates.extend(
             self._frontier_query_candidates(
@@ -657,6 +821,7 @@ class SparseOccSemanticMemory:
                 current_angle=current_angle,
                 current_goal_grid=current_goal_grid,
                 semantic_nodes=semantic_nodes,
+                goal_progress_state=goal_progress_state,
             )
         )
         raw_candidates.extend(
@@ -666,6 +831,7 @@ class SparseOccSemanticMemory:
                 current_angle=current_angle,
                 current_goal_grid=current_goal_grid,
                 semantic_nodes=semantic_nodes,
+                goal_progress_state=goal_progress_state,
             )
         )
         raw_candidates.extend(
@@ -675,6 +841,7 @@ class SparseOccSemanticMemory:
                 current_angle=current_angle,
                 current_goal_grid=current_goal_grid,
                 semantic_nodes=semantic_nodes,
+                goal_progress_state=goal_progress_state,
             )
         )
         candidates = self._select_query_candidates(raw_candidates)
@@ -689,6 +856,10 @@ class SparseOccSemanticMemory:
         semantic_evidence_count = 0
         instruction_relevant_count = 0
         semanticized_count = 0
+        next_landmark_relevant_count = 0
+        completed_landmark_count = 0
+        repeated_semantic_count = 0
+        unknown_target_frontier_bonus_count = 0
         for item in candidates:
             candidate_types[str(item.get("candidate_type", "unknown"))] += 1
             direction_counts[str(item.get("direction_bucket", "unknown"))] += 1
@@ -704,6 +875,14 @@ class SparseOccSemanticMemory:
                 instruction_relevant_count += 1
             if item.get("semanticized_candidate"):
                 semanticized_count += 1
+            if float(item.get("next_landmark_relevance", 0.0) or 0.0) > 0.0:
+                next_landmark_relevant_count += 1
+            if float(item.get("completed_landmark_penalty", 0.0) or 0.0) > 0.0:
+                completed_landmark_count += 1
+            if float(item.get("repeated_semantic_penalty", 0.0) or 0.0) > 0.0:
+                repeated_semantic_count += 1
+            if float(item.get("unknown_target_frontier_bonus", 0.0) or 0.0) > 0.0:
+                unknown_target_frontier_bonus_count += 1
         bev_path = None
         if self.config.candidate_probe_save_bev and candidates:
             bev_path = self._write_candidate_bev_snapshot(candidates, context)
@@ -729,8 +908,20 @@ class SparseOccSemanticMemory:
                 "candidate_semantic_evidence_count": int(semantic_evidence_count),
                 "candidate_instruction_relevant_count": int(instruction_relevant_count),
                 "candidate_semanticized_count": int(semanticized_count),
+                "candidate_next_landmark_relevant_count": int(next_landmark_relevant_count),
+                "candidate_completed_landmark_count": int(completed_landmark_count),
+                "candidate_repeated_semantic_count": int(repeated_semantic_count),
+                "candidate_unknown_target_frontier_bonus_count": int(
+                    unknown_target_frontier_bonus_count
+                ),
                 "semantic_memory_node_count": int(len(semantic_nodes)),
                 "instruction_terms": self._instruction_terms(),
+                "goal_progress_enabled": bool(goal_progress_state.get("enabled")),
+                "goal_progress_landmark_sequence": goal_progress_state.get("landmark_sequence"),
+                "goal_progress_completed_landmarks": goal_progress_state.get("completed_landmarks"),
+                "goal_progress_next_landmark": goal_progress_state.get("next_landmark"),
+                "goal_progress_next_landmark_index": goal_progress_state.get("next_landmark_index"),
+                "goal_progress_recent_repeated_terms": goal_progress_state.get("recent_repeated_terms"),
                 "candidate_best_score": (
                     float(candidates[0].get("score", 0.0)) if candidates else None
                 ),
@@ -801,6 +992,7 @@ class SparseOccSemanticMemory:
         current_angle: Any,
         current_goal_grid: Any,
         semantic_nodes: List[Dict[str, Any]],
+        goal_progress_state: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         best_by_bucket: Dict[str, Dict[str, Any]] = {}
         frontiers = self.get_frontier_cells(
@@ -817,6 +1009,7 @@ class SparseOccSemanticMemory:
                 current_goal_grid=current_goal_grid,
                 source_score=1.0,
                 semantic=semantic,
+                goal_progress_state=goal_progress_state,
             )
             if candidate is None:
                 continue
@@ -836,6 +1029,7 @@ class SparseOccSemanticMemory:
         current_angle: Any,
         current_goal_grid: Any,
         semantic_nodes: List[Dict[str, Any]],
+        goal_progress_state: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         cells = [cell for cell in self.free2d_counts.keys() if cell not in self.occ2d_counts]
         limit = int(self.config.candidate_probe_free_sample_limit)
@@ -854,6 +1048,7 @@ class SparseOccSemanticMemory:
                 current_goal_grid=current_goal_grid,
                 source_score=0.25,
                 semantic=semantic,
+                goal_progress_state=goal_progress_state,
             )
             if candidate is None:
                 continue
@@ -873,6 +1068,7 @@ class SparseOccSemanticMemory:
         current_angle: Any,
         current_goal_grid: Any,
         semantic_nodes: List[Dict[str, Any]],
+        goal_progress_state: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         if not self.config.candidate_probe_semantic_enable:
             return []
@@ -896,6 +1092,7 @@ class SparseOccSemanticMemory:
                 current_goal_grid=current_goal_grid,
                 source_score=0.75,
                 semantic=node,
+                goal_progress_state=goal_progress_state,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -903,12 +1100,19 @@ class SparseOccSemanticMemory:
                 break
         return candidates
 
-    def _semantic_memory_nodes(self, start_grid: Iterable[int], yaw: float) -> List[Dict[str, Any]]:
+    def _semantic_memory_nodes(
+        self,
+        start_grid: Iterable[int],
+        yaw: float,
+        *,
+        goal_progress_state: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         if not self.config.candidate_probe_semantic_enable:
             return []
         min_score = float(self.config.candidate_probe_semantic_min_score)
         high_conf_only = bool(self.config.candidate_probe_semantic_high_conf_only)
         instruction_terms = set(self._instruction_terms())
+        goal_progress_state = goal_progress_state or self._semantic_goal_progress_state()
         nodes: List[Dict[str, Any]] = []
         seen = set()
         sources = []
@@ -945,6 +1149,7 @@ class SparseOccSemanticMemory:
             direction = self._direction_to_cell(start_grid, [row, col], yaw)
             relevance = self._semantic_instruction_relevance(term, instruction_terms)
             recent_novelty = self._semantic_recent_novelty(term)
+            goal_progress = self._semantic_goal_progress_for_term(term, goal_progress_state)
             confidence_score = min(1.0, max(0.0, (score_float - min_score) / max(1e-6, 0.35 - min_score)))
             semantic_candidate_score = (
                 1.20 * relevance
@@ -953,6 +1158,20 @@ class SparseOccSemanticMemory:
                 + 0.25 * recent_novelty
                 - 0.03 * float(direction.get("distance_m", 0.0) or 0.0)
             )
+            if goal_progress_state.get("enabled"):
+                semantic_candidate_score += (
+                    float(self.config.candidate_probe_goal_progress_next_weight)
+                    * float(goal_progress.get("next_landmark_relevance", 0.0) or 0.0)
+                    + (
+                        float(self.config.candidate_probe_goal_progress_high_conf_bonus)
+                        if high_conf and float(goal_progress.get("next_landmark_relevance", 0.0) or 0.0) > 0.0
+                        else 0.0
+                    )
+                    - float(self.config.candidate_probe_goal_progress_completed_penalty)
+                    * float(goal_progress.get("completed_landmark_penalty", 0.0) or 0.0)
+                    - float(self.config.candidate_probe_goal_progress_repeated_penalty)
+                    * float(goal_progress.get("repeated_semantic_penalty", 0.0) or 0.0)
+                )
             xy = self._grid_to_xy([row, col])
             nodes.append(
                 {
@@ -966,6 +1185,20 @@ class SparseOccSemanticMemory:
                     "high_conf_semantic": high_conf,
                     "instruction_relevance": float(relevance),
                     "semantic_recent_novelty": float(recent_novelty),
+                    "matched_landmark": goal_progress.get("matched_landmark"),
+                    "landmark_status": goal_progress.get("landmark_status"),
+                    "next_landmark_relevance": float(
+                        goal_progress.get("next_landmark_relevance", 0.0) or 0.0
+                    ),
+                    "completed_landmark_penalty": float(
+                        goal_progress.get("completed_landmark_penalty", 0.0) or 0.0
+                    ),
+                    "repeated_semantic_penalty": float(
+                        goal_progress.get("repeated_semantic_penalty", 0.0) or 0.0
+                    ),
+                    "semantic_progress_score": float(
+                        goal_progress.get("semantic_progress_score", 0.0) or 0.0
+                    ),
                     "semantic_candidate_score": float(semantic_candidate_score),
                     "distance_m": direction.get("distance_m"),
                     "direction_bucket": direction.get("bucket"),
@@ -1010,10 +1243,20 @@ class SparseOccSemanticMemory:
             relevance = float(node.get("instruction_relevance", 0.0) or 0.0)
             novelty = float(node.get("semantic_recent_novelty", 0.0) or 0.0)
             semantic_score = float(node.get("semantic_candidate_score", 0.0) or 0.0)
+            next_relevance = float(node.get("next_landmark_relevance", 0.0) or 0.0)
+            completed_penalty = float(node.get("completed_landmark_penalty", 0.0) or 0.0)
+            repeated_penalty = float(node.get("repeated_semantic_penalty", 0.0) or 0.0)
             bind_score = (
                 semantic_score
                 + 0.45 * relevance
                 + 0.20 * novelty
+                + (
+                    0.65 * next_relevance
+                    - 0.35 * completed_penalty
+                    - 0.25 * repeated_penalty
+                    if self.config.candidate_probe_goal_progress_enable
+                    else 0.0
+                )
                 + (0.25 if nearby else 0.0)
                 + (0.20 if direction_aligned else 0.0)
                 - 0.04 * spatial_distance
@@ -1087,6 +1330,169 @@ class SparseOccSemanticMemory:
                 phrases.append(phrase)
         return sorted(set(tokens + phrases))
 
+    def _instruction_landmark_sequence(self) -> List[str]:
+        instruction = str(self.episode_meta.get("instruction") or "").lower()
+        text = f" {instruction} "
+        alias_items = dict(_GOAL_PROGRESS_LANDMARK_ALIASES)
+        for term in _GOAL_PROGRESS_LANDMARK_TERMS:
+            alias_items.setdefault(term.replace("_", " "), term)
+        candidates: List[Tuple[int, str, str]] = []
+        for phrase, canonical in alias_items.items():
+            pattern = r"(?<![a-z0-9])" + re.escape(str(phrase).lower()) + r"(?![a-z0-9])"
+            match = re.search(pattern, text)
+            if match:
+                candidates.append((match.start(), str(phrase), self._canonical_semantic_term(canonical)))
+        candidates.sort(key=lambda item: (item[0], -len(item[1])))
+        has_specific_room = any(
+            canonical in _GOAL_PROGRESS_SPECIFIC_ROOMS for _, _, canonical in candidates
+        )
+        sequence = []
+        seen = set()
+        for _, _, canonical in candidates:
+            if canonical == "room" and has_specific_room:
+                continue
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            sequence.append(canonical)
+        return sequence
+
+    def _canonical_semantic_term(self, term: Any) -> str:
+        text = str(term or "").lower().strip().replace("_", " ")
+        text = re.sub(r"\s+", " ", text)
+        if not text:
+            return ""
+        return _GOAL_PROGRESS_LANDMARK_ALIASES.get(text, text)
+
+    def _semantic_goal_progress_state(self) -> Dict[str, Any]:
+        enabled = bool(
+            self.config.candidate_probe_semantic_enable
+            and self.config.candidate_probe_goal_progress_enable
+        )
+        sequence = self._instruction_landmark_sequence() if enabled else []
+        completed: List[str] = []
+        completed_set = set()
+        threshold = float(self.config.candidate_probe_goal_progress_seen_score_threshold)
+        for event in self.semantic_events:
+            term = event.get("top_match")
+            canonical = self._canonical_semantic_term(term)
+            if not canonical:
+                continue
+            try:
+                score = float(event.get("top_score", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            if not bool(event.get("high_conf_semantic")) and score < threshold:
+                continue
+            for landmark in sequence:
+                if landmark in completed_set:
+                    continue
+                if self._semantic_landmark_match_score(canonical, landmark) > 0.0:
+                    completed_set.add(landmark)
+                    completed.append(landmark)
+                    break
+        next_landmark = None
+        next_index = None
+        for idx, landmark in enumerate(sequence):
+            if landmark not in completed_set:
+                next_landmark = landmark
+                next_index = idx
+                break
+        window = max(1, int(self.config.attribution_recent_semantic_window))
+        recent_counts: Dict[str, int] = defaultdict(int)
+        for event in self.semantic_events[-window:]:
+            canonical = self._canonical_semantic_term(event.get("top_match"))
+            if canonical:
+                recent_counts[canonical] += 1
+        recent_repeated = sorted([term for term, count in recent_counts.items() if count >= 2])
+        return {
+            "enabled": bool(enabled),
+            "landmark_sequence": sequence,
+            "completed_landmarks": completed,
+            "next_landmark": next_landmark,
+            "next_landmark_index": next_index,
+            "recent_repeated_terms": recent_repeated,
+            "seen_score_threshold": threshold,
+        }
+
+    def _semantic_landmark_match_score(self, term: Any, landmark: Any) -> float:
+        term_text = self._canonical_semantic_term(term)
+        landmark_text = self._canonical_semantic_term(landmark)
+        if not term_text or not landmark_text:
+            return 0.0
+        if term_text == landmark_text:
+            return 1.0
+        if term_text in landmark_text or landmark_text in term_text:
+            return 0.85
+        term_tokens = set(re.findall(r"[a-z0-9]+", term_text))
+        landmark_tokens = set(re.findall(r"[a-z0-9]+", landmark_text))
+        if not term_tokens or not landmark_tokens:
+            return 0.0
+        overlap = len(term_tokens.intersection(landmark_tokens))
+        if overlap <= 0:
+            return 0.0
+        return min(0.75, float(overlap) / float(max(len(term_tokens), len(landmark_tokens))))
+
+    def _semantic_goal_progress_for_term(
+        self,
+        term: Any,
+        goal_progress_state: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        state = goal_progress_state or {}
+        if not state.get("enabled"):
+            return {
+                "matched_landmark": None,
+                "landmark_status": "disabled",
+                "next_landmark_relevance": 0.0,
+                "completed_landmark_penalty": 0.0,
+                "repeated_semantic_penalty": 0.0,
+                "semantic_progress_score": 0.0,
+            }
+        sequence = list(state.get("landmark_sequence") or [])
+        completed = set(state.get("completed_landmarks") or [])
+        repeated = set(state.get("recent_repeated_terms") or [])
+        next_landmark = state.get("next_landmark")
+        best_landmark = None
+        best_score = 0.0
+        for landmark in sequence:
+            score = self._semantic_landmark_match_score(term, landmark)
+            if score > best_score:
+                best_landmark = landmark
+                best_score = score
+        next_relevance = 0.0
+        completed_penalty = 0.0
+        repeated_penalty = 0.0
+        status = "unknown"
+        if best_landmark is not None and best_score > 0.0:
+            if next_landmark and best_landmark == next_landmark:
+                status = "next"
+                next_relevance = best_score
+            elif best_landmark in completed:
+                status = "completed"
+                completed_penalty = best_score
+            else:
+                status = "future"
+                next_relevance = 0.25 * best_score
+        canonical = self._canonical_semantic_term(term)
+        for repeated_term in repeated:
+            repeated_penalty = max(
+                repeated_penalty,
+                self._semantic_landmark_match_score(canonical, repeated_term),
+            )
+        progress_score = (
+            float(self.config.candidate_probe_goal_progress_next_weight) * next_relevance
+            - float(self.config.candidate_probe_goal_progress_completed_penalty) * completed_penalty
+            - float(self.config.candidate_probe_goal_progress_repeated_penalty) * repeated_penalty
+        )
+        return {
+            "matched_landmark": best_landmark,
+            "landmark_status": status,
+            "next_landmark_relevance": float(next_relevance),
+            "completed_landmark_penalty": float(completed_penalty),
+            "repeated_semantic_penalty": float(repeated_penalty),
+            "semantic_progress_score": float(progress_score),
+        }
+
     def _semantic_instruction_relevance(self, term: Any, instruction_terms: Iterable[str]) -> float:
         term_text = str(term or "").lower()
         if not term_text:
@@ -1138,6 +1544,7 @@ class SparseOccSemanticMemory:
         current_goal_grid: Any,
         source_score: float,
         semantic: Optional[Dict[str, Any]] = None,
+        goal_progress_state: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         row, col = [int(v) for v in list(cell)[:2]]
         direction = self._direction_to_cell(start_grid, [row, col], yaw)
@@ -1198,11 +1605,27 @@ class SparseOccSemanticMemory:
         semantic_novelty_score = 0.0
         semantic_confidence_score = 0.0
         semantic_bind_score = 0.0
+        matched_landmark = None
+        landmark_status = "none"
+        next_landmark_relevance = 0.0
+        completed_landmark_penalty = 0.0
+        repeated_semantic_penalty = 0.0
+        semantic_progress_score = 0.0
         instruction_relevant = False
         if semantic is not None:
             semantic_relevance_score = float(semantic.get("instruction_relevance", 0.0) or 0.0)
             semantic_novelty_score = float(semantic.get("semantic_recent_novelty", 0.0) or 0.0)
             semantic_bind_score = float(semantic.get("bind_score", 0.0) or 0.0)
+            matched_landmark = semantic.get("matched_landmark")
+            landmark_status = str(semantic.get("landmark_status") or "unknown")
+            next_landmark_relevance = float(semantic.get("next_landmark_relevance", 0.0) or 0.0)
+            completed_landmark_penalty = float(
+                semantic.get("completed_landmark_penalty", 0.0) or 0.0
+            )
+            repeated_semantic_penalty = float(
+                semantic.get("repeated_semantic_penalty", 0.0) or 0.0
+            )
+            semantic_progress_score = float(semantic.get("semantic_progress_score", 0.0) or 0.0)
             try:
                 semantic_score = float(semantic.get("semantic_top_score", 0.0) or 0.0)
             except (TypeError, ValueError):
@@ -1217,6 +1640,7 @@ class SparseOccSemanticMemory:
             semantic is not None
             and (
                 semantic_relevance_score >= float(self.config.candidate_probe_semantic_frontier_min_relevance)
+                or next_landmark_relevance > 0.0
                 or bool(semantic.get("high_conf_semantic"))
                 or candidate_type == "semantic_keyframe"
             )
@@ -1226,6 +1650,34 @@ class SparseOccSemanticMemory:
         topology_novelty_score = float(frontier_progress_score * (1.0 - revisit_risk))
         preferred_distance_m = 2.0
         distance_score = -0.08 * abs(distance_m - preferred_distance_m)
+        goal_progress_enabled = bool(
+            (goal_progress_state or {}).get("enabled")
+            or self.config.candidate_probe_goal_progress_enable
+        )
+        next_landmark = (goal_progress_state or {}).get("next_landmark")
+        unknown_target_frontier_bonus = 0.0
+        if (
+            goal_progress_enabled
+            and next_landmark
+            and next_landmark_relevance <= 0.0
+            and completed_landmark_penalty <= 0.0
+            and frontier_progress_score > 0.0
+        ):
+            unknown_target_frontier_bonus = (
+                float(self.config.candidate_probe_goal_progress_unknown_target_bonus)
+                * float(frontier_progress_score)
+            )
+        goal_progress_score = 0.0
+        if goal_progress_enabled:
+            goal_progress_score = (
+                float(self.config.candidate_probe_goal_progress_next_weight)
+                * next_landmark_relevance
+                + unknown_target_frontier_bonus
+                - float(self.config.candidate_probe_goal_progress_completed_penalty)
+                * completed_landmark_penalty
+                - float(self.config.candidate_probe_goal_progress_repeated_penalty)
+                * repeated_semantic_penalty
+            )
         score = (
             float(source_score)
             + geometry_score
@@ -1240,6 +1692,7 @@ class SparseOccSemanticMemory:
             )
             + float(self.config.candidate_probe_semantic_novelty_weight) * semantic_novelty_score
             + float(self.config.candidate_probe_topology_novelty_weight) * topology_novelty_score
+            + goal_progress_score
             + distance_score
             - 0.65 * revisit_risk
         )
@@ -1271,6 +1724,16 @@ class SparseOccSemanticMemory:
             "semantic_novelty_score": float(semantic_novelty_score),
             "semantic_confidence_score": float(semantic_confidence_score),
             "semantic_bind_score": float(semantic_bind_score),
+            "goal_progress_enabled": bool(goal_progress_enabled),
+            "goal_progress_next_landmark": next_landmark,
+            "matched_landmark": matched_landmark,
+            "landmark_status": landmark_status,
+            "next_landmark_relevance": float(next_landmark_relevance),
+            "completed_landmark_penalty": float(completed_landmark_penalty),
+            "repeated_semantic_penalty": float(repeated_semantic_penalty),
+            "semantic_progress_score": float(semantic_progress_score),
+            "unknown_target_frontier_bonus": float(unknown_target_frontier_bonus),
+            "goal_progress_score": float(goal_progress_score),
             "score": float(score),
         }
 
@@ -1356,6 +1819,10 @@ class SparseOccSemanticMemory:
         candidate_semantic_evidence_sum = 0
         candidate_instruction_relevant_sum = 0
         candidate_semanticized_sum = 0
+        candidate_next_landmark_relevant_sum = 0
+        candidate_completed_landmark_sum = 0
+        candidate_repeated_semantic_sum = 0
+        candidate_unknown_target_frontier_bonus_sum = 0
         candidate_type_counts: Dict[str, int] = defaultdict(int)
         candidate_direction_counts: Dict[str, int] = defaultdict(int)
         for event in self.candidate_probe_events:
@@ -1370,6 +1837,18 @@ class SparseOccSemanticMemory:
                 event.get("candidate_instruction_relevant_count", 0) or 0
             )
             candidate_semanticized_sum += int(event.get("candidate_semanticized_count", 0) or 0)
+            candidate_next_landmark_relevant_sum += int(
+                event.get("candidate_next_landmark_relevant_count", 0) or 0
+            )
+            candidate_completed_landmark_sum += int(
+                event.get("candidate_completed_landmark_count", 0) or 0
+            )
+            candidate_repeated_semantic_sum += int(
+                event.get("candidate_repeated_semantic_count", 0) or 0
+            )
+            candidate_unknown_target_frontier_bonus_sum += int(
+                event.get("candidate_unknown_target_frontier_bonus_count", 0) or 0
+            )
             for key, value in (event.get("candidate_type_counts") or {}).items():
                 candidate_type_counts[str(key)] += int(value or 0)
             for key, value in (event.get("candidate_direction_counts") or {}).items():
@@ -1379,6 +1858,9 @@ class SparseOccSemanticMemory:
         selection_none_count = 0
         selection_active_gate_safe_count = 0
         selection_current_aligned_count = 0
+        selection_next_landmark_relevant_count = 0
+        selection_completed_landmark_count = 0
+        selection_repeated_semantic_count = 0
         selection_reason_counts: Dict[str, int] = defaultdict(int)
         for event in self.candidate_selection_events:
             if event.get("selection_valid"):
@@ -1393,6 +1875,12 @@ class SparseOccSemanticMemory:
                 selection_active_gate_safe_count += 1
             if selected.get("aligned_with_current_waypoint"):
                 selection_current_aligned_count += 1
+            if float(selected.get("next_landmark_relevance", 0.0) or 0.0) > 0.0:
+                selection_next_landmark_relevant_count += 1
+            if float(selected.get("completed_landmark_penalty", 0.0) or 0.0) > 0.0:
+                selection_completed_landmark_count += 1
+            if float(selected.get("repeated_semantic_penalty", 0.0) or 0.0) > 0.0:
+                selection_repeated_semantic_count += 1
         if self.config.validation_enable and self.config.validation_save_final_memory_ply:
             self._write_final_validation_snapshot({"step_id": steps, "final": True})
         final_frontier_summary = {}
@@ -1446,6 +1934,22 @@ class SparseOccSemanticMemory:
             "candidate_probe_mean_semanticized_count": (
                 float(candidate_semanticized_sum / candidate_event_count) if candidate_event_count else None
             ),
+            "candidate_probe_mean_next_landmark_relevant_count": (
+                float(candidate_next_landmark_relevant_sum / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "candidate_probe_mean_completed_landmark_count": (
+                float(candidate_completed_landmark_sum / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "candidate_probe_mean_repeated_semantic_count": (
+                float(candidate_repeated_semantic_sum / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "candidate_probe_mean_unknown_target_frontier_bonus_count": (
+                float(candidate_unknown_target_frontier_bonus_sum / candidate_event_count)
+                if candidate_event_count else None
+            ),
             "candidate_probe_type_counts": dict(candidate_type_counts),
             "candidate_probe_direction_counts": dict(candidate_direction_counts),
             "candidate_selection_event_count": int(selection_event_count),
@@ -1453,6 +1957,11 @@ class SparseOccSemanticMemory:
             "candidate_selection_none_count": int(selection_none_count),
             "candidate_selection_active_gate_safe_count": int(selection_active_gate_safe_count),
             "candidate_selection_current_aligned_count": int(selection_current_aligned_count),
+            "candidate_selection_next_landmark_relevant_count": int(
+                selection_next_landmark_relevant_count
+            ),
+            "candidate_selection_completed_landmark_count": int(selection_completed_landmark_count),
+            "candidate_selection_repeated_semantic_count": int(selection_repeated_semantic_count),
             "candidate_selection_reason_counts": dict(selection_reason_counts),
             "waypoint_goal_state_counts": dict(waypoint_state_counts),
             "waypoint_mean_frontier_distance_m": (
