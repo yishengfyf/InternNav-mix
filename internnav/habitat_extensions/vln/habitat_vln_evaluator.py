@@ -837,6 +837,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
             angle_to_current = item.get("angle_to_current_waypoint_deg")
             angle_text = "unknown" if angle_to_current is None else f"{float(angle_to_current):.1f}deg"
+            target_text = ""
+            if item.get("target_frontier_enabled"):
+                target_text = (
+                    f", target_frontier={float(item.get('target_frontier_score') or 0.0):.2f} "
+                    f"escape={item.get('target_frontier_escape_candidate')} "
+                    f"doorway={float(item.get('target_frontier_doorway_like_score') or 0.0):.2f} "
+                    f"cluster={float(item.get('target_frontier_cluster_score') or 0.0):.2f} "
+                    f"corridor={float(item.get('target_frontier_corridor_continuation_score') or 0.0):.2f} "
+                    f"intent_safe={item.get('target_frontier_intent_safe')}"
+                )
             lines.append(
                 f"{label}: type={item.get('candidate_type')}, "
                 f"direction={item.get('direction_bucket')} "
@@ -847,7 +857,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 f"topology_novelty={float(item.get('topology_novelty_score') or 0.0):.2f}, "
                 f"revisit_risk={float(item.get('revisit_risk') or 0.0):.2f}, "
                 f"angle_to_original={angle_text}"
-                f"{semantic_text}."
+                f"{semantic_text}"
+                f"{target_text}."
             )
         return " ".join(lines)
 
@@ -1921,6 +1932,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             occ_memory_candidate_probe_completed_landmark_sum = 0
             occ_memory_candidate_probe_repeated_semantic_sum = 0
             occ_memory_candidate_probe_unknown_target_frontier_bonus_sum = 0
+            occ_memory_candidate_probe_target_frontier_sum = 0
+            occ_memory_candidate_probe_target_frontier_escape_sum = 0
+            occ_memory_candidate_probe_target_frontier_intent_safe_sum = 0
+            occ_memory_candidate_probe_target_frontier_doorway_like_sum = 0
             occ_memory_candidate_selection_query_count = 0
             occ_memory_candidate_selection_valid_count = 0
             occ_memory_candidate_selection_none_count = 0
@@ -2309,6 +2324,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 occ_memory_candidate_probe_unknown_target_frontier_bonus_sum += int(
                                     candidate_event.get(
                                         "candidate_unknown_target_frontier_bonus_count", 0
+                                    ) or 0
+                                )
+                                occ_memory_candidate_probe_target_frontier_sum += int(
+                                    candidate_event.get("candidate_target_frontier_count", 0) or 0
+                                )
+                                occ_memory_candidate_probe_target_frontier_escape_sum += int(
+                                    candidate_event.get(
+                                        "candidate_target_frontier_escape_count", 0
+                                    ) or 0
+                                )
+                                occ_memory_candidate_probe_target_frontier_intent_safe_sum += int(
+                                    candidate_event.get(
+                                        "candidate_target_frontier_intent_safe_count", 0
+                                    ) or 0
+                                )
+                                occ_memory_candidate_probe_target_frontier_doorway_like_sum += int(
+                                    candidate_event.get(
+                                        "candidate_target_frontier_doorway_like_count", 0
                                     ) or 0
                                 )
                                 selection_max_queries = int(
@@ -3168,6 +3201,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     occ_memory_candidate_probe_unknown_target_frontier_bonus_sum
                     / max(1, occ_memory_candidate_probe_event_count)
                 )
+                result["occ_memory_candidate_probe_mean_target_frontier_count"] = (
+                    occ_memory_candidate_probe_target_frontier_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_target_frontier_escape_count"] = (
+                    occ_memory_candidate_probe_target_frontier_escape_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_target_frontier_intent_safe_count"] = (
+                    occ_memory_candidate_probe_target_frontier_intent_safe_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
+                result["occ_memory_candidate_probe_mean_target_frontier_doorway_like_count"] = (
+                    occ_memory_candidate_probe_target_frontier_doorway_like_sum
+                    / max(1, occ_memory_candidate_probe_event_count)
+                )
                 result["occ_memory_candidate_selection_query_count"] = (
                     occ_memory_candidate_selection_query_count
                 )
@@ -3255,6 +3304,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result[
                     "occ_memory_candidate_probe_summary_mean_unknown_target_frontier_bonus_count"
                 ] = occ_memory_summary.get("candidate_probe_mean_unknown_target_frontier_bonus_count")
+                result["occ_memory_candidate_probe_summary_mean_target_frontier_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_target_frontier_count")
+                )
+                result["occ_memory_candidate_probe_summary_mean_target_frontier_escape_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_target_frontier_escape_count")
+                )
+                result["occ_memory_candidate_probe_summary_mean_target_frontier_intent_safe_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_target_frontier_intent_safe_count")
+                )
+                result["occ_memory_candidate_probe_summary_mean_target_frontier_doorway_like_count"] = (
+                    occ_memory_summary.get("candidate_probe_mean_target_frontier_doorway_like_count")
+                )
                 result["occ_memory_candidate_selection_summary_event_count"] = (
                     occ_memory_summary.get("candidate_selection_event_count")
                 )

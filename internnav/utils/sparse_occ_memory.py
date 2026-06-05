@@ -162,6 +162,17 @@ _GOAL_PROGRESS_SPECIFIC_ROOMS = {
     "balcony",
 }
 
+_TARGET_FRONTIER_TRANSITION_TERMS = {
+    "door",
+    "entryway",
+    "hall",
+    "hallway",
+    "corridor",
+    "stairs",
+    "balcony",
+    "patio",
+}
+
 
 def _as_intrinsic3(intrinsic: np.ndarray) -> np.ndarray:
     intrinsic = np.asarray(intrinsic, dtype=np.float32)
@@ -297,6 +308,14 @@ class SparseOccMemoryConfig:
     candidate_probe_goal_progress_seen_score_threshold: float = 0.25
     candidate_probe_goal_progress_high_conf_bonus: float = 0.25
     candidate_probe_goal_progress_unknown_target_bonus: float = 0.20
+    candidate_probe_target_frontier_enable: bool = False
+    candidate_probe_target_frontier_score_weight: float = 1.10
+    candidate_probe_target_frontier_cluster_radius_cells: int = 8
+    candidate_probe_target_frontier_cluster_norm: int = 18
+    candidate_probe_target_frontier_doorway_threshold: float = 0.35
+    candidate_probe_target_frontier_candidate_threshold: float = 0.35
+    candidate_probe_target_frontier_intent_max_deviation_deg: float = 75.0
+    candidate_probe_target_frontier_intent_penalty_weight: float = 0.45
     candidate_probe_save_bev: bool = True
     candidate_probe_max_bev_snapshots: int = 12
     save_bev: bool = True
@@ -407,6 +426,8 @@ class SparseOccSemanticMemory:
         self.occupied_update_count = 0
         self.frontier_cache: Optional[List[Tuple[int, int]]] = None
         self.frontier_cache_update = -1
+        self.frontier_set_cache: Optional[set] = None
+        self.frontier_set_cache_update = -1
         self.last_pose_grid: Optional[Tuple[int, int]] = None
         self.last_keyframe_xy: Optional[np.ndarray] = None
         self.saved_bev_count = 0
@@ -860,6 +881,10 @@ class SparseOccSemanticMemory:
         completed_landmark_count = 0
         repeated_semantic_count = 0
         unknown_target_frontier_bonus_count = 0
+        target_frontier_count = 0
+        target_frontier_escape_count = 0
+        target_frontier_intent_safe_count = 0
+        target_frontier_doorway_like_count = 0
         for item in candidates:
             candidate_types[str(item.get("candidate_type", "unknown"))] += 1
             direction_counts[str(item.get("direction_bucket", "unknown"))] += 1
@@ -883,6 +908,16 @@ class SparseOccSemanticMemory:
                 repeated_semantic_count += 1
             if float(item.get("unknown_target_frontier_bonus", 0.0) or 0.0) > 0.0:
                 unknown_target_frontier_bonus_count += 1
+            if item.get("target_frontier_candidate"):
+                target_frontier_count += 1
+            if item.get("target_frontier_escape_candidate"):
+                target_frontier_escape_count += 1
+            if item.get("target_frontier_intent_safe"):
+                target_frontier_intent_safe_count += 1
+            if float(item.get("target_frontier_doorway_like_score", 0.0) or 0.0) >= float(
+                self.config.candidate_probe_target_frontier_doorway_threshold
+            ):
+                target_frontier_doorway_like_count += 1
         bev_path = None
         if self.config.candidate_probe_save_bev and candidates:
             bev_path = self._write_candidate_bev_snapshot(candidates, context)
@@ -913,6 +948,14 @@ class SparseOccSemanticMemory:
                 "candidate_repeated_semantic_count": int(repeated_semantic_count),
                 "candidate_unknown_target_frontier_bonus_count": int(
                     unknown_target_frontier_bonus_count
+                ),
+                "candidate_target_frontier_count": int(target_frontier_count),
+                "candidate_target_frontier_escape_count": int(target_frontier_escape_count),
+                "candidate_target_frontier_intent_safe_count": int(
+                    target_frontier_intent_safe_count
+                ),
+                "candidate_target_frontier_doorway_like_count": int(
+                    target_frontier_doorway_like_count
                 ),
                 "semantic_memory_node_count": int(len(semantic_nodes)),
                 "instruction_terms": self._instruction_terms(),
@@ -1678,6 +1721,18 @@ class SparseOccSemanticMemory:
                 - float(self.config.candidate_probe_goal_progress_repeated_penalty)
                 * repeated_semantic_penalty
             )
+        target_frontier = self._target_frontier_features(
+            [row, col],
+            start_grid,
+            frontier_progress_score=frontier_progress_score,
+            revisit_risk=revisit_risk,
+            angle_to_current=angle_to_current,
+            goal_progress_state=goal_progress_state,
+            completed_landmark_penalty=completed_landmark_penalty,
+            repeated_semantic_penalty=repeated_semantic_penalty,
+            unknown_target_frontier_bonus=unknown_target_frontier_bonus,
+        )
+        target_frontier_score = float(target_frontier.get("score", 0.0) or 0.0)
         score = (
             float(source_score)
             + geometry_score
@@ -1693,6 +1748,8 @@ class SparseOccSemanticMemory:
             + float(self.config.candidate_probe_semantic_novelty_weight) * semantic_novelty_score
             + float(self.config.candidate_probe_topology_novelty_weight) * topology_novelty_score
             + goal_progress_score
+            + float(self.config.candidate_probe_target_frontier_score_weight)
+            * target_frontier_score
             + distance_score
             - 0.65 * revisit_risk
         )
@@ -1734,6 +1791,36 @@ class SparseOccSemanticMemory:
             "semantic_progress_score": float(semantic_progress_score),
             "unknown_target_frontier_bonus": float(unknown_target_frontier_bonus),
             "goal_progress_score": float(goal_progress_score),
+            "target_frontier_enabled": bool(target_frontier.get("enabled")),
+            "target_frontier_score": float(target_frontier_score),
+            "target_frontier_candidate": bool(target_frontier.get("candidate")),
+            "target_frontier_escape_candidate": bool(target_frontier.get("escape_candidate")),
+            "target_frontier_cluster_count": int(target_frontier.get("cluster_count", 0) or 0),
+            "target_frontier_cluster_score": float(
+                target_frontier.get("cluster_score", 0.0) or 0.0
+            ),
+            "target_frontier_doorway_like_score": float(
+                target_frontier.get("doorway_like_score", 0.0) or 0.0
+            ),
+            "target_frontier_corridor_continuation_score": float(
+                target_frontier.get("corridor_continuation_score", 0.0) or 0.0
+            ),
+            "target_frontier_transition_prior": float(
+                target_frontier.get("transition_prior", 0.0) or 0.0
+            ),
+            "target_frontier_intent_deviation_penalty": float(
+                target_frontier.get("intent_deviation_penalty", 0.0) or 0.0
+            ),
+            "target_frontier_intent_safe": bool(target_frontier.get("intent_safe")),
+            "target_frontier_local_free_count": int(
+                target_frontier.get("local_free_count", 0) or 0
+            ),
+            "target_frontier_local_occupied_count": int(
+                target_frontier.get("local_occupied_count", 0) or 0
+            ),
+            "target_frontier_local_unknown_count": int(
+                target_frontier.get("local_unknown_count", 0) or 0
+            ),
             "score": float(score),
         }
 
@@ -1823,6 +1910,10 @@ class SparseOccSemanticMemory:
         candidate_completed_landmark_sum = 0
         candidate_repeated_semantic_sum = 0
         candidate_unknown_target_frontier_bonus_sum = 0
+        candidate_target_frontier_sum = 0
+        candidate_target_frontier_escape_sum = 0
+        candidate_target_frontier_intent_safe_sum = 0
+        candidate_target_frontier_doorway_like_sum = 0
         candidate_type_counts: Dict[str, int] = defaultdict(int)
         candidate_direction_counts: Dict[str, int] = defaultdict(int)
         for event in self.candidate_probe_events:
@@ -1848,6 +1939,18 @@ class SparseOccSemanticMemory:
             )
             candidate_unknown_target_frontier_bonus_sum += int(
                 event.get("candidate_unknown_target_frontier_bonus_count", 0) or 0
+            )
+            candidate_target_frontier_sum += int(
+                event.get("candidate_target_frontier_count", 0) or 0
+            )
+            candidate_target_frontier_escape_sum += int(
+                event.get("candidate_target_frontier_escape_count", 0) or 0
+            )
+            candidate_target_frontier_intent_safe_sum += int(
+                event.get("candidate_target_frontier_intent_safe_count", 0) or 0
+            )
+            candidate_target_frontier_doorway_like_sum += int(
+                event.get("candidate_target_frontier_doorway_like_count", 0) or 0
             )
             for key, value in (event.get("candidate_type_counts") or {}).items():
                 candidate_type_counts[str(key)] += int(value or 0)
@@ -1950,6 +2053,22 @@ class SparseOccSemanticMemory:
                 float(candidate_unknown_target_frontier_bonus_sum / candidate_event_count)
                 if candidate_event_count else None
             ),
+            "candidate_probe_mean_target_frontier_count": (
+                float(candidate_target_frontier_sum / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "candidate_probe_mean_target_frontier_escape_count": (
+                float(candidate_target_frontier_escape_sum / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "candidate_probe_mean_target_frontier_intent_safe_count": (
+                float(candidate_target_frontier_intent_safe_sum / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "candidate_probe_mean_target_frontier_doorway_like_count": (
+                float(candidate_target_frontier_doorway_like_sum / candidate_event_count)
+                if candidate_event_count else None
+            ),
             "candidate_probe_type_counts": dict(candidate_type_counts),
             "candidate_probe_direction_counts": dict(candidate_direction_counts),
             "candidate_selection_event_count": int(selection_event_count),
@@ -2035,6 +2154,15 @@ class SparseOccSemanticMemory:
             ids = np.linspace(0, len(cells) - 1, int(sample_limit)).astype(np.int64)
             return [cells[int(i)] for i in ids]
         return list(cells)
+
+    def _frontier_cell_set(self) -> set:
+        if (
+            self.frontier_set_cache is None
+            or self.frontier_set_cache_update != self.update_count
+        ):
+            self.frontier_set_cache = set(self.get_frontier_cells(sample_limit=0))
+            self.frontier_set_cache_update = self.update_count
+        return self.frontier_set_cache
 
     def _pose_from_obs(self, obs: Dict[str, Any]) -> Optional[np.ndarray]:
         if obs.get("gps") is None or obs.get("compass") is None:
@@ -2214,6 +2342,167 @@ class SparseOccSemanticMemory:
         if not frontiers:
             return None
         return float(min(math.hypot(row - r, col - c) for r, c in frontiers))
+
+    def _target_frontier_features(
+        self,
+        cell: Iterable[int],
+        start_grid: Iterable[int],
+        *,
+        frontier_progress_score: float,
+        revisit_risk: float,
+        angle_to_current: Any,
+        goal_progress_state: Optional[Dict[str, Any]],
+        completed_landmark_penalty: float,
+        repeated_semantic_penalty: float,
+        unknown_target_frontier_bonus: float,
+    ) -> Dict[str, Any]:
+        if not self.config.candidate_probe_target_frontier_enable:
+            return {
+                "enabled": False,
+                "score": 0.0,
+                "cluster_count": 0,
+                "cluster_score": 0.0,
+                "doorway_like_score": 0.0,
+                "corridor_continuation_score": 0.0,
+                "transition_prior": 0.0,
+                "intent_deviation_penalty": 0.0,
+                "intent_safe": False,
+                "candidate": False,
+                "escape_candidate": False,
+            }
+        row, col = [int(v) for v in list(cell)[:2]]
+        radius = max(1, int(self.config.candidate_probe_target_frontier_cluster_radius_cells))
+        frontier_set = self._frontier_cell_set()
+        free_count = 0
+        occupied_count = 0
+        unknown_count = 0
+        frontier_count = 0
+        total_count = 0
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if dr * dr + dc * dc > radius * radius:
+                    continue
+                rr = row + dr
+                cc = col + dc
+                total_count += 1
+                state = self._cell_state(rr, cc)
+                if state == "occupied":
+                    occupied_count += 1
+                elif state == "free":
+                    free_count += 1
+                else:
+                    unknown_count += 1
+                if (rr, cc) in frontier_set:
+                    frontier_count += 1
+        cluster_norm = max(1.0, float(self.config.candidate_probe_target_frontier_cluster_norm))
+        cluster_score = min(1.0, float(frontier_count) / cluster_norm)
+        occupied_score = min(1.0, float(occupied_count) / max(1.0, 0.12 * float(total_count)))
+        unknown_score = min(1.0, float(unknown_count) / max(1.0, 0.20 * float(total_count)))
+        free_score = min(1.0, float(free_count) / max(1.0, 0.30 * float(total_count)))
+        doorway_like_score = 0.0
+        if frontier_progress_score > 0.0:
+            doorway_like_score = min(
+                1.0,
+                0.40 * occupied_score
+                + 0.35 * unknown_score
+                + 0.25 * min(free_score, cluster_score),
+            )
+        corridor_score = self._corridor_continuation_score(start_grid, [row, col])
+        transition_prior = self._target_frontier_transition_prior(goal_progress_state)
+        try:
+            intent_deviation = float(angle_to_current) / 180.0
+        except (TypeError, ValueError):
+            intent_deviation = 0.0
+        intent_deviation = min(1.0, max(0.0, intent_deviation))
+        try:
+            intent_safe = float(angle_to_current) <= float(
+                self.config.candidate_probe_target_frontier_intent_max_deviation_deg
+            )
+        except (TypeError, ValueError):
+            intent_safe = True
+        topology_score = (
+            0.35 * cluster_score
+            + 0.35 * doorway_like_score
+            + 0.30 * corridor_score
+        )
+        target_score = (
+            transition_prior * topology_score
+            + 0.25 * float(frontier_progress_score)
+            + float(unknown_target_frontier_bonus)
+            - 0.30 * float(revisit_risk)
+            - 0.25 * float(completed_landmark_penalty)
+            - 0.20 * float(repeated_semantic_penalty)
+            - float(self.config.candidate_probe_target_frontier_intent_penalty_weight)
+            * intent_deviation
+        )
+        target_score = max(0.0, min(1.0, target_score))
+        candidate_threshold = float(self.config.candidate_probe_target_frontier_candidate_threshold)
+        is_candidate = bool(target_score >= candidate_threshold)
+        escape_candidate = bool(
+            is_candidate
+            and intent_safe
+            and completed_landmark_penalty <= 0.0
+            and repeated_semantic_penalty <= 0.0
+        )
+        return {
+            "enabled": True,
+            "score": float(target_score),
+            "cluster_count": int(frontier_count),
+            "cluster_score": float(cluster_score),
+            "doorway_like_score": float(doorway_like_score),
+            "corridor_continuation_score": float(corridor_score),
+            "transition_prior": float(transition_prior),
+            "intent_deviation_penalty": float(intent_deviation),
+            "intent_safe": bool(intent_safe),
+            "candidate": bool(is_candidate),
+            "escape_candidate": bool(escape_candidate),
+            "local_free_count": int(free_count),
+            "local_occupied_count": int(occupied_count),
+            "local_unknown_count": int(unknown_count),
+        }
+
+    def _corridor_continuation_score(
+        self,
+        start_grid: Iterable[int],
+        target_grid: Iterable[int],
+    ) -> float:
+        start_row, start_col = [int(v) for v in list(start_grid)[:2]]
+        target_row, target_col = [int(v) for v in list(target_grid)[:2]]
+        steps = max(abs(target_row - start_row), abs(target_col - start_col))
+        if steps <= 1:
+            return 0.0
+        free_count = 0
+        occupied_count = 0
+        checked = 0
+        for idx in range(1, steps + 1):
+            t = float(idx) / float(steps)
+            row = int(round(start_row + t * (target_row - start_row)))
+            col = int(round(start_col + t * (target_col - start_col)))
+            state = self._cell_state(row, col)
+            checked += 1
+            if state == "occupied":
+                occupied_count += 1
+            elif state == "free":
+                free_count += 1
+        if checked <= 0:
+            return 0.0
+        free_ratio = float(free_count) / float(checked)
+        occupied_ratio = float(occupied_count) / float(checked)
+        return max(0.0, min(1.0, free_ratio * (1.0 - occupied_ratio)))
+
+    def _target_frontier_transition_prior(
+        self,
+        goal_progress_state: Optional[Dict[str, Any]],
+    ) -> float:
+        state = goal_progress_state or {}
+        next_landmark = self._canonical_semantic_term(state.get("next_landmark"))
+        if not next_landmark:
+            return 0.35
+        if next_landmark in _TARGET_FRONTIER_TRANSITION_TERMS:
+            return 1.0
+        if next_landmark in _GOAL_PROGRESS_SPECIFIC_ROOMS:
+            return 0.75
+        return 0.45
 
     def _frontier_direction_summary(self, start_grid: Iterable[int], yaw: float) -> Dict[str, Any]:
         buckets = ("front", "left", "right", "back")
