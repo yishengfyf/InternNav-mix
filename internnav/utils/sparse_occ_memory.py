@@ -1027,6 +1027,119 @@ class SparseOccSemanticMemory:
             "yaw": float(yaw),
         }
 
+    def score_local_xy_trajectory(
+        self,
+        local_xy,
+        obs: Optional[Dict[str, Any]] = None,
+        *,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Score a local XY trajectory against persistent sparse occupancy.
+
+        The local trajectory uses the same convention as NextDiT action samples:
+        x is forward from the current pose and y is lateral in the current local
+        frame. This probe is shadow-only and does not mutate memory.
+        """
+        context = dict(context or {})
+        result = {
+            "enabled": bool(self.enabled),
+            "valid": False,
+            "reason": None,
+        }
+        if not self.enabled:
+            result["reason"] = "disabled"
+            return result
+        pose_state = self._current_pose_state(obs or {})
+        if pose_state is None:
+            result["reason"] = "missing_pose_or_memory"
+            return result
+        try:
+            points = np.asarray(local_xy, dtype=np.float32)
+        except (TypeError, ValueError):
+            result["reason"] = "invalid_trajectory"
+            return result
+        if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] < 2:
+            result["reason"] = "invalid_trajectory_shape"
+            return result
+
+        x0, y0 = [float(v) for v in pose_state["xy"][:2]]
+        yaw = float(pose_state["yaw"])
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+
+        checked_cells = []
+        prev_world = None
+        stride = max(float(self.cs), 0.05)
+        for point in points[:, :2]:
+            lx = float(point[0])
+            ly = float(point[1])
+            world = np.array(
+                [
+                    x0 + cos_yaw * lx - sin_yaw * ly,
+                    y0 + sin_yaw * lx + cos_yaw * ly,
+                ],
+                dtype=np.float32,
+            )
+            if prev_world is None:
+                prev_world = world
+                continue
+            delta = world - prev_world
+            distance = float(np.linalg.norm(delta))
+            sample_count = max(1, int(math.ceil(distance / stride)))
+            for idx in range(1, sample_count + 1):
+                alpha = float(idx) / float(sample_count)
+                sample_xy = prev_world + alpha * delta
+                row, col = self._xy_to_grid_cell(sample_xy[0], sample_xy[1])
+                if 0 <= row < self.gs and 0 <= col < self.gs:
+                    checked_cells.append((int(row), int(col)))
+            prev_world = world
+
+        unique_cells = []
+        seen = set()
+        for cell in checked_cells:
+            if cell not in seen:
+                seen.add(cell)
+                unique_cells.append(cell)
+
+        occupied_cells = []
+        free_count = 0
+        unknown_count = 0
+        for row, col in unique_cells:
+            state = self._cell_state(row, col)
+            if state == "occupied":
+                occupied_cells.append((row, col))
+            elif state == "free":
+                free_count += 1
+            else:
+                unknown_count += 1
+
+        checked_count = len(unique_cells)
+        occupied_count = len(occupied_cells)
+        unknown_ratio = float(unknown_count / checked_count) if checked_count else 1.0
+        occupied_ratio = float(occupied_count / checked_count) if checked_count else 0.0
+        end_row, end_col = unique_cells[-1] if unique_cells else pose_state["grid"][:2]
+        result.update(
+            {
+                "valid": True,
+                "reason": "ok",
+                "checked_cell_count": int(checked_count),
+                "occupied_hit_count": int(occupied_count),
+                "free_hit_count": int(free_count),
+                "unknown_hit_count": int(unknown_count),
+                "occupied_hit_ratio": float(occupied_ratio),
+                "unknown_hit_ratio": float(unknown_ratio),
+                "would_reject": bool(occupied_count > 0),
+                "has_unknown": bool(unknown_count > 0),
+                "start_grid": [int(v) for v in pose_state["grid"][:2]],
+                "end_grid": [int(end_row), int(end_col)],
+                "sampled_point_count": int(points.shape[0]),
+                "local_endpoint_xy": [float(points[-1, 0]), float(points[-1, 1])],
+                "occupied_cells_preview": [[int(r), int(c)] for r, c in occupied_cells[:8]],
+                "context": self._jsonable(context),
+            }
+        )
+        return result
+
     def _frontier_query_candidates(
         self,
         start_grid: Iterable[int],
@@ -2184,15 +2297,18 @@ class SparseOccSemanticMemory:
 
     def _pose_to_grid(self, rel_base_tf: np.ndarray) -> Tuple[int, int, float]:
         x, y, _ = rel_base_tf[:3, 3]
-        row = int(self.gs / 2 - int(float(x) / self.cs))
-        col = int(self.gs / 2 - int(float(y) / self.cs))
+        row, col = self._xy_to_grid_cell(float(x), float(y))
         yaw = float(math.atan2(float(rel_base_tf[1, 0]), float(rel_base_tf[0, 0])))
         return row, col, yaw
 
+    def _xy_to_grid_cell(self, x: float, y: float) -> Tuple[int, int]:
+        row = int(self.gs / 2 - int(float(x) / self.cs))
+        col = int(self.gs / 2 - int(float(y) / self.cs))
+        return int(row), int(col)
+
     def _xyz_to_grid(self, xyz: np.ndarray) -> Optional[Tuple[int, int, int]]:
         x, y, z = [float(v) for v in xyz[:3]]
-        row = int(self.gs / 2 - int(x / self.cs))
-        col = int(self.gs / 2 - int(y / self.cs))
+        row, col = self._xy_to_grid_cell(x, y)
         height = int(z / self.cs)
         if row < 0 or row >= self.gs or col < 0 or col >= self.gs or height < 0 or height >= self.vh:
             return None

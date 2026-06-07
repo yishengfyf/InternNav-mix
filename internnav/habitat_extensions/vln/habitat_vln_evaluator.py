@@ -269,9 +269,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         # Now just implement the actual eval here and return dict.
 
         if self.model_args.mode == 'dual_system':
-            sucs, spls, oss, nes, ndtws = self._run_eval_dual_system()
+            sucs, spls, oss, nes, ndtws, collisions, collision_free, cf_sucs, cf_spls = self._run_eval_dual_system()
         elif self.model_args.mode == 'system2':
-            sucs, spls, oss, nes, ndtws = self._run_eval_system2()
+            sucs, spls, oss, nes, ndtws, collisions, collision_free, cf_sucs, cf_spls = self._run_eval_system2()
         else:
             raise ValueError(f"Invalid mode: {self.model_args.mode}")
 
@@ -280,6 +280,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "spls": spls,  # shape [N_local]
             "oss": oss,  # shape [N_local]
             "nes": nes,  # shape [N_local]
+            "collisions": collisions,  # shape [N_local]
+            "collision_free": collision_free,  # shape [N_local]
+            "cf_sucs": cf_sucs,  # shape [N_local]
+            "cf_spls": cf_spls,  # shape [N_local]
         }
 
         if ndtws is not None:
@@ -313,13 +317,82 @@ class HabitatVLNEvaluator(DistributedEvaluator):
     def _write_episode_progress(self, result: dict) -> None:
         os.makedirs(self.output_path, exist_ok=True)
         with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
-            f.write(json.dumps(result) + "\n")
+            f.write(json.dumps(self._jsonable(result)) + "\n")
 
         run_dir = self._get_vlmap_run_dir()
         if run_dir:
             os.makedirs(run_dir, exist_ok=True)
             with open(os.path.join(run_dir, 'progress.json'), 'a', encoding="utf-8") as f:
-                f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                f.write(json.dumps(self._jsonable(result), ensure_ascii=False) + "\n")
+
+    def _jsonable(self, value):
+        if isinstance(value, dict):
+            return {str(k): self._jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._jsonable(v) for v in value]
+        if isinstance(value, np.ndarray):
+            return self._jsonable(value.tolist())
+        if isinstance(value, torch.Tensor):
+            return self._jsonable(value.detach().cpu().tolist())
+        if isinstance(value, np.integer):
+            return int(value)
+        if isinstance(value, np.floating):
+            return float(value)
+        if isinstance(value, np.bool_):
+            return bool(value)
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if hasattr(value, "__dict__"):
+            return self._jsonable(vars(value))
+        return str(value)
+
+    def _extract_collision_summary(self, metrics: dict, *, steps: Optional[int] = None) -> dict:
+        raw = (metrics or {}).get("collisions")
+        count = 0.0
+        is_collision = False
+        if isinstance(raw, dict):
+            for key in ("count", "collision_count", "num_collisions", "collisions"):
+                if key in raw and raw[key] is not None:
+                    try:
+                        count = float(raw[key])
+                    except (TypeError, ValueError):
+                        count = 0.0
+                    break
+            if "is_collision" in raw:
+                is_collision = bool(raw.get("is_collision"))
+            else:
+                is_collision = count > 0.0
+        elif raw is not None:
+            for attr in ("count", "collision_count", "num_collisions"):
+                if hasattr(raw, attr):
+                    try:
+                        count = float(getattr(raw, attr))
+                    except (TypeError, ValueError):
+                        count = 0.0
+                    break
+            else:
+                try:
+                    count = float(raw)
+                except (TypeError, ValueError):
+                    count = 0.0
+            if hasattr(raw, "is_collision"):
+                is_collision = bool(getattr(raw, "is_collision"))
+            else:
+                is_collision = count > 0.0
+
+        steps_int = max(1, int(steps or 0))
+        success = float((metrics or {}).get("success", 0.0) or 0.0)
+        spl = float((metrics or {}).get("spl", 0.0) or 0.0)
+        collision_free = 1.0 if count <= 0.0 else 0.0
+        return {
+            "collision_raw": self._jsonable(raw),
+            "collision_count": float(count),
+            "collision_is_collision": bool(is_collision),
+            "collision_free": float(collision_free),
+            "collision_rate_per_step": float(count / steps_int),
+            "cf_success": float(success * collision_free),
+            "cf_spl": float(spl * collision_free),
+        }
 
     def _seed_eval_rng(self, seed: int, label: str = "") -> None:
         random.seed(seed)
@@ -373,6 +446,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "nes_all": float(nes_all.mean().item()) if denom > 0 else 0.0,
             # "length" will be filled by base class
         }
+
+        if "collisions" in global_metrics:
+            collisions_all = global_metrics["collisions"]
+            result_all["collision_count_sum"] = float(collisions_all.sum().item()) if denom > 0 else 0.0
+            result_all["collision_count_mean"] = float(collisions_all.mean().item()) if denom > 0 else 0.0
+            result_all["collision_episode_rate"] = (
+                float((collisions_all > 0).float().mean().item()) if denom > 0 else 0.0
+            )
+        if "collision_free" in global_metrics:
+            collision_free_all = global_metrics["collision_free"]
+            result_all["collision_free_rate"] = (
+                float(collision_free_all.mean().item()) if denom > 0 else 0.0
+            )
+        if "cf_sucs" in global_metrics:
+            cf_sucs_all = global_metrics["cf_sucs"]
+            result_all["cf_sucs_all"] = float(cf_sucs_all.mean().item()) if denom > 0 else 0.0
+        if "cf_spls" in global_metrics:
+            cf_spls_all = global_metrics["cf_spls"]
+            result_all["cf_spls_all"] = float(cf_spls_all.mean().item()) if denom > 0 else 0.0
 
         if "ndtws" in global_metrics:
             ndtws_all = global_metrics["ndtws"]
@@ -1365,6 +1457,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "active_require_current_reject": bool(
                 vlmap_safety_cfg.get("nextdit_candidate_active_require_current_reject", True)
             ),
+            "occ_memory_score_enable": bool(
+                vlmap_safety_cfg.get("nextdit_candidate_occ_memory_score_enable", False)
+            ),
+            "occ_memory_score_max_points": max(
+                2,
+                int(vlmap_safety_cfg.get("nextdit_candidate_occ_memory_score_max_points", 33)),
+            ),
         }
 
     def _write_nextdit_candidate_probe_event(self, event: dict) -> None:
@@ -1411,6 +1510,28 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             print(f"[NextDiTCandidateProbe] failed to convert sample {sample_index}: {exc}")
             actions = []
         return self._normalize_candidate_actions(actions, horizon=horizon)
+
+    def _local_xy_from_nextdit_sample(self, dp_actions, sample_index: int, max_points: int) -> Optional[np.ndarray]:
+        try:
+            sample = dp_actions[int(sample_index)]
+            if hasattr(sample, "detach"):
+                arr = sample.detach().float().cpu().numpy().copy()
+            else:
+                arr = np.asarray(sample, dtype=np.float32).copy()
+            if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 2:
+                return None
+            # Match traj_to_actions(): dx/dy are stored at 4x scale.
+            arr[:, :2] /= 4.0
+            cumsum_xy = np.cumsum(arr[:, :2], axis=0)
+            local_xy = np.zeros((arr.shape[0] + 1, 2), dtype=np.float32)
+            local_xy[1:] = cumsum_xy
+            if max_points > 0 and local_xy.shape[0] > max_points:
+                ids = np.linspace(0, local_xy.shape[0] - 1, int(max_points)).astype(np.int64)
+                local_xy = local_xy[ids]
+            return local_xy
+        except Exception as exc:
+            print(f"[NextDiTCandidateProbe] failed to reconstruct raw sample {sample_index}: {exc}")
+            return None
 
     def _trajectory_blocked_fraction_sum(self, decision: dict) -> float:
         blocked_fraction_sum = 0.0
@@ -1490,6 +1611,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return {}
 
         candidates = []
+        occ_valid_count = 0
+        occ_invalid_count = 0
+        occ_would_reject_count = 0
+        occ_unknown_candidate_count = 0
+        occ_checked_cell_sum = 0
+        occ_occupied_hit_sum = 0
+        occ_unknown_hit_sum = 0
+        occ_memory_score_enabled = bool(cfg.get("occ_memory_score_enable"))
         for candidate_index in range(candidate_count):
             actions = self._actions_from_nextdit_sample(dp_actions, candidate_index, horizon=horizon)
             decision = validate(
@@ -1508,6 +1637,45 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "suppress_trajectory_event": True,
                 },
             )
+            occ_memory_score = None
+            if occ_memory_score_enabled:
+                local_xy = self._local_xy_from_nextdit_sample(
+                    dp_actions,
+                    candidate_index,
+                    int(cfg.get("occ_memory_score_max_points", 33)),
+                )
+                if local_xy is None:
+                    occ_memory_score = {
+                        "enabled": True,
+                        "valid": False,
+                        "reason": "raw_sample_reconstruction_failed",
+                    }
+                    occ_invalid_count += 1
+                else:
+                    occ_memory_score = self.occ_memory.score_local_xy_trajectory(
+                        local_xy,
+                        safety_obs,
+                        context={
+                            "step_id": step_id,
+                            "scene_id": scene_id,
+                            "episode_id": episode_id,
+                            "episode_index": episode_index,
+                            "episode_count": episode_count,
+                            "candidate_index": candidate_index,
+                            "candidate_probe": "nextdit_raw_trajectory",
+                        },
+                    )
+                    if occ_memory_score.get("valid"):
+                        occ_valid_count += 1
+                        if occ_memory_score.get("would_reject"):
+                            occ_would_reject_count += 1
+                        if occ_memory_score.get("has_unknown"):
+                            occ_unknown_candidate_count += 1
+                        occ_checked_cell_sum += int(occ_memory_score.get("checked_cell_count", 0) or 0)
+                        occ_occupied_hit_sum += int(occ_memory_score.get("occupied_hit_count", 0) or 0)
+                        occ_unknown_hit_sum += int(occ_memory_score.get("unknown_hit_count", 0) or 0)
+                    else:
+                        occ_invalid_count += 1
             candidates.append(
                 {
                     "candidate_index": int(candidate_index),
@@ -1515,6 +1683,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "score": float(self._trajectory_decision_score(decision)),
                     "obstacle_score": float(self._trajectory_obstacle_score(decision)),
                     "decision": decision,
+                    "occ_memory_score": occ_memory_score,
                 }
             )
 
@@ -1557,6 +1726,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 self._unique_endpoint_count(candidates, cfg["min_endpoint_grid_distance"])
             ),
             "min_endpoint_grid_distance": float(cfg["min_endpoint_grid_distance"]),
+            "occ_memory_score_enabled": bool(occ_memory_score_enabled),
+            "occ_memory_score_valid_candidate_count": int(occ_valid_count),
+            "occ_memory_score_invalid_candidate_count": int(occ_invalid_count),
+            "occ_memory_score_would_reject_candidate_count": int(occ_would_reject_count),
+            "occ_memory_score_unknown_candidate_count": int(occ_unknown_candidate_count),
+            "occ_memory_score_mean_checked_cell_count": float(
+                occ_checked_cell_sum / max(1, occ_valid_count)
+            ),
+            "occ_memory_score_mean_occupied_hit_count": float(
+                occ_occupied_hit_sum / max(1, occ_valid_count)
+            ),
+            "occ_memory_score_mean_unknown_hit_count": float(
+                occ_unknown_hit_sum / max(1, occ_valid_count)
+            ),
             "pixel_goal": None if pixel_goal is None else [int(pixel_goal[0]), int(pixel_goal[1])],
             "candidates": candidates,
         }
@@ -1809,8 +1992,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
+        collisions, collision_free, cf_sucs, cf_spls = [], [], [], []
         if self.rank != 0:
-            return sucs, spls, oss, nes, ndtw
+            return sucs, spls, oss, nes, ndtw, collisions, collision_free, cf_sucs, cf_spls
 
         # resume from previous results
         if os.path.exists(os.path.join(self.output_path, 'progress.json')):
@@ -1823,13 +2007,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     nes.append(res['ne'])
                     if 'ndtw' in res:
                         ndtw.append(res['ndtw'])
-        return sucs, spls, oss, nes, ndtw
+                    collision_count = float(res.get("collision_count", 0.0) or 0.0)
+                    collision_free_value = float(res.get("collision_free", 1.0 if collision_count <= 0.0 else 0.0))
+                    collisions.append(collision_count)
+                    collision_free.append(collision_free_value)
+                    cf_sucs.append(float(res.get("cf_success", float(res["success"]) * collision_free_value)))
+                    cf_spls.append(float(res.get("cf_spl", float(res["spl"]) * collision_free_value)))
+        return sucs, spls, oss, nes, ndtw, collisions, collision_free, cf_sucs, cf_spls
 
     def _run_eval_dual_system(self) -> tuple:  # noqa: C901
         self.model.eval()
 
         # resume from previous results
-        sucs, spls, oss, nes, ndtw = self.resume_from_output_path()
+        (
+            sucs,
+            spls,
+            oss,
+            nes,
+            ndtw,
+            collisions,
+            collision_free,
+            cf_sucs,
+            cf_spls,
+        ) = self.resume_from_output_path()
 
         # Episode loop is now driven by env.reset() + env.is_running
         episode_count = len(self.env.episodes)
@@ -1969,6 +2169,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             nextdit_candidate_probe_selected_diff_count = 0
             nextdit_candidate_probe_current_reject_count = 0
             nextdit_candidate_probe_would_reject_candidate_sum = 0
+            nextdit_candidate_occ_valid_candidate_sum = 0
+            nextdit_candidate_occ_invalid_candidate_sum = 0
+            nextdit_candidate_occ_would_reject_candidate_sum = 0
+            nextdit_candidate_occ_unknown_candidate_sum = 0
+            nextdit_candidate_occ_checked_cell_sum = 0.0
+            nextdit_candidate_occ_occupied_hit_sum = 0.0
+            nextdit_candidate_occ_unknown_hit_sum = 0.0
             nextdit_candidate_active_considered_count = 0
             nextdit_candidate_active_intervention_count = 0
             nextdit_candidate_active_changed_count = 0
@@ -2741,6 +2948,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             nextdit_candidate_probe_would_reject_candidate_sum += int(
                                 nextdit_probe_event.get("would_reject_candidate_count", 0) or 0
                             )
+                            nextdit_candidate_occ_valid_candidate_sum += int(
+                                nextdit_probe_event.get("occ_memory_score_valid_candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_occ_invalid_candidate_sum += int(
+                                nextdit_probe_event.get("occ_memory_score_invalid_candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_occ_would_reject_candidate_sum += int(
+                                nextdit_probe_event.get("occ_memory_score_would_reject_candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_occ_unknown_candidate_sum += int(
+                                nextdit_probe_event.get("occ_memory_score_unknown_candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_occ_checked_cell_sum += float(
+                                nextdit_probe_event.get("occ_memory_score_mean_checked_cell_count", 0.0) or 0.0
+                            )
+                            nextdit_candidate_occ_occupied_hit_sum += float(
+                                nextdit_probe_event.get("occ_memory_score_mean_occupied_hit_count", 0.0) or 0.0
+                            )
+                            nextdit_candidate_occ_unknown_hit_sum += float(
+                                nextdit_probe_event.get("occ_memory_score_mean_unknown_hit_count", 0.0) or 0.0
+                            )
                             if int(nextdit_probe_event.get("safer_candidate_count", 0) or 0) > 0:
                                 nextdit_candidate_probe_safer_event_count += 1
                             if nextdit_probe_event.get("selected_differs_from_current"):
@@ -2876,6 +3104,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             )
                             nextdit_candidate_probe_would_reject_candidate_sum += int(
                                 nextdit_probe_event.get("would_reject_candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_occ_valid_candidate_sum += int(
+                                nextdit_probe_event.get("occ_memory_score_valid_candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_occ_invalid_candidate_sum += int(
+                                nextdit_probe_event.get("occ_memory_score_invalid_candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_occ_would_reject_candidate_sum += int(
+                                nextdit_probe_event.get("occ_memory_score_would_reject_candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_occ_unknown_candidate_sum += int(
+                                nextdit_probe_event.get("occ_memory_score_unknown_candidate_count", 0) or 0
+                            )
+                            nextdit_candidate_occ_checked_cell_sum += float(
+                                nextdit_probe_event.get("occ_memory_score_mean_checked_cell_count", 0.0) or 0.0
+                            )
+                            nextdit_candidate_occ_occupied_hit_sum += float(
+                                nextdit_probe_event.get("occ_memory_score_mean_occupied_hit_count", 0.0) or 0.0
+                            )
+                            nextdit_candidate_occ_unknown_hit_sum += float(
+                                nextdit_probe_event.get("occ_memory_score_mean_unknown_hit_count", 0.0) or 0.0
                             )
                             if int(nextdit_probe_event.get("safer_candidate_count", 0) or 0) > 0:
                                 nextdit_candidate_probe_safer_event_count += 1
@@ -3019,18 +3268,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             # After the episode finishes, collect metrics:
             metrics = self.env.get_metrics()
+            safety_summary = self._extract_collision_summary(metrics, steps=step_id)
 
             sucs.append(metrics['success'])
             spls.append(metrics['spl'])
             oss.append(metrics['oracle_success'])
             nes.append(metrics["distance_to_goal"])
+            collisions.append(safety_summary["collision_count"])
+            collision_free.append(safety_summary["collision_free"])
+            cf_sucs.append(safety_summary["cf_success"])
+            cf_spls.append(safety_summary["cf_spl"])
             if 'ndtw' in metrics:
                 ndtw.append(metrics["ndtw"])
 
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
                 f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
-                f"ne: {metrics['distance_to_goal']}"
+                f"ne: {metrics['distance_to_goal']}, "
+                f"collisions: {safety_summary['collision_count']}"
             )
             if pending_vlmap_semantic_hint and semantic_hint_not_injected_reason == "pending_next_s2_query":
                 semantic_hint_not_injected_reason = "episode_ended"
@@ -3053,6 +3308,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
             }
+            result.update(safety_summary)
             if semantic_summary:
                 result["semantic_landmark_count"] = semantic_summary.get("landmark_count")
                 result["semantic_seen_count"] = semantic_summary.get("seen_count")
@@ -3490,6 +3746,43 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result["nextdit_candidate_probe_current_reject_count"] = (
                     nextdit_candidate_probe_current_reject_count
                 )
+                if nextdit_probe_cfg.get("occ_memory_score_enable"):
+                    result["nextdit_candidate_occ_valid_candidate_count"] = (
+                        nextdit_candidate_occ_valid_candidate_sum
+                    )
+                    result["nextdit_candidate_occ_invalid_candidate_count"] = (
+                        nextdit_candidate_occ_invalid_candidate_sum
+                    )
+                    result["nextdit_candidate_occ_valid_ratio"] = (
+                        nextdit_candidate_occ_valid_candidate_sum
+                        / max(1, nextdit_candidate_probe_candidate_sum)
+                    )
+                    result["nextdit_candidate_occ_would_reject_candidate_count"] = (
+                        nextdit_candidate_occ_would_reject_candidate_sum
+                    )
+                    result["nextdit_candidate_occ_would_reject_ratio"] = (
+                        nextdit_candidate_occ_would_reject_candidate_sum
+                        / max(1, nextdit_candidate_occ_valid_candidate_sum)
+                    )
+                    result["nextdit_candidate_occ_unknown_candidate_count"] = (
+                        nextdit_candidate_occ_unknown_candidate_sum
+                    )
+                    result["nextdit_candidate_occ_unknown_ratio"] = (
+                        nextdit_candidate_occ_unknown_candidate_sum
+                        / max(1, nextdit_candidate_occ_valid_candidate_sum)
+                    )
+                    result["nextdit_candidate_occ_mean_checked_cell_count"] = (
+                        nextdit_candidate_occ_checked_cell_sum
+                        / max(1, nextdit_candidate_probe_event_count)
+                    )
+                    result["nextdit_candidate_occ_mean_occupied_hit_count"] = (
+                        nextdit_candidate_occ_occupied_hit_sum
+                        / max(1, nextdit_candidate_probe_event_count)
+                    )
+                    result["nextdit_candidate_occ_mean_unknown_hit_count"] = (
+                        nextdit_candidate_occ_unknown_hit_sum
+                        / max(1, nextdit_candidate_probe_event_count)
+                    )
             if nextdit_probe_cfg.get("active_enable"):
                 result["nextdit_candidate_active_considered_count"] = (
                     nextdit_candidate_active_considered_count
@@ -3534,13 +3827,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             torch.tensor(oss).to(self.device),
             torch.tensor(nes).to(self.device),
             torch.tensor(ndtw).to(self.device) if ndtw else None,
+            torch.tensor(collisions).to(self.device),
+            torch.tensor(collision_free).to(self.device),
+            torch.tensor(cf_sucs).to(self.device),
+            torch.tensor(cf_spls).to(self.device),
         )
 
     def _run_eval_system2(self) -> tuple:
         self.model.eval()
 
         # resume from previous results
-        sucs, spls, oss, nes, ndtw = self.resume_from_output_path()
+        (
+            sucs,
+            spls,
+            oss,
+            nes,
+            ndtw,
+            collisions,
+            collision_free,
+            cf_sucs,
+            cf_spls,
+        ) = self.resume_from_output_path()
 
         # Episode loop is now driven by env.reset() + env.is_running
         process_bar = tqdm.tqdm(total=len(self.env.episodes), desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
@@ -3801,18 +4108,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             # After the episode finishes, collect metrics:
             metrics = self.env.get_metrics()
+            safety_summary = self._extract_collision_summary(metrics, steps=step_id)
 
             sucs.append(metrics['success'])
             spls.append(metrics['spl'])
             oss.append(metrics['oracle_success'])
             nes.append(metrics["distance_to_goal"])
+            collisions.append(safety_summary["collision_count"])
+            collision_free.append(safety_summary["collision_free"])
+            cf_sucs.append(safety_summary["cf_success"])
+            cf_spls.append(safety_summary["cf_spl"])
             if 'ndtw' in metrics:
                 ndtw.append(metrics["ndtw"])
 
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
                 f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
-                f"ne: {metrics['distance_to_goal']}"
+                f"ne: {metrics['distance_to_goal']}, "
+                f"collisions: {safety_summary['collision_count']}"
             )
 
             # Write per-episode result.json entry (still per-rank)
@@ -3826,6 +4139,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
             }
+            result.update(safety_summary)
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
 
@@ -3850,4 +4164,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             torch.tensor(oss).to(self.device),
             torch.tensor(nes).to(self.device),
             torch.tensor(ndtw).to(self.device) if ndtw else None,
+            torch.tensor(collisions).to(self.device),
+            torch.tensor(collision_free).to(self.device),
+            torch.tensor(cf_sucs).to(self.device),
+            torch.tensor(cf_spls).to(self.device),
         )

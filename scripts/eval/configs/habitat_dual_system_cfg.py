@@ -113,6 +113,8 @@ eval_cfg = EvalCfg(
                 "nextdit_candidate_active_enable": False,
                 "nextdit_candidate_active_max_interventions_per_episode": 2,
                 "nextdit_candidate_active_require_current_reject": True,
+                "nextdit_candidate_occ_memory_score_enable": False,
+                "nextdit_candidate_occ_memory_score_max_points": 33,
                 "occ_memory_enable": False,
                 "occ_memory_shadow_only": True,
                 "occ_memory_update_every_steps": 1,
