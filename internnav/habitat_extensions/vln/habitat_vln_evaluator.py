@@ -1515,6 +1515,717 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
+    def _get_occ_memory_recovery_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "enable": bool(vlmap_safety_cfg.get("occ_memory_recovery_enable", False)),
+            "shadow_only": bool(vlmap_safety_cfg.get("occ_memory_recovery_shadow_only", True)),
+            "min_step": max(0, int(vlmap_safety_cfg.get("occ_memory_recovery_min_step", 30))),
+            "occupied_stagnation_window_steps": max(
+                1,
+                int(vlmap_safety_cfg.get("occ_memory_recovery_occupied_stagnation_window_steps", 20)),
+            ),
+            "total_stagnation_window_steps": max(
+                1,
+                int(vlmap_safety_cfg.get("occ_memory_recovery_total_stagnation_window_steps", 20)),
+            ),
+            "displacement_window_steps": max(
+                1,
+                int(vlmap_safety_cfg.get("occ_memory_recovery_displacement_window_steps", 20)),
+            ),
+            "low_displacement_threshold_m": max(
+                0.0,
+                float(vlmap_safety_cfg.get("occ_memory_recovery_low_displacement_threshold_m", 0.35)),
+            ),
+            "require_low_displacement_for_map_stagnation": bool(
+                vlmap_safety_cfg.get("occ_memory_recovery_require_low_displacement_for_map_stagnation", True)
+            ),
+            "collision_trigger_enable": bool(
+                vlmap_safety_cfg.get("occ_memory_recovery_collision_trigger_enable", True)
+            ),
+            "total_map_stagnation_trigger_enable": bool(
+                vlmap_safety_cfg.get("occ_memory_recovery_total_map_stagnation_trigger_enable", False)
+            ),
+            "max_interventions_per_episode": int(
+                vlmap_safety_cfg.get("occ_memory_recovery_max_interventions_per_episode", 1)
+            ),
+            "active_use_map_stagnation": bool(
+                vlmap_safety_cfg.get("occ_memory_recovery_active_use_map_stagnation", True)
+            ),
+            "active_use_collision_trigger": bool(
+                vlmap_safety_cfg.get("occ_memory_recovery_active_use_collision_trigger", False)
+            ),
+            "arrival_like_protection_enable": bool(
+                vlmap_safety_cfg.get("occ_memory_recovery_arrival_like_protection_enable", True)
+            ),
+            "arrival_like_radius_cells": max(
+                1,
+                int(vlmap_safety_cfg.get("occ_memory_recovery_arrival_like_radius_cells", 8)),
+            ),
+            "arrival_like_min_free_ratio": float(
+                vlmap_safety_cfg.get("occ_memory_recovery_arrival_like_min_free_ratio", 0.35)
+            ),
+            "arrival_like_max_occupied_ratio": float(
+                vlmap_safety_cfg.get("occ_memory_recovery_arrival_like_max_occupied_ratio", 0.04)
+            ),
+            "escape_probe_distance_m": max(
+                0.10,
+                float(vlmap_safety_cfg.get("occ_memory_recovery_escape_probe_distance_m", 0.75)),
+            ),
+            "escape_candidate_angles_deg": list(
+                vlmap_safety_cfg.get("occ_memory_recovery_escape_candidate_angles_deg", [45.0, -45.0, 60.0, -60.0])
+            ),
+            "escape_max_turn_steps": max(
+                1,
+                int(vlmap_safety_cfg.get("occ_memory_recovery_escape_max_turn_steps", 3)),
+            ),
+            "escape_forward_steps": max(
+                0,
+                int(vlmap_safety_cfg.get("occ_memory_recovery_escape_forward_steps", 1)),
+            ),
+            "escape_allow_forward_only_if_free": bool(
+                vlmap_safety_cfg.get("occ_memory_recovery_escape_allow_forward_only_if_free", True)
+            ),
+            "escape_clear_goal": bool(vlmap_safety_cfg.get("occ_memory_recovery_escape_clear_goal", True)),
+            "log_every_step": bool(vlmap_safety_cfg.get("occ_memory_recovery_log_every_step", True)),
+        }
+
+    def _init_occ_memory_recovery_state(self) -> dict:
+        return {
+            "event_count": 0,
+            "logged_event_count": 0,
+            "recovery_trigger_event_count": 0,
+            "recovery_trigger_start_count": 0,
+            "map_stagnation_event_count": 0,
+            "map_stagnation_start_count": 0,
+            "total_map_stagnation_event_count": 0,
+            "low_displacement_event_count": 0,
+            "collision_trigger_event_count": 0,
+            "collision_trigger_start_count": 0,
+            "first_recovery_trigger_step": None,
+            "first_map_stagnation_step": None,
+            "first_collision_trigger_step": None,
+            "max_occupied_stagnation_streak": 0,
+            "max_total_stagnation_streak": 0,
+            "max_collision_delta": 0.0,
+            "max_pose_window_displacement_m": 0.0,
+            "min_pose_window_displacement_m": None,
+            "prev_occupied_cell_count": None,
+            "prev_free_cell_count": None,
+            "prev_collision_count": 0.0,
+            "occupied_stagnation_streak": 0,
+            "total_stagnation_streak": 0,
+            "pose_history": [],
+            "last_recovery_trigger": False,
+            "last_map_stagnation": False,
+            "last_collision_trigger": False,
+            "active_intervention_count": 0,
+            "active_applied_count": 0,
+            "active_suppressed_count": 0,
+            "active_first_step": None,
+            "active_reason_counts": {},
+            "last_event": None,
+        }
+
+    def _write_occ_memory_recovery_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "occ_memory_recovery_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _occ_memory_cell_state(self, row: int, col: int) -> str:
+        try:
+            return str(self.occ_memory._cell_state(int(row), int(col)))
+        except Exception:
+            return "unknown"
+
+    def _occ_memory_local_surround_summary(self, cfg: dict) -> dict:
+        pose_state = None
+        try:
+            pose_state = self.occ_memory._current_pose_state({})
+        except Exception:
+            pose_state = None
+        result = {
+            "valid": False,
+            "reason": None,
+        }
+        if pose_state is None:
+            result["reason"] = "missing_pose"
+            return result
+        grid = pose_state.get("grid") or []
+        if len(grid) < 2:
+            result["reason"] = "missing_grid"
+            return result
+        row0, col0 = int(grid[0]), int(grid[1])
+        radius = max(1, int(cfg.get("arrival_like_radius_cells", 8)))
+        occupied = 0
+        free = 0
+        unknown = 0
+        checked = 0
+        for row in range(row0 - radius, row0 + radius + 1):
+            for col in range(col0 - radius, col0 + radius + 1):
+                if row < 0 or row >= int(self.occ_memory.gs) or col < 0 or col >= int(self.occ_memory.gs):
+                    continue
+                if (row - row0) * (row - row0) + (col - col0) * (col - col0) > radius * radius:
+                    continue
+                checked += 1
+                state = self._occ_memory_cell_state(row, col)
+                if state == "occupied":
+                    occupied += 1
+                elif state == "free":
+                    free += 1
+                else:
+                    unknown += 1
+        free_ratio = float(free / checked) if checked else 0.0
+        occupied_ratio = float(occupied / checked) if checked else 0.0
+        unknown_ratio = float(unknown / checked) if checked else 1.0
+        arrival_like = bool(
+            checked > 0
+            and free_ratio >= float(cfg.get("arrival_like_min_free_ratio", 0.35))
+            and occupied_ratio <= float(cfg.get("arrival_like_max_occupied_ratio", 0.04))
+        )
+        result.update(
+            {
+                "valid": True,
+                "reason": "ok",
+                "grid": [int(row0), int(col0)],
+                "radius_cells": int(radius),
+                "checked_cell_count": int(checked),
+                "occupied_cell_count": int(occupied),
+                "free_cell_count": int(free),
+                "unknown_cell_count": int(unknown),
+                "free_ratio": float(free_ratio),
+                "occupied_ratio": float(occupied_ratio),
+                "unknown_ratio": float(unknown_ratio),
+                "arrival_like_free_space": bool(arrival_like),
+            }
+        )
+        return result
+
+    def _occ_memory_probe_line_summary(self, start_xy, yaw: float, rel_angle_deg: float, distance_m: float) -> dict:
+        cs = max(0.05, float(getattr(self.occ_memory, "cs", 0.05)))
+        sample_count = max(1, int(math.ceil(float(distance_m) / cs)))
+        angle = float(yaw) + math.radians(float(rel_angle_deg))
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        cells = []
+        seen = set()
+        for idx in range(1, sample_count + 1):
+            dist = float(distance_m) * float(idx) / float(sample_count)
+            x = float(start_xy[0]) + cos_a * dist
+            y = float(start_xy[1]) + sin_a * dist
+            try:
+                row, col = self.occ_memory._xy_to_grid_cell(x, y)
+            except Exception:
+                continue
+            if row < 0 or row >= int(self.occ_memory.gs) or col < 0 or col >= int(self.occ_memory.gs):
+                continue
+            cell = (int(row), int(col))
+            if cell in seen:
+                continue
+            seen.add(cell)
+            cells.append(cell)
+        occupied = 0
+        free = 0
+        unknown = 0
+        occupied_preview = []
+        for row, col in cells:
+            state = self._occ_memory_cell_state(row, col)
+            if state == "occupied":
+                occupied += 1
+                if len(occupied_preview) < 8:
+                    occupied_preview.append([int(row), int(col)])
+            elif state == "free":
+                free += 1
+            else:
+                unknown += 1
+        checked = len(cells)
+        return {
+            "checked_cell_count": int(checked),
+            "occupied_hit_count": int(occupied),
+            "free_hit_count": int(free),
+            "unknown_hit_count": int(unknown),
+            "occupied_hit_ratio": float(occupied / checked) if checked else 0.0,
+            "free_hit_ratio": float(free / checked) if checked else 0.0,
+            "unknown_hit_ratio": float(unknown / checked) if checked else 1.0,
+            "occupied_cells_preview": occupied_preview,
+        }
+
+    def _occ_memory_escape_plan(self, cfg: dict) -> dict:
+        pose_state = None
+        try:
+            pose_state = self.occ_memory._current_pose_state({})
+        except Exception:
+            pose_state = None
+        result = {
+            "valid": False,
+            "reason": None,
+            "actions": [],
+            "candidates": [],
+        }
+        if pose_state is None:
+            result["reason"] = "missing_pose"
+            return result
+        start_xy = pose_state.get("xy")
+        if not start_xy or len(start_xy) < 2:
+            result["reason"] = "missing_xy"
+            return result
+        yaw = float(pose_state.get("yaw", 0.0))
+        turn_angle = max(1e-6, abs(float(getattr(self.config.habitat.simulator, "turn_angle", 15.0))))
+        max_turn_steps = max(1, int(cfg.get("escape_max_turn_steps", 3)))
+        probe_distance = float(cfg.get("escape_probe_distance_m", 0.75))
+        forward_steps_cfg = max(0, int(cfg.get("escape_forward_steps", 1)))
+        allow_forward_only_if_free = bool(cfg.get("escape_allow_forward_only_if_free", True))
+        candidates = []
+        seen_keys = set()
+        for raw_angle in list(cfg.get("escape_candidate_angles_deg") or []):
+            try:
+                requested_angle = float(raw_angle)
+            except (TypeError, ValueError):
+                continue
+            if abs(requested_angle) < 1e-6:
+                continue
+            turn_steps = int(math.ceil(abs(requested_angle) / turn_angle))
+            turn_steps = max(1, min(max_turn_steps, turn_steps))
+            sign = 1.0 if requested_angle > 0.0 else -1.0
+            actual_angle = sign * float(turn_steps) * turn_angle
+            turn_action = action_code.LEFT if actual_angle > 0.0 else action_code.RIGHT
+            key = (int(turn_action), int(turn_steps))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            probe = self._occ_memory_probe_line_summary(start_xy, yaw, actual_angle, probe_distance)
+            path_free = bool(probe.get("checked_cell_count", 0) > 0 and probe.get("occupied_hit_count", 0) == 0)
+            forward_steps = int(forward_steps_cfg)
+            if allow_forward_only_if_free and not path_free:
+                forward_steps = 0
+            actions = [int(turn_action)] * int(turn_steps)
+            if forward_steps > 0:
+                actions.extend([int(action_code.FORWARD)] * int(forward_steps))
+            score = (
+                10.0 * float(probe.get("occupied_hit_count", 0) or 0)
+                + 0.40 * float(probe.get("unknown_hit_count", 0) or 0)
+                - 0.15 * float(probe.get("free_hit_count", 0) or 0)
+                + 0.05 * float(turn_steps)
+            )
+            candidates.append(
+                {
+                    "requested_angle_deg": float(requested_angle),
+                    "actual_angle_deg": float(actual_angle),
+                    "turn_action": int(turn_action),
+                    "turn_steps": int(turn_steps),
+                    "forward_steps": int(forward_steps),
+                    "actions": actions,
+                    "path_free": bool(path_free),
+                    "score": float(score),
+                    **probe,
+                }
+            )
+        if not candidates:
+            result["reason"] = "no_candidates"
+            return result
+        best = min(candidates, key=lambda item: float(item.get("score", 0.0)))
+        actions = [int(item) for item in best.get("actions", []) if int(item) in (1, 2, 3)]
+        if not actions:
+            result["reason"] = "selected_empty_actions"
+            result["candidates"] = candidates
+            result["selected"] = best
+            return result
+        result.update(
+            {
+                "valid": True,
+                "reason": "ok",
+                "actions": actions,
+                "selected": best,
+                "candidates": candidates,
+                "probe_distance_m": float(probe_distance),
+            }
+        )
+        return result
+
+    def _update_occ_memory_recovery_shadow(
+        self,
+        state: dict,
+        *,
+        update_event: Optional[dict],
+        metrics: Optional[dict],
+        step_id: int,
+        scene_id: str,
+        episode_id: int,
+        episode_index: int,
+        episode_count: int,
+        last_action,
+        pixel_goal,
+        local_actions,
+        action_seq,
+        vlmap_recovery_actions,
+    ) -> Optional[dict]:
+        cfg = self._get_occ_memory_recovery_cfg()
+        if not cfg["enable"]:
+            return None
+
+        update_event = dict(update_event or {})
+        try:
+            occupied_count = int(update_event.get("occupied_cell_count"))
+        except (TypeError, ValueError):
+            occupied_count = int(len(getattr(self.occ_memory, "occ2d_counts", {}) or {}))
+        try:
+            free_count = int(update_event.get("free_cell_count"))
+        except (TypeError, ValueError):
+            free_count = int(len(getattr(self.occ_memory, "free2d_counts", {}) or {}))
+
+        prev_occ = state.get("prev_occupied_cell_count")
+        prev_free = state.get("prev_free_cell_count")
+        if prev_occ is None:
+            occupied_delta = 0
+            free_delta = 0
+            total_delta = 0
+            state["occupied_stagnation_streak"] = 0
+            state["total_stagnation_streak"] = 0
+        else:
+            occupied_delta = int(occupied_count - int(prev_occ))
+            free_delta = int(free_count - int(prev_free or 0))
+            total_delta = int(occupied_delta + free_delta)
+            if occupied_delta <= 0:
+                state["occupied_stagnation_streak"] = int(state.get("occupied_stagnation_streak", 0)) + 1
+            else:
+                state["occupied_stagnation_streak"] = 0
+            if total_delta <= 0:
+                state["total_stagnation_streak"] = int(state.get("total_stagnation_streak", 0)) + 1
+            else:
+                state["total_stagnation_streak"] = 0
+        state["prev_occupied_cell_count"] = int(occupied_count)
+        state["prev_free_cell_count"] = int(free_count)
+
+        pose = None
+        if getattr(self.occ_memory, "pose_trace", None):
+            pose = self.occ_memory.pose_trace[-1]
+        pose_xy = None
+        pose_grid = None
+        pose_yaw = None
+        if pose:
+            pose_xy = [float(pose.get("x", 0.0)), float(pose.get("y", 0.0))]
+            pose_grid = [int(pose.get("row", 0)), int(pose.get("col", 0))]
+            pose_yaw = float(pose.get("yaw", 0.0))
+            state["pose_history"].append(
+                {
+                    "step_id": int(step_id),
+                    "x": float(pose_xy[0]),
+                    "y": float(pose_xy[1]),
+                }
+            )
+        max_pose_history = int(cfg["displacement_window_steps"]) + 1
+        if len(state["pose_history"]) > max_pose_history:
+            state["pose_history"] = state["pose_history"][-max_pose_history:]
+
+        pose_window_displacement = None
+        pose_window_ready = len(state["pose_history"]) >= max_pose_history
+        if pose_window_ready:
+            first_pose = state["pose_history"][0]
+            last_pose = state["pose_history"][-1]
+            pose_window_displacement = float(
+                math.hypot(float(last_pose["x"]) - float(first_pose["x"]), float(last_pose["y"]) - float(first_pose["y"]))
+            )
+            state["max_pose_window_displacement_m"] = max(
+                float(state.get("max_pose_window_displacement_m", 0.0) or 0.0),
+                float(pose_window_displacement),
+            )
+            min_disp = state.get("min_pose_window_displacement_m")
+            if min_disp is None or pose_window_displacement < float(min_disp):
+                state["min_pose_window_displacement_m"] = float(pose_window_displacement)
+        low_displacement = bool(
+            pose_window_ready
+            and pose_window_displacement is not None
+            and pose_window_displacement <= float(cfg["low_displacement_threshold_m"])
+        )
+
+        collision_summary = self._extract_collision_summary(metrics or {}, steps=max(1, int(step_id)))
+        collision_count = float(collision_summary.get("collision_count", 0.0) or 0.0)
+        prev_collision_count = float(state.get("prev_collision_count", 0.0) or 0.0)
+        collision_delta = max(0.0, float(collision_count - prev_collision_count))
+        state["prev_collision_count"] = float(collision_count)
+
+        late_enough = int(step_id) >= int(cfg["min_step"])
+        occupied_streak = int(state.get("occupied_stagnation_streak", 0) or 0)
+        total_streak = int(state.get("total_stagnation_streak", 0) or 0)
+        map_stagnation = bool(
+            late_enough and occupied_streak >= int(cfg["occupied_stagnation_window_steps"])
+        )
+        total_map_stagnation = bool(
+            late_enough and total_streak >= int(cfg["total_stagnation_window_steps"])
+        )
+        map_stagnation_recovery_gate = bool(
+            map_stagnation
+            and (
+                not bool(cfg["require_low_displacement_for_map_stagnation"])
+                or low_displacement
+            )
+        )
+        collision_trigger = bool(cfg["collision_trigger_enable"] and collision_delta > 0.0)
+        total_map_stagnation_trigger = bool(
+            cfg["total_map_stagnation_trigger_enable"]
+            and total_map_stagnation
+            and (
+                not bool(cfg["require_low_displacement_for_map_stagnation"])
+                or low_displacement
+            )
+        )
+        recovery_trigger = bool(
+            collision_trigger
+            or map_stagnation_recovery_gate
+            or total_map_stagnation_trigger
+        )
+        local_surround = self._occ_memory_local_surround_summary(cfg)
+        arrival_like_free_space = bool(
+            cfg.get("arrival_like_protection_enable", True)
+            and local_surround.get("valid")
+            and local_surround.get("arrival_like_free_space")
+            and map_stagnation
+            and collision_count <= 0.0
+            and not collision_trigger
+        )
+        escape_plan = self._occ_memory_escape_plan(cfg)
+        active_signal_allowed = bool(
+            (
+                bool(cfg.get("active_use_map_stagnation", True))
+                and (map_stagnation_recovery_gate or total_map_stagnation_trigger)
+            )
+            or (
+                bool(cfg.get("active_use_collision_trigger", False))
+                and collision_trigger
+            )
+        )
+        active_recovery_allowed = bool(
+            recovery_trigger
+            and active_signal_allowed
+            and not arrival_like_free_space
+            and escape_plan.get("valid")
+            and bool(escape_plan.get("actions"))
+        )
+        trigger_started = bool(recovery_trigger and not state.get("last_recovery_trigger", False))
+        map_stagnation_started = bool(map_stagnation and not state.get("last_map_stagnation", False))
+        collision_trigger_started = bool(collision_trigger and not state.get("last_collision_trigger", False))
+
+        state["event_count"] = int(state.get("event_count", 0)) + 1
+        if recovery_trigger:
+            state["recovery_trigger_event_count"] = int(state.get("recovery_trigger_event_count", 0)) + 1
+            if state.get("first_recovery_trigger_step") is None:
+                state["first_recovery_trigger_step"] = int(step_id)
+        if trigger_started:
+            state["recovery_trigger_start_count"] = int(state.get("recovery_trigger_start_count", 0)) + 1
+        if map_stagnation:
+            state["map_stagnation_event_count"] = int(state.get("map_stagnation_event_count", 0)) + 1
+            if state.get("first_map_stagnation_step") is None:
+                state["first_map_stagnation_step"] = int(step_id)
+        if map_stagnation_started:
+            state["map_stagnation_start_count"] = int(state.get("map_stagnation_start_count", 0)) + 1
+        if total_map_stagnation:
+            state["total_map_stagnation_event_count"] = int(state.get("total_map_stagnation_event_count", 0)) + 1
+        if low_displacement:
+            state["low_displacement_event_count"] = int(state.get("low_displacement_event_count", 0)) + 1
+        if collision_trigger:
+            state["collision_trigger_event_count"] = int(state.get("collision_trigger_event_count", 0)) + 1
+            if state.get("first_collision_trigger_step") is None:
+                state["first_collision_trigger_step"] = int(step_id)
+        if collision_trigger_started:
+            state["collision_trigger_start_count"] = int(state.get("collision_trigger_start_count", 0)) + 1
+        state["max_occupied_stagnation_streak"] = max(
+            int(state.get("max_occupied_stagnation_streak", 0) or 0),
+            int(occupied_streak),
+        )
+        state["max_total_stagnation_streak"] = max(
+            int(state.get("max_total_stagnation_streak", 0) or 0),
+            int(total_streak),
+        )
+        state["max_collision_delta"] = max(
+            float(state.get("max_collision_delta", 0.0) or 0.0),
+            float(collision_delta),
+        )
+
+        event = {
+            "event_type": "occ_memory_recovery_shadow",
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "episode_index": int(episode_index),
+            "episode_count": int(episode_count),
+            "step_id": int(step_id),
+            "enabled": bool(cfg["enable"]),
+            "shadow_only": bool(cfg["shadow_only"]),
+            "late_enough": bool(late_enough),
+            "occupied_cell_count": int(occupied_count),
+            "free_cell_count": int(free_count),
+            "occupied_cell_delta": int(occupied_delta),
+            "free_cell_delta": int(free_delta),
+            "total_cell_delta": int(total_delta),
+            "occupied_stagnation_streak": int(occupied_streak),
+            "total_stagnation_streak": int(total_streak),
+            "map_stagnation": bool(map_stagnation),
+            "map_stagnation_started": bool(map_stagnation_started),
+            "total_map_stagnation": bool(total_map_stagnation),
+            "low_displacement": bool(low_displacement),
+            "pose_window_ready": bool(pose_window_ready),
+            "pose_window_displacement_m": (
+                None if pose_window_displacement is None else float(pose_window_displacement)
+            ),
+            "pose_grid": pose_grid,
+            "pose_xy": pose_xy,
+            "pose_yaw": pose_yaw,
+            "collision_count": float(collision_count),
+            "collision_delta": float(collision_delta),
+            "collision_trigger": bool(collision_trigger),
+            "collision_trigger_started": bool(collision_trigger_started),
+            "map_stagnation_recovery_gate": bool(map_stagnation_recovery_gate),
+            "total_map_stagnation_trigger": bool(total_map_stagnation_trigger),
+            "recovery_trigger": bool(recovery_trigger),
+            "recovery_trigger_started": bool(trigger_started),
+            "arrival_like_free_space": bool(arrival_like_free_space),
+            "local_surround": local_surround,
+            "escape_plan": escape_plan,
+            "active_signal_allowed": bool(active_signal_allowed),
+            "active_recovery_allowed": bool(active_recovery_allowed),
+            "last_action": None if last_action is None else int(last_action),
+            "pixel_goal_active": pixel_goal is not None,
+            "local_action_count": len(list(local_actions or [])),
+            "action_seq_count": len(list(action_seq or [])),
+            "vlmap_recovery_action_count": len(list(vlmap_recovery_actions or [])),
+            "config": {
+                "min_step": int(cfg["min_step"]),
+                "occupied_stagnation_window_steps": int(cfg["occupied_stagnation_window_steps"]),
+                "total_stagnation_window_steps": int(cfg["total_stagnation_window_steps"]),
+                "displacement_window_steps": int(cfg["displacement_window_steps"]),
+                "low_displacement_threshold_m": float(cfg["low_displacement_threshold_m"]),
+                "require_low_displacement_for_map_stagnation": bool(
+                    cfg["require_low_displacement_for_map_stagnation"]
+                ),
+                "collision_trigger_enable": bool(cfg["collision_trigger_enable"]),
+                "total_map_stagnation_trigger_enable": bool(cfg["total_map_stagnation_trigger_enable"]),
+                "active_use_map_stagnation": bool(cfg["active_use_map_stagnation"]),
+                "active_use_collision_trigger": bool(cfg["active_use_collision_trigger"]),
+                "arrival_like_protection_enable": bool(cfg["arrival_like_protection_enable"]),
+            },
+        }
+        state["last_recovery_trigger"] = bool(recovery_trigger)
+        state["last_map_stagnation"] = bool(map_stagnation)
+        state["last_collision_trigger"] = bool(collision_trigger)
+        state["last_event"] = event
+        if bool(cfg["log_every_step"]) or recovery_trigger or trigger_started:
+            self._write_occ_memory_recovery_event(event)
+            state["logged_event_count"] = int(state.get("logged_event_count", 0)) + 1
+        return event
+
+    def _summarize_occ_memory_recovery_state(self, state: dict) -> dict:
+        if not state:
+            return {}
+        return {
+            "event_count": int(state.get("event_count", 0) or 0),
+            "logged_event_count": int(state.get("logged_event_count", 0) or 0),
+            "recovery_trigger_event_count": int(state.get("recovery_trigger_event_count", 0) or 0),
+            "recovery_trigger_start_count": int(state.get("recovery_trigger_start_count", 0) or 0),
+            "first_recovery_trigger_step": state.get("first_recovery_trigger_step"),
+            "map_stagnation_event_count": int(state.get("map_stagnation_event_count", 0) or 0),
+            "map_stagnation_start_count": int(state.get("map_stagnation_start_count", 0) or 0),
+            "first_map_stagnation_step": state.get("first_map_stagnation_step"),
+            "total_map_stagnation_event_count": int(state.get("total_map_stagnation_event_count", 0) or 0),
+            "low_displacement_event_count": int(state.get("low_displacement_event_count", 0) or 0),
+            "collision_trigger_event_count": int(state.get("collision_trigger_event_count", 0) or 0),
+            "collision_trigger_start_count": int(state.get("collision_trigger_start_count", 0) or 0),
+            "first_collision_trigger_step": state.get("first_collision_trigger_step"),
+            "max_occupied_stagnation_streak": int(state.get("max_occupied_stagnation_streak", 0) or 0),
+            "max_total_stagnation_streak": int(state.get("max_total_stagnation_streak", 0) or 0),
+            "max_collision_delta": float(state.get("max_collision_delta", 0.0) or 0.0),
+            "max_pose_window_displacement_m": float(
+                state.get("max_pose_window_displacement_m", 0.0) or 0.0
+            ),
+            "min_pose_window_displacement_m": state.get("min_pose_window_displacement_m"),
+            "active_intervention_count": int(state.get("active_intervention_count", 0) or 0),
+            "active_applied_count": int(state.get("active_applied_count", 0) or 0),
+            "active_suppressed_count": int(state.get("active_suppressed_count", 0) or 0),
+            "active_first_step": state.get("active_first_step"),
+            "active_reason_counts": dict(state.get("active_reason_counts") or {}),
+        }
+
+    def _record_occ_memory_recovery_active_reason(self, state: dict, reason: str) -> None:
+        counts = dict(state.get("active_reason_counts") or {})
+        counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
+        state["active_reason_counts"] = counts
+
+    def _maybe_apply_occ_memory_recovery(
+        self,
+        state: dict,
+        event: Optional[dict],
+        *,
+        step_id: int,
+        active_count: int,
+    ) -> dict:
+        cfg = self._get_occ_memory_recovery_cfg()
+        status = {
+            "event_type": "occ_memory_recovery_active",
+            "step_id": int(step_id),
+            "enabled": bool(cfg.get("enable")),
+            "shadow_only": bool(cfg.get("shadow_only")),
+            "considered": False,
+            "applied": False,
+            "reason": None,
+            "actions": [],
+            "active_intervention_index": int(active_count + 1),
+            "active_intervention_budget": int(cfg.get("max_interventions_per_episode", 1)),
+        }
+        if not cfg.get("enable"):
+            status["reason"] = "disabled"
+            return status
+        if not event:
+            status["reason"] = "missing_recovery_event"
+            return status
+        if cfg.get("shadow_only"):
+            status["considered"] = bool(event.get("recovery_trigger"))
+            status["reason"] = "shadow_only"
+            return status
+        if not event.get("recovery_trigger"):
+            status["reason"] = "no_recovery_trigger"
+            return status
+
+        status["considered"] = True
+        max_interventions = int(cfg.get("max_interventions_per_episode", 1))
+        if max_interventions >= 0 and active_count >= max_interventions:
+            status["reason"] = "budget_exhausted"
+        elif event.get("arrival_like_free_space"):
+            status["reason"] = "arrival_like_free_space"
+        elif not event.get("active_signal_allowed"):
+            status["reason"] = "active_signal_disabled"
+        elif not event.get("active_recovery_allowed"):
+            status["reason"] = "active_recovery_not_allowed"
+        else:
+            escape_plan = event.get("escape_plan") or {}
+            actions = [int(item) for item in list(escape_plan.get("actions") or []) if int(item) in (1, 2, 3)]
+            if not actions:
+                status["reason"] = "empty_escape_actions"
+            else:
+                status.update(
+                    {
+                        "applied": True,
+                        "reason": "applied",
+                        "actions": actions,
+                        "escape_plan": escape_plan,
+                        "recovery_event": event,
+                    }
+                )
+
+        if status["applied"]:
+            state["active_intervention_count"] = int(state.get("active_intervention_count", 0) or 0) + 1
+            state["active_applied_count"] = int(state.get("active_applied_count", 0) or 0) + 1
+            if state.get("active_first_step") is None:
+                state["active_first_step"] = int(step_id)
+        else:
+            if status["considered"]:
+                state["active_suppressed_count"] = int(state.get("active_suppressed_count", 0) or 0) + 1
+        self._record_occ_memory_recovery_active_reason(state, status.get("reason") or "unknown")
+        self._write_occ_memory_recovery_event(status)
+        return status
+
     def _normalize_candidate_actions(self, actions, horizon: Optional[int] = None) -> list:
         normalized = [int(item) for item in list(actions or [])]
         if len(normalized) < MAX_STEPS:
@@ -2493,10 +3204,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             nextdit_candidate_active_intervention_count = 0
             nextdit_candidate_active_changed_count = 0
             nextdit_candidate_active_no_candidate_count = 0
+            occ_memory_recovery_state = self._init_occ_memory_recovery_state()
+            occ_memory_recovery_active_count = 0
 
             done = False
             flag = False
             pixel_goal = None
+            forward_action = 0
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
@@ -2509,7 +3223,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 depth = depth * (self._max_depth - self._min_depth) + self._min_depth
                 current_depth_m = depth.copy()
                 depth = current_depth_m * 1000
-                self.occ_memory.update_observation(
+                occ_memory_update_event = self.occ_memory.update_observation(
                     {
                         "rgb": rgb,
                         "depth": current_depth_m,
@@ -2526,6 +3240,45 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         "episode_count": episode_count,
                     },
                 )
+                occ_memory_recovery_event = self._update_occ_memory_recovery_shadow(
+                    occ_memory_recovery_state,
+                    update_event=occ_memory_update_event,
+                    metrics=self.env.get_metrics(),
+                    step_id=step_id,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    episode_index=episode_index,
+                    episode_count=episode_count,
+                    last_action=action,
+                    pixel_goal=pixel_goal,
+                    local_actions=local_actions,
+                    action_seq=action_seq,
+                    vlmap_recovery_actions=vlmap_recovery_actions,
+                )
+                occ_memory_recovery_active_status = self._maybe_apply_occ_memory_recovery(
+                    occ_memory_recovery_state,
+                    occ_memory_recovery_event,
+                    step_id=step_id,
+                    active_count=occ_memory_recovery_active_count,
+                )
+                if occ_memory_recovery_active_status.get("applied"):
+                    occ_memory_recovery_active_count += 1
+                    vlmap_recovery_actions = list(occ_memory_recovery_active_status.get("actions") or [])
+                    if self._get_occ_memory_recovery_cfg().get("escape_clear_goal"):
+                        pixel_goal = None
+                        output_ids = None
+                        messages = []
+                        input_images = []
+                        llm_outputs = ""
+                        local_actions = []
+                        action_seq = []
+                        forward_action = 0
+                        draw_pixel_goal = False
+                        flag = False
+                    print(
+                        "[OccMemoryRecovery][Habitat] queue recovery actions "
+                        f"{vlmap_recovery_actions} at step {step_id}"
+                    )
 
                 image = Image.fromarray(rgb).convert('RGB')
                 save_raw_image = image.copy()
@@ -3629,6 +4382,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 occ_memory_guidance_not_injected_reason = "episode_ended"
             semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
             occ_memory_summary = self.occ_memory.finish_episode(metrics=metrics, steps=step_id)
+            occ_memory_recovery_summary = self._summarize_occ_memory_recovery_state(
+                occ_memory_recovery_state
+            )
 
             # Write per-episode progress.json entry (still per-rank)
             result = {
@@ -3642,6 +4398,71 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "episode_instruction": episode_instruction,
             }
             result.update(safety_summary)
+            if self._get_occ_memory_recovery_cfg().get("enable"):
+                result["occ_memory_recovery_event_count"] = occ_memory_recovery_summary.get("event_count")
+                result["occ_memory_recovery_logged_event_count"] = occ_memory_recovery_summary.get(
+                    "logged_event_count"
+                )
+                result["occ_memory_recovery_trigger_event_count"] = occ_memory_recovery_summary.get(
+                    "recovery_trigger_event_count"
+                )
+                result["occ_memory_recovery_trigger_start_count"] = occ_memory_recovery_summary.get(
+                    "recovery_trigger_start_count"
+                )
+                result["occ_memory_recovery_first_trigger_step"] = occ_memory_recovery_summary.get(
+                    "first_recovery_trigger_step"
+                )
+                result["occ_memory_recovery_map_stagnation_event_count"] = occ_memory_recovery_summary.get(
+                    "map_stagnation_event_count"
+                )
+                result["occ_memory_recovery_map_stagnation_start_count"] = occ_memory_recovery_summary.get(
+                    "map_stagnation_start_count"
+                )
+                result["occ_memory_recovery_first_map_stagnation_step"] = occ_memory_recovery_summary.get(
+                    "first_map_stagnation_step"
+                )
+                result["occ_memory_recovery_total_map_stagnation_event_count"] = (
+                    occ_memory_recovery_summary.get("total_map_stagnation_event_count")
+                )
+                result["occ_memory_recovery_low_displacement_event_count"] = occ_memory_recovery_summary.get(
+                    "low_displacement_event_count"
+                )
+                result["occ_memory_recovery_collision_trigger_event_count"] = occ_memory_recovery_summary.get(
+                    "collision_trigger_event_count"
+                )
+                result["occ_memory_recovery_collision_trigger_start_count"] = occ_memory_recovery_summary.get(
+                    "collision_trigger_start_count"
+                )
+                result["occ_memory_recovery_first_collision_trigger_step"] = occ_memory_recovery_summary.get(
+                    "first_collision_trigger_step"
+                )
+                result["occ_memory_recovery_max_occupied_stagnation_streak"] = (
+                    occ_memory_recovery_summary.get("max_occupied_stagnation_streak")
+                )
+                result["occ_memory_recovery_max_total_stagnation_streak"] = (
+                    occ_memory_recovery_summary.get("max_total_stagnation_streak")
+                )
+                result["occ_memory_recovery_max_collision_delta"] = occ_memory_recovery_summary.get(
+                    "max_collision_delta"
+                )
+                result["occ_memory_recovery_min_pose_window_displacement_m"] = (
+                    occ_memory_recovery_summary.get("min_pose_window_displacement_m")
+                )
+                result["occ_memory_recovery_active_intervention_count"] = (
+                    occ_memory_recovery_summary.get("active_intervention_count")
+                )
+                result["occ_memory_recovery_active_applied_count"] = (
+                    occ_memory_recovery_summary.get("active_applied_count")
+                )
+                result["occ_memory_recovery_active_suppressed_count"] = (
+                    occ_memory_recovery_summary.get("active_suppressed_count")
+                )
+                result["occ_memory_recovery_active_first_step"] = (
+                    occ_memory_recovery_summary.get("active_first_step")
+                )
+                result["occ_memory_recovery_active_reason_counts"] = (
+                    occ_memory_recovery_summary.get("active_reason_counts")
+                )
             if semantic_summary:
                 result["semantic_landmark_count"] = semantic_summary.get("landmark_count")
                 result["semantic_seen_count"] = semantic_summary.get("seen_count")
