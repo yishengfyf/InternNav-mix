@@ -7,6 +7,7 @@ from enum import IntEnum
 sys.path.append('./src/diffusion-policy')
 import copy
 import itertools
+import math
 import random
 import re
 from collections import OrderedDict
@@ -1451,11 +1452,39 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ),
             "action_horizon": max(1, int(vlmap_safety_cfg.get("nextdit_candidate_action_horizon", MAX_LOCAL_STEPS))),
             "active_enable": bool(vlmap_safety_cfg.get("nextdit_candidate_active_enable", False)),
+            "active_strategy": str(
+                vlmap_safety_cfg.get("nextdit_candidate_active_strategy", "vlmap_obstacle")
+            ),
             "active_max_interventions_per_episode": int(
                 vlmap_safety_cfg.get("nextdit_candidate_active_max_interventions_per_episode", 2)
             ),
             "active_require_current_reject": bool(
                 vlmap_safety_cfg.get("nextdit_candidate_active_require_current_reject", True)
+            ),
+            "active_occ_current_min_occupied_hits": max(
+                1,
+                int(vlmap_safety_cfg.get("nextdit_candidate_active_occ_current_min_occupied_hits", 1)),
+            ),
+            "active_occ_max_direction_deviation_deg": float(
+                vlmap_safety_cfg.get("nextdit_candidate_active_occ_max_direction_deviation_deg", 45.0)
+            ),
+            "active_occ_unknown_weight": float(
+                vlmap_safety_cfg.get("nextdit_candidate_active_occ_unknown_weight", 0.15)
+            ),
+            "active_occ_direction_weight": float(
+                vlmap_safety_cfg.get("nextdit_candidate_active_occ_direction_weight", 0.30)
+            ),
+            "active_occ_forward_progress_weight": float(
+                vlmap_safety_cfg.get("nextdit_candidate_active_occ_forward_progress_weight", 0.05)
+            ),
+            "active_occ_require_action_diff": bool(
+                vlmap_safety_cfg.get("nextdit_candidate_active_occ_require_action_diff", True)
+            ),
+            "active_occ_reject_all_unknown": bool(
+                vlmap_safety_cfg.get("nextdit_candidate_active_occ_reject_all_unknown", True)
+            ),
+            "active_occ_require_vlmap_nonreject": bool(
+                vlmap_safety_cfg.get("nextdit_candidate_active_occ_require_vlmap_nonreject", False)
             ),
             "occ_memory_score_enable": bool(
                 vlmap_safety_cfg.get("nextdit_candidate_occ_memory_score_enable", False)
@@ -1533,6 +1562,68 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             print(f"[NextDiTCandidateProbe] failed to reconstruct raw sample {sample_index}: {exc}")
             return None
 
+    def _local_xy_from_nextdit_average(self, dp_actions, max_points: int) -> Optional[np.ndarray]:
+        try:
+            if hasattr(dp_actions, "detach"):
+                samples = dp_actions.detach().float().cpu().clone()
+            else:
+                samples = torch.as_tensor(np.asarray(dp_actions), dtype=torch.float32).clone()
+            if samples.dim() != 3 or samples.shape[0] < 1 or samples.shape[1] < 1 or samples.shape[2] < 2:
+                return None
+            # traj_to_actions(..., use_discrate_action=False) performs the single /4 unnormalization.
+            local_xy = np.asarray(traj_to_actions(samples, use_discrate_action=False), dtype=np.float32)
+            if local_xy.ndim != 2 or local_xy.shape[0] < 2 or local_xy.shape[1] < 2:
+                return None
+            if max_points > 0 and local_xy.shape[0] > max_points:
+                ids = np.linspace(0, local_xy.shape[0] - 1, int(max_points)).astype(np.int64)
+                local_xy = local_xy[ids]
+            return local_xy
+        except Exception as exc:
+            print(f"[NextDiTCandidateProbe] failed to reconstruct averaged trajectory: {exc}")
+            return None
+
+    def _score_nextdit_averaged_trajectory_with_occ_memory(
+        self,
+        dp_actions,
+        observations: dict,
+        *,
+        scene_id: str,
+        episode_id: int,
+        episode_index: int,
+        episode_count: int,
+        step_id: int,
+        query_index: int,
+    ) -> Optional[dict]:
+        cfg = self._get_nextdit_candidate_probe_cfg()
+        if not cfg.get("occ_memory_score_enable") or dp_actions is None:
+            return None
+        local_xy = self._local_xy_from_nextdit_average(
+            dp_actions,
+            int(cfg.get("occ_memory_score_max_points", 33)),
+        )
+        if local_xy is None:
+            return {
+                "enabled": True,
+                "valid": False,
+                "reason": "averaged_trajectory_reconstruction_failed",
+            }
+        return self.occ_memory.score_local_xy_trajectory(
+            local_xy,
+            {
+                "gps": observations.get("gps"),
+                "compass": observations.get("compass"),
+            },
+            context={
+                "step_id": step_id,
+                "scene_id": scene_id,
+                "episode_id": episode_id,
+                "episode_index": episode_index,
+                "episode_count": episode_count,
+                "query_index": query_index,
+                "candidate_probe": "nextdit_averaged_trajectory",
+            },
+        )
+
     def _trajectory_blocked_fraction_sum(self, decision: dict) -> float:
         blocked_fraction_sum = 0.0
         for step in (decision or {}).get("step_details", []) or []:
@@ -1572,6 +1663,69 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 representatives.append(end_grid)
         return len(representatives)
 
+    def _is_nextdit_occ_memory_active_strategy(self, cfg: Optional[dict] = None) -> bool:
+        cfg = cfg or self._get_nextdit_candidate_probe_cfg()
+        return str(cfg.get("active_strategy", "")).lower() in {
+            "occ_memory_conservative",
+            "occ_memory",
+            "occmem_conservative",
+        }
+
+    def _local_endpoint_angle_deg_from_occ_score(self, score: Optional[dict]) -> Optional[float]:
+        if not score or not score.get("valid"):
+            return None
+        endpoint = score.get("local_endpoint_xy")
+        if endpoint is None:
+            return None
+        try:
+            x = float(endpoint[0])
+            y = float(endpoint[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if float(np.hypot(x, y)) < 1e-4:
+            return None
+        return float(math.degrees(math.atan2(y, x)))
+
+    def _angle_distance_deg(self, angle_a: Optional[float], angle_b: Optional[float]) -> Optional[float]:
+        if angle_a is None or angle_b is None:
+            return None
+        try:
+            diff = (float(angle_a) - float(angle_b) + 180.0) % 360.0 - 180.0
+        except (TypeError, ValueError):
+            return None
+        return float(abs(diff))
+
+    def _occ_memory_candidate_deviation_deg(self, current_score: Optional[dict], candidate_score: Optional[dict]):
+        current_angle = self._local_endpoint_angle_deg_from_occ_score(current_score)
+        candidate_angle = self._local_endpoint_angle_deg_from_occ_score(candidate_score)
+        return self._angle_distance_deg(current_angle, candidate_angle)
+
+    def _occ_memory_candidate_active_score(
+        self,
+        occ_score: dict,
+        direction_deviation_deg: Optional[float],
+        cfg: dict,
+    ) -> float:
+        occupied_hit_count = int(occ_score.get("occupied_hit_count", 0) or 0)
+        unknown_hit_count = int(occ_score.get("unknown_hit_count", 0) or 0)
+        endpoint = occ_score.get("local_endpoint_xy") or [0.0, 0.0]
+        try:
+            forward_progress = max(0.0, float(endpoint[0]))
+        except (TypeError, ValueError, IndexError):
+            forward_progress = 0.0
+        max_deviation = max(1e-6, float(cfg.get("active_occ_max_direction_deviation_deg", 45.0)))
+        deviation_ratio = (
+            float(direction_deviation_deg) / max_deviation
+            if direction_deviation_deg is not None
+            else 1.0
+        )
+        return float(
+            1.0 * occupied_hit_count
+            + float(cfg.get("active_occ_unknown_weight", 0.15)) * unknown_hit_count
+            + float(cfg.get("active_occ_direction_weight", 0.30)) * deviation_ratio
+            - float(cfg.get("active_occ_forward_progress_weight", 0.05)) * forward_progress
+        )
+
     def _probe_nextdit_trajectory_candidates(
         self,
         dp_actions,
@@ -1588,6 +1742,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         step_id: int,
         query_index: int,
         pixel_goal,
+        current_occ_memory_score: Optional[dict] = None,
     ) -> dict:
         cfg = self._get_nextdit_candidate_probe_cfg()
         if not (cfg["enable"] or cfg["active_enable"]) or dp_actions is None:
@@ -1619,6 +1774,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         occ_occupied_hit_sum = 0
         occ_unknown_hit_sum = 0
         occ_memory_score_enabled = bool(cfg.get("occ_memory_score_enable"))
+        if occ_memory_score_enabled and current_occ_memory_score is None:
+            current_occ_memory_score = self._score_nextdit_averaged_trajectory_with_occ_memory(
+                dp_actions,
+                observations,
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_index=episode_index,
+                episode_count=episode_count,
+                step_id=step_id,
+                query_index=query_index,
+            )
         for candidate_index in range(candidate_count):
             actions = self._actions_from_nextdit_sample(dp_actions, candidate_index, horizon=horizon)
             decision = validate(
@@ -1713,6 +1879,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "current_obstacle_score": current_obstacle_score,
             "current_would_reject": bool((current_decision or {}).get("would_reject")),
             "current_decision": current_decision,
+            "current_occ_memory_score": current_occ_memory_score,
+            "current_occ_memory_valid": bool(
+                (current_occ_memory_score or {}).get("valid")
+            ),
+            "current_occ_memory_would_reject": bool(
+                (current_occ_memory_score or {}).get("would_reject")
+            ),
+            "current_occ_memory_occupied_hit_count": int(
+                (current_occ_memory_score or {}).get("occupied_hit_count", 0) or 0
+            ),
+            "current_occ_memory_unknown_hit_count": int(
+                (current_occ_memory_score or {}).get("unknown_hit_count", 0) or 0
+            ),
+            "current_occ_memory_unknown_hit_ratio": float(
+                (current_occ_memory_score or {}).get("unknown_hit_ratio", 0.0) or 0.0
+            ),
             "selected_candidate_index": int(selected["candidate_index"]),
             "selected_actions": selected["actions"],
             "selected_score": float(selected["score"]),
@@ -1755,21 +1937,94 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         )
         return event
 
-    def _nextdit_active_probe_needed(self, current_decision: dict, active_intervention_count: int) -> bool:
+    def _nextdit_active_probe_needed(
+        self,
+        current_decision: dict,
+        active_intervention_count: int,
+        current_occ_memory_score: Optional[dict] = None,
+    ) -> bool:
         cfg = self._get_nextdit_candidate_probe_cfg()
         if not cfg.get("active_enable"):
             return False
         max_interventions = int(cfg.get("active_max_interventions_per_episode", 2))
         if max_interventions >= 0 and active_intervention_count >= max_interventions:
             return False
+        if self._is_nextdit_occ_memory_active_strategy(cfg):
+            if not cfg.get("occ_memory_score_enable"):
+                return False
+            if not current_occ_memory_score or not current_occ_memory_score.get("valid"):
+                return False
+            occupied_hits = int(current_occ_memory_score.get("occupied_hit_count", 0) or 0)
+            return occupied_hits >= int(cfg.get("active_occ_current_min_occupied_hits", 1))
         if cfg.get("active_require_current_reject", True) and not bool(
             (current_decision or {}).get("would_reject")
         ):
             return False
         return True
 
+    def _select_nextdit_occ_memory_active_candidate(self, event: dict):
+        cfg = self._get_nextdit_candidate_probe_cfg()
+        current_occ = event.get("current_occ_memory_score") or {}
+        if not current_occ.get("valid"):
+            return None, "current_occ_invalid"
+        current_occupied_hits = int(current_occ.get("occupied_hit_count", 0) or 0)
+        if current_occupied_hits < int(cfg.get("active_occ_current_min_occupied_hits", 1)):
+            return None, "current_occ_not_occupied"
+
+        horizon = int(event.get("action_horizon", cfg.get("action_horizon", MAX_LOCAL_STEPS)))
+        current_actions = self._normalize_candidate_actions(event.get("current_actions"), horizon=horizon)
+        max_deviation = float(cfg.get("active_occ_max_direction_deviation_deg", 45.0))
+        eligible = []
+        for item in event.get("candidates") or []:
+            decision = item.get("decision") or {}
+            if cfg.get("active_occ_require_vlmap_nonreject", False):
+                if not decision.get("valid") or decision.get("would_reject"):
+                    continue
+            candidate_actions = self._normalize_candidate_actions(item.get("actions"), horizon=horizon)
+            if not candidate_actions or int(candidate_actions[0]) == int(action_code.STOP):
+                continue
+            if cfg.get("active_occ_require_action_diff", True) and candidate_actions == current_actions:
+                continue
+            occ_score = item.get("occ_memory_score") or {}
+            if not occ_score.get("valid"):
+                continue
+            if int(occ_score.get("occupied_hit_count", 0) or 0) > 0:
+                continue
+            checked = int(occ_score.get("checked_cell_count", 0) or 0)
+            unknown_hits = int(occ_score.get("unknown_hit_count", 0) or 0)
+            if cfg.get("active_occ_reject_all_unknown", True) and checked > 0 and unknown_hits >= checked:
+                continue
+            deviation = self._occ_memory_candidate_deviation_deg(current_occ, occ_score)
+            if deviation is None:
+                continue
+            if deviation > max_deviation:
+                continue
+            active_score = self._occ_memory_candidate_active_score(occ_score, deviation, cfg)
+            enriched = dict(item)
+            enriched["active_occ_score"] = float(active_score)
+            enriched["active_direction_deviation_deg"] = float(deviation)
+            enriched["active_selected_actions"] = candidate_actions
+            eligible.append(enriched)
+
+        if not eligible:
+            return None, "no_occ_safe_intent_aligned_candidate"
+
+        def candidate_key(item):
+            occ_score = item.get("occ_memory_score") or {}
+            return (
+                float(item.get("active_occ_score", float("inf"))),
+                int(occ_score.get("unknown_hit_count", 0) or 0),
+                float(item.get("active_direction_deviation_deg", 180.0) or 180.0),
+                int(item.get("candidate_index", 0)),
+            )
+
+        return min(eligible, key=candidate_key), "selected_occ_memory_conservative"
+
     def _select_nextdit_active_candidate(self, event: dict):
         cfg = self._get_nextdit_candidate_probe_cfg()
+        if self._is_nextdit_occ_memory_active_strategy(cfg):
+            return self._select_nextdit_occ_memory_active_candidate(event)
+
         if cfg.get("active_require_current_reject", True) and not bool(
             event.get("current_would_reject")
         ):
@@ -1818,9 +2073,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         if max_interventions >= 0 and active_intervention_count >= max_interventions:
             status["reason"] = "episode_intervention_budget"
             return status
-        if cfg.get("active_require_current_reject", True) and not bool(event.get("current_would_reject")):
+        occ_memory_strategy = self._is_nextdit_occ_memory_active_strategy(cfg)
+        if (
+            not occ_memory_strategy
+            and cfg.get("active_require_current_reject", True)
+            and not bool(event.get("current_would_reject"))
+        ):
             status["reason"] = "current_not_reject"
             return status
+        if occ_memory_strategy:
+            current_occ = event.get("current_occ_memory_score") or {}
+            if not current_occ.get("valid"):
+                status["reason"] = "current_occ_invalid"
+                return status
+            occupied_hits = int(current_occ.get("occupied_hit_count", 0) or 0)
+            if occupied_hits < int(cfg.get("active_occ_current_min_occupied_hits", 1)):
+                status["reason"] = "current_occ_not_occupied"
+                return status
 
         status["considered"] = True
         horizon = int(event.get("action_horizon", cfg.get("action_horizon", MAX_LOCAL_STEPS)))
@@ -1842,14 +2111,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "current_score": event.get("current_score"),
                 "current_obstacle_score": event.get("current_obstacle_score"),
                 "current_decision": event.get("current_decision"),
+                "current_occ_memory_score": event.get("current_occ_memory_score"),
                 "selected_candidate_index": None,
                 "selected_actions": None,
                 "selected_score": None,
                 "selected_obstacle_score": None,
                 "selected_decision": None,
+                "selected_occ_memory_score": None,
+                "selected_active_occ_score": None,
+                "selected_direction_deviation_deg": None,
                 "selected_differs_from_current": False,
                 "candidate_count": event.get("candidate_count"),
                 "would_reject_candidate_count": event.get("would_reject_candidate_count"),
+                "occ_memory_score_valid_candidate_count": event.get(
+                    "occ_memory_score_valid_candidate_count"
+                ),
+                "occ_memory_score_would_reject_candidate_count": event.get(
+                    "occ_memory_score_would_reject_candidate_count"
+                ),
                 "unique_action_sequence_count": event.get("unique_action_sequence_count"),
                 "unique_endpoint_count": event.get("unique_endpoint_count"),
                 "applied": False,
@@ -1875,14 +2154,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "current_score": event.get("current_score"),
             "current_obstacle_score": event.get("current_obstacle_score"),
             "current_decision": event.get("current_decision"),
+            "current_occ_memory_score": event.get("current_occ_memory_score"),
             "selected_candidate_index": int(selected.get("candidate_index", -1)),
             "selected_actions": selected_actions,
             "selected_score": selected.get("score"),
             "selected_obstacle_score": selected.get("obstacle_score"),
             "selected_decision": selected.get("decision"),
+            "selected_occ_memory_score": selected.get("occ_memory_score"),
+            "selected_active_occ_score": selected.get("active_occ_score"),
+            "selected_direction_deviation_deg": selected.get("active_direction_deviation_deg"),
             "selected_differs_from_current": bool(selected_actions != current_actions),
             "candidate_count": event.get("candidate_count"),
             "would_reject_candidate_count": event.get("would_reject_candidate_count"),
+            "occ_memory_score_valid_candidate_count": event.get(
+                "occ_memory_score_valid_candidate_count"
+            ),
+            "occ_memory_score_would_reject_candidate_count": event.get(
+                "occ_memory_score_would_reject_candidate_count"
+            ),
             "unique_action_sequence_count": event.get("unique_action_sequence_count"),
             "unique_endpoint_count": event.get("unique_endpoint_count"),
             "applied": True,
@@ -1894,7 +2183,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             f"episode={event.get('episode_id')} step={event.get('step_id')} "
             f"candidate={active_event['selected_candidate_index']} "
             f"current={current_actions} selected={selected_actions} "
-            f"score={active_event['current_obstacle_score']}->{active_event['selected_obstacle_score']}"
+            f"score={active_event['current_obstacle_score']}->{active_event['selected_obstacle_score']} "
+            f"occ={int((event.get('current_occ_memory_score') or {}).get('occupied_hit_count', 0) or 0)}"
+            f"->{int((selected.get('occ_memory_score') or {}).get('occupied_hit_count', 0) or 0)} "
+            f"dev={active_event.get('selected_direction_deviation_deg')}"
         )
         status.update(active_event)
         status["applied"] = True
@@ -1921,7 +2213,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
     ):
         cfg = self._get_nextdit_candidate_probe_cfg()
         probe_enabled = bool(cfg.get("enable"))
-        active_needed = self._nextdit_active_probe_needed(current_decision, active_intervention_count)
+        current_occ_memory_score = None
+        if cfg.get("occ_memory_score_enable"):
+            current_occ_memory_score = self._score_nextdit_averaged_trajectory_with_occ_memory(
+                dp_actions,
+                observations,
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_index=episode_index,
+                episode_count=episode_count,
+                step_id=step_id,
+                query_index=query_index,
+            )
+        active_needed = self._nextdit_active_probe_needed(
+            current_decision,
+            active_intervention_count,
+            current_occ_memory_score,
+        )
         if not (probe_enabled or active_needed):
             return {}, {}, False
 
@@ -1946,6 +2254,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             step_id=step_id,
             query_index=query_index,
             pixel_goal=pixel_goal,
+            current_occ_memory_score=current_occ_memory_score,
         )
         active_status = {}
         if active_needed:
@@ -2176,6 +2485,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             nextdit_candidate_occ_checked_cell_sum = 0.0
             nextdit_candidate_occ_occupied_hit_sum = 0.0
             nextdit_candidate_occ_unknown_hit_sum = 0.0
+            nextdit_candidate_occ_current_valid_event_count = 0
+            nextdit_candidate_occ_current_would_reject_event_count = 0
+            nextdit_candidate_occ_current_occupied_hit_sum = 0.0
+            nextdit_candidate_occ_current_unknown_hit_sum = 0.0
             nextdit_candidate_active_considered_count = 0
             nextdit_candidate_active_intervention_count = 0
             nextdit_candidate_active_changed_count = 0
@@ -2969,6 +3282,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             nextdit_candidate_occ_unknown_hit_sum += float(
                                 nextdit_probe_event.get("occ_memory_score_mean_unknown_hit_count", 0.0) or 0.0
                             )
+                            if nextdit_probe_event.get("current_occ_memory_valid"):
+                                nextdit_candidate_occ_current_valid_event_count += 1
+                                if nextdit_probe_event.get("current_occ_memory_would_reject"):
+                                    nextdit_candidate_occ_current_would_reject_event_count += 1
+                                nextdit_candidate_occ_current_occupied_hit_sum += float(
+                                    nextdit_probe_event.get("current_occ_memory_occupied_hit_count", 0) or 0.0
+                                )
+                                nextdit_candidate_occ_current_unknown_hit_sum += float(
+                                    nextdit_probe_event.get("current_occ_memory_unknown_hit_count", 0) or 0.0
+                                )
                             if int(nextdit_probe_event.get("safer_candidate_count", 0) or 0) > 0:
                                 nextdit_candidate_probe_safer_event_count += 1
                             if nextdit_probe_event.get("selected_differs_from_current"):
@@ -3126,6 +3449,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             nextdit_candidate_occ_unknown_hit_sum += float(
                                 nextdit_probe_event.get("occ_memory_score_mean_unknown_hit_count", 0.0) or 0.0
                             )
+                            if nextdit_probe_event.get("current_occ_memory_valid"):
+                                nextdit_candidate_occ_current_valid_event_count += 1
+                                if nextdit_probe_event.get("current_occ_memory_would_reject"):
+                                    nextdit_candidate_occ_current_would_reject_event_count += 1
+                                nextdit_candidate_occ_current_occupied_hit_sum += float(
+                                    nextdit_probe_event.get("current_occ_memory_occupied_hit_count", 0) or 0.0
+                                )
+                                nextdit_candidate_occ_current_unknown_hit_sum += float(
+                                    nextdit_probe_event.get("current_occ_memory_unknown_hit_count", 0) or 0.0
+                                )
                             if int(nextdit_probe_event.get("safer_candidate_count", 0) or 0) > 0:
                                 nextdit_candidate_probe_safer_event_count += 1
                             if nextdit_probe_event.get("selected_differs_from_current"):
@@ -3782,6 +4115,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     result["nextdit_candidate_occ_mean_unknown_hit_count"] = (
                         nextdit_candidate_occ_unknown_hit_sum
                         / max(1, nextdit_candidate_probe_event_count)
+                    )
+                    result["nextdit_candidate_occ_current_valid_event_count"] = (
+                        nextdit_candidate_occ_current_valid_event_count
+                    )
+                    result["nextdit_candidate_occ_current_would_reject_event_count"] = (
+                        nextdit_candidate_occ_current_would_reject_event_count
+                    )
+                    result["nextdit_candidate_occ_current_would_reject_event_ratio"] = (
+                        nextdit_candidate_occ_current_would_reject_event_count
+                        / max(1, nextdit_candidate_occ_current_valid_event_count)
+                    )
+                    result["nextdit_candidate_occ_current_mean_occupied_hit_count"] = (
+                        nextdit_candidate_occ_current_occupied_hit_sum
+                        / max(1, nextdit_candidate_occ_current_valid_event_count)
+                    )
+                    result["nextdit_candidate_occ_current_mean_unknown_hit_count"] = (
+                        nextdit_candidate_occ_current_unknown_hit_sum
+                        / max(1, nextdit_candidate_occ_current_valid_event_count)
                     )
             if nextdit_probe_cfg.get("active_enable"):
                 result["nextdit_candidate_active_considered_count"] = (
