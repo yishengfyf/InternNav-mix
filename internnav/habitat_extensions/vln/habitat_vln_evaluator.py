@@ -2148,6 +2148,397 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "active_reason_counts": dict(state.get("active_reason_counts") or {}),
         }
 
+    def _get_failure_prediction_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "enable": bool(vlmap_safety_cfg.get("failure_prediction_enable", False)),
+            "shadow_only": bool(vlmap_safety_cfg.get("failure_prediction_shadow_only", True)),
+            "min_step": max(0, int(vlmap_safety_cfg.get("failure_prediction_min_step", 30))),
+            "window_steps": max(1, int(vlmap_safety_cfg.get("failure_prediction_window_steps", 20))),
+            "threshold": float(vlmap_safety_cfg.get("failure_prediction_threshold", 0.65)),
+            "stagnation_weight": float(vlmap_safety_cfg.get("failure_prediction_stagnation_score_weight", 0.40)),
+            "semantic_weight": float(vlmap_safety_cfg.get("failure_prediction_semantic_weight", 0.30)),
+            "collision_weight": float(vlmap_safety_cfg.get("failure_prediction_collision_weight", 0.20)),
+            "displacement_weight": float(vlmap_safety_cfg.get("failure_prediction_displacement_weight", 0.10)),
+            "map_growth_weight": float(vlmap_safety_cfg.get("failure_prediction_map_growth_weight", 0.15)),
+            "unsafe_waypoint_weight": float(vlmap_safety_cfg.get("failure_prediction_unsafe_waypoint_weight", 0.15)),
+            "stagnation_streak_scale": max(
+                1.0,
+                float(vlmap_safety_cfg.get("failure_prediction_stagnation_streak_scale", 30.0)),
+            ),
+            "low_map_growth_norm": max(
+                1.0,
+                float(vlmap_safety_cfg.get("failure_prediction_low_map_growth_norm", 120.0)),
+            ),
+            "displacement_norm_m": max(
+                0.01,
+                float(vlmap_safety_cfg.get("failure_prediction_displacement_norm_m", 1.25)),
+            ),
+            "collision_norm": max(
+                1.0,
+                float(vlmap_safety_cfg.get("failure_prediction_collision_norm", 2.0)),
+            ),
+            "min_explore_efficiency": max(
+                0.0,
+                float(vlmap_safety_cfg.get("failure_prediction_min_explore_efficiency", 20.0)),
+            ),
+            "log_every_step": bool(vlmap_safety_cfg.get("failure_prediction_log_every_step", True)),
+            "predictor_version": str(vlmap_safety_cfg.get("failure_prediction_version", "stage14a_rule_v1")),
+        }
+
+    def _init_failure_prediction_state(self) -> dict:
+        return {
+            "event_count": 0,
+            "logged_event_count": 0,
+            "predicted_event_count": 0,
+            "prediction_start_count": 0,
+            "first_predicted_step": None,
+            "max_failure_score": 0.0,
+            "max_stagnation_score": 0.0,
+            "max_semantic_score": 0.0,
+            "max_collision_score": 0.0,
+            "max_displacement_score": 0.0,
+            "mode_hint_counts": {},
+            "samples": [],
+            "last_predicted": False,
+            "last_event": None,
+        }
+
+    def _write_failure_prediction_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "failure_prediction_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _failure_prediction_semantic_snapshot(self, step_id: int) -> dict:
+        semantic_events = list(getattr(self.occ_memory, "semantic_events", []) or [])
+        high_conf_events = [event for event in semantic_events if event.get("high_conf_semantic")]
+        latest = dict(getattr(self.occ_memory, "last_semantic_decision", {}) or {})
+        recent_terms = latest.get("stagnation_recent_terms")
+        if recent_terms is None and semantic_events:
+            recent_terms = semantic_events[-1].get("stagnation_recent_terms")
+
+        waypoint_events = list(getattr(self.occ_memory, "waypoint_events", []) or [])
+        latest_waypoint = waypoint_events[-1] if waypoint_events else {}
+        dead_zone_score = latest_waypoint.get("semantic_dead_zone_score")
+        if dead_zone_score is None:
+            dead_zone_score = latest.get("semantic_dead_zone_score")
+        try:
+            dead_zone_score = float(dead_zone_score)
+        except (TypeError, ValueError):
+            dead_zone_score = 0.0
+
+        return {
+            "step_id": int(step_id),
+            "semantic_event_count": int(len(semantic_events)),
+            "semantic_high_conf_count": int(len(high_conf_events)),
+            "latest_top_match": latest.get("top_match"),
+            "latest_top_score": latest.get("top_score"),
+            "latest_high_conf_semantic": bool(latest.get("high_conf_semantic")),
+            "semantic_stagnation": bool(
+                latest.get("stagnation_would_requery")
+                or latest_waypoint.get("semantic_stagnation_active")
+                or latest_waypoint.get("semantic_last_stagnation")
+            ),
+            "semantic_recent_unique_count": latest.get("stagnation_recent_unique_count"),
+            "semantic_recent_terms": recent_terms,
+            "semantic_dead_zone": bool(latest_waypoint.get("semantic_dead_zone")),
+            "semantic_dead_zone_score": float(dead_zone_score),
+        }
+
+    def _failure_prediction_window_samples(self, samples: list, step_id: int, window_steps: int) -> list:
+        min_step = int(step_id) - int(window_steps)
+        return [sample for sample in samples if int(sample.get("step_id", 0)) >= min_step]
+
+    def _failure_prediction_score_from_history(
+        self,
+        *,
+        step_id: int,
+        state: dict,
+        cfg: dict,
+    ) -> dict:
+        samples = list(state.get("samples") or [])
+        if not samples:
+            return {
+                "failure_score": 0.0,
+                "failure_predicted": False,
+                "failure_mode_hint": "insufficient_history",
+                "signal_breakdown": {},
+                "features": {},
+            }
+
+        window_steps = int(cfg.get("window_steps", 20))
+        window = self._failure_prediction_window_samples(samples, step_id, window_steps)
+        if not window:
+            window = [samples[-1]]
+        first = window[0]
+        last = window[-1]
+        window_span = max(1, int(last.get("step_id", step_id)) - int(first.get("step_id", step_id)))
+
+        occ_growth = int(last.get("occupied_cell_count", 0) or 0) - int(
+            first.get("occupied_cell_count", 0) or 0
+        )
+        free_growth = int(last.get("free_cell_count", 0) or 0) - int(first.get("free_cell_count", 0) or 0)
+        total_growth = occ_growth + free_growth
+        collision_sum = float(sum(float(item.get("collision_delta", 0.0) or 0.0) for item in window))
+        collision_rate = float(collision_sum / max(1, len(window)))
+
+        displacement_total = 0.0
+        prev_xy = None
+        for item in window:
+            xy = item.get("pose_xy")
+            if not xy or len(xy) < 2:
+                continue
+            xy = [float(xy[0]), float(xy[1])]
+            if prev_xy is not None:
+                displacement_total += float(math.hypot(xy[0] - prev_xy[0], xy[1] - prev_xy[1]))
+            prev_xy = xy
+
+        semantic_new_events = int(last.get("semantic_event_count", 0) or 0) - int(
+            first.get("semantic_event_count", 0) or 0
+        )
+        high_conf_count = int(last.get("semantic_high_conf_count", 0) or 0)
+        semantic_dead_zone_score = float(last.get("semantic_dead_zone_score", 0.0) or 0.0)
+        semantic_stagnation = bool(last.get("semantic_stagnation"))
+
+        waypoint_window = []
+        try:
+            min_step = int(step_id) - window_steps
+            for event in list(getattr(self.occ_memory, "waypoint_events", []) or []):
+                event_step = event.get("step_id")
+                if event_step is None or int(event_step) < min_step or int(event_step) > int(step_id):
+                    continue
+                waypoint_window.append(event)
+        except Exception:
+            waypoint_window = []
+        unsafe_waypoint_count = 0
+        for event in waypoint_window:
+            goal_state = str(event.get("goal_state") or "")
+            if goal_state in ("occupied", "unknown") or event.get("semantic_dead_zone"):
+                unsafe_waypoint_count += 1
+        unsafe_waypoint_ratio = float(unsafe_waypoint_count / max(1, len(waypoint_window)))
+
+        stagnation_streak = int(last.get("occupied_stagnation_streak", 0) or 0)
+        stagnation_score = min(
+            1.0,
+            max(0.0, float(stagnation_streak) / float(cfg.get("stagnation_streak_scale", 30.0))),
+        )
+        low_growth_score = 1.0 - min(
+            1.0,
+            max(0.0, float(max(0, total_growth)) / float(cfg.get("low_map_growth_norm", 120.0))),
+        )
+        displacement_score = 1.0 - min(
+            1.0,
+            max(0.0, float(displacement_total) / float(cfg.get("displacement_norm_m", 1.25))),
+        )
+        collision_score = min(
+            1.0,
+            max(0.0, float(collision_sum) / float(cfg.get("collision_norm", 2.0))),
+        )
+        semantic_no_new_score = 1.0 if int(step_id) >= int(cfg.get("min_step", 30)) and semantic_new_events <= 0 else 0.0
+        semantic_score = max(
+            1.0 if semantic_stagnation else 0.0,
+            float(semantic_dead_zone_score),
+            0.50 * semantic_no_new_score if high_conf_count <= 0 else 0.0,
+        )
+        explore_efficiency = float(max(0, occ_growth) / max(0.01, displacement_total))
+        inefficient_explore_score = 1.0 - min(
+            1.0,
+            explore_efficiency / max(1e-6, float(cfg.get("min_explore_efficiency", 20.0))),
+        )
+        map_signal = max(float(low_growth_score), float(inefficient_explore_score))
+
+        raw_score = (
+            float(cfg.get("stagnation_weight", 0.40)) * float(stagnation_score)
+            + float(cfg.get("semantic_weight", 0.30)) * float(semantic_score)
+            + float(cfg.get("collision_weight", 0.20)) * float(collision_score)
+            + float(cfg.get("displacement_weight", 0.10)) * float(displacement_score)
+            + float(cfg.get("map_growth_weight", 0.15)) * float(map_signal)
+            + float(cfg.get("unsafe_waypoint_weight", 0.15)) * float(unsafe_waypoint_ratio)
+        )
+        normalizer = max(
+            1e-6,
+            float(cfg.get("stagnation_weight", 0.40))
+            + float(cfg.get("semantic_weight", 0.30))
+            + float(cfg.get("collision_weight", 0.20))
+            + float(cfg.get("displacement_weight", 0.10))
+            + float(cfg.get("map_growth_weight", 0.15))
+            + float(cfg.get("unsafe_waypoint_weight", 0.15)),
+        )
+        failure_score = min(1.0, max(0.0, float(raw_score / normalizer)))
+        failure_predicted = bool(
+            int(step_id) >= int(cfg.get("min_step", 30))
+            and failure_score >= float(cfg.get("threshold", 0.65))
+        )
+
+        if stagnation_score >= 0.65 and displacement_score >= 0.50:
+            mode_hint = "stuck"
+        elif collision_score >= 0.50:
+            mode_hint = "collision_risk"
+        elif semantic_score >= 0.60 or unsafe_waypoint_ratio >= 0.50:
+            mode_hint = "lost_or_wrong_direction"
+        elif map_signal >= 0.65 and displacement_score >= 0.35:
+            mode_hint = "low_progress"
+        else:
+            mode_hint = "navigating"
+
+        features = {
+            "window_steps": int(window_steps),
+            "window_span_steps": int(window_span),
+            "occ_growth_last_w": int(occ_growth),
+            "free_growth_last_w": int(free_growth),
+            "total_growth_last_w": int(total_growth),
+            "displacement_total_w": float(displacement_total),
+            "collision_sum_w": float(collision_sum),
+            "collision_rate_w": float(collision_rate),
+            "semantic_new_events_w": int(semantic_new_events),
+            "semantic_high_conf_count_t": int(high_conf_count),
+            "semantic_dead_zone_score_t": float(semantic_dead_zone_score),
+            "semantic_stagnation_t": bool(semantic_stagnation),
+            "unsafe_waypoint_count_w": int(unsafe_waypoint_count),
+            "waypoint_count_w": int(len(waypoint_window)),
+            "unsafe_waypoint_ratio_w": float(unsafe_waypoint_ratio),
+            "step_fraction": float(step_id / max(1, int(self.max_steps_per_episode))),
+            "explore_efficiency": float(explore_efficiency),
+        }
+        signal_breakdown = {
+            "stagnation_score": float(stagnation_score),
+            "semantic_score": float(semantic_score),
+            "collision_score": float(collision_score),
+            "displacement_score": float(displacement_score),
+            "low_map_growth_score": float(low_growth_score),
+            "inefficient_explore_score": float(inefficient_explore_score),
+            "map_signal": float(map_signal),
+            "unsafe_waypoint_score": float(unsafe_waypoint_ratio),
+        }
+        return {
+            "failure_score": float(failure_score),
+            "failure_predicted": bool(failure_predicted),
+            "failure_mode_hint": mode_hint,
+            "signal_breakdown": signal_breakdown,
+            "features": features,
+        }
+
+    def _update_failure_prediction_shadow(
+        self,
+        *,
+        state: dict,
+        occ_event: Optional[dict],
+        step_id: int,
+        scene_id: str,
+        episode_id: int,
+        episode_index: int,
+        episode_count: int,
+    ) -> Optional[dict]:
+        cfg = self._get_failure_prediction_cfg()
+        if not cfg.get("enable"):
+            return None
+        occ_event = dict(occ_event or {})
+        semantic_snapshot = self._failure_prediction_semantic_snapshot(step_id)
+        sample = {
+            "step_id": int(step_id),
+            "occupied_cell_count": int(occ_event.get("occupied_cell_count", 0) or 0),
+            "free_cell_count": int(occ_event.get("free_cell_count", 0) or 0),
+            "occupied_stagnation_streak": int(occ_event.get("occupied_stagnation_streak", 0) or 0),
+            "total_stagnation_streak": int(occ_event.get("total_stagnation_streak", 0) or 0),
+            "collision_delta": float(occ_event.get("collision_delta", 0.0) or 0.0),
+            "collision_count": float(occ_event.get("collision_count", 0.0) or 0.0),
+            "pose_xy": occ_event.get("pose_xy"),
+            **semantic_snapshot,
+        }
+        samples = list(state.get("samples") or [])
+        samples.append(sample)
+        max_samples = max(64, int(cfg.get("window_steps", 20)) * 4 + 8)
+        state["samples"] = samples[-max_samples:]
+
+        score = self._failure_prediction_score_from_history(step_id=step_id, state=state, cfg=cfg)
+        predicted = bool(score.get("failure_predicted"))
+        started = bool(predicted and not bool(state.get("last_predicted")))
+        state["event_count"] = int(state.get("event_count", 0) or 0) + 1
+        if predicted:
+            state["predicted_event_count"] = int(state.get("predicted_event_count", 0) or 0) + 1
+        if started:
+            state["prediction_start_count"] = int(state.get("prediction_start_count", 0) or 0) + 1
+            if state.get("first_predicted_step") is None:
+                state["first_predicted_step"] = int(step_id)
+
+        failure_score = float(score.get("failure_score", 0.0) or 0.0)
+        breakdown = dict(score.get("signal_breakdown") or {})
+        state["max_failure_score"] = max(float(state.get("max_failure_score", 0.0) or 0.0), failure_score)
+        state["max_stagnation_score"] = max(
+            float(state.get("max_stagnation_score", 0.0) or 0.0),
+            float(breakdown.get("stagnation_score", 0.0) or 0.0),
+        )
+        state["max_semantic_score"] = max(
+            float(state.get("max_semantic_score", 0.0) or 0.0),
+            float(breakdown.get("semantic_score", 0.0) or 0.0),
+        )
+        state["max_collision_score"] = max(
+            float(state.get("max_collision_score", 0.0) or 0.0),
+            float(breakdown.get("collision_score", 0.0) or 0.0),
+        )
+        state["max_displacement_score"] = max(
+            float(state.get("max_displacement_score", 0.0) or 0.0),
+            float(breakdown.get("displacement_score", 0.0) or 0.0),
+        )
+        mode_hint = str(score.get("failure_mode_hint") or "unknown")
+        mode_counts = dict(state.get("mode_hint_counts") or {})
+        mode_counts[mode_hint] = int(mode_counts.get(mode_hint, 0) or 0) + 1
+        state["mode_hint_counts"] = mode_counts
+
+        event = {
+            "event_type": "failure_prediction_shadow",
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "episode_index": int(episode_index),
+            "episode_count": int(episode_count),
+            "step_id": int(step_id),
+            "enabled": True,
+            "shadow_only": bool(cfg.get("shadow_only", True)),
+            "predictor_version": cfg.get("predictor_version"),
+            "min_step": int(cfg.get("min_step", 30)),
+            "window_steps": int(cfg.get("window_steps", 20)),
+            "threshold": float(cfg.get("threshold", 0.65)),
+            "failure_score": failure_score,
+            "failure_predicted": bool(predicted),
+            "failure_prediction_started": bool(started),
+            "failure_mode_hint": mode_hint,
+            "signal_breakdown": breakdown,
+            "features": score.get("features") or {},
+            "source": {
+                "occ_event_valid": bool(occ_event),
+                "semantic_event_count": int(semantic_snapshot.get("semantic_event_count", 0) or 0),
+                "semantic_high_conf_count": int(semantic_snapshot.get("semantic_high_conf_count", 0) or 0),
+            },
+        }
+        state["last_predicted"] = bool(predicted)
+        state["last_event"] = event
+        if bool(cfg.get("log_every_step", True)) or predicted or started:
+            self._write_failure_prediction_event(event)
+            state["logged_event_count"] = int(state.get("logged_event_count", 0) or 0) + 1
+        return event
+
+    def _summarize_failure_prediction_state(self, state: dict) -> dict:
+        if not state:
+            return {}
+        return {
+            "event_count": int(state.get("event_count", 0) or 0),
+            "logged_event_count": int(state.get("logged_event_count", 0) or 0),
+            "predicted_event_count": int(state.get("predicted_event_count", 0) or 0),
+            "prediction_start_count": int(state.get("prediction_start_count", 0) or 0),
+            "first_predicted_step": state.get("first_predicted_step"),
+            "max_failure_score": float(state.get("max_failure_score", 0.0) or 0.0),
+            "max_stagnation_score": float(state.get("max_stagnation_score", 0.0) or 0.0),
+            "max_semantic_score": float(state.get("max_semantic_score", 0.0) or 0.0),
+            "max_collision_score": float(state.get("max_collision_score", 0.0) or 0.0),
+            "max_displacement_score": float(state.get("max_displacement_score", 0.0) or 0.0),
+            "mode_hint_counts": dict(state.get("mode_hint_counts") or {}),
+        }
+
     def _record_occ_memory_recovery_active_reason(self, state: dict, reason: str) -> None:
         counts = dict(state.get("active_reason_counts") or {})
         counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
@@ -3206,6 +3597,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             nextdit_candidate_active_no_candidate_count = 0
             occ_memory_recovery_state = self._init_occ_memory_recovery_state()
             occ_memory_recovery_active_count = 0
+            failure_prediction_state = self._init_failure_prediction_state()
 
             done = False
             flag = False
@@ -3254,6 +3646,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     local_actions=local_actions,
                     action_seq=action_seq,
                     vlmap_recovery_actions=vlmap_recovery_actions,
+                )
+                failure_prediction_event = self._update_failure_prediction_shadow(
+                    state=failure_prediction_state,
+                    occ_event=occ_memory_recovery_event,
+                    step_id=step_id,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    episode_index=episode_index,
+                    episode_count=episode_count,
                 )
                 occ_memory_recovery_active_status = self._maybe_apply_occ_memory_recovery(
                     occ_memory_recovery_state,
@@ -4385,6 +4786,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             occ_memory_recovery_summary = self._summarize_occ_memory_recovery_state(
                 occ_memory_recovery_state
             )
+            failure_prediction_summary = self._summarize_failure_prediction_state(
+                failure_prediction_state
+            )
 
             # Write per-episode progress.json entry (still per-rank)
             result = {
@@ -4462,6 +4866,36 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["occ_memory_recovery_active_reason_counts"] = (
                     occ_memory_recovery_summary.get("active_reason_counts")
+                )
+            if self._get_failure_prediction_cfg().get("enable"):
+                result["failure_prediction_event_count"] = failure_prediction_summary.get("event_count")
+                result["failure_prediction_logged_event_count"] = failure_prediction_summary.get(
+                    "logged_event_count"
+                )
+                result["failure_prediction_predicted_event_count"] = failure_prediction_summary.get(
+                    "predicted_event_count"
+                )
+                result["failure_prediction_start_count"] = failure_prediction_summary.get(
+                    "prediction_start_count"
+                )
+                result["failure_prediction_first_step"] = failure_prediction_summary.get(
+                    "first_predicted_step"
+                )
+                result["failure_prediction_max_score"] = failure_prediction_summary.get("max_failure_score")
+                result["failure_prediction_max_stagnation_score"] = failure_prediction_summary.get(
+                    "max_stagnation_score"
+                )
+                result["failure_prediction_max_semantic_score"] = failure_prediction_summary.get(
+                    "max_semantic_score"
+                )
+                result["failure_prediction_max_collision_score"] = failure_prediction_summary.get(
+                    "max_collision_score"
+                )
+                result["failure_prediction_max_displacement_score"] = failure_prediction_summary.get(
+                    "max_displacement_score"
+                )
+                result["failure_prediction_mode_hint_counts"] = failure_prediction_summary.get(
+                    "mode_hint_counts"
                 )
             if semantic_summary:
                 result["semantic_landmark_count"] = semantic_summary.get("landmark_count")
