@@ -1363,6 +1363,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "min_unsafe_signal": float(
                 vlmap_safety_cfg.get("som_counterfactual_min_unsafe_signal", 0.50)
             ),
+            "active_min_unsafe_signal": float(
+                vlmap_safety_cfg.get("som_counterfactual_active_min_unsafe_signal", 0.50)
+            ),
+            "active_max_per_episode": int(
+                vlmap_safety_cfg.get("som_counterfactual_active_max_per_episode", 3)
+            ),
             "frontier_alpha": max(
                 0,
                 min(255, int(vlmap_safety_cfg.get("som_counterfactual_frontier_alpha", 80))),
@@ -4072,6 +4078,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             som_counterfactual_skipped_count = 0
             som_counterfactual_error_count = 0
             som_counterfactual_pixel_shift_sum = 0.0
+            som_counterfactual_active_applied_count = 0
             occ_memory_candidate_probe_event_count = 0
             occ_memory_candidate_probe_valid_event_count = 0
             occ_memory_candidate_probe_skipped_count = 0
@@ -4519,6 +4526,107 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 context=som_context,
                                 image_width=int(self.model_args.resize_w),
                             )
+                            som_event["active_applied"] = False
+                            som_event["active_original_pixel_goal"] = None
+                            som_event["active_replaced_pixel_goal"] = None
+                            som_event["active_output_ids_rewritten"] = False
+                            som_event["active_replacement_mode"] = None
+                            som_event["active_gate_reason"] = "shadow_only"
+                            if not bool(som_cfg.get("shadow_only", True)):
+                                active_min_unsafe_signal = float(
+                                    som_cfg.get("active_min_unsafe_signal", 0.50) or 0.50
+                                )
+                                active_max_per_episode = max(
+                                    0, int(som_cfg.get("active_max_per_episode", 3))
+                                )
+                                unsafe_signal = float(som_event.get("unsafe_signal", 0.0) or 0.0)
+                                overlay_goal = som_event.get("overlay_pixel_goal")
+                                active_allowed = (
+                                    som_event.get("status") == "ok"
+                                    and bool(som_event.get("overlay_valid"))
+                                    and bool(som_event.get("changed_pixel"))
+                                    and unsafe_signal >= active_min_unsafe_signal
+                                    and som_counterfactual_active_applied_count < active_max_per_episode
+                                )
+                                if active_allowed and overlay_goal and len(overlay_goal) == 2:
+                                    old_pixel_goal = None if pixel_goal is None else list(pixel_goal)
+                                    overlay_output = str(som_event.get("overlay_output") or "").strip()
+                                    try:
+                                        if output_ids is None or output_ids.ndim != 2:
+                                            som_event["active_gate_reason"] = "missing_base_output_ids"
+                                        else:
+                                            overlay_generated_ids = self.processor.tokenizer(
+                                                overlay_output,
+                                                add_special_tokens=False,
+                                                return_tensors="pt",
+                                            ).input_ids.to(output_ids.device)
+                                            prompt_len = int(inputs.input_ids.shape[1])
+                                            if overlay_generated_ids.numel() <= 0:
+                                                som_event["active_gate_reason"] = "empty_overlay_output_ids"
+                                            else:
+                                                output_ids = torch.cat(
+                                                    [
+                                                        output_ids[:, :prompt_len],
+                                                        overlay_generated_ids,
+                                                    ],
+                                                    dim=1,
+                                                )
+                                                pixel_goal = [
+                                                    int(overlay_goal[0]),
+                                                    int(overlay_goal[1]),
+                                                ]
+                                                local_actions = []
+                                                traj_latents = None
+                                                draw_pixel_goal = True
+                                                som_counterfactual_active_applied_count += 1
+                                                som_event["active_applied"] = True
+                                                som_event["active_original_pixel_goal"] = old_pixel_goal
+                                                som_event["active_replaced_pixel_goal"] = list(pixel_goal)
+                                                som_event["active_output_ids_rewritten"] = True
+                                                som_event["active_replacement_mode"] = (
+                                                    "base_prompt_overlay_coordinate_tokens"
+                                                )
+                                                som_event["active_gate_reason"] = "applied"
+                                                try:
+                                                    traj_cache = list(
+                                                        failure_prediction_state.get("traj_cache") or []
+                                                    )
+                                                    if traj_cache and int(
+                                                        traj_cache[-1].get("eval_step", -1)
+                                                    ) == int(step_id):
+                                                        traj_cache[-1]["pixel_goal"] = [
+                                                            float(pixel_goal[0]),
+                                                            float(pixel_goal[1]),
+                                                        ]
+                                                        traj_cache[-1]["pixel_goal_source"] = (
+                                                            "som_active_overlay"
+                                                        )
+                                                        failure_prediction_state["traj_cache"] = traj_cache
+                                                except (TypeError, ValueError):
+                                                    pass
+                                                print(
+                                                    "[OccMemory][Habitat][SoM][Active] replace pixel_goal "
+                                                    f"{old_pixel_goal} -> {pixel_goal} "
+                                                    f"shift={som_event.get('pixel_shift')} "
+                                                    f"unsafe={unsafe_signal:.2f} "
+                                                    f"count={som_counterfactual_active_applied_count}/"
+                                                    f"{active_max_per_episode}"
+                                                )
+                                    except Exception as exc:
+                                        som_event["active_gate_reason"] = "output_id_rewrite_error"
+                                        som_event["active_error"] = str(exc)
+                                elif som_counterfactual_active_applied_count >= active_max_per_episode:
+                                    som_event["active_gate_reason"] = "max_per_episode"
+                                elif som_event.get("status") != "ok":
+                                    som_event["active_gate_reason"] = "status_not_ok"
+                                elif not som_event.get("overlay_valid"):
+                                    som_event["active_gate_reason"] = "invalid_overlay"
+                                elif not som_event.get("changed_pixel"):
+                                    som_event["active_gate_reason"] = "unchanged_pixel"
+                                elif unsafe_signal < active_min_unsafe_signal:
+                                    som_event["active_gate_reason"] = "unsafe_signal_low"
+                                else:
+                                    som_event["active_gate_reason"] = "invalid_overlay_goal"
                             self._write_som_counterfactual_event(som_event)
                             som_counterfactual_count += 1
                             som_status = str(som_event.get("status", "ok"))
@@ -5629,6 +5737,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["som_counterfactual_skipped_count"] = som_counterfactual_skipped_count
                 result["som_counterfactual_error_count"] = som_counterfactual_error_count
+                result["som_counterfactual_active_applied_count"] = (
+                    som_counterfactual_active_applied_count
+                )
                 if som_counterfactual_valid_count > 0:
                     result["som_counterfactual_mean_pixel_shift"] = (
                         som_counterfactual_pixel_shift_sum
