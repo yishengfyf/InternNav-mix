@@ -2162,6 +2162,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "displacement_weight": float(vlmap_safety_cfg.get("failure_prediction_displacement_weight", 0.10)),
             "map_growth_weight": float(vlmap_safety_cfg.get("failure_prediction_map_growth_weight", 0.15)),
             "unsafe_waypoint_weight": float(vlmap_safety_cfg.get("failure_prediction_unsafe_waypoint_weight", 0.15)),
+            "direction_enable": bool(vlmap_safety_cfg.get("failure_prediction_direction_enable", False)),
+            "pg_ecc_weight": float(vlmap_safety_cfg.get("failure_prediction_pg_ecc_weight", 0.0)),
+            "compass_reversal_weight": float(
+                vlmap_safety_cfg.get("failure_prediction_compass_reversal_weight", 0.0)
+            ),
+            "heading_var_weight": float(vlmap_safety_cfg.get("failure_prediction_heading_var_weight", 0.0)),
+            "pg_ecc_threshold": float(vlmap_safety_cfg.get("failure_prediction_pg_ecc_threshold", 0.30)),
+            "pg_ecc_norm": max(
+                1e-6,
+                float(vlmap_safety_cfg.get("failure_prediction_pg_ecc_norm", 0.30)),
+            ),
+            "compass_reversal_max": max(
+                1.0,
+                float(vlmap_safety_cfg.get("failure_prediction_compass_reversal_max", 4.0)),
+            ),
+            "direction_image_width": max(
+                1.0,
+                float(vlmap_safety_cfg.get("failure_prediction_direction_image_width", 640.0)),
+            ),
+            "direction_cache_max_events": max(
+                16,
+                int(vlmap_safety_cfg.get("failure_prediction_direction_cache_max_events", 256)),
+            ),
             "stagnation_streak_scale": max(
                 1.0,
                 float(vlmap_safety_cfg.get("failure_prediction_stagnation_streak_scale", 30.0)),
@@ -2198,8 +2221,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "max_semantic_score": 0.0,
             "max_collision_score": 0.0,
             "max_displacement_score": 0.0,
+            "max_pg_ecc_score": 0.0,
+            "max_compass_reversal_score": 0.0,
+            "max_heading_var_score": 0.0,
             "mode_hint_counts": {},
             "samples": [],
+            "traj_cache": [],
             "last_predicted": False,
             "last_event": None,
         }
@@ -2253,6 +2280,155 @@ class HabitatVLNEvaluator(DistributedEvaluator):
     def _failure_prediction_window_samples(self, samples: list, step_id: int, window_steps: int) -> list:
         min_step = int(step_id) - int(window_steps)
         return [sample for sample in samples if int(sample.get("step_id", 0)) >= min_step]
+
+    def _failure_prediction_float_list(
+        self,
+        value,
+        *,
+        max_len: Optional[int] = None,
+    ) -> Optional[list]:
+        value = self._jsonable(value)
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            value = [value]
+        if not isinstance(value, list):
+            return None
+        if max_len is not None:
+            value = value[:max_len]
+        out = []
+        for item in value:
+            try:
+                out.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return out or None
+
+    def _append_failure_prediction_trajectory_cache(
+        self,
+        state: Optional[dict],
+        *,
+        step_id: int,
+        pixel_goal,
+        observations: dict,
+    ) -> None:
+        if not state or pixel_goal is None:
+            return
+        cfg = self._get_failure_prediction_cfg()
+        if not cfg.get("enable") or not cfg.get("direction_enable"):
+            return
+
+        pg = self._failure_prediction_float_list(pixel_goal, max_len=2)
+        if not pg or len(pg) < 2:
+            return
+        gps = self._failure_prediction_float_list((observations or {}).get("gps"), max_len=2)
+        compass = self._failure_prediction_float_list((observations or {}).get("compass"), max_len=1)
+        event = {
+            "eval_step": int(step_id),
+            "pixel_goal": [float(pg[0]), float(pg[1])],
+            "gps": gps,
+            "compass": compass,
+        }
+        cache = list(state.get("traj_cache") or [])
+        cache.append(event)
+        max_events = int(cfg.get("direction_cache_max_events", 256))
+        state["traj_cache"] = cache[-max_events:]
+
+    def _failure_prediction_direction_features(
+        self,
+        *,
+        step_id: int,
+        state: dict,
+        cfg: dict,
+    ) -> dict:
+        if not cfg.get("direction_enable"):
+            return {
+                "trajectory_event_count_w": 0,
+                "pg_ecc_mean_w": 0.0,
+                "compass_reversal_count_w": 0,
+                "heading_variance_w": 0.0,
+            }
+
+        window_steps = int(cfg.get("window_steps", 20))
+        min_step = int(step_id) - window_steps
+        traj_cache = list(state.get("traj_cache") or [])
+        traj_window = []
+        for event in traj_cache:
+            try:
+                event_step = int(event.get("eval_step", -1))
+            except (TypeError, ValueError):
+                continue
+            if min_step <= event_step <= int(step_id):
+                traj_window.append(event)
+        traj_window.sort(key=lambda item: int(item.get("eval_step", -1)))
+
+        image_width = float(cfg.get("direction_image_width", 640.0))
+        center_x = image_width * 0.5
+        half_width = max(1.0, image_width * 0.5)
+        pg_eccentricities = []
+        for event in traj_window:
+            pg = event.get("pixel_goal")
+            if not pg or len(pg) < 1:
+                continue
+            try:
+                pg_x = float(pg[0])
+            except (TypeError, ValueError):
+                continue
+            pg_eccentricities.append(min(1.0, max(0.0, abs(pg_x - center_x) / half_width)))
+        pg_ecc_mean = (
+            float(sum(pg_eccentricities) / len(pg_eccentricities))
+            if pg_eccentricities
+            else 0.0
+        )
+
+        compass_vals = []
+        for event in traj_window:
+            compass = event.get("compass")
+            if not compass or len(compass) < 1:
+                continue
+            try:
+                compass_vals.append(float(compass[0]))
+            except (TypeError, ValueError):
+                continue
+        compass_reversals = 0
+        for i in range(1, len(compass_vals)):
+            if compass_vals[i - 1] * compass_vals[i] < 0:
+                compass_reversals += 1
+
+        gps_pairs = []
+        for event in traj_window:
+            gps = event.get("gps")
+            if not gps or len(gps) < 2:
+                continue
+            try:
+                gps_pairs.append(
+                    (
+                        int(event.get("eval_step", -1)),
+                        [float(gps[0]), float(gps[1])],
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        gps_pairs.sort(key=lambda item: item[0])
+        headings = []
+        for i in range(1, len(gps_pairs)):
+            dx = gps_pairs[i][1][0] - gps_pairs[i - 1][1][0]
+            dz = gps_pairs[i][1][1] - gps_pairs[i - 1][1][1]
+            if math.hypot(dx, dz) > 1e-4:
+                headings.append(math.atan2(dx, dz))
+        heading_variance = 0.0
+        if len(headings) >= 2:
+            sin_m = sum(math.sin(h) for h in headings) / len(headings)
+            cos_m = sum(math.cos(h) for h in headings) / len(headings)
+            heading_variance = 1.0 - math.sqrt(sin_m * sin_m + cos_m * cos_m)
+            heading_variance = min(1.0, max(0.0, float(heading_variance)))
+
+        return {
+            "trajectory_event_count_w": int(len(traj_window)),
+            "pg_ecc_mean_w": float(pg_ecc_mean),
+            "compass_reversal_count_w": int(compass_reversals),
+            "heading_variance_w": float(heading_variance),
+        }
 
     def _failure_prediction_score_from_history(
         self,
@@ -2351,6 +2527,37 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             explore_efficiency / max(1e-6, float(cfg.get("min_explore_efficiency", 20.0))),
         )
         map_signal = max(float(low_growth_score), float(inefficient_explore_score))
+        direction_features = self._failure_prediction_direction_features(
+            step_id=step_id,
+            state=state,
+            cfg=cfg,
+        )
+        pg_ecc_mean = float(direction_features.get("pg_ecc_mean_w", 0.0) or 0.0)
+        pg_ecc_score = min(
+            1.0,
+            max(
+                0.0,
+                (pg_ecc_mean - float(cfg.get("pg_ecc_threshold", 0.30)))
+                / float(cfg.get("pg_ecc_norm", 0.30)),
+            ),
+        )
+        compass_reversal_count = int(direction_features.get("compass_reversal_count_w", 0) or 0)
+        compass_reversal_score = min(
+            1.0,
+            max(
+                0.0,
+                float(compass_reversal_count) / float(cfg.get("compass_reversal_max", 4.0)),
+            ),
+        )
+        heading_var_score = min(
+            1.0,
+            max(0.0, float(direction_features.get("heading_variance_w", 0.0) or 0.0)),
+        )
+        direction_signal = max(
+            float(pg_ecc_score),
+            float(compass_reversal_score),
+            float(heading_var_score),
+        )
 
         raw_score = (
             float(cfg.get("stagnation_weight", 0.40)) * float(stagnation_score)
@@ -2359,6 +2566,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             + float(cfg.get("displacement_weight", 0.10)) * float(displacement_score)
             + float(cfg.get("map_growth_weight", 0.15)) * float(map_signal)
             + float(cfg.get("unsafe_waypoint_weight", 0.15)) * float(unsafe_waypoint_ratio)
+            + float(cfg.get("pg_ecc_weight", 0.0)) * float(pg_ecc_score)
+            + float(cfg.get("compass_reversal_weight", 0.0)) * float(compass_reversal_score)
+            + float(cfg.get("heading_var_weight", 0.0)) * float(heading_var_score)
         )
         normalizer = max(
             1e-6,
@@ -2367,7 +2577,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             + float(cfg.get("collision_weight", 0.20))
             + float(cfg.get("displacement_weight", 0.10))
             + float(cfg.get("map_growth_weight", 0.15))
-            + float(cfg.get("unsafe_waypoint_weight", 0.15)),
+            + float(cfg.get("unsafe_waypoint_weight", 0.15))
+            + float(cfg.get("pg_ecc_weight", 0.0))
+            + float(cfg.get("compass_reversal_weight", 0.0))
+            + float(cfg.get("heading_var_weight", 0.0)),
         )
         failure_score = min(1.0, max(0.0, float(raw_score / normalizer)))
         failure_predicted = bool(
@@ -2379,6 +2592,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             mode_hint = "stuck"
         elif collision_score >= 0.50:
             mode_hint = "collision_risk"
+        elif direction_signal >= 0.65:
+            mode_hint = "direction_confusion"
         elif semantic_score >= 0.60 or unsafe_waypoint_ratio >= 0.50:
             mode_hint = "lost_or_wrong_direction"
         elif map_signal >= 0.65 and displacement_score >= 0.35:
@@ -2404,6 +2619,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "unsafe_waypoint_ratio_w": float(unsafe_waypoint_ratio),
             "step_fraction": float(step_id / max(1, int(self.max_steps_per_episode))),
             "explore_efficiency": float(explore_efficiency),
+            "trajectory_event_count_w": int(direction_features.get("trajectory_event_count_w", 0) or 0),
+            "pg_ecc_mean_w": float(pg_ecc_mean),
+            "compass_reversal_count_w": int(compass_reversal_count),
+            "heading_variance_w": float(direction_features.get("heading_variance_w", 0.0) or 0.0),
         }
         signal_breakdown = {
             "stagnation_score": float(stagnation_score),
@@ -2414,6 +2633,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "inefficient_explore_score": float(inefficient_explore_score),
             "map_signal": float(map_signal),
             "unsafe_waypoint_score": float(unsafe_waypoint_ratio),
+            "pg_ecc_score": float(pg_ecc_score),
+            "compass_reversal_score": float(compass_reversal_score),
+            "heading_var_score": float(heading_var_score),
+            "direction_signal": float(direction_signal),
         }
         return {
             "failure_score": float(failure_score),
@@ -2485,6 +2708,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             float(state.get("max_displacement_score", 0.0) or 0.0),
             float(breakdown.get("displacement_score", 0.0) or 0.0),
         )
+        state["max_pg_ecc_score"] = max(
+            float(state.get("max_pg_ecc_score", 0.0) or 0.0),
+            float(breakdown.get("pg_ecc_score", 0.0) or 0.0),
+        )
+        state["max_compass_reversal_score"] = max(
+            float(state.get("max_compass_reversal_score", 0.0) or 0.0),
+            float(breakdown.get("compass_reversal_score", 0.0) or 0.0),
+        )
+        state["max_heading_var_score"] = max(
+            float(state.get("max_heading_var_score", 0.0) or 0.0),
+            float(breakdown.get("heading_var_score", 0.0) or 0.0),
+        )
         mode_hint = str(score.get("failure_mode_hint") or "unknown")
         mode_counts = dict(state.get("mode_hint_counts") or {})
         mode_counts[mode_hint] = int(mode_counts.get(mode_hint, 0) or 0) + 1
@@ -2536,6 +2771,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "max_semantic_score": float(state.get("max_semantic_score", 0.0) or 0.0),
             "max_collision_score": float(state.get("max_collision_score", 0.0) or 0.0),
             "max_displacement_score": float(state.get("max_displacement_score", 0.0) or 0.0),
+            "max_pg_ecc_score": float(state.get("max_pg_ecc_score", 0.0) or 0.0),
+            "max_compass_reversal_score": float(
+                state.get("max_compass_reversal_score", 0.0) or 0.0
+            ),
+            "max_heading_var_score": float(state.get("max_heading_var_score", 0.0) or 0.0),
             "mode_hint_counts": dict(state.get("mode_hint_counts") or {}),
         }
 
@@ -3887,6 +4127,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                         pixel_goal = [int(coord[1]), int(coord[0])]
                         draw_pixel_goal = True
+                        self._append_failure_prediction_trajectory_cache(
+                            failure_prediction_state,
+                            step_id=step_id,
+                            pixel_goal=pixel_goal,
+                            observations=observations,
+                        )
 
                         semantic_image = input_images[-1] if input_images else image
                         semantic_source = "look_down" if action == action_code.LOOKDOWN else "forward"
@@ -4893,6 +5139,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["failure_prediction_max_displacement_score"] = failure_prediction_summary.get(
                     "max_displacement_score"
+                )
+                result["failure_prediction_max_pg_ecc_score"] = failure_prediction_summary.get(
+                    "max_pg_ecc_score"
+                )
+                result["failure_prediction_max_compass_reversal_score"] = (
+                    failure_prediction_summary.get("max_compass_reversal_score")
+                )
+                result["failure_prediction_max_heading_var_score"] = failure_prediction_summary.get(
+                    "max_heading_var_score"
                 )
                 result["failure_prediction_mode_hint_counts"] = failure_prediction_summary.get(
                     "mode_hint_counts"
