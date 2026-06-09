@@ -31,7 +31,7 @@ from habitat.config.default_structured_configs import (
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations.utils import images_to_video, observations_to_image
 from habitat_baselines.config.default import get_config as get_habitat_config
-from PIL import Image
+from PIL import Image, ImageDraw
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from internnav.configs.evaluator import EvalCfg
@@ -1344,6 +1344,297 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             context=context,
             extra=event,
         )
+        return event
+
+    def _get_som_counterfactual_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "enable": bool(vlmap_safety_cfg.get("som_counterfactual_enable", False)),
+            "shadow_only": bool(vlmap_safety_cfg.get("som_counterfactual_shadow_only", True)),
+            "max_queries_per_episode": int(
+                vlmap_safety_cfg.get("som_counterfactual_max_queries_per_episode", 30)
+            ),
+            "overlay_type": str(
+                vlmap_safety_cfg.get("som_counterfactual_overlay_type", "frontier_direction")
+            ),
+            "pixel_shift_threshold": float(
+                vlmap_safety_cfg.get("som_counterfactual_pixel_shift_threshold", 40.0)
+            ),
+            "min_unsafe_signal": float(
+                vlmap_safety_cfg.get("som_counterfactual_min_unsafe_signal", 0.50)
+            ),
+            "frontier_alpha": max(
+                0,
+                min(255, int(vlmap_safety_cfg.get("som_counterfactual_frontier_alpha", 80))),
+            ),
+            "unsafe_alpha": max(
+                0,
+                min(255, int(vlmap_safety_cfg.get("som_counterfactual_unsafe_alpha", 120))),
+            ),
+            "draw_frontier": bool(vlmap_safety_cfg.get("som_counterfactual_draw_frontier", True)),
+            "draw_unsafe_goal": bool(vlmap_safety_cfg.get("som_counterfactual_draw_unsafe_goal", True)),
+            "draw_base_goal": bool(vlmap_safety_cfg.get("som_counterfactual_draw_base_goal", False)),
+            "max_new_tokens": int(vlmap_safety_cfg.get("som_counterfactual_max_new_tokens", 128)),
+        }
+
+    def _write_som_counterfactual_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "som_counterfactual_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _som_direction_bucket(self, pixel_goal, image_width: int) -> str:
+        try:
+            x = float(pixel_goal[0])
+        except (TypeError, ValueError, IndexError):
+            return "invalid"
+        width = max(1.0, float(image_width))
+        if x < width / 3.0:
+            return "left"
+        if x > 2.0 * width / 3.0:
+            return "right"
+        return "center"
+
+    def _som_unsafe_signal_from_decision(self, decision: dict) -> float:
+        decision = dict(decision or {})
+        signal = 0.0
+        goal_state = str(decision.get("goal_state") or "")
+        if goal_state in ("occupied", "unknown"):
+            signal = max(signal, 1.0)
+        if bool(decision.get("semantic_dead_zone")):
+            signal = max(signal, 0.75)
+        try:
+            signal = max(signal, float(decision.get("semantic_dead_zone_score", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            if bool(decision.get("points_to_revisited_region")):
+                signal = max(signal, float(decision.get("revisit_score", 0.0) or 0.25))
+        except (TypeError, ValueError):
+            signal = max(signal, 0.25)
+        return min(1.0, max(0.0, float(signal)))
+
+    def _render_som_overlay_v1(
+        self,
+        image_pil: Image.Image,
+        *,
+        frontier_direction: Optional[str],
+        unsafe_signal: float,
+        base_pixel_goal,
+        cfg: dict,
+    ):
+        img = image_pil.convert("RGBA")
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        w, h = img.size
+        marks = []
+
+        direction = str(frontier_direction or "").lower()
+        if direction == "forward":
+            direction = "front"
+        if bool(cfg.get("draw_frontier", True)) and direction in ("left", "right", "front", "center", "back"):
+            alpha = int(cfg.get("frontier_alpha", 80))
+            green = (0, 200, 60, alpha)
+            if direction == "left":
+                box = [0, h // 4, w // 3, (3 * h) // 4]
+            elif direction == "right":
+                box = [(2 * w) // 3, h // 4, w - 1, (3 * h) // 4]
+            elif direction in ("front", "center"):
+                box = [w // 3, h // 5, (2 * w) // 3, (3 * h) // 5]
+            else:
+                box = [w // 3, (3 * h) // 5, (2 * w) // 3, h - 1]
+            draw.rectangle(box, fill=green)
+            marks.append({"type": "frontier_direction", "direction": direction, "box": box})
+
+        unsafe_signal = min(1.0, max(0.0, float(unsafe_signal or 0.0)))
+        if (
+            bool(cfg.get("draw_unsafe_goal", True))
+            and unsafe_signal >= float(cfg.get("min_unsafe_signal", 0.50))
+            and base_pixel_goal is not None
+        ):
+            try:
+                x = int(float(base_pixel_goal[0]))
+                y = int(float(base_pixel_goal[1]))
+                radius = max(16, min(w, h) // 12)
+                alpha = int(cfg.get("unsafe_alpha", 120))
+                red = (255, 40, 40, alpha)
+                box = [x - radius, y - radius, x + radius, y + radius]
+                draw.ellipse(box, fill=red, outline=(255, 0, 0, min(255, alpha + 60)), width=3)
+                marks.append(
+                    {
+                        "type": "unsafe_goal",
+                        "unsafe_signal": float(unsafe_signal),
+                        "center": [int(x), int(y)],
+                        "radius": int(radius),
+                    }
+                )
+            except (TypeError, ValueError, IndexError):
+                pass
+
+        if bool(cfg.get("draw_base_goal", False)) and base_pixel_goal is not None:
+            try:
+                x = int(float(base_pixel_goal[0]))
+                y = int(float(base_pixel_goal[1]))
+                radius = 8
+                draw.line([x - radius, y, x + radius, y], fill=(30, 120, 255, 200), width=3)
+                draw.line([x, y - radius, x, y + radius], fill=(30, 120, 255, 200), width=3)
+                marks.append({"type": "base_goal_cross", "center": [int(x), int(y)]})
+            except (TypeError, ValueError, IndexError):
+                pass
+
+        if not marks:
+            return image_pil.copy(), {"marks": [], "rendered": False}
+        return Image.alpha_composite(img, overlay).convert("RGB"), {"marks": marks, "rendered": True}
+
+    def _run_som_counterfactual(
+        self,
+        *,
+        base_prompt_body: str,
+        final_prompt: str,
+        input_images: list,
+        messages_prefix: Optional[list],
+        base_output: str,
+        base_pixel_goal,
+        occ_decision: dict,
+        context: dict,
+        image_width: int,
+    ) -> dict:
+        cfg = self._get_som_counterfactual_cfg()
+        threshold = float(cfg.get("pixel_shift_threshold", 40.0) or 40.0)
+        frontier_direction = (occ_decision or {}).get("frontier_dominant_direction")
+        unsafe_signal = self._som_unsafe_signal_from_decision(occ_decision or {})
+        event = {
+            "event_type": "som_counterfactual_shadow",
+            "status": "ok",
+            "shadow_only": bool(cfg.get("shadow_only", True)),
+            "overlay_type": cfg.get("overlay_type"),
+            "base_output": base_output,
+            "overlay_output": "",
+            "frontier_dominant_direction": frontier_direction,
+            "frontier_dominant_count": (occ_decision or {}).get("frontier_dominant_count"),
+            "frontier_direction_counts": (occ_decision or {}).get("frontier_direction_counts"),
+            "semantic_dead_zone_score": (occ_decision or {}).get("semantic_dead_zone_score"),
+            "goal_state": (occ_decision or {}).get("goal_state"),
+            "unsafe_signal": float(unsafe_signal),
+            **dict(context or {}),
+        }
+        if not input_images:
+            event.update({"status": "skipped_no_images", "overlay_valid": False})
+            return event
+
+        current_image = input_images[-1]
+        overlay_image, overlay_info = self._render_som_overlay_v1(
+            current_image,
+            frontier_direction=frontier_direction,
+            unsafe_signal=unsafe_signal,
+            base_pixel_goal=base_pixel_goal,
+            cfg=cfg,
+        )
+        event["overlay_info"] = overlay_info
+        if not overlay_info.get("rendered"):
+            event.update({"status": "skipped_no_overlay", "overlay_valid": False})
+            return event
+
+        overlay_images = list(input_images)
+        overlay_images[-1] = overlay_image
+        rng_state = self._capture_torch_rng_state()
+        try:
+            prompt_instruction = f"{base_prompt_body} {final_prompt}."
+            overlay_output = self._generate_s2_text_from_prompt_instruction(
+                prompt_instruction,
+                overlay_images,
+                messages_prefix=messages_prefix,
+                max_new_tokens=int(cfg.get("max_new_tokens", 128) or 128),
+            )
+        except Exception as exc:
+            overlay_output = ""
+            event["status"] = "error"
+            event["error"] = str(exc)
+        finally:
+            self._restore_torch_rng_state(rng_state)
+
+        base_parse = self._parse_s2_candidate_output(base_output, image_width=image_width)
+        overlay_parse = self._parse_s2_candidate_output(overlay_output, image_width=image_width)
+        event.update(
+            {
+                "overlay_output": overlay_output,
+                "base_valid": bool(base_parse.get("valid")),
+                "overlay_valid": bool(overlay_parse.get("valid")),
+                "base_is_stop": bool(base_parse.get("is_stop")),
+                "overlay_is_stop": bool(overlay_parse.get("is_stop")),
+                "base_pixel_goal": base_parse.get("pixel_goal"),
+                "overlay_pixel_goal": overlay_parse.get("pixel_goal"),
+                "base_direction_bucket": base_parse.get("direction_bucket"),
+                "overlay_direction_bucket": overlay_parse.get("direction_bucket"),
+            }
+        )
+
+        if base_parse.get("valid") and overlay_parse.get("valid"):
+            base_goal = base_parse["pixel_goal"]
+            overlay_goal = overlay_parse["pixel_goal"]
+            dx = float(overlay_goal[0]) - float(base_goal[0])
+            dy = float(overlay_goal[1]) - float(base_goal[1])
+            pixel_shift = float(np.hypot(dx, dy))
+            direction = str(frontier_direction or "").lower()
+            if direction == "forward":
+                direction = "front"
+            if direction == "right":
+                follows_frontier = dx >= threshold
+            elif direction == "left":
+                follows_frontier = dx <= -threshold
+            elif direction in ("front", "center"):
+                follows_frontier = (
+                    overlay_parse.get("direction_bucket") == "center"
+                    and base_parse.get("direction_bucket") != "center"
+                )
+            else:
+                follows_frontier = None
+            unsafe_shift_proxy = (
+                pixel_shift >= threshold
+                if unsafe_signal >= float(cfg.get("min_unsafe_signal", 0.50))
+                else None
+            )
+            event.update(
+                {
+                    "pixel_shift": pixel_shift,
+                    "pixel_dx": dx,
+                    "pixel_dy": dy,
+                    "changed_pixel": bool(pixel_shift >= threshold),
+                    "changed_direction_bucket": bool(
+                        base_parse.get("direction_bucket") != overlay_parse.get("direction_bucket")
+                    ),
+                    "follows_frontier_direction": follows_frontier,
+                    "unsafe_shift_proxy": unsafe_shift_proxy,
+                    "unsafe_shift_proxy_note": (
+                        "proxy only: significant pixel shift when unsafe signal is present; "
+                        "does not prove motion away from the unsafe region"
+                    ),
+                    "moved_away_from_unsafe": None,
+                    "moved_away_from_unsafe_reason": "not_computable_without_projected_unsafe_region",
+                }
+            )
+        else:
+            event.update(
+                {
+                    "pixel_shift": None,
+                    "pixel_dx": None,
+                    "pixel_dy": None,
+                    "changed_pixel": False,
+                    "changed_direction_bucket": False,
+                    "follows_frontier_direction": None,
+                    "unsafe_shift_proxy": None,
+                    "unsafe_shift_proxy_note": (
+                        "proxy only: significant pixel shift when unsafe signal is present; "
+                        "does not prove motion away from the unsafe region"
+                    ),
+                    "moved_away_from_unsafe": None,
+                    "moved_away_from_unsafe_reason": "invalid_base_or_overlay_pixel_goal",
+                }
+            )
         return event
 
     def _write_s2_candidate_probe_event(self, event: dict) -> None:
@@ -3772,6 +4063,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             occ_memory_guidance_counterfactual_direction_changed_count = 0
             occ_memory_guidance_counterfactual_left_right_follow_count = 0
             occ_memory_guidance_counterfactual_pixel_shift_sum = 0.0
+            som_counterfactual_count = 0
+            som_counterfactual_valid_count = 0
+            som_counterfactual_changed_count = 0
+            som_counterfactual_direction_changed_count = 0
+            som_counterfactual_frontier_follow_count = 0
+            som_counterfactual_unsafe_shift_proxy_count = 0
+            som_counterfactual_skipped_count = 0
+            som_counterfactual_error_count = 0
+            som_counterfactual_pixel_shift_sum = 0.0
             occ_memory_candidate_probe_event_count = 0
             occ_memory_candidate_probe_valid_event_count = 0
             occ_memory_candidate_probe_skipped_count = 0
@@ -4191,6 +4491,62 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 "vlmap_waypoint_reason": vlmap_waypoint_decision.get("reason"),
                             },
                         )
+                        som_cfg = self._get_som_counterfactual_cfg()
+                        som_max_queries = int(som_cfg.get("max_queries_per_episode", 30) or 0)
+                        som_allowed = (
+                            bool(som_cfg.get("enable"))
+                            and (
+                                som_max_queries <= 0
+                                or som_counterfactual_count < som_max_queries
+                            )
+                        )
+                        if som_allowed:
+                            som_context = {
+                                "step_id": step_id,
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "episode_index": episode_index,
+                                "episode_count": episode_count,
+                            }
+                            som_event = self._run_som_counterfactual(
+                                base_prompt_body=s2_prompt_body_before_final_prompt,
+                                final_prompt=prompt,
+                                input_images=input_images,
+                                messages_prefix=s2_counterfactual_messages_prefix,
+                                base_output=llm_outputs,
+                                base_pixel_goal=pixel_goal,
+                                occ_decision=occ_waypoint_decision,
+                                context=som_context,
+                                image_width=int(self.model_args.resize_w),
+                            )
+                            self._write_som_counterfactual_event(som_event)
+                            som_counterfactual_count += 1
+                            som_status = str(som_event.get("status", "ok"))
+                            if som_status.startswith("skipped"):
+                                som_counterfactual_skipped_count += 1
+                            if som_status == "error":
+                                som_counterfactual_error_count += 1
+                            if som_event.get("overlay_valid"):
+                                som_counterfactual_valid_count += 1
+                            if som_event.get("changed_pixel"):
+                                som_counterfactual_changed_count += 1
+                            if som_event.get("changed_direction_bucket"):
+                                som_counterfactual_direction_changed_count += 1
+                            if som_event.get("follows_frontier_direction"):
+                                som_counterfactual_frontier_follow_count += 1
+                            if som_event.get("unsafe_shift_proxy"):
+                                som_counterfactual_unsafe_shift_proxy_count += 1
+                            som_shift = som_event.get("pixel_shift")
+                            if isinstance(som_shift, (int, float)):
+                                som_counterfactual_pixel_shift_sum += float(som_shift)
+                            print(
+                                "[OccMemory][Habitat][SoM] counterfactual overlay; "
+                                f"status={som_event.get('status')} "
+                                f"frontier={som_event.get('frontier_dominant_direction')} "
+                                f"base={som_event.get('base_pixel_goal')} "
+                                f"overlay={som_event.get('overlay_pixel_goal')} "
+                                f"shift={som_event.get('pixel_shift')}"
+                            )
                         candidate_probe_cfg = self._get_occ_memory_candidate_probe_cfg()
                         if candidate_probe_cfg.get("enable"):
                             candidate_context = {
@@ -5253,6 +5609,33 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
             else:
                 result["occ_memory_guidance_counterfactual_mean_pixel_shift"] = None
+            if self._get_som_counterfactual_cfg().get("enable"):
+                result["som_counterfactual_count"] = som_counterfactual_count
+                result["som_counterfactual_valid_count"] = som_counterfactual_valid_count
+                result["som_counterfactual_changed_count"] = som_counterfactual_changed_count
+                result["som_counterfactual_direction_changed_count"] = (
+                    som_counterfactual_direction_changed_count
+                )
+                result["som_counterfactual_frontier_follow_count"] = (
+                    som_counterfactual_frontier_follow_count
+                )
+                result["som_counterfactual_unsafe_shift_proxy_count"] = (
+                    som_counterfactual_unsafe_shift_proxy_count
+                )
+                result["som_counterfactual_moved_away_count"] = None
+                result["som_counterfactual_moved_away_note"] = (
+                    "not computed in Stage14b-v1; use unsafe_shift_proxy only as a "
+                    "significant-shift proxy when unsafe signal is present"
+                )
+                result["som_counterfactual_skipped_count"] = som_counterfactual_skipped_count
+                result["som_counterfactual_error_count"] = som_counterfactual_error_count
+                if som_counterfactual_valid_count > 0:
+                    result["som_counterfactual_mean_pixel_shift"] = (
+                        som_counterfactual_pixel_shift_sum
+                        / float(som_counterfactual_valid_count)
+                    )
+                else:
+                    result["som_counterfactual_mean_pixel_shift"] = None
             candidate_probe_cfg = self._get_occ_memory_candidate_probe_cfg()
             if candidate_probe_cfg.get("enable"):
                 result["occ_memory_candidate_probe_event_count"] = (
