@@ -273,6 +273,9 @@ class SparseOccMemoryConfig:
     waypoint_depth_patch_radius: int = 2
     waypoint_revisit_radius_cells: int = 8
     waypoint_frontier_sample_limit: int = 2000
+    stage15_repair_shadow_enable: bool = False
+    stage15_repair_active: bool = False
+    stage15_repair_backtrack_max_steps: int = 20
     attribution_enable: bool = False
     attribution_frontier_sample_limit: int = 5000
     attribution_recent_semantic_window: int = 5
@@ -708,6 +711,14 @@ class SparseOccSemanticMemory:
             return event
         goal_grid = target["goal_grid"]
         state = self._cell_state(goal_grid[0], goal_grid[1])
+        stage15_repair_info = self._stage15_repair_shadow_info(
+            pixel_goal=pixel_goal,
+            depth=depth,
+            pose_tf=pose_tf,
+            context=context,
+            target=target,
+            goal_state=state,
+        )
         frontier_distance = self._nearest_frontier_distance(goal_grid)
         revisit_count = self._nearby_visit_count(goal_grid, int(self.config.waypoint_revisit_radius_cells))
         attribution: Dict[str, Any] = {}
@@ -781,6 +792,7 @@ class SparseOccSemanticMemory:
                 "occupied_cell_count": int(len(self.occ2d_counts)),
                 "free_cell_count": int(len(self.free2d_counts)),
                 "frontier_count": int(len(self.get_frontier_cells(sample_limit=0))),
+                **stage15_repair_info,
                 **attribution,
             }
         )
@@ -1982,9 +1994,46 @@ class SparseOccSemanticMemory:
         first_dead_zone_step = None
         waypoint_frontier_align_count = 0
         waypoint_high_conf_align_count = 0
+        stage15_repair_event_count = 0
+        stage15_roundtrip_valid_count = 0
+        stage15_roundtrip_errors = []
+        stage15_repair_candidate_count = 0
+        stage15_repair_free_found_count = 0
+        stage15_repair_valid_count = 0
+        stage15_repair_no_free_count = 0
+        stage15_repair_projection_failed_count = 0
+        stage15_repair_reason_counts: Dict[str, int] = defaultdict(int)
+        stage15_repair_shifts = []
+        stage15_repair_backtrack_cells = []
         for event in self.waypoint_events:
             state = str(event.get("goal_state", "invalid"))
             waypoint_state_counts[state] += 1
+            if event.get("stage15_repair_enabled"):
+                stage15_repair_event_count += 1
+                if event.get("roundtrip_valid"):
+                    stage15_roundtrip_valid_count += 1
+                roundtrip_error = event.get("roundtrip_error_px")
+                if roundtrip_error is not None:
+                    stage15_roundtrip_errors.append(float(roundtrip_error))
+                repair_reason = event.get("repair_reason")
+                if repair_reason:
+                    stage15_repair_reason_counts[str(repair_reason)] += 1
+                if event.get("repair_candidate"):
+                    stage15_repair_candidate_count += 1
+                if event.get("repair_free_grid") is not None:
+                    stage15_repair_free_found_count += 1
+                if event.get("repair_valid"):
+                    stage15_repair_valid_count += 1
+                if repair_reason == "no_free_along_bearing":
+                    stage15_repair_no_free_count += 1
+                if repair_reason == "repair_projection_failed":
+                    stage15_repair_projection_failed_count += 1
+                repair_shift = event.get("repair_pixel_shift")
+                if repair_shift is not None:
+                    stage15_repair_shifts.append(float(repair_shift))
+                backtrack = event.get("repair_backtrack_cells")
+                if backtrack is not None:
+                    stage15_repair_backtrack_cells.append(float(backtrack))
             dist = event.get("frontier_distance_m")
             if dist is not None:
                 frontier_distances.append(float(dist))
@@ -2196,6 +2245,41 @@ class SparseOccSemanticMemory:
             "candidate_selection_repeated_semantic_count": int(selection_repeated_semantic_count),
             "candidate_selection_reason_counts": dict(selection_reason_counts),
             "waypoint_goal_state_counts": dict(waypoint_state_counts),
+            "stage15_repair_event_count": int(stage15_repair_event_count),
+            "stage15_roundtrip_valid_count": int(stage15_roundtrip_valid_count),
+            "stage15_roundtrip_error_mean_px": (
+                float(np.mean(stage15_roundtrip_errors)) if stage15_roundtrip_errors else None
+            ),
+            "stage15_roundtrip_error_median_px": (
+                float(np.median(stage15_roundtrip_errors)) if stage15_roundtrip_errors else None
+            ),
+            "stage15_roundtrip_error_p90_px": (
+                float(np.percentile(stage15_roundtrip_errors, 90))
+                if stage15_roundtrip_errors else None
+            ),
+            "stage15_roundtrip_error_max_px": (
+                float(np.max(stage15_roundtrip_errors)) if stage15_roundtrip_errors else None
+            ),
+            "stage15_repair_candidate_count": int(stage15_repair_candidate_count),
+            "stage15_repair_free_found_count": int(stage15_repair_free_found_count),
+            "stage15_repair_valid_count": int(stage15_repair_valid_count),
+            "stage15_repair_no_free_count": int(stage15_repair_no_free_count),
+            "stage15_repair_projection_failed_count": int(stage15_repair_projection_failed_count),
+            "stage15_repair_reason_counts": dict(stage15_repair_reason_counts),
+            "stage15_repair_pixel_shift_mean": (
+                float(np.mean(stage15_repair_shifts)) if stage15_repair_shifts else None
+            ),
+            "stage15_repair_pixel_shift_median": (
+                float(np.median(stage15_repair_shifts)) if stage15_repair_shifts else None
+            ),
+            "stage15_repair_backtrack_cells_mean": (
+                float(np.mean(stage15_repair_backtrack_cells))
+                if stage15_repair_backtrack_cells else None
+            ),
+            "stage15_repair_backtrack_cells_median": (
+                float(np.median(stage15_repair_backtrack_cells))
+                if stage15_repair_backtrack_cells else None
+            ),
             "waypoint_mean_frontier_distance_m": (
                 float(np.mean(frontier_distances)) if frontier_distances else None
             ),
@@ -2434,7 +2518,186 @@ class SparseOccSemanticMemory:
             "goal_grid": [int(goal[0]), int(goal[1])],
             "start_yaw": float(start_yaw),
             "depth_m": depth_m,
+            "goal_world_z": float(point[2]),
         }
+
+    def _project_to_nearest_free_along_bearing(
+        self,
+        goal_grid: Iterable[int],
+        start_grid: Iterable[int],
+        *,
+        max_steps: int = 20,
+    ) -> Optional[Tuple[int, int]]:
+        """Move an occupied goal back toward the agent and return the first free cell."""
+        try:
+            goal = np.asarray(list(goal_grid)[:2], dtype=np.float32)
+            start = np.asarray(list(start_grid)[:2], dtype=np.float32)
+        except (TypeError, ValueError):
+            return None
+        if goal.shape[0] < 2 or start.shape[0] < 2:
+            return None
+        direction = start - goal
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-6:
+            return None
+        direction = direction / norm
+        seen = set()
+        for step in range(1, max(1, int(max_steps)) + 1):
+            pos = goal + direction * float(step)
+            cell = (int(round(float(pos[0]))), int(round(float(pos[1]))))
+            if cell in seen:
+                continue
+            seen.add(cell)
+            if self._cell_state(cell[0], cell[1]) == "free":
+                return cell
+        return None
+
+    def _grid_to_pixel_goal(
+        self,
+        free_grid: Iterable[int],
+        goal_world_z: float,
+        pose_tf: np.ndarray,
+        context: Dict[str, Any],
+        depth: np.ndarray,
+    ) -> Optional[List[int]]:
+        """Project a BEV grid cell back into the S2 pixel-goal coordinate space."""
+        if self.camera_intrinsic is None:
+            return None
+        try:
+            world_xy = self._grid_to_xy(free_grid)
+            world_z = float(goal_world_z)
+        except (TypeError, ValueError, IndexError):
+            return None
+        depth_arr = np.asarray(depth)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        if depth_arr.ndim < 2:
+            return None
+        h, w = depth_arr.shape[:2]
+        image_w = int(
+            context.get("image_width")
+            or self.config.waypoint_source_image_width
+            or w
+        )
+        image_h = int(
+            context.get("image_height")
+            or self.config.waypoint_source_image_height
+            or h
+        )
+        if image_w <= 0 or image_h <= 0 or w <= 0 or h <= 0:
+            return None
+        rel_base_tf = self._relative_base_tf(pose_tf)
+        cam_pose_tf = rel_base_tf @ self.cam_to_base_tf
+        world_point = np.array([world_xy[0], world_xy[1], world_z, 1.0], dtype=np.float32)
+        try:
+            cam_point = np.linalg.inv(cam_pose_tf) @ world_point
+        except np.linalg.LinAlgError:
+            return None
+        cam_z = float(cam_point[2])
+        if not np.isfinite(cam_z) or cam_z <= 1e-6:
+            return None
+        uvw = self.camera_intrinsic @ cam_point[:3]
+        if not np.all(np.isfinite(uvw)) or abs(float(uvw[2])) <= 1e-6:
+            return None
+        sx = float(uvw[0] / uvw[2]) - 0.5
+        sy = float(uvw[1] / uvw[2]) - 0.5
+        px = sx * float(image_w) / float(w)
+        py = sy * float(image_h) / float(h)
+        if not np.isfinite(px) or not np.isfinite(py):
+            return None
+        return [int(round(px)), int(round(py))]
+
+    def _stage15_repair_shadow_info(
+        self,
+        *,
+        pixel_goal: Any,
+        depth: np.ndarray,
+        pose_tf: np.ndarray,
+        context: Dict[str, Any],
+        target: Dict[str, Any],
+        goal_state: str,
+    ) -> Dict[str, Any]:
+        enabled = bool(
+            self.config.stage15_repair_shadow_enable
+            or self.config.stage15_repair_active
+        )
+        if not enabled:
+            return {}
+        info: Dict[str, Any] = {
+            "stage15_repair_enabled": True,
+            "stage15_repair_active": bool(self.config.stage15_repair_active),
+            "roundtrip_pixel_goal": None,
+            "roundtrip_error_px": None,
+            "roundtrip_valid": False,
+            "repair_candidate": False,
+            "repair_free_grid": None,
+            "repair_pixel_goal": None,
+            "repair_pixel_shift": None,
+            "repair_backtrack_cells": None,
+            "repair_free_state_check": None,
+            "repair_valid": False,
+            "repair_reason": "goal_state_not_occupied",
+        }
+        goal_world_z = target.get("goal_world_z")
+        if goal_world_z is None:
+            info["repair_reason"] = "missing_goal_world_z"
+            return info
+        info["goal_world_z"] = float(goal_world_z)
+        rt = self._grid_to_pixel_goal(
+            target.get("goal_grid"),
+            float(goal_world_z),
+            pose_tf,
+            context,
+            depth,
+        )
+        info["roundtrip_pixel_goal"] = None if rt is None else [int(rt[0]), int(rt[1])]
+        info["roundtrip_valid"] = rt is not None
+        if rt is not None:
+            try:
+                dx = float(rt[0]) - float(pixel_goal[0])
+                dy = float(rt[1]) - float(pixel_goal[1])
+                info["roundtrip_error_px"] = float(math.hypot(dx, dy))
+            except (TypeError, ValueError, IndexError):
+                info["roundtrip_error_px"] = None
+        if str(goal_state) != "occupied":
+            return info
+        info["repair_candidate"] = True
+        free_grid = self._project_to_nearest_free_along_bearing(
+            target.get("goal_grid"),
+            target.get("start_grid"),
+            max_steps=int(self.config.stage15_repair_backtrack_max_steps),
+        )
+        if free_grid is None:
+            info["repair_reason"] = "no_free_along_bearing"
+            return info
+        info["repair_free_grid"] = [int(free_grid[0]), int(free_grid[1])]
+        info["repair_free_state_check"] = self._cell_state(free_grid[0], free_grid[1])
+        try:
+            goal = np.asarray(list(target.get("goal_grid"))[:2], dtype=np.float32)
+            free = np.asarray(list(free_grid)[:2], dtype=np.float32)
+            info["repair_backtrack_cells"] = float(np.linalg.norm(free - goal))
+        except (TypeError, ValueError):
+            info["repair_backtrack_cells"] = None
+        repaired = self._grid_to_pixel_goal(
+            free_grid,
+            float(goal_world_z),
+            pose_tf,
+            context,
+            depth,
+        )
+        info["repair_pixel_goal"] = None if repaired is None else [int(repaired[0]), int(repaired[1])]
+        if repaired is None:
+            info["repair_reason"] = "repair_projection_failed"
+            return info
+        try:
+            dx = float(repaired[0]) - float(pixel_goal[0])
+            dy = float(repaired[1]) - float(pixel_goal[1])
+            info["repair_pixel_shift"] = float(math.hypot(dx, dy))
+        except (TypeError, ValueError, IndexError):
+            info["repair_pixel_shift"] = None
+        info["repair_valid"] = info["repair_free_state_check"] == "free"
+        info["repair_reason"] = "ok" if info["repair_valid"] else "free_state_check_failed"
+        return info
 
     def _cell_state(self, row: int, col: int) -> str:
         key = (int(row), int(col))

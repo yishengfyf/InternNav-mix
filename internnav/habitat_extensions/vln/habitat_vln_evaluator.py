@@ -5979,6 +5979,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 waypoint_state_counts = occ_memory_summary.get("waypoint_goal_state_counts") or {}
                 for state_key, state_count in waypoint_state_counts.items():
                     result[f"occ_memory_waypoint_goal_{state_key}_count"] = state_count
+                for stage15_key in (
+                    "stage15_repair_event_count",
+                    "stage15_roundtrip_valid_count",
+                    "stage15_roundtrip_error_mean_px",
+                    "stage15_roundtrip_error_median_px",
+                    "stage15_roundtrip_error_p90_px",
+                    "stage15_roundtrip_error_max_px",
+                    "stage15_repair_candidate_count",
+                    "stage15_repair_free_found_count",
+                    "stage15_repair_valid_count",
+                    "stage15_repair_no_free_count",
+                    "stage15_repair_projection_failed_count",
+                    "stage15_repair_pixel_shift_mean",
+                    "stage15_repair_pixel_shift_median",
+                    "stage15_repair_backtrack_cells_mean",
+                    "stage15_repair_backtrack_cells_median",
+                ):
+                    result[stage15_key] = occ_memory_summary.get(stage15_key)
+                stage15_repair_reason_counts = (
+                    occ_memory_summary.get("stage15_repair_reason_counts") or {}
+                )
+                for reason_key, reason_count in stage15_repair_reason_counts.items():
+                    result[f"stage15_repair_reason_{reason_key}_count"] = reason_count
                 waypoint_direction_counts = occ_memory_summary.get("waypoint_direction_counts") or {}
                 for direction_key, direction_count in waypoint_direction_counts.items():
                     result[f"occ_memory_waypoint_direction_{direction_key}_count"] = direction_count
