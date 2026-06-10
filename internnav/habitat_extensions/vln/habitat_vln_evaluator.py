@@ -1369,6 +1369,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "active_max_per_episode": int(
                 vlmap_safety_cfg.get("som_counterfactual_active_max_per_episode", 3)
             ),
+            # Stage14c-v2: gate active replacement on OccMem goal_state.
+            # "any"  -> original Stage14c behaviour (no geometry gate)
+            # "occupied" -> only replace when S2 goal lands on occupied cell (v2a)
+            # "occupied_or_free_follows" -> occupied OR (free AND follows_frontier) (v2b)
+            "active_goal_state_gate": str(
+                vlmap_safety_cfg.get("som_counterfactual_active_goal_state_gate", "any")
+            ),
             "frontier_alpha": max(
                 0,
                 min(255, int(vlmap_safety_cfg.get("som_counterfactual_frontier_alpha", 80))),
@@ -4541,13 +4548,42 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 )
                                 unsafe_signal = float(som_event.get("unsafe_signal", 0.0) or 0.0)
                                 overlay_goal = som_event.get("overlay_pixel_goal")
+                                # Stage14c-v2: geometry gate on OccMem goal_state.
+                                # post-hoc analysis of Stage14c showed all 4 succ->fail
+                                # regressions were goal_state=="unknown" replacements,
+                                # while both recoveries (266,286) carried occupied events.
+                                active_goal_state_gate = str(
+                                    som_cfg.get("active_goal_state_gate", "any")
+                                )
+                                som_goal_state = str(som_event.get("goal_state") or "")
+                                som_follows_frontier = bool(
+                                    som_event.get("follows_frontier_direction")
+                                )
+                                if active_goal_state_gate == "occupied":
+                                    goal_state_gate_ok = som_goal_state == "occupied"
+                                elif active_goal_state_gate == "occupied_or_free_follows":
+                                    goal_state_gate_ok = (
+                                        som_goal_state == "occupied"
+                                        or (
+                                            som_goal_state == "free"
+                                            and som_follows_frontier
+                                        )
+                                    )
+                                else:
+                                    goal_state_gate_ok = True
                                 active_allowed = (
                                     som_event.get("status") == "ok"
                                     and bool(som_event.get("overlay_valid"))
                                     and bool(som_event.get("changed_pixel"))
                                     and unsafe_signal >= active_min_unsafe_signal
+                                    and goal_state_gate_ok
                                     and som_counterfactual_active_applied_count < active_max_per_episode
                                 )
+                                # always log geometry gate fields for post-hoc analysis
+                                som_event["active_goal_state_gate"] = active_goal_state_gate
+                                som_event["active_goal_state_gate_ok"] = goal_state_gate_ok
+                                som_event["active_som_goal_state"] = som_goal_state
+                                som_event["active_som_follows_frontier"] = som_follows_frontier
                                 if active_allowed and overlay_goal and len(overlay_goal) == 2:
                                     old_pixel_goal = None if pixel_goal is None else list(pixel_goal)
                                     overlay_output = str(som_event.get("overlay_output") or "").strip()
@@ -4625,6 +4661,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                     som_event["active_gate_reason"] = "unchanged_pixel"
                                 elif unsafe_signal < active_min_unsafe_signal:
                                     som_event["active_gate_reason"] = "unsafe_signal_low"
+                                elif not goal_state_gate_ok:
+                                    som_event["active_gate_reason"] = (
+                                        f"goal_state_gate_blocked"
+                                        f"[gate={active_goal_state_gate}"
+                                        f",state={som_goal_state}]"
+                                    )
                                 else:
                                     som_event["active_gate_reason"] = "invalid_overlay_goal"
                             self._write_som_counterfactual_event(som_event)
