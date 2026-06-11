@@ -1400,6 +1400,30 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
+    def _get_stage15_repair_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "active": bool(vlmap_safety_cfg.get("stage15_repair_active", False)),
+            "gate_mode": str(vlmap_safety_cfg.get("stage15_repair_gate_mode", "consecutive")),
+            "gate_min_count": max(
+                1, int(vlmap_safety_cfg.get("stage15_repair_gate_min_count", 3))
+            ),
+            "active_max_per_episode": max(
+                0,
+                int(vlmap_safety_cfg.get("stage15_repair_active_max_per_episode", 5)),
+            ),
+        }
+
+    def _write_stage15_repair_active_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "stage15_repair_active_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
     def _som_direction_bucket(self, pixel_goal, image_width: int) -> str:
         try:
             x = float(pixel_goal[0])
@@ -4086,6 +4110,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             som_counterfactual_error_count = 0
             som_counterfactual_pixel_shift_sum = 0.0
             som_counterfactual_active_applied_count = 0
+            stage15_repair_consecutive_count = 0
+            stage15_repair_cumulative_count = 0
+            stage15_repair_active_event_count = 0
+            stage15_repair_active_applied_count = 0
+            stage15_repair_active_first_step = None
+            stage15_repair_active_reason_counts = {}
             occ_memory_candidate_probe_event_count = 0
             occ_memory_candidate_probe_valid_event_count = 0
             occ_memory_candidate_probe_skipped_count = 0
@@ -4503,8 +4533,209 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 "s2_pixel_goal": pixel_goal,
                                 "vlmap_waypoint_valid": vlmap_waypoint_decision.get("valid"),
                                 "vlmap_waypoint_reason": vlmap_waypoint_decision.get("reason"),
+                                "stage15_repair_prev_consecutive_count": int(
+                                    stage15_repair_consecutive_count
+                                ),
+                                "stage15_repair_prev_cumulative_count": int(
+                                    stage15_repair_cumulative_count
+                                ),
                             },
                         )
+                        if occ_waypoint_decision.get("valid"):
+                            stage15_repair_consecutive_count = int(
+                                occ_waypoint_decision.get(
+                                    "stage15_repair_consecutive_count",
+                                    stage15_repair_consecutive_count,
+                                )
+                                or 0
+                            )
+                            stage15_repair_cumulative_count = int(
+                                occ_waypoint_decision.get(
+                                    "stage15_repair_cumulative_count",
+                                    stage15_repair_cumulative_count,
+                                )
+                                or 0
+                            )
+                        else:
+                            stage15_repair_consecutive_count = 0
+                        stage15_cfg = self._get_stage15_repair_cfg()
+                        if bool(stage15_cfg.get("active")):
+                            stage15_repair_active_event_count += 1
+                            repair_goal = occ_waypoint_decision.get("repair_pixel_goal")
+                            repair_valid = bool(occ_waypoint_decision.get("repair_valid"))
+                            repair_candidate = bool(occ_waypoint_decision.get("repair_candidate"))
+                            gate_mode = str(stage15_cfg.get("gate_mode", "consecutive"))
+                            gate_min_count = int(stage15_cfg.get("gate_min_count", 3) or 3)
+                            active_max_per_episode = int(
+                                stage15_cfg.get("active_max_per_episode", 5) or 0
+                            )
+                            current_consecutive = int(stage15_repair_consecutive_count)
+                            current_cumulative = int(stage15_repair_cumulative_count)
+                            if gate_mode == "consecutive":
+                                count_gate_ok = current_consecutive >= gate_min_count
+                                count_gate_reason = "consecutive_too_low"
+                            elif gate_mode == "cumulative":
+                                count_gate_ok = current_cumulative >= gate_min_count
+                                count_gate_reason = "cumulative_too_low"
+                            elif gate_mode == "all":
+                                count_gate_ok = True
+                                count_gate_reason = "count_gate_ok"
+                            else:
+                                count_gate_ok = False
+                                count_gate_reason = "invalid_gate_mode"
+                            stage15_event = {
+                                "event_type": "stage15_repair_active",
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "episode_index": episode_index,
+                                "episode_count": episode_count,
+                                "step_id": step_id,
+                                "gate_mode": gate_mode,
+                                "gate_min_count": gate_min_count,
+                                "active_max_per_episode": active_max_per_episode,
+                                "goal_state": occ_waypoint_decision.get("goal_state"),
+                                "repair_candidate": repair_candidate,
+                                "repair_valid": repair_valid,
+                                "repair_reason": occ_waypoint_decision.get("repair_reason"),
+                                "repair_active_applied": False,
+                                "repair_active_output_ids_rewritten": False,
+                                "repair_active_gate_reason": None,
+                                "repair_active_original_pixel_goal": (
+                                    None if pixel_goal is None else list(pixel_goal)
+                                ),
+                                "repair_active_replaced_pixel_goal": None,
+                                "repair_active_consecutive_count": current_consecutive,
+                                "repair_active_cumulative_count": current_cumulative,
+                                "repair_active_applied_count_before": int(
+                                    stage15_repair_active_applied_count
+                                ),
+                                "repair_active_backtrack_cells": occ_waypoint_decision.get(
+                                    "repair_backtrack_cells"
+                                ),
+                                "repair_active_pixel_shift": occ_waypoint_decision.get(
+                                    "repair_pixel_shift"
+                                ),
+                                "repair_free_grid": occ_waypoint_decision.get("repair_free_grid"),
+                                "repair_pixel_goal": repair_goal,
+                            }
+                            active_allowed = (
+                                bool(occ_waypoint_decision.get("valid"))
+                                and repair_candidate
+                                and repair_valid
+                                and repair_goal is not None
+                                and len(repair_goal) == 2
+                                and count_gate_ok
+                                and stage15_repair_active_applied_count < active_max_per_episode
+                            )
+                            if active_allowed:
+                                old_pixel_goal = None if pixel_goal is None else list(pixel_goal)
+                                try:
+                                    if output_ids is None or output_ids.ndim != 2:
+                                        stage15_event["repair_active_gate_reason"] = (
+                                            "missing_base_output_ids"
+                                        )
+                                    else:
+                                        repair_x = int(repair_goal[0])
+                                        repair_y = int(repair_goal[1])
+                                        # S2 text convention is "row col"; pixel_goal storage is [x, y].
+                                        repair_output = f"{repair_y} {repair_x}"
+                                        repair_generated_ids = self.processor.tokenizer(
+                                            repair_output,
+                                            add_special_tokens=False,
+                                            return_tensors="pt",
+                                        ).input_ids.to(output_ids.device)
+                                        prompt_len = int(inputs.input_ids.shape[1])
+                                        if repair_generated_ids.numel() <= 0:
+                                            stage15_event["repair_active_gate_reason"] = (
+                                                "empty_repair_output_ids"
+                                            )
+                                        else:
+                                            output_ids = torch.cat(
+                                                [
+                                                    output_ids[:, :prompt_len],
+                                                    repair_generated_ids,
+                                                ],
+                                                dim=1,
+                                            )
+                                            pixel_goal = [repair_x, repair_y]
+                                            local_actions = []
+                                            traj_latents = None
+                                            draw_pixel_goal = True
+                                            stage15_repair_active_applied_count += 1
+                                            if stage15_repair_active_first_step is None:
+                                                stage15_repair_active_first_step = step_id
+                                            stage15_event["repair_active_applied"] = True
+                                            stage15_event[
+                                                "repair_active_output_ids_rewritten"
+                                            ] = True
+                                            stage15_event["repair_active_gate_reason"] = "applied"
+                                            stage15_event[
+                                                "repair_active_original_pixel_goal"
+                                            ] = old_pixel_goal
+                                            stage15_event[
+                                                "repair_active_replaced_pixel_goal"
+                                            ] = list(pixel_goal)
+                                            stage15_event["repair_active_coordinate_text"] = (
+                                                repair_output
+                                            )
+                                            try:
+                                                traj_cache = list(
+                                                    failure_prediction_state.get("traj_cache") or []
+                                                )
+                                                if traj_cache and int(
+                                                    traj_cache[-1].get("eval_step", -1)
+                                                ) == int(step_id):
+                                                    traj_cache[-1]["pixel_goal"] = [
+                                                        float(pixel_goal[0]),
+                                                        float(pixel_goal[1]),
+                                                    ]
+                                                    traj_cache[-1]["pixel_goal_source"] = (
+                                                        "stage15_repair_active"
+                                                    )
+                                                    failure_prediction_state["traj_cache"] = traj_cache
+                                            except (TypeError, ValueError):
+                                                pass
+                                            print(
+                                                "[OccMemory][Habitat][Stage15][Active] "
+                                                f"repair pixel_goal {old_pixel_goal} -> {pixel_goal} "
+                                                f"mode={gate_mode} "
+                                                f"consecutive={current_consecutive} "
+                                                f"cumulative={current_cumulative} "
+                                                f"count={stage15_repair_active_applied_count}/"
+                                                f"{active_max_per_episode}"
+                                            )
+                                except Exception as exc:
+                                    stage15_event["repair_active_gate_reason"] = (
+                                        "output_id_rewrite_error"
+                                    )
+                                    stage15_event["repair_active_error"] = str(exc)
+                            elif not occ_waypoint_decision.get("valid"):
+                                stage15_event["repair_active_gate_reason"] = "invalid_waypoint"
+                            elif not repair_candidate:
+                                stage15_event["repair_active_gate_reason"] = (
+                                    "goal_state_not_occupied"
+                                )
+                            elif not repair_valid:
+                                stage15_event["repair_active_gate_reason"] = "repair_invalid"
+                            elif repair_goal is None or len(repair_goal) != 2:
+                                stage15_event["repair_active_gate_reason"] = "invalid_repair_goal"
+                            elif not count_gate_ok:
+                                stage15_event["repair_active_gate_reason"] = count_gate_reason
+                            elif stage15_repair_active_applied_count >= active_max_per_episode:
+                                stage15_event["repair_active_gate_reason"] = "cap_reached"
+                            else:
+                                stage15_event["repair_active_gate_reason"] = "not_applied"
+                            stage15_reason = str(
+                                stage15_event.get("repair_active_gate_reason") or "unknown"
+                            )
+                            stage15_repair_active_reason_counts[stage15_reason] = (
+                                int(stage15_repair_active_reason_counts.get(stage15_reason, 0))
+                                + 1
+                            )
+                            stage15_event["repair_active_applied_count_after"] = int(
+                                stage15_repair_active_applied_count
+                            )
+                            self._write_stage15_repair_active_event(stage15_event)
                         som_cfg = self._get_som_counterfactual_cfg()
                         som_max_queries = int(som_cfg.get("max_queries_per_episode", 30) or 0)
                         som_allowed = (
@@ -5789,6 +6020,30 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                 else:
                     result["som_counterfactual_mean_pixel_shift"] = None
+            stage15_cfg = self._get_stage15_repair_cfg()
+            if stage15_cfg.get("active"):
+                result["stage15_repair_active_event_count"] = int(
+                    stage15_repair_active_event_count
+                )
+                result["stage15_repair_active_applied_count"] = int(
+                    stage15_repair_active_applied_count
+                )
+                result["stage15_repair_active_first_step"] = stage15_repair_active_first_step
+                result["stage15_repair_active_gate_mode"] = stage15_cfg.get("gate_mode")
+                result["stage15_repair_active_gate_min_count"] = int(
+                    stage15_cfg.get("gate_min_count", 0) or 0
+                )
+                result["stage15_repair_active_max_per_episode"] = int(
+                    stage15_cfg.get("active_max_per_episode", 0) or 0
+                )
+                result["stage15_repair_final_consecutive_count"] = int(
+                    stage15_repair_consecutive_count
+                )
+                result["stage15_repair_final_cumulative_count"] = int(
+                    stage15_repair_cumulative_count
+                )
+                for reason_key, reason_count in stage15_repair_active_reason_counts.items():
+                    result[f"stage15_repair_active_reason_{reason_key}_count"] = reason_count
             candidate_probe_cfg = self._get_occ_memory_candidate_probe_cfg()
             if candidate_probe_cfg.get("enable"):
                 result["occ_memory_candidate_probe_event_count"] = (

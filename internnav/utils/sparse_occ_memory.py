@@ -276,6 +276,9 @@ class SparseOccMemoryConfig:
     stage15_repair_shadow_enable: bool = False
     stage15_repair_active: bool = False
     stage15_repair_backtrack_max_steps: int = 20
+    stage15_repair_gate_mode: str = "consecutive"
+    stage15_repair_gate_min_count: int = 3
+    stage15_repair_active_max_per_episode: int = 5
     attribution_enable: bool = False
     attribution_frontier_sample_limit: int = 5000
     attribution_recent_semantic_window: int = 5
@@ -2626,6 +2629,10 @@ class SparseOccSemanticMemory:
         info: Dict[str, Any] = {
             "stage15_repair_enabled": True,
             "stage15_repair_active": bool(self.config.stage15_repair_active),
+            "stage15_repair_prev_consecutive_count": 0,
+            "stage15_repair_prev_cumulative_count": 0,
+            "stage15_repair_consecutive_count": 0,
+            "stage15_repair_cumulative_count": 0,
             "roundtrip_pixel_goal": None,
             "roundtrip_error_px": None,
             "roundtrip_valid": False,
@@ -2638,6 +2645,30 @@ class SparseOccSemanticMemory:
             "repair_valid": False,
             "repair_reason": "goal_state_not_occupied",
         }
+        try:
+            prev_consecutive = max(
+                0,
+                int(context.get("stage15_repair_prev_consecutive_count", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            prev_consecutive = 0
+        try:
+            prev_cumulative = max(
+                0,
+                int(context.get("stage15_repair_prev_cumulative_count", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            prev_cumulative = 0
+        if str(goal_state) == "occupied":
+            current_consecutive = prev_consecutive + 1
+            current_cumulative = prev_cumulative + 1
+        else:
+            current_consecutive = 0
+            current_cumulative = prev_cumulative
+        info["stage15_repair_prev_consecutive_count"] = int(prev_consecutive)
+        info["stage15_repair_prev_cumulative_count"] = int(prev_cumulative)
+        info["stage15_repair_consecutive_count"] = int(current_consecutive)
+        info["stage15_repair_cumulative_count"] = int(current_cumulative)
         goal_world_z = target.get("goal_world_z")
         if goal_world_z is None:
             info["repair_reason"] = "missing_goal_world_z"
