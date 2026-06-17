@@ -1424,6 +1424,221 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
+    def _get_stage_d_bfs_escape_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "enable": bool(vlmap_safety_cfg.get("stage_d_bfs_escape_shadow_enable", False)),
+            "shadow_only": bool(vlmap_safety_cfg.get("stage_d_bfs_escape_shadow_only", True)),
+            "min_step": max(0, int(vlmap_safety_cfg.get("stage_d_bfs_escape_min_step", 30))),
+            "compass_window_steps": max(
+                1, int(vlmap_safety_cfg.get("stage_d_bfs_escape_compass_window_steps", 20))
+            ),
+            "compass_reversal_threshold": max(
+                0.0,
+                float(vlmap_safety_cfg.get("stage_d_bfs_escape_compass_reversal_threshold", 0.07)),
+            ),
+            "compass_reversal_metric": str(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_compass_reversal_metric", "sign")
+                or "sign"
+            ).lower(),
+            "consecutive_occupied_min": max(
+                1, int(vlmap_safety_cfg.get("stage_d_bfs_escape_consecutive_occupied_min", 3))
+            ),
+            "use_compass_reversal": bool(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_use_compass_reversal", True)
+            ),
+            "use_consecutive_occupied": bool(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_use_consecutive_occupied", True)
+            ),
+            "use_semantic_stagnation": bool(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_use_semantic_stagnation", True)
+            ),
+            "max_action_steps": max(
+                1, int(vlmap_safety_cfg.get("stage_d_bfs_escape_max_action_steps", 8))
+            ),
+            "forward_step_m": max(
+                0.05,
+                float(
+                    vlmap_safety_cfg.get(
+                        "stage_d_bfs_escape_forward_step_m",
+                        getattr(self.config.habitat.simulator, "forward_step_size", 0.25),
+                    )
+                ),
+            ),
+            "frontier_sample_limit": max(
+                0, int(vlmap_safety_cfg.get("stage_d_bfs_escape_frontier_sample_limit", 5000))
+            ),
+            "require_instruction_relevant": bool(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_require_instruction_relevant", True)
+            ),
+            "allow_fallback_target_frontier": bool(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_allow_fallback_target_frontier", False)
+            ),
+            "max_events_per_episode": int(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_max_events_per_episode", -1)
+            ),
+            "log_non_trigger_steps": bool(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_log_non_trigger_steps", False)
+            ),
+        }
+
+    def _write_stage_d_bfs_escape_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "bfs_escape_shadow_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _stage_d_compass_reversal_rate(
+        self,
+        cache: list,
+        step_id: int,
+        window_steps: int,
+        metric: str = "sign",
+    ) -> dict:
+        min_step = int(step_id) - int(window_steps)
+        events = []
+        for item in list(cache or []):
+            try:
+                item_step = int(item.get("eval_step", -1))
+            except (TypeError, ValueError):
+                continue
+            if min_step <= item_step <= int(step_id):
+                events.append(item)
+        events.sort(key=lambda item: int(item.get("eval_step", -1)))
+        compass_vals = []
+        for item in events:
+            compass = item.get("compass")
+            if not compass or len(compass) < 1:
+                continue
+            try:
+                compass_vals.append(float(compass[0]))
+            except (TypeError, ValueError):
+                continue
+        sign_reversal_count = 0
+        angle_reversal_count = 0
+        for idx in range(1, len(compass_vals)):
+            prev = float(compass_vals[idx - 1])
+            cur = float(compass_vals[idx])
+            if prev * cur < 0:
+                sign_reversal_count += 1
+            diff = abs((cur - prev + math.pi) % (2.0 * math.pi) - math.pi)
+            if diff >= (0.75 * math.pi):
+                angle_reversal_count += 1
+        denom = max(1, len(compass_vals) - 1)
+        metric = str(metric or "sign").lower()
+        if metric == "angle":
+            reversal_count = angle_reversal_count
+        else:
+            metric = "sign"
+            reversal_count = sign_reversal_count
+        return {
+            "trajectory_event_count_w": int(len(events)),
+            "compass_sample_count_w": int(len(compass_vals)),
+            "compass_reversal_metric": metric,
+            "compass_sign_reversal_count_w": int(sign_reversal_count),
+            "compass_sign_reversal_rate_w": float(sign_reversal_count / denom),
+            "compass_angle_reversal_count_w": int(angle_reversal_count),
+            "compass_angle_reversal_rate_w": float(angle_reversal_count / denom),
+            "compass_reversal_count_w": int(reversal_count),
+            "compass_reversal_rate_w": float(reversal_count / denom),
+        }
+
+    def _update_stage_d_bfs_escape_shadow(
+        self,
+        *,
+        cfg: dict,
+        trajectory_cache: list,
+        step_id: int,
+        scene_id: str,
+        episode_id: int,
+        episode_index: int,
+        episode_count: int,
+        observations: dict,
+        occ_waypoint_decision: dict,
+        consecutive_occupied_count: int,
+    ) -> Optional[dict]:
+        if not cfg.get("enable"):
+            return None
+        compass = self._stage_d_compass_reversal_rate(
+            trajectory_cache,
+            step_id,
+            int(cfg.get("compass_window_steps", 20)),
+            str(cfg.get("compass_reversal_metric", "sign") or "sign"),
+        )
+        semantic_stagnation = bool(
+            (occ_waypoint_decision or {}).get("semantic_stagnation_active")
+            or (occ_waypoint_decision or {}).get("semantic_last_stagnation")
+        )
+        compass_trigger = bool(
+            cfg.get("use_compass_reversal")
+            and compass.get("compass_reversal_rate_w", 0.0)
+            > float(cfg.get("compass_reversal_threshold", 0.07))
+        )
+        occupied_trigger = bool(
+            cfg.get("use_consecutive_occupied")
+            and int(consecutive_occupied_count) >= int(cfg.get("consecutive_occupied_min", 3))
+        )
+        stagnation_trigger = bool(cfg.get("use_semantic_stagnation") and semantic_stagnation)
+        trigger_conditions = []
+        if compass_trigger:
+            trigger_conditions.append("compass_reversal")
+        if occupied_trigger:
+            trigger_conditions.append("consecutive_occupied")
+        if stagnation_trigger:
+            trigger_conditions.append("semantic_stagnation")
+        triggered = bool(step_id >= int(cfg.get("min_step", 30)) and trigger_conditions)
+        event = {
+            "event_type": "stage_d_bfs_escape_shadow",
+            "scene_id": scene_id,
+            "episode_id": episode_id,
+            "episode_index": episode_index,
+            "episode_count": episode_count,
+            "step_id": int(step_id),
+            "shadow_only": bool(cfg.get("shadow_only", True)),
+            "triggered": bool(triggered),
+            "trigger_conditions": trigger_conditions,
+            "trigger_condition": "+".join(trigger_conditions) if trigger_conditions else None,
+            "min_step": int(cfg.get("min_step", 30)),
+            "goal_state": (occ_waypoint_decision or {}).get("goal_state"),
+            "consecutive_occupied_count": int(consecutive_occupied_count),
+            "semantic_stagnation_active": bool(semantic_stagnation),
+            **compass,
+        }
+        if not triggered:
+            event["reason"] = "not_triggered"
+            if bool(cfg.get("log_non_trigger_steps", False)):
+                self._write_stage_d_bfs_escape_event(event)
+            return event
+        try:
+            bfs = self.occ_memory.bfs_to_semantic_frontier(
+                obs={
+                    "gps": (observations or {}).get("gps"),
+                    "compass": (observations or {}).get("compass"),
+                },
+                current_waypoint_decision=occ_waypoint_decision,
+                max_action_steps=int(cfg.get("max_action_steps", 8)),
+                forward_step_m=float(cfg.get("forward_step_m", 0.25)),
+                frontier_sample_limit=int(cfg.get("frontier_sample_limit", 5000)),
+                require_instruction_relevant=bool(cfg.get("require_instruction_relevant", True)),
+                allow_fallback_target_frontier=bool(cfg.get("allow_fallback_target_frontier", False)),
+            )
+            event.update(bfs)
+        except Exception as exc:
+            event.update(
+                {
+                    "valid": False,
+                    "reason": "bfs_exception",
+                    "bfs_reachable": False,
+                    "error": str(exc),
+                }
+            )
+        self._write_stage_d_bfs_escape_event(event)
+        return event
+
     def _som_direction_bucket(self, pixel_goal, image_width: int) -> str:
         try:
             x = float(pixel_goal[0])
@@ -4116,6 +4331,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             stage15_repair_active_applied_count = 0
             stage15_repair_active_first_step = None
             stage15_repair_active_reason_counts = {}
+            stage_d_bfs_escape_event_count = 0
+            stage_d_bfs_escape_trigger_count = 0
+            stage_d_bfs_escape_reachable_count = 0
+            stage_d_bfs_escape_first_trigger_step = None
+            stage_d_bfs_escape_reason_counts = {}
+            stage_d_bfs_escape_trigger_reason_counts = {}
+            stage_d_bfs_trajectory_cache = []
             occ_memory_candidate_probe_event_count = 0
             occ_memory_candidate_probe_valid_event_count = 0
             occ_memory_candidate_probe_skipped_count = 0
@@ -4477,6 +4699,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             pixel_goal=pixel_goal,
                             observations=observations,
                         )
+                        try:
+                            stage_d_bfs_trajectory_cache.append(
+                                {
+                                    "eval_step": int(step_id),
+                                    "pixel_goal": [int(pixel_goal[0]), int(pixel_goal[1])],
+                                    "gps": self._jsonable(observations.get("gps")),
+                                    "compass": self._jsonable(observations.get("compass")),
+                                }
+                            )
+                            stage_d_bfs_trajectory_cache = stage_d_bfs_trajectory_cache[-256:]
+                        except Exception:
+                            pass
 
                         semantic_image = input_images[-1] if input_images else image
                         semantic_source = "look_down" if action == action_code.LOOKDOWN else "forward"
@@ -4736,6 +4970,54 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 stage15_repair_active_applied_count
                             )
                             self._write_stage15_repair_active_event(stage15_event)
+                        stage_d_cfg = self._get_stage_d_bfs_escape_cfg()
+                        stage_d_max_events = int(
+                            stage_d_cfg.get("max_events_per_episode", -1) or -1
+                        )
+                        stage_d_allowed = bool(stage_d_cfg.get("enable")) and (
+                            stage_d_max_events < 0
+                            or stage_d_bfs_escape_trigger_count < stage_d_max_events
+                        )
+                        if stage_d_allowed:
+                            stage_d_event = self._update_stage_d_bfs_escape_shadow(
+                                cfg=stage_d_cfg,
+                                trajectory_cache=stage_d_bfs_trajectory_cache,
+                                step_id=step_id,
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                episode_index=episode_index,
+                                episode_count=episode_count,
+                                observations=observations,
+                                occ_waypoint_decision=occ_waypoint_decision,
+                                consecutive_occupied_count=stage15_repair_consecutive_count,
+                            )
+                            if stage_d_event is not None:
+                                if (
+                                    stage_d_event.get("triggered")
+                                    or stage_d_cfg.get("log_non_trigger_steps")
+                                ):
+                                    stage_d_bfs_escape_event_count += 1
+                                if stage_d_event.get("triggered"):
+                                    stage_d_bfs_escape_trigger_count += 1
+                                    if stage_d_bfs_escape_first_trigger_step is None:
+                                        stage_d_bfs_escape_first_trigger_step = step_id
+                                    if stage_d_event.get("bfs_reachable"):
+                                        stage_d_bfs_escape_reachable_count += 1
+                                    for condition in list(
+                                        stage_d_event.get("trigger_conditions") or []
+                                    ):
+                                        stage_d_bfs_escape_trigger_reason_counts[condition] = (
+                                            int(
+                                                stage_d_bfs_escape_trigger_reason_counts.get(
+                                                    condition, 0
+                                                )
+                                            )
+                                            + 1
+                                        )
+                                reason = str(stage_d_event.get("reason") or "unknown")
+                                stage_d_bfs_escape_reason_counts[reason] = (
+                                    int(stage_d_bfs_escape_reason_counts.get(reason, 0)) + 1
+                                )
                         som_cfg = self._get_som_counterfactual_cfg()
                         som_max_queries = int(som_cfg.get("max_queries_per_episode", 30) or 0)
                         som_allowed = (
@@ -6044,6 +6326,36 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 for reason_key, reason_count in stage15_repair_active_reason_counts.items():
                     result[f"stage15_repair_active_reason_{reason_key}_count"] = reason_count
+            stage_d_cfg = self._get_stage_d_bfs_escape_cfg()
+            if stage_d_cfg.get("enable"):
+                result["stage_d_bfs_escape_event_count"] = int(stage_d_bfs_escape_event_count)
+                result["stage_d_bfs_escape_trigger_count"] = int(stage_d_bfs_escape_trigger_count)
+                result["stage_d_bfs_escape_reachable_count"] = int(
+                    stage_d_bfs_escape_reachable_count
+                )
+                result["stage_d_bfs_escape_reachable_rate"] = (
+                    float(stage_d_bfs_escape_reachable_count)
+                    / max(1, int(stage_d_bfs_escape_trigger_count))
+                )
+                result["stage_d_bfs_escape_first_trigger_step"] = (
+                    stage_d_bfs_escape_first_trigger_step
+                )
+                result["stage_d_bfs_escape_max_action_steps"] = int(
+                    stage_d_cfg.get("max_action_steps", 8) or 8
+                )
+                result["stage_d_bfs_escape_compass_reversal_threshold"] = float(
+                    stage_d_cfg.get("compass_reversal_threshold", 0.07) or 0.07
+                )
+                result["stage_d_bfs_escape_compass_reversal_metric"] = str(
+                    stage_d_cfg.get("compass_reversal_metric", "sign") or "sign"
+                )
+                result["stage_d_bfs_escape_consecutive_occupied_min"] = int(
+                    stage_d_cfg.get("consecutive_occupied_min", 3) or 3
+                )
+                for reason_key, reason_count in stage_d_bfs_escape_reason_counts.items():
+                    result[f"stage_d_bfs_escape_reason_{reason_key}_count"] = reason_count
+                for reason_key, reason_count in stage_d_bfs_escape_trigger_reason_counts.items():
+                    result[f"stage_d_bfs_escape_trigger_{reason_key}_count"] = reason_count
             candidate_probe_cfg = self._get_occ_memory_candidate_probe_cfg()
             if candidate_probe_cfg.get("enable"):
                 result["occ_memory_candidate_probe_event_count"] = (

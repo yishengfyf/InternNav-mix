@@ -4,7 +4,7 @@ import json
 import math
 import os
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -990,6 +990,220 @@ class SparseOccSemanticMemory:
         self.candidate_probe_events.append(event)
         self._write_event(event)
         return event
+
+    def bfs_to_semantic_frontier(
+        self,
+        *,
+        obs: Optional[Dict[str, Any]] = None,
+        current_waypoint_decision: Optional[Dict[str, Any]] = None,
+        max_action_steps: int = 8,
+        forward_step_m: float = 0.25,
+        frontier_sample_limit: int = 5000,
+        require_instruction_relevant: bool = True,
+        allow_fallback_target_frontier: bool = False,
+    ) -> Dict[str, Any]:
+        """Shadow query: BFS through known free space to a semantic frontier.
+
+        `max_action_steps` is interpreted in Habitat forward-action units, not
+        grid cells. With the default 0.25m action and 0.05m cells, 8 action
+        steps allow a 40-cell BFS radius.
+        """
+        decision = dict(current_waypoint_decision or {})
+        result: Dict[str, Any] = {
+            "enabled": bool(self.enabled),
+            "valid": False,
+            "reason": None,
+            "bfs_reachable": False,
+            "bfs_path": [],
+            "bfs_path_preview": [],
+            "bfs_target_grid": None,
+            "bfs_target_direction": None,
+            "bfs_target_instruction_relevant": False,
+        }
+        if not self.enabled:
+            result["reason"] = "disabled"
+            return result
+        pose_state = self._current_pose_state(obs or {})
+        if pose_state is None:
+            result["reason"] = "missing_pose_or_memory"
+            return result
+        start_grid = pose_state.get("grid")
+        if not start_grid or len(start_grid) < 2:
+            result["reason"] = "missing_start_grid"
+            return result
+        start = (int(start_grid[0]), int(start_grid[1]))
+        yaw = float(pose_state.get("yaw", 0.0) or 0.0)
+        forward_step_m = max(float(self.cs), float(forward_step_m or 0.25))
+        max_action_steps = max(1, int(max_action_steps))
+        max_grid_steps = max(1, int(math.ceil(max_action_steps * forward_step_m / max(1e-6, self.cs))))
+
+        goal_progress_state = self._semantic_goal_progress_state()
+        semantic_nodes = self._semantic_memory_nodes(
+            start,
+            yaw,
+            goal_progress_state=goal_progress_state,
+        )
+        current_angle = decision.get("waypoint_direction_angle_deg")
+        current_goal_grid = decision.get("goal_grid")
+
+        raw_targets: List[Dict[str, Any]] = []
+        frontier_cells = self.get_frontier_cells(sample_limit=max(0, int(frontier_sample_limit)))
+        for cell in frontier_cells:
+            semantic = self._semantic_evidence_for_cell(cell, start, yaw, semantic_nodes)
+            candidate = self._build_query_candidate(
+                cell,
+                "frontier",
+                start,
+                yaw,
+                current_angle=current_angle,
+                current_goal_grid=current_goal_grid,
+                source_score=1.0,
+                semantic=semantic,
+                goal_progress_state=goal_progress_state,
+            )
+            if candidate is None:
+                continue
+            if not candidate.get("geometry_safe"):
+                continue
+            raw_targets.append(candidate)
+
+        def _is_instruction_target(item: Dict[str, Any]) -> bool:
+            return bool(
+                item.get("instruction_relevant")
+                or float(item.get("next_landmark_relevance", 0.0) or 0.0) > 0.0
+                or float(item.get("semantic_progress_score", 0.0) or 0.0) > 0.0
+                or float(item.get("semantic_relevance_score", 0.0) or 0.0) > 0.0
+            )
+
+        instruction_targets = [item for item in raw_targets if _is_instruction_target(item)]
+        fallback_targets = [
+            item
+            for item in raw_targets
+            if item.get("target_frontier_candidate") or item.get("target_frontier_escape_candidate")
+        ]
+        if require_instruction_relevant:
+            targets = instruction_targets
+            if not targets and allow_fallback_target_frontier:
+                targets = fallback_targets
+        else:
+            targets = instruction_targets or fallback_targets or raw_targets
+
+        result.update(
+            {
+                "valid": True,
+                "reason": "ok",
+                "start_grid": [int(start[0]), int(start[1])],
+                "start_yaw": float(yaw),
+                "max_action_steps": int(max_action_steps),
+                "forward_step_m": float(forward_step_m),
+                "max_grid_steps": int(max_grid_steps),
+                "frontier_sample_count": int(len(frontier_cells)),
+                "raw_target_count": int(len(raw_targets)),
+                "instruction_target_count": int(len(instruction_targets)),
+                "fallback_target_count": int(len(fallback_targets)),
+                "target_count": int(len(targets)),
+                "require_instruction_relevant": bool(require_instruction_relevant),
+                "allow_fallback_target_frontier": bool(allow_fallback_target_frontier),
+                "semantic_memory_node_count": int(len(semantic_nodes)),
+                "goal_progress_enabled": bool(goal_progress_state.get("enabled")),
+                "goal_progress_next_landmark": goal_progress_state.get("next_landmark"),
+                "goal_progress_completed_landmarks": goal_progress_state.get("completed_landmarks"),
+            }
+        )
+        if not targets:
+            result["reason"] = "no_instruction_relevant_frontier" if require_instruction_relevant else "no_frontier_targets"
+            return result
+
+        target_by_cell: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for item in sorted(targets, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True):
+            grid = item.get("grid")
+            if not grid or len(grid) < 2:
+                continue
+            target_by_cell.setdefault((int(grid[0]), int(grid[1])), item)
+        if not target_by_cell:
+            result["reason"] = "no_target_cells"
+            return result
+
+        free_cells = set(self.free2d_counts.keys()) - set(self.occ2d_counts.keys())
+        if not free_cells:
+            result["reason"] = "no_free_cells"
+            return result
+        queue = deque([start])
+        parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
+        depth: Dict[Tuple[int, int], int] = {start: 0}
+        reached: Optional[Tuple[int, int]] = None
+        visited_count = 0
+        while queue:
+            cell = queue.popleft()
+            visited_count += 1
+            if cell in target_by_cell and cell != start:
+                reached = cell
+                break
+            cur_depth = int(depth[cell])
+            if cur_depth >= max_grid_steps:
+                continue
+            for nbr in self._neighbors2d(cell[0], cell[1]):
+                nbr = (int(nbr[0]), int(nbr[1]))
+                if nbr in parent:
+                    continue
+                if nbr not in free_cells and nbr not in target_by_cell:
+                    continue
+                if nbr in self.occ2d_counts:
+                    continue
+                parent[nbr] = cell
+                depth[nbr] = cur_depth + 1
+                queue.append(nbr)
+
+        result["bfs_visited_cell_count"] = int(visited_count)
+        if reached is None:
+            nearest = None
+            nearest_dist = None
+            for cell in target_by_cell:
+                dist = abs(cell[0] - start[0]) + abs(cell[1] - start[1])
+                if nearest_dist is None or dist < nearest_dist:
+                    nearest = cell
+                    nearest_dist = dist
+            result.update(
+                {
+                    "bfs_reachable": False,
+                    "reason": "no_reachable_target_within_budget",
+                    "nearest_target_grid": None if nearest is None else [int(nearest[0]), int(nearest[1])],
+                    "nearest_target_manhattan_cells": nearest_dist,
+                }
+            )
+            return result
+
+        path = []
+        cur: Optional[Tuple[int, int]] = reached
+        while cur is not None:
+            path.append(cur)
+            cur = parent.get(cur)
+        path.reverse()
+        target = target_by_cell[reached]
+        direction = self._direction_to_cell(start, reached, yaw)
+        path_edges = max(0, len(path) - 1)
+        path_m = float(path_edges * self.cs)
+        action_steps_est = int(math.ceil(path_m / max(1e-6, forward_step_m)))
+        preview = path[:8] + ([path[-1]] if len(path) > 8 else [])
+        result.update(
+            {
+                "bfs_reachable": True,
+                "reason": "ok",
+                "bfs_path": [[int(r), int(c)] for r, c in path],
+                "bfs_path_preview": [[int(r), int(c)] for r, c in preview],
+                "bfs_path_cell_count": int(len(path)),
+                "bfs_path_edge_count": int(path_edges),
+                "bfs_path_m": float(path_m),
+                "bfs_action_steps_estimate": int(action_steps_est),
+                "bfs_target_grid": [int(reached[0]), int(reached[1])],
+                "bfs_target_direction": direction.get("bucket"),
+                "bfs_target_direction_angle_deg": direction.get("angle_deg"),
+                "bfs_target_distance_m": direction.get("distance_m"),
+                "bfs_target_instruction_relevant": bool(_is_instruction_target(target)),
+                "bfs_target_candidate": self._jsonable(target),
+            }
+        )
+        return result
 
     def record_candidate_selection_event(
         self,
