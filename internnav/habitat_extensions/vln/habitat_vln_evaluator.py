@@ -1429,6 +1429,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         return {
             "enable": bool(vlmap_safety_cfg.get("stage_d_bfs_escape_shadow_enable", False)),
             "shadow_only": bool(vlmap_safety_cfg.get("stage_d_bfs_escape_shadow_only", True)),
+            "active": bool(vlmap_safety_cfg.get("stage_d_bfs_escape_active_enable", False)),
+            "active_max_per_episode": max(
+                0, int(vlmap_safety_cfg.get("stage_d_bfs_escape_active_max_per_episode", 2))
+            ),
+            "active_require_target_frontier": bool(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_active_require_target_frontier", True)
+            ),
+            "active_path_edge_steps": max(
+                1, int(vlmap_safety_cfg.get("stage_d_bfs_escape_active_path_edge_steps", 8))
+            ),
+            "active_goal_world_z": float(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_active_goal_world_z", 0.0)
+            ),
+            "active_require_pixel_in_bounds": bool(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_active_require_pixel_in_bounds", True)
+            ),
             "min_step": max(0, int(vlmap_safety_cfg.get("stage_d_bfs_escape_min_step", 30))),
             "compass_window_steps": max(
                 1, int(vlmap_safety_cfg.get("stage_d_bfs_escape_compass_window_steps", 20))
@@ -1489,6 +1505,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "bfs_escape_shadow_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _write_stage_d_bfs_escape_active_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "bfs_escape_active_events.jsonl")
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
@@ -4338,6 +4364,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             stage_d_bfs_escape_reason_counts = {}
             stage_d_bfs_escape_trigger_reason_counts = {}
             stage_d_bfs_trajectory_cache = []
+            stage_d_bfs_escape_active_event_count = 0
+            stage_d_bfs_escape_active_applied_count = 0
+            stage_d_bfs_escape_active_first_step = None
+            stage_d_bfs_escape_active_reason_counts = {}
             occ_memory_candidate_probe_event_count = 0
             occ_memory_candidate_probe_valid_event_count = 0
             occ_memory_candidate_probe_skipped_count = 0
@@ -5018,6 +5048,339 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 stage_d_bfs_escape_reason_counts[reason] = (
                                     int(stage_d_bfs_escape_reason_counts.get(reason, 0)) + 1
                                 )
+                                stage_d_active_enabled = (
+                                    bool(stage_d_cfg.get("active"))
+                                    and not bool(stage_d_cfg.get("shadow_only", True))
+                                    and bool(stage_d_event.get("triggered"))
+                                )
+                                if stage_d_active_enabled:
+                                    stage_d_bfs_escape_active_event_count += 1
+                                    active_max_per_episode = int(
+                                        stage_d_cfg.get("active_max_per_episode", 2) or 0
+                                    )
+                                    active_path_edge_steps = int(
+                                        stage_d_cfg.get("active_path_edge_steps", 8) or 8
+                                    )
+                                    target_candidate = dict(
+                                        stage_d_event.get("bfs_target_candidate") or {}
+                                    )
+                                    path = list(stage_d_event.get("bfs_path") or [])
+                                    require_target_frontier = bool(
+                                        stage_d_cfg.get("active_require_target_frontier", True)
+                                    )
+                                    target_frontier_ok = (
+                                        bool(target_candidate.get("target_frontier_candidate"))
+                                        if require_target_frontier
+                                        else True
+                                    )
+                                    active_event = {
+                                        "event_type": "stage_d_bfs_escape_active",
+                                        "scene_id": scene_id,
+                                        "episode_id": episode_id,
+                                        "episode_index": episode_index,
+                                        "episode_count": episode_count,
+                                        "step_id": int(step_id),
+                                        "trigger_conditions": list(
+                                            stage_d_event.get("trigger_conditions") or []
+                                        ),
+                                        "trigger_condition": stage_d_event.get(
+                                            "trigger_condition"
+                                        ),
+                                        "bfs_reachable": bool(
+                                            stage_d_event.get("bfs_reachable")
+                                        ),
+                                        "bfs_reason": stage_d_event.get("reason"),
+                                        "bfs_path_edge_count": stage_d_event.get(
+                                            "bfs_path_edge_count"
+                                        ),
+                                        "bfs_path_m": stage_d_event.get("bfs_path_m"),
+                                        "bfs_action_steps_estimate": stage_d_event.get(
+                                            "bfs_action_steps_estimate"
+                                        ),
+                                        "bfs_target_grid": stage_d_event.get(
+                                            "bfs_target_grid"
+                                        ),
+                                        "bfs_target_direction": stage_d_event.get(
+                                            "bfs_target_direction"
+                                        ),
+                                        "bfs_target_direction_angle_deg": stage_d_event.get(
+                                            "bfs_target_direction_angle_deg"
+                                        ),
+                                        "bfs_target_instruction_relevant": bool(
+                                            stage_d_event.get(
+                                                "bfs_target_instruction_relevant"
+                                            )
+                                        ),
+                                        "target_frontier_candidate": bool(
+                                            target_candidate.get("target_frontier_candidate")
+                                        ),
+                                        "target_frontier_escape_candidate": bool(
+                                            target_candidate.get(
+                                                "target_frontier_escape_candidate"
+                                            )
+                                        ),
+                                        "target_matched_landmark": target_candidate.get(
+                                            "matched_landmark"
+                                        ),
+                                        "target_landmark_status": target_candidate.get(
+                                            "landmark_status"
+                                        ),
+                                        "target_next_landmark_relevance": target_candidate.get(
+                                            "next_landmark_relevance"
+                                        ),
+                                        "target_semantic_progress_score": target_candidate.get(
+                                            "semantic_progress_score"
+                                        ),
+                                        "target_goal_progress_score": target_candidate.get(
+                                            "goal_progress_score"
+                                        ),
+                                        "active_require_target_frontier": bool(
+                                            require_target_frontier
+                                        ),
+                                        "active_target_frontier_gate_ok": bool(
+                                            target_frontier_ok
+                                        ),
+                                        "active_max_per_episode": int(active_max_per_episode),
+                                        "active_applied_count_before": int(
+                                            stage_d_bfs_escape_active_applied_count
+                                        ),
+                                        "active_applied": False,
+                                        "active_output_ids_rewritten": False,
+                                        "active_original_pixel_goal": (
+                                            None if pixel_goal is None else list(pixel_goal)
+                                        ),
+                                        "active_replaced_pixel_goal": None,
+                                        "active_selected_grid": None,
+                                        "active_selected_path_index": None,
+                                        "active_projection": None,
+                                        "active_gate_reason": None,
+                                    }
+                                    active_allowed = (
+                                        bool(stage_d_event.get("bfs_reachable"))
+                                        and target_frontier_ok
+                                        and stage_d_bfs_escape_active_applied_count
+                                        < active_max_per_episode
+                                    )
+                                    if active_allowed and len(path) >= 2:
+                                        path_index = min(
+                                            max(1, active_path_edge_steps),
+                                            len(path) - 1,
+                                        )
+                                        selected_grid = path[path_index]
+                                        active_event["active_selected_grid"] = selected_grid
+                                        active_event["active_selected_path_index"] = int(
+                                            path_index
+                                        )
+                                        active_context = {
+                                            "step_id": step_id,
+                                            "scene_id": scene_id,
+                                            "episode_id": episode_id,
+                                            "episode_index": episode_index,
+                                            "episode_count": episode_count,
+                                            "image_width": int(
+                                                vlmap_safety_cfg.get(
+                                                    "waypoint_source_image_width"
+                                                )
+                                                or depth_w
+                                            ),
+                                            "image_height": int(
+                                                vlmap_safety_cfg.get(
+                                                    "waypoint_source_image_height"
+                                                )
+                                                or depth_h
+                                            ),
+                                        }
+                                        projection = self.occ_memory.project_grid_to_pixel_goal(
+                                            selected_grid,
+                                            {
+                                                "gps": observations.get("gps"),
+                                                "compass": observations.get("compass"),
+                                            },
+                                            current_depth_m,
+                                            context=active_context,
+                                            goal_world_z=float(
+                                                stage_d_cfg.get("active_goal_world_z", 0.0)
+                                                or 0.0
+                                            ),
+                                        )
+                                        active_event["active_projection"] = projection
+                                        projected_goal = (
+                                            projection.get("pixel_goal")
+                                            if isinstance(projection, dict)
+                                            else None
+                                        )
+                                        if not projection.get("valid"):
+                                            active_event["active_gate_reason"] = str(
+                                                projection.get("reason")
+                                                or "projection_failed"
+                                            )
+                                        elif not projected_goal or len(projected_goal) != 2:
+                                            active_event["active_gate_reason"] = (
+                                                "invalid_projected_goal"
+                                            )
+                                        else:
+                                            proj_x = int(projected_goal[0])
+                                            proj_y = int(projected_goal[1])
+                                            in_bounds = (
+                                                0 <= proj_x < int(active_context["image_width"])
+                                                and 0
+                                                <= proj_y
+                                                < int(active_context["image_height"])
+                                            )
+                                            active_event["active_projected_in_bounds"] = bool(
+                                                in_bounds
+                                            )
+                                            if (
+                                                stage_d_cfg.get(
+                                                    "active_require_pixel_in_bounds", True
+                                                )
+                                                and not in_bounds
+                                            ):
+                                                active_event["active_gate_reason"] = (
+                                                    "projected_goal_out_of_bounds"
+                                                )
+                                            elif output_ids is None or output_ids.ndim != 2:
+                                                active_event["active_gate_reason"] = (
+                                                    "missing_base_output_ids"
+                                                )
+                                            else:
+                                                try:
+                                                    active_output = f"{proj_y} {proj_x}"
+                                                    active_generated_ids = (
+                                                        self.processor.tokenizer(
+                                                            active_output,
+                                                            add_special_tokens=False,
+                                                            return_tensors="pt",
+                                                        ).input_ids.to(output_ids.device)
+                                                    )
+                                                    prompt_len = int(inputs.input_ids.shape[1])
+                                                    if active_generated_ids.numel() <= 0:
+                                                        active_event[
+                                                            "active_gate_reason"
+                                                        ] = "empty_active_output_ids"
+                                                    else:
+                                                        old_pixel_goal = (
+                                                            None
+                                                            if pixel_goal is None
+                                                            else list(pixel_goal)
+                                                        )
+                                                        output_ids = torch.cat(
+                                                            [
+                                                                output_ids[:, :prompt_len],
+                                                                active_generated_ids,
+                                                            ],
+                                                            dim=1,
+                                                        )
+                                                        pixel_goal = [proj_x, proj_y]
+                                                        local_actions = []
+                                                        traj_latents = None
+                                                        draw_pixel_goal = True
+                                                        stage_d_bfs_escape_active_applied_count += 1
+                                                        if (
+                                                            stage_d_bfs_escape_active_first_step
+                                                            is None
+                                                        ):
+                                                            stage_d_bfs_escape_active_first_step = (
+                                                                step_id
+                                                            )
+                                                        active_event["active_applied"] = True
+                                                        active_event[
+                                                            "active_output_ids_rewritten"
+                                                        ] = True
+                                                        active_event[
+                                                            "active_original_pixel_goal"
+                                                        ] = old_pixel_goal
+                                                        active_event[
+                                                            "active_replaced_pixel_goal"
+                                                        ] = list(pixel_goal)
+                                                        active_event[
+                                                            "active_coordinate_text"
+                                                        ] = active_output
+                                                        active_event[
+                                                            "active_gate_reason"
+                                                        ] = "applied"
+                                                        try:
+                                                            if (
+                                                                stage_d_bfs_trajectory_cache
+                                                                and int(
+                                                                    stage_d_bfs_trajectory_cache[
+                                                                        -1
+                                                                    ].get("eval_step", -1)
+                                                                )
+                                                                == int(step_id)
+                                                            ):
+                                                                stage_d_bfs_trajectory_cache[-1][
+                                                                    "pixel_goal"
+                                                                ] = [
+                                                                    int(pixel_goal[0]),
+                                                                    int(pixel_goal[1]),
+                                                                ]
+                                                                stage_d_bfs_trajectory_cache[-1][
+                                                                    "pixel_goal_source"
+                                                                ] = "stage_d_bfs_active"
+                                                            traj_cache = list(
+                                                                failure_prediction_state.get(
+                                                                    "traj_cache"
+                                                                )
+                                                                or []
+                                                            )
+                                                            if traj_cache and int(
+                                                                traj_cache[-1].get(
+                                                                    "eval_step", -1
+                                                                )
+                                                            ) == int(step_id):
+                                                                traj_cache[-1][
+                                                                    "pixel_goal"
+                                                                ] = [
+                                                                    float(pixel_goal[0]),
+                                                                    float(pixel_goal[1]),
+                                                                ]
+                                                                traj_cache[-1][
+                                                                    "pixel_goal_source"
+                                                                ] = "stage_d_bfs_active"
+                                                                failure_prediction_state[
+                                                                    "traj_cache"
+                                                                ] = traj_cache
+                                                        except (TypeError, ValueError):
+                                                            pass
+                                                        print(
+                                                            "[OccMemory][Habitat][StageD][Active] "
+                                                            f"replace pixel_goal {old_pixel_goal} "
+                                                            f"-> {pixel_goal} "
+                                                            f"target_frontier={target_frontier_ok} "
+                                                            f"count={stage_d_bfs_escape_active_applied_count}/"
+                                                            f"{active_max_per_episode}"
+                                                        )
+                                                except Exception as exc:
+                                                    active_event[
+                                                        "active_gate_reason"
+                                                    ] = "output_id_rewrite_error"
+                                                    active_event["active_error"] = str(exc)
+                                    elif stage_d_bfs_escape_active_applied_count >= active_max_per_episode:
+                                        active_event["active_gate_reason"] = "cap_reached"
+                                    elif not stage_d_event.get("bfs_reachable"):
+                                        active_event["active_gate_reason"] = "bfs_not_reachable"
+                                    elif not target_frontier_ok:
+                                        active_event["active_gate_reason"] = (
+                                            "target_frontier_gate_failed"
+                                        )
+                                    else:
+                                        active_event["active_gate_reason"] = "invalid_bfs_path"
+                                    active_reason = str(
+                                        active_event.get("active_gate_reason") or "unknown"
+                                    )
+                                    stage_d_bfs_escape_active_reason_counts[active_reason] = (
+                                        int(
+                                            stage_d_bfs_escape_active_reason_counts.get(
+                                                active_reason, 0
+                                            )
+                                        )
+                                        + 1
+                                    )
+                                    active_event["active_applied_count_after"] = int(
+                                        stage_d_bfs_escape_active_applied_count
+                                    )
+                                    self._write_stage_d_bfs_escape_active_event(active_event)
                         som_cfg = self._get_som_counterfactual_cfg()
                         som_max_queries = int(som_cfg.get("max_queries_per_episode", 30) or 0)
                         som_allowed = (
@@ -6352,10 +6715,34 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 result["stage_d_bfs_escape_consecutive_occupied_min"] = int(
                     stage_d_cfg.get("consecutive_occupied_min", 3) or 3
                 )
+                result["stage_d_bfs_escape_active_enabled"] = bool(
+                    stage_d_cfg.get("active")
+                    and not bool(stage_d_cfg.get("shadow_only", True))
+                )
+                result["stage_d_bfs_escape_active_event_count"] = int(
+                    stage_d_bfs_escape_active_event_count
+                )
+                result["stage_d_bfs_escape_active_applied_count"] = int(
+                    stage_d_bfs_escape_active_applied_count
+                )
+                result["stage_d_bfs_escape_active_first_step"] = (
+                    stage_d_bfs_escape_active_first_step
+                )
+                result["stage_d_bfs_escape_active_max_per_episode"] = int(
+                    stage_d_cfg.get("active_max_per_episode", 0) or 0
+                )
+                result["stage_d_bfs_escape_active_require_target_frontier"] = bool(
+                    stage_d_cfg.get("active_require_target_frontier", True)
+                )
+                result["stage_d_bfs_escape_active_path_edge_steps"] = int(
+                    stage_d_cfg.get("active_path_edge_steps", 8) or 8
+                )
                 for reason_key, reason_count in stage_d_bfs_escape_reason_counts.items():
                     result[f"stage_d_bfs_escape_reason_{reason_key}_count"] = reason_count
                 for reason_key, reason_count in stage_d_bfs_escape_trigger_reason_counts.items():
                     result[f"stage_d_bfs_escape_trigger_{reason_key}_count"] = reason_count
+                for reason_key, reason_count in stage_d_bfs_escape_active_reason_counts.items():
+                    result[f"stage_d_bfs_escape_active_reason_{reason_key}_count"] = reason_count
             candidate_probe_cfg = self._get_occ_memory_candidate_probe_cfg()
             if candidate_probe_cfg.get("enable"):
                 result["occ_memory_candidate_probe_event_count"] = (

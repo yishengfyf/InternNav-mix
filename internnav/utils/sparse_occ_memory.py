@@ -2824,6 +2824,58 @@ class SparseOccSemanticMemory:
             return None
         return [int(round(px)), int(round(py))]
 
+    def project_grid_to_pixel_goal(
+        self,
+        grid: Iterable[int],
+        obs: Dict[str, Any],
+        depth: np.ndarray,
+        *,
+        context: Optional[Dict[str, Any]] = None,
+        goal_world_z: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Project a BEV grid cell into S2 pixel-goal coordinates."""
+        context = dict(context or {})
+        result: Dict[str, Any] = {
+            "valid": False,
+            "reason": None,
+            "grid": None,
+            "pixel_goal": None,
+            "goal_world_z": float(goal_world_z),
+        }
+        if self.camera_intrinsic is None:
+            result["reason"] = "missing_intrinsic"
+            return result
+        pose_tf = self._pose_from_obs(obs or {})
+        if pose_tf is None:
+            result["reason"] = "missing_pose"
+            return result
+        if self.init_base_tf is None:
+            result["reason"] = "memory_not_initialized"
+            return result
+        try:
+            cell = [int(v) for v in list(grid)[:2]]
+        except (TypeError, ValueError):
+            result["reason"] = "invalid_grid"
+            return result
+        if len(cell) < 2:
+            result["reason"] = "invalid_grid"
+            return result
+        result["grid"] = [int(cell[0]), int(cell[1])]
+        projected = self._grid_to_pixel_goal(
+            cell,
+            float(goal_world_z),
+            pose_tf,
+            context,
+            depth,
+        )
+        if projected is None:
+            result["reason"] = "projection_failed"
+            return result
+        result["valid"] = True
+        result["reason"] = "ok"
+        result["pixel_goal"] = [int(projected[0]), int(projected[1])]
+        return result
+
     def _stage15_repair_shadow_info(
         self,
         *,
