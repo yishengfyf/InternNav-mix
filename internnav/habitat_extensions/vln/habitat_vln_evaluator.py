@@ -1445,6 +1445,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "active_require_pixel_in_bounds": bool(
                 vlmap_safety_cfg.get("stage_d_bfs_escape_active_require_pixel_in_bounds", True)
             ),
+            "active_pixel_goal_mode": str(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_active_pixel_goal_mode", "projection")
+                or "projection"
+            ).lower(),
+            "active_direction_y_ratio": float(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_active_direction_y_ratio", 0.75)
+            ),
+            "active_direction_front_x_ratio": float(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_active_direction_front_x_ratio", 0.50)
+            ),
+            "active_direction_left_x_ratio": float(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_active_direction_left_x_ratio", 0.25)
+            ),
+            "active_direction_right_x_ratio": float(
+                vlmap_safety_cfg.get("stage_d_bfs_escape_active_direction_right_x_ratio", 0.75)
+            ),
             "min_step": max(0, int(vlmap_safety_cfg.get("stage_d_bfs_escape_min_step", 30))),
             "compass_window_steps": max(
                 1, int(vlmap_safety_cfg.get("stage_d_bfs_escape_compass_window_steps", 20))
@@ -5171,6 +5187,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                         active_event["active_selected_path_index"] = int(
                                             path_index
                                         )
+                                        active_pixel_goal_mode = str(
+                                            stage_d_cfg.get(
+                                                "active_pixel_goal_mode", "projection"
+                                            )
+                                            or "projection"
+                                        ).lower()
                                         active_context = {
                                             "step_id": step_id,
                                             "scene_id": scene_id,
@@ -5190,19 +5212,110 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                                 or depth_h
                                             ),
                                         }
-                                        projection = self.occ_memory.project_grid_to_pixel_goal(
-                                            selected_grid,
-                                            {
-                                                "gps": observations.get("gps"),
-                                                "compass": observations.get("compass"),
-                                            },
-                                            current_depth_m,
-                                            context=active_context,
-                                            goal_world_z=float(
-                                                stage_d_cfg.get("active_goal_world_z", 0.0)
-                                                or 0.0
-                                            ),
+                                        active_event["active_pixel_goal_mode"] = (
+                                            active_pixel_goal_mode
                                         )
+                                        active_event["active_direction"] = stage_d_event.get(
+                                            "bfs_target_direction"
+                                        )
+                                        active_event["active_direction_pixel_goal"] = None
+                                        if active_pixel_goal_mode == "directional":
+                                            image_w = max(
+                                                1,
+                                                int(
+                                                    getattr(
+                                                        self.model_args,
+                                                        "resize_w",
+                                                        active_context["image_width"],
+                                                    )
+                                                    or active_context["image_width"]
+                                                ),
+                                            )
+                                            image_h = max(
+                                                1,
+                                                int(
+                                                    getattr(
+                                                        self.model_args,
+                                                        "resize_h",
+                                                        active_context["image_height"],
+                                                    )
+                                                    or active_context["image_height"]
+                                                ),
+                                            )
+                                            active_context["image_width"] = int(image_w)
+                                            active_context["image_height"] = int(image_h)
+                                            direction = str(
+                                                stage_d_event.get("bfs_target_direction") or ""
+                                            ).lower()
+                                            x_ratios = {
+                                                "front": float(
+                                                    stage_d_cfg.get(
+                                                        "active_direction_front_x_ratio", 0.50
+                                                    )
+                                                ),
+                                                "left": float(
+                                                    stage_d_cfg.get(
+                                                        "active_direction_left_x_ratio", 0.25
+                                                    )
+                                                ),
+                                                "right": float(
+                                                    stage_d_cfg.get(
+                                                        "active_direction_right_x_ratio", 0.75
+                                                    )
+                                                ),
+                                            }
+                                            if direction not in x_ratios:
+                                                projection = {
+                                                    "valid": False,
+                                                    "reason": "direction_not_actionable",
+                                                    "pixel_goal": None,
+                                                    "direction": direction,
+                                                }
+                                            else:
+                                                y_ratio = float(
+                                                    stage_d_cfg.get(
+                                                        "active_direction_y_ratio", 0.75
+                                                    )
+                                                )
+                                                dir_goal = [
+                                                    int(
+                                                        round(
+                                                            max(0.0, min(1.0, x_ratios[direction]))
+                                                            * float(image_w - 1)
+                                                        )
+                                                    ),
+                                                    int(
+                                                        round(
+                                                            max(0.0, min(1.0, y_ratio))
+                                                            * float(image_h - 1)
+                                                        )
+                                                    ),
+                                                ]
+                                                projection = {
+                                                    "valid": True,
+                                                    "reason": "ok",
+                                                    "pixel_goal": dir_goal,
+                                                    "direction": direction,
+                                                    "image_width": int(image_w),
+                                                    "image_height": int(image_h),
+                                                }
+                                                active_event[
+                                                    "active_direction_pixel_goal"
+                                                ] = list(dir_goal)
+                                        else:
+                                            projection = self.occ_memory.project_grid_to_pixel_goal(
+                                                selected_grid,
+                                                {
+                                                    "gps": observations.get("gps"),
+                                                    "compass": observations.get("compass"),
+                                                },
+                                                current_depth_m,
+                                                context=active_context,
+                                                goal_world_z=float(
+                                                    stage_d_cfg.get("active_goal_world_z", 0.0)
+                                                    or 0.0
+                                                ),
+                                            )
                                         active_event["active_projection"] = projection
                                         projected_goal = (
                                             projection.get("pixel_goal")
@@ -6736,6 +6849,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["stage_d_bfs_escape_active_path_edge_steps"] = int(
                     stage_d_cfg.get("active_path_edge_steps", 8) or 8
+                )
+                result["stage_d_bfs_escape_active_pixel_goal_mode"] = str(
+                    stage_d_cfg.get("active_pixel_goal_mode", "projection") or "projection"
                 )
                 for reason_key, reason_count in stage_d_bfs_escape_reason_counts.items():
                     result[f"stage_d_bfs_escape_reason_{reason_key}_count"] = reason_count
