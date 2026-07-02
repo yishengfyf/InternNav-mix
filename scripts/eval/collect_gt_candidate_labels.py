@@ -60,7 +60,10 @@ def _read_json_records(path: Path) -> List[Dict[str, Any]]:
     if not text:
         return []
     if text.startswith("{"):
-        data = json.loads(text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
         if isinstance(data, dict):
             for key in ("episodes", "data", "items"):
                 if isinstance(data.get(key), list):
