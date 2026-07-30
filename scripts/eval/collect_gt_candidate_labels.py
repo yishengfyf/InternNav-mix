@@ -16,7 +16,8 @@ Example:
   python scripts/eval/collect_gt_candidate_labels.py \
     --run-dir ./logs/habitat/compare_vlmap_stage11a_100_occ_memory_target_frontier_shadow_epseed/vlmap_safety_debug/run_001 \
     --episodes-file /path/to/val_seen.jsonl.gz \
-    --reference-coordinate-mode x_neg_y
+    --reference-frame episodic_gps \
+    --gps-coordinate-mode x_neg_y
 """
 
 import argparse
@@ -160,24 +161,115 @@ def _extract_reference_path(record: Dict[str, Any]) -> Optional[List[Any]]:
     return None
 
 
-def _load_reference_paths(episodes_file: Optional[Path]) -> Dict[str, List[Any]]:
+def _episode_reference_metadata(record: Dict[str, Any]) -> Dict[str, Any]:
+    episode = record.get("episode")
+    nested = episode if isinstance(episode, dict) else {}
+    return {
+        "reference_path": _extract_reference_path(record),
+        "start_position": record.get("start_position", nested.get("start_position")),
+        "start_rotation": record.get("start_rotation", nested.get("start_rotation")),
+    }
+
+
+def _load_reference_paths(episodes_file: Optional[Path]) -> Dict[str, Dict[str, Any]]:
     if not episodes_file:
         return {}
     records = _read_json_records(episodes_file)
-    by_key: Dict[str, List[Any]] = {}
-    by_ep: Dict[str, List[List[Any]]] = defaultdict(list)
+    by_key: Dict[str, Dict[str, Any]] = {}
+    by_ep: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for record in records:
-        path = _extract_reference_path(record)
-        if not path:
+        metadata = _episode_reference_metadata(record)
+        if not metadata["reference_path"]:
             continue
         key = _episode_key(record)
-        by_key[key] = path
-        by_ep[str(record.get("episode_id"))].append(path)
+        by_key[key] = metadata
+        by_ep[str(record.get("episode_id"))].append(metadata)
     # Fallback for files whose scene_id convention does not match logs.
-    for ep_id, paths in by_ep.items():
-        if len(paths) == 1:
-            by_key.setdefault(f"|{ep_id}", paths[0])
+    for ep_id, metadata_items in by_ep.items():
+        if len(metadata_items) == 1:
+            by_key.setdefault(f"|{ep_id}", metadata_items[0])
     return by_key
+
+
+def _cross(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _rotate_vector_by_inverse_quaternion(
+    vector: Tuple[float, float, float],
+    rotation: Any,
+    quaternion_order: str,
+) -> Optional[Tuple[float, float, float]]:
+    if not isinstance(rotation, (list, tuple)) or len(rotation) < 4:
+        return None
+    values = [_safe_float(value, float("nan")) for value in rotation[:4]]
+    if any(math.isnan(value) for value in values):
+        return None
+    if quaternion_order == "xyzw":
+        qx, qy, qz, qw = values
+    else:
+        qw, qx, qy, qz = values
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if norm <= 1e-8:
+        return None
+    # Habitat computes inverse(start_rotation) * (point - start_position).
+    inverse_vector = (-qx / norm, -qy / norm, -qz / norm)
+    inverse_scalar = qw / norm
+    first_cross = _cross(inverse_vector, vector)
+    second_cross = _cross(inverse_vector, first_cross)
+    return tuple(
+        vector[idx] + 2.0 * inverse_scalar * first_cross[idx] + 2.0 * second_cross[idx]
+        for idx in range(3)
+    )
+
+
+def _world_path_to_episodic_gps(
+    metadata: Dict[str, Any],
+    quaternion_order: str,
+) -> Tuple[Optional[List[List[float]]], Optional[str]]:
+    reference_path = metadata.get("reference_path")
+    start_position = metadata.get("start_position")
+    start_rotation = metadata.get("start_rotation")
+    if not isinstance(start_position, (list, tuple)) or len(start_position) < 3:
+        return None, "missing_start_position"
+    if not isinstance(start_rotation, (list, tuple)) or len(start_rotation) < 4:
+        return None, "missing_start_rotation"
+    start = [_safe_float(value, float("nan")) for value in start_position[:3]]
+    if any(math.isnan(value) for value in start):
+        return None, "invalid_start_position"
+    episodic_path = []
+    for point in reference_path or []:
+        if not isinstance(point, (list, tuple)) or len(point) < 3:
+            continue
+        world = [_safe_float(value, float("nan")) for value in point[:3]]
+        if any(math.isnan(value) for value in world):
+            continue
+        delta = tuple(world[idx] - start[idx] for idx in range(3))
+        local = _rotate_vector_by_inverse_quaternion(delta, start_rotation, quaternion_order)
+        if local is None:
+            return None, "invalid_start_rotation"
+        # This is the exact 2-D convention used by Habitat's EpisodicGPSSensor.
+        episodic_path.append([-float(local[2]), float(local[0])])
+    if len(episodic_path) < 2:
+        return None, "reference_path_too_short"
+    return episodic_path, None
+
+
+def _prepare_reference_path(
+    metadata: Dict[str, Any],
+    reference_frame: str,
+    quaternion_order: str,
+) -> Tuple[Optional[List[Any]], Optional[str]]:
+    if reference_frame == "episodic_gps":
+        return _world_path_to_episodic_gps(metadata, quaternion_order)
+    path = metadata.get("reference_path")
+    if not path:
+        return None, "no_reference_path"
+    return path, None
 
 
 def _point_to_xy(point: Any, mode: str) -> Optional[Tuple[float, float]]:
@@ -238,6 +330,19 @@ def _nearest_traj_event(events: List[Dict[str, Any]], step: int) -> Optional[Dic
     if not events:
         return None
     return min(events, key=lambda item: abs(_safe_int(item.get("eval_step"), -1) - int(step)))
+
+
+def _percentile(values: List[float], percentile: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * min(1.0, max(0.0, float(percentile)))
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
 def _gt_direction_from_path(
@@ -301,8 +406,10 @@ def collect_labels(
     *,
     run_dir: Path,
     episodes_file: Optional[Path],
+    reference_frame: str,
     reference_coordinate_mode: str,
     gps_coordinate_mode: str,
+    quaternion_order: str,
     lookahead_m: float,
     max_angle_deg: float,
     step_min: int,
@@ -312,13 +419,13 @@ def collect_labels(
     memory_events = _read_json_records(run_dir / "occ_memory" / "memory_events.jsonl")
     trajectory_events = _read_json_records(run_dir / "trajectory_events.jsonl")
     progress_records = _read_json_records(run_dir / "progress.json")
-    reference_paths = _load_reference_paths(episodes_file)
+    reference_metadata = _load_reference_paths(episodes_file)
 
     # Also accept reference_path embedded in progress logs.
     for record in progress_records:
         path = _extract_reference_path(record)
         if path:
-            reference_paths[_episode_key(record)] = path
+            reference_metadata.setdefault(_episode_key(record), _episode_reference_metadata(record))
 
     traj_by_key = _group_by_episode(trajectory_events, "eval_step")
     label_rows = []
@@ -326,6 +433,14 @@ def collect_labels(
     correct_candidate_events = 0
     candidate_event_count = 0
     angle_diffs = []
+    nearest_reference_distances = []
+    waypoint_gt_angle_diffs = []
+    gt_positive_candidate_count = 0
+    completed_gt_positive_count = 0
+    nearest_index_transition_count = 0
+    nearest_index_backward_count = 0
+    last_nearest_index_by_episode: Dict[str, Tuple[int, int]] = {}
+    prepared_paths: Dict[str, Tuple[Optional[List[Any]], Optional[str]]] = {}
 
     for event in memory_events:
         if event.get("event_type") != "occ_memory_query_candidates":
@@ -335,9 +450,11 @@ def collect_labels(
             continue
         candidate_event_count += 1
         key = _episode_key(event)
-        reference_path = reference_paths.get(key)
-        if reference_path is None:
-            reference_path = reference_paths.get(f"|{event.get('episode_id')}")
+        metadata_key = key
+        metadata = reference_metadata.get(metadata_key)
+        if metadata is None:
+            metadata_key = f"|{event.get('episode_id')}"
+            metadata = reference_metadata.get(metadata_key)
         traj_event = _nearest_traj_event(traj_by_key.get(key, []), step)
         base_row = {
             "scene_id": event.get("scene_id"),
@@ -349,8 +466,24 @@ def collect_labels(
             "current_waypoint_direction_bucket": event.get("current_waypoint_direction_bucket"),
             "label_status": None,
         }
-        if reference_path is None:
+        if metadata is None:
             row = {**base_row, "label_status": "no_reference_path", "candidates": event.get("candidates") or []}
+            label_rows.append(row)
+            status_counts[row["label_status"]] += 1
+            continue
+        if metadata_key not in prepared_paths:
+            prepared_paths[metadata_key] = _prepare_reference_path(
+                metadata,
+                reference_frame,
+                quaternion_order,
+            )
+        reference_path, reference_error = prepared_paths[metadata_key]
+        if reference_path is None:
+            row = {
+                **base_row,
+                "label_status": reference_error or "invalid_reference_path",
+                "candidates": event.get("candidates") or [],
+            }
             label_rows.append(row)
             status_counts[row["label_status"]] += 1
             continue
@@ -371,8 +504,11 @@ def collect_labels(
             current_xy=current_xy,
             yaw_rad=_safe_float(compass[0]),
             lookahead_m=lookahead_m,
-            coordinate_mode=reference_coordinate_mode,
+            coordinate_mode=(gps_coordinate_mode if reference_frame == "episodic_gps" else reference_coordinate_mode),
         )
+        nearest_distance = gt.get("nearest_reference_distance_m")
+        if nearest_distance is not None:
+            nearest_reference_distances.append(_safe_float(nearest_distance))
         if not gt.get("valid"):
             row = {
                 **base_row,
@@ -383,6 +519,20 @@ def collect_labels(
             label_rows.append(row)
             status_counts[row["label_status"]] += 1
             continue
+
+        waypoint_angle = event.get("current_waypoint_direction_angle_deg")
+        if waypoint_angle is not None:
+            waypoint_gt_angle_diffs.append(
+                _angle_diff_deg(_safe_float(waypoint_angle), _safe_float(gt["gt_direction_angle_deg"]))
+            )
+        nearest_index = _safe_int(gt.get("nearest_reference_index"), -1)
+        previous_step_index = last_nearest_index_by_episode.get(key)
+        if nearest_index >= 0 and previous_step_index is not None and step > previous_step_index[0]:
+            nearest_index_transition_count += 1
+            if nearest_index < previous_step_index[1]:
+                nearest_index_backward_count += 1
+        if nearest_index >= 0:
+            last_nearest_index_by_episode[key] = (step, nearest_index)
 
         best_id = None
         best_diff = None
@@ -406,6 +556,11 @@ def collect_labels(
             item["gt_correct"] = bool(is_correct)
             labeled_candidates.append(item)
         correct_ids = [item.get("candidate_id") for item in labeled_candidates if item.get("gt_correct")]
+        positive_candidates = [item for item in labeled_candidates if item.get("gt_correct")]
+        gt_positive_candidate_count += len(positive_candidates)
+        completed_gt_positive_count += sum(
+            item.get("landmark_status") == "completed" for item in positive_candidates
+        )
         if correct_ids:
             correct_candidate_events += 1
         if best_diff is not None:
@@ -430,8 +585,10 @@ def collect_labels(
     summary = {
         "run_dir": str(run_dir),
         "episodes_file": None if episodes_file is None else str(episodes_file),
+        "reference_frame": reference_frame,
         "reference_coordinate_mode": reference_coordinate_mode,
         "gps_coordinate_mode": gps_coordinate_mode,
+        "quaternion_order": quaternion_order,
         "lookahead_m": float(lookahead_m),
         "max_angle_deg": float(max_angle_deg),
         "step_min": int(step_min),
@@ -448,6 +605,32 @@ def collect_labels(
         ),
         "best_angle_diff_min_deg": min(angle_diffs) if angle_diffs else None,
         "best_angle_diff_max_deg": max(angle_diffs) if angle_diffs else None,
+        "nearest_reference_distance_mean_m": (
+            float(sum(nearest_reference_distances) / len(nearest_reference_distances))
+            if nearest_reference_distances
+            else None
+        ),
+        "nearest_reference_distance_median_m": _percentile(nearest_reference_distances, 0.5),
+        "nearest_reference_distance_p90_m": _percentile(nearest_reference_distances, 0.9),
+        "nearest_reference_distance_max_m": max(nearest_reference_distances) if nearest_reference_distances else None,
+        "nearest_reference_distance_le_1m_count": sum(
+            distance <= 1.0 for distance in nearest_reference_distances
+        ),
+        "current_waypoint_gt_angle_diff_mean_deg": (
+            float(sum(waypoint_gt_angle_diffs) / len(waypoint_gt_angle_diffs))
+            if waypoint_gt_angle_diffs
+            else None
+        ),
+        "nearest_index_transition_count": int(nearest_index_transition_count),
+        "nearest_index_backward_count": int(nearest_index_backward_count),
+        "nearest_index_backward_rate": float(
+            nearest_index_backward_count / max(1, nearest_index_transition_count)
+        ),
+        "gt_positive_candidate_count": int(gt_positive_candidate_count),
+        "completed_gt_positive_count": int(completed_gt_positive_count),
+        "completed_gt_positive_rate": float(
+            completed_gt_positive_count / max(1, gt_positive_candidate_count)
+        ),
     }
     return label_rows, summary
 
@@ -457,6 +640,12 @@ def main() -> None:
     parser.add_argument("--run-dir", type=Path, default=_default_run_dir())
     parser.add_argument("--episodes-file", type=Path)
     parser.add_argument(
+        "--reference-frame",
+        choices=["world", "episodic_gps"],
+        default="world",
+        help="Frame of reference_path before comparison with trajectory GPS.",
+    )
+    parser.add_argument(
         "--reference-coordinate-mode",
         choices=["xy", "x_neg_y", "xz", "x_neg_z"],
         default="x_neg_y",
@@ -465,6 +654,12 @@ def main() -> None:
         "--gps-coordinate-mode",
         choices=["xy", "x_neg_y"],
         default="x_neg_y",
+    )
+    parser.add_argument(
+        "--quaternion-order",
+        choices=["xyzw", "wxyz"],
+        default="xyzw",
+        help="Component order of episode start_rotation; Habitat R2R JSON uses xyzw.",
     )
     parser.add_argument("--lookahead-m", type=float, default=1.5)
     parser.add_argument("--max-angle-deg", type=float, default=60.0)
@@ -478,8 +673,10 @@ def main() -> None:
     rows, summary = collect_labels(
         run_dir=run_dir,
         episodes_file=args.episodes_file,
+        reference_frame=args.reference_frame,
         reference_coordinate_mode=args.reference_coordinate_mode,
         gps_coordinate_mode=args.gps_coordinate_mode,
+        quaternion_order=args.quaternion_order,
         lookahead_m=args.lookahead_m,
         max_angle_deg=args.max_angle_deg,
         step_min=args.step_min,
