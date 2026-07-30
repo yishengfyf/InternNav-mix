@@ -11,7 +11,7 @@ import math
 from typing import Any, Dict, List
 
 
-CANDIDATE_TYPES = ("frontier", "semantic_frontier", "open_floor")
+CANDIDATE_TYPES = ("frontier", "semantic_frontier", "semantic_keyframe", "open_floor")
 DIRECTION_BUCKETS = ("front", "left", "right", "back")
 
 _NUMERIC_FIELDS = (
@@ -86,4 +86,3 @@ def encode_candidate(candidate: Dict[str, Any]) -> List[float]:
     values.extend((math.sin(angle_rad), math.cos(angle_rad)))
     values.append(float(str(candidate.get("landmark_status") or "").lower() == "completed"))
     return values
-
