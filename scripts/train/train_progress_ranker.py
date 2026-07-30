@@ -77,8 +77,10 @@ def listwise_loss(scores: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor
     """Uniform-positive ListNet target; each row is guaranteed to have a positive."""
 
     masked_scores = scores.masked_fill(~mask, float("-inf"))
-    target = labels / labels.sum(dim=1, keepdim=True).clamp_min(1.0)
-    return -(target * F.log_softmax(masked_scores, dim=1)).sum(dim=1).mean()
+    target = labels.masked_fill(~mask, 0.0)
+    target = target / target.sum(dim=1, keepdim=True).clamp_min(1.0)
+    log_probs = F.log_softmax(masked_scores, dim=1).masked_fill(~mask, 0.0)
+    return -(target * log_probs).sum(dim=1).mean()
 
 
 @torch.no_grad()
