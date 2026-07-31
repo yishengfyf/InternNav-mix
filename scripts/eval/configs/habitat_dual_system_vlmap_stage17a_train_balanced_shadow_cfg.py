@@ -33,21 +33,38 @@ def _load_episode_ids():
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _get_run_name():
+    run_name = os.environ.get(
+        "STAGE17_BALANCED_RUN_NAME",
+        "compare_vlmap_stage17a_train_balanced_occ_memory_target_frontier_shadow",
+    ).strip()
+    if not run_name:
+        raise ValueError("STAGE17_BALANCED_RUN_NAME cannot be empty.")
+    if run_name in {".", ".."}:
+        raise ValueError(
+            "STAGE17_BALANCED_RUN_NAME should be a simple directory name, "
+            f"got: {run_name!r}"
+        )
+    if "/" in run_name or "\\" in run_name:
+        raise ValueError(
+            "STAGE17_BALANCED_RUN_NAME should be a simple directory name, "
+            f"got: {run_name!r}"
+        )
+    return run_name
+
+
 eval_cfg = copy.deepcopy(_load_stage17a_train_cfg())
 
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
 episode_ids = _load_episode_ids()
+run_name = _get_run_name()
+output_path = f"./logs/habitat/{run_name}"
 
 eval_cfg.env.env_settings["episode_ids"] = episode_ids
 eval_cfg.env.env_settings["episode_start_index"] = 0
 eval_cfg.env.env_settings["max_eval_episodes"] = None
 
-vlmap_cfg["debug_dir"] = (
-    "./logs/habitat/compare_vlmap_stage17a_train_balanced_occ_memory_target_frontier_shadow/"
-    "vlmap_safety_debug"
-)
+vlmap_cfg["debug_dir"] = f"{output_path}/vlmap_safety_debug"
 
-eval_cfg.eval_settings["output_path"] = (
-    "./logs/habitat/compare_vlmap_stage17a_train_balanced_occ_memory_target_frontier_shadow"
-)
+eval_cfg.eval_settings["output_path"] = output_path
 eval_cfg.eval_settings["port"] = "2392"

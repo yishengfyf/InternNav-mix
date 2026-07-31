@@ -86,7 +86,7 @@ def listwise_loss(scores: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
     model.eval()
-    total_loss = total_rows = top1_correct = mrr_sum = 0.0
+    total_loss = total_rows = top1_correct = mrr_sum = ndcg_sum = 0.0
     for batch in loader:
         features = batch["features"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
@@ -97,16 +97,27 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
         total_rows += batch_size
         ranked = scores.masked_fill(~mask, float("-inf")).argsort(dim=1, descending=True)
         for row in range(features.shape[0]):
-            ordered_labels = labels[row, ranked[row]]
+            valid_count = int(mask[row].sum().item())
+            ordered_labels = labels[row, ranked[row][:valid_count]]
             top1_correct += float(ordered_labels[0] > 0.0)
             positive_positions = torch.nonzero(ordered_labels > 0.0, as_tuple=False)
             if len(positive_positions):
                 mrr_sum += 1.0 / float(positive_positions[0].item() + 1)
+            gains = ordered_labels.clamp_min(0.0)
+            discounts = torch.log2(
+                torch.arange(valid_count, device=device, dtype=torch.float32) + 2.0
+            )
+            dcg = torch.sum(gains / discounts)
+            ideal_gains = torch.sort(labels[row, mask[row]].clamp_min(0.0), descending=True).values
+            idcg = torch.sum(ideal_gains / discounts)
+            if float(idcg.item()) > 0.0:
+                ndcg_sum += float((dcg / idcg).item())
 
     return {
         "loss": total_loss / max(1.0, total_rows),
         "top1_accuracy": top1_correct / max(1.0, total_rows),
         "mrr": mrr_sum / max(1.0, total_rows),
+        "ndcg": ndcg_sum / max(1.0, total_rows),
         "examples": total_rows,
     }
 
