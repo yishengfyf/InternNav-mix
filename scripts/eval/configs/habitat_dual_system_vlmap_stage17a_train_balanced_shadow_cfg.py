@@ -53,6 +53,24 @@ def _get_run_name():
     return run_name
 
 
+def _get_debug_run_prefix():
+    explicit_prefix = os.environ.get("STAGE17_DEBUG_RUN_PREFIX")
+    if explicit_prefix:
+        prefix = explicit_prefix.strip()
+        if not prefix or "/" in prefix or "\\" in prefix:
+            raise ValueError(
+                "STAGE17_DEBUG_RUN_PREFIX should be a simple file prefix, "
+                f"got: {explicit_prefix!r}"
+            )
+        return prefix
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return "run"
+    rank = int(os.environ.get("RANK", "0"))
+    return f"rank{rank}_run"
+
+
 eval_cfg = copy.deepcopy(_load_stage17a_train_cfg())
 
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
@@ -65,6 +83,7 @@ eval_cfg.env.env_settings["episode_start_index"] = 0
 eval_cfg.env.env_settings["max_eval_episodes"] = None
 
 vlmap_cfg["debug_dir"] = f"{output_path}/vlmap_safety_debug"
+vlmap_cfg["debug_run_prefix"] = _get_debug_run_prefix()
 
 eval_cfg.eval_settings["output_path"] = output_path
 eval_cfg.eval_settings["port"] = "2392"
