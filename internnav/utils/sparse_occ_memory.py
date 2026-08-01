@@ -10,6 +10,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+from internnav.utils.progress_ranker_shadow import ProgressRankerShadowScorer
+
 _GOAL_PROGRESS_LANDMARK_ALIASES = {
     "appliance": "appliances",
     "appliances": "appliances",
@@ -322,6 +324,10 @@ class SparseOccMemoryConfig:
     candidate_probe_target_frontier_candidate_threshold: float = 0.35
     candidate_probe_target_frontier_intent_max_deviation_deg: float = 75.0
     candidate_probe_target_frontier_intent_penalty_weight: float = 0.45
+    progress_ranker_shadow_enable: bool = False
+    progress_ranker_shadow_checkpoint: str = ""
+    progress_ranker_shadow_device: str = "cpu"
+    progress_ranker_shadow_resilience_weight: float = 0.20
     candidate_probe_save_bev: bool = True
     candidate_probe_max_bev_snapshots: int = 12
     save_bev: bool = True
@@ -388,6 +394,13 @@ class SparseOccSemanticMemory:
         self.camera_intrinsic = _as_intrinsic3(camera_intrinsic) if camera_intrinsic is not None else None
         self.cam_to_base_tf = _default_cam_to_base_tf(float(self.config.camera_height))
         self.debug_dir: Optional[str] = None
+        self.progress_ranker_shadow_scorer: Optional[ProgressRankerShadowScorer] = None
+        if bool(self.config.progress_ranker_shadow_enable):
+            self.progress_ranker_shadow_scorer = ProgressRankerShadowScorer(
+                checkpoint_path=str(self.config.progress_ranker_shadow_checkpoint),
+                device=str(self.config.progress_ranker_shadow_device or "cpu"),
+                resilience_weight=float(self.config.progress_ranker_shadow_resilience_weight),
+            )
         self.reset_episode()
 
     @property
@@ -987,9 +1000,25 @@ class SparseOccSemanticMemory:
                 "candidates": candidates,
             }
         )
+        event["progress_ranker_shadow"] = self._score_progress_ranker_shadow(candidates)
         self.candidate_probe_events.append(event)
         self._write_event(event)
         return event
+
+    def _score_progress_ranker_shadow(self, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not bool(self.config.progress_ranker_shadow_enable):
+            return {"enabled": False, "valid": False, "reason": "disabled"}
+        if self.progress_ranker_shadow_scorer is None:
+            return {"enabled": True, "valid": False, "reason": "not_initialized"}
+        try:
+            return self.progress_ranker_shadow_scorer.score_candidates(candidates)
+        except Exception as exc:  # shadow diagnostics must not affect navigation
+            return {
+                "enabled": True,
+                "valid": False,
+                "reason": "error",
+                "error": str(exc),
+            }
 
     def bfs_to_semantic_frontier(
         self,
@@ -2293,6 +2322,16 @@ class SparseOccSemanticMemory:
         candidate_target_frontier_escape_sum = 0
         candidate_target_frontier_intent_safe_sum = 0
         candidate_target_frontier_doorway_like_sum = 0
+        progress_ranker_shadow_enabled_count = 0
+        progress_ranker_shadow_valid_count = 0
+        progress_ranker_shadow_error_count = 0
+        progress_ranker_shadow_ranker_change_count = 0
+        progress_ranker_shadow_resilience_change_count = 0
+        progress_ranker_shadow_resilience_completed_count = 0
+        progress_ranker_shadow_resilience_repeated_count = 0
+        progress_ranker_shadow_resilience_unsafe_count = 0
+        progress_ranker_shadow_resilience_future_sum = 0.0
+        progress_ranker_shadow_resilience_recoverability_sum = 0.0
         candidate_type_counts: Dict[str, int] = defaultdict(int)
         candidate_direction_counts: Dict[str, int] = defaultdict(int)
         for event in self.candidate_probe_events:
@@ -2331,6 +2370,30 @@ class SparseOccSemanticMemory:
             candidate_target_frontier_doorway_like_sum += int(
                 event.get("candidate_target_frontier_doorway_like_count", 0) or 0
             )
+            shadow = event.get("progress_ranker_shadow") or {}
+            if shadow.get("enabled"):
+                progress_ranker_shadow_enabled_count += 1
+            if shadow.get("reason") == "error":
+                progress_ranker_shadow_error_count += 1
+            if shadow.get("valid"):
+                progress_ranker_shadow_valid_count += 1
+                if shadow.get("ranker_changes_target_frontier"):
+                    progress_ranker_shadow_ranker_change_count += 1
+                if shadow.get("ranker_resilience_changes_target_frontier"):
+                    progress_ranker_shadow_resilience_change_count += 1
+                selected = shadow.get("ranker_resilience_selected") or {}
+                if selected.get("completed_landmark"):
+                    progress_ranker_shadow_resilience_completed_count += 1
+                if selected.get("repeated_semantic"):
+                    progress_ranker_shadow_resilience_repeated_count += 1
+                if not selected.get("geometry_safe") or not selected.get("active_gate_safe"):
+                    progress_ranker_shadow_resilience_unsafe_count += 1
+                progress_ranker_shadow_resilience_future_sum += float(
+                    selected.get("future_observability_proxy", 0.0) or 0.0
+                )
+                progress_ranker_shadow_resilience_recoverability_sum += float(
+                    selected.get("recoverability_proxy", 0.0) or 0.0
+                )
             for key, value in (event.get("candidate_type_counts") or {}).items():
                 candidate_type_counts[str(key)] += int(value or 0)
             for key, value in (event.get("candidate_direction_counts") or {}).items():
@@ -2450,6 +2513,48 @@ class SparseOccSemanticMemory:
             ),
             "candidate_probe_type_counts": dict(candidate_type_counts),
             "candidate_probe_direction_counts": dict(candidate_direction_counts),
+            "progress_ranker_shadow_enabled_count": int(progress_ranker_shadow_enabled_count),
+            "progress_ranker_shadow_valid_count": int(progress_ranker_shadow_valid_count),
+            "progress_ranker_shadow_error_count": int(progress_ranker_shadow_error_count),
+            "progress_ranker_shadow_ranker_change_count": int(
+                progress_ranker_shadow_ranker_change_count
+            ),
+            "progress_ranker_shadow_resilience_change_count": int(
+                progress_ranker_shadow_resilience_change_count
+            ),
+            "progress_ranker_shadow_resilience_completed_count": int(
+                progress_ranker_shadow_resilience_completed_count
+            ),
+            "progress_ranker_shadow_resilience_repeated_count": int(
+                progress_ranker_shadow_resilience_repeated_count
+            ),
+            "progress_ranker_shadow_resilience_unsafe_count": int(
+                progress_ranker_shadow_resilience_unsafe_count
+            ),
+            "progress_ranker_shadow_resilience_change_ratio": (
+                float(progress_ranker_shadow_resilience_change_count / progress_ranker_shadow_valid_count)
+                if progress_ranker_shadow_valid_count else None
+            ),
+            "progress_ranker_shadow_resilience_completed_rate": (
+                float(progress_ranker_shadow_resilience_completed_count / progress_ranker_shadow_valid_count)
+                if progress_ranker_shadow_valid_count else None
+            ),
+            "progress_ranker_shadow_resilience_repeated_rate": (
+                float(progress_ranker_shadow_resilience_repeated_count / progress_ranker_shadow_valid_count)
+                if progress_ranker_shadow_valid_count else None
+            ),
+            "progress_ranker_shadow_resilience_unsafe_rate": (
+                float(progress_ranker_shadow_resilience_unsafe_count / progress_ranker_shadow_valid_count)
+                if progress_ranker_shadow_valid_count else None
+            ),
+            "progress_ranker_shadow_resilience_future_observability_mean": (
+                float(progress_ranker_shadow_resilience_future_sum / progress_ranker_shadow_valid_count)
+                if progress_ranker_shadow_valid_count else None
+            ),
+            "progress_ranker_shadow_resilience_recoverability_mean": (
+                float(progress_ranker_shadow_resilience_recoverability_sum / progress_ranker_shadow_valid_count)
+                if progress_ranker_shadow_valid_count else None
+            ),
             "candidate_selection_event_count": int(selection_event_count),
             "candidate_selection_valid_count": int(selection_valid_count),
             "candidate_selection_none_count": int(selection_none_count),

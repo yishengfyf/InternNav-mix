@@ -464,6 +464,7 @@ def collect_labels(
             "candidate_count": _safe_int(event.get("candidate_count")),
             "current_waypoint_direction_angle_deg": event.get("current_waypoint_direction_angle_deg"),
             "current_waypoint_direction_bucket": event.get("current_waypoint_direction_bucket"),
+            "progress_ranker_shadow": event.get("progress_ranker_shadow"),
             "label_status": None,
         }
         if metadata is None:

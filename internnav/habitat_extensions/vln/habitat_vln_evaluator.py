@@ -7084,6 +7084,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 candidate_direction_counts = occ_memory_summary.get("candidate_probe_direction_counts") or {}
                 for direction_key, direction_count in candidate_direction_counts.items():
                     result[f"occ_memory_candidate_direction_{direction_key}_count"] = direction_count
+                for shadow_key in (
+                    "progress_ranker_shadow_enabled_count",
+                    "progress_ranker_shadow_valid_count",
+                    "progress_ranker_shadow_error_count",
+                    "progress_ranker_shadow_ranker_change_count",
+                    "progress_ranker_shadow_resilience_change_count",
+                    "progress_ranker_shadow_resilience_completed_count",
+                    "progress_ranker_shadow_resilience_repeated_count",
+                    "progress_ranker_shadow_resilience_unsafe_count",
+                    "progress_ranker_shadow_resilience_change_ratio",
+                    "progress_ranker_shadow_resilience_completed_rate",
+                    "progress_ranker_shadow_resilience_repeated_rate",
+                    "progress_ranker_shadow_resilience_unsafe_rate",
+                    "progress_ranker_shadow_resilience_future_observability_mean",
+                    "progress_ranker_shadow_resilience_recoverability_mean",
+                ):
+                    result[f"occ_memory_{shadow_key}"] = occ_memory_summary.get(shadow_key)
                 dead_zone_frontier_counts = (
                     occ_memory_summary.get("semantic_dead_zone_frontier_direction_counts") or {}
                 )
