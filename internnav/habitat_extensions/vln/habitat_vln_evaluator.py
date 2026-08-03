@@ -7084,6 +7084,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 candidate_direction_counts = occ_memory_summary.get("candidate_probe_direction_counts") or {}
                 for direction_key, direction_count in candidate_direction_counts.items():
                     result[f"occ_memory_candidate_direction_{direction_key}_count"] = direction_count
+                for current_policy_key in (
+                    "current_policy_candidate_valid_count",
+                    "current_policy_candidate_valid_rate",
+                    "current_policy_candidate_geometry_safe_count",
+                    "current_policy_candidate_geometry_safe_rate",
+                    "current_policy_candidate_active_gate_safe_count",
+                    "current_policy_candidate_active_gate_safe_rate",
+                    "current_policy_candidate_revisited_count",
+                    "current_policy_candidate_revisited_rate",
+                    "current_policy_candidate_dead_zone_count",
+                    "current_policy_candidate_dead_zone_rate",
+                ):
+                    result[f"occ_memory_{current_policy_key}"] = occ_memory_summary.get(
+                        current_policy_key
+                    )
                 for shadow_key in (
                     "progress_ranker_shadow_enabled_count",
                     "progress_ranker_shadow_valid_count",

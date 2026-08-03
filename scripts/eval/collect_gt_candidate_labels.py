@@ -122,9 +122,22 @@ def _resolve_run_dir(path: Path) -> Path:
         path / "run_001",
     ]
     for candidate in candidates:
-        if (candidate / "occ_memory" / "memory_events.jsonl").exists():
+        if (
+            (candidate / "occ_memory" / "memory_events.jsonl").exists()
+            or (candidate / "memory_events.jsonl").exists()
+        ):
             return candidate
     raise FileNotFoundError(f"occ_memory/memory_events.jsonl not found under {path}")
+
+
+def _memory_events_path(run_dir: Path) -> Path:
+    nested = run_dir / "occ_memory" / "memory_events.jsonl"
+    if nested.exists():
+        return nested
+    flat = run_dir / "memory_events.jsonl"
+    if flat.exists():
+        return flat
+    return nested
 
 
 def _group_by_episode(records: Iterable[Dict[str, Any]], step_field: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -402,6 +415,30 @@ def _gt_direction_from_path(
     }
 
 
+def _label_candidate_direction(
+    candidate: Dict[str, Any],
+    gt_angle_deg: float,
+    max_angle_deg: float,
+) -> Dict[str, Any]:
+    item = dict(candidate or {})
+    cand_angle = item.get("direction_angle_deg")
+    diff = None
+    direction_correct = False
+    safe_correct = False
+    if cand_angle is not None:
+        diff = _angle_diff_deg(_safe_float(cand_angle), _safe_float(gt_angle_deg))
+        direction_correct = bool(diff <= float(max_angle_deg))
+        safe_correct = bool(
+            direction_correct
+            and bool(item.get("geometry_safe", True))
+            and bool(item.get("active_gate_safe", True))
+        )
+    item["gt_angle_diff_deg"] = diff
+    item["gt_direction_correct"] = bool(direction_correct)
+    item["gt_correct"] = bool(safe_correct)
+    return item
+
+
 def collect_labels(
     *,
     run_dir: Path,
@@ -416,7 +453,7 @@ def collect_labels(
     step_max: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     run_dir = _resolve_run_dir(run_dir)
-    memory_events = _read_json_records(run_dir / "occ_memory" / "memory_events.jsonl")
+    memory_events = _read_json_records(_memory_events_path(run_dir))
     trajectory_events = _read_json_records(run_dir / "trajectory_events.jsonl")
     progress_records = _read_json_records(run_dir / "progress.json")
     reference_metadata = _load_reference_paths(episodes_file)
@@ -435,8 +472,16 @@ def collect_labels(
     angle_diffs = []
     nearest_reference_distances = []
     waypoint_gt_angle_diffs = []
+    current_policy_gt_angle_diffs = []
     gt_positive_candidate_count = 0
     completed_gt_positive_count = 0
+    current_policy_candidate_valid_count = 0
+    current_policy_candidate_direction_correct_count = 0
+    current_policy_candidate_correct_count = 0
+    current_policy_better_than_best_candidate_count = 0
+    best_candidate_better_than_current_policy_count = 0
+    current_policy_tied_best_candidate_count = 0
+    events_with_current_policy_and_candidates = 0
     nearest_index_transition_count = 0
     nearest_index_backward_count = 0
     last_nearest_index_by_episode: Dict[str, Tuple[int, int]] = {}
@@ -464,6 +509,7 @@ def collect_labels(
             "candidate_count": _safe_int(event.get("candidate_count")),
             "current_waypoint_direction_angle_deg": event.get("current_waypoint_direction_angle_deg"),
             "current_waypoint_direction_bucket": event.get("current_waypoint_direction_bucket"),
+            "current_policy_candidate": event.get("current_policy_candidate"),
             "progress_ranker_shadow": event.get("progress_ranker_shadow"),
             "label_status": None,
         }
@@ -535,27 +581,46 @@ def collect_labels(
         if nearest_index >= 0:
             last_nearest_index_by_episode[key] = (step, nearest_index)
 
+        gt_angle = _safe_float(gt["gt_direction_angle_deg"])
         best_id = None
         best_diff = None
         labeled_candidates = []
         for candidate in event.get("candidates") or []:
-            cand_angle = candidate.get("direction_angle_deg")
-            diff = None
-            is_correct = False
-            if cand_angle is not None:
-                diff = _angle_diff_deg(_safe_float(cand_angle), _safe_float(gt["gt_direction_angle_deg"]))
-                is_correct = bool(
-                    diff <= float(max_angle_deg)
-                    and bool(candidate.get("geometry_safe", True))
-                    and bool(candidate.get("active_gate_safe", True))
-                )
-                if best_diff is None or diff < best_diff:
-                    best_diff = diff
-                    best_id = candidate.get("candidate_id")
-            item = dict(candidate)
-            item["gt_angle_diff_deg"] = diff
-            item["gt_correct"] = bool(is_correct)
+            item = _label_candidate_direction(candidate, gt_angle, max_angle_deg)
+            diff = item.get("gt_angle_diff_deg")
+            if diff is not None and (best_diff is None or diff < best_diff):
+                best_diff = diff
+                best_id = item.get("candidate_id")
             labeled_candidates.append(item)
+        current_policy_candidate = dict(event.get("current_policy_candidate") or {})
+        labeled_current_policy_candidate = current_policy_candidate
+        current_policy_diff = None
+        if current_policy_candidate:
+            labeled_current_policy_candidate = _label_candidate_direction(
+                current_policy_candidate,
+                gt_angle,
+                max_angle_deg,
+            )
+            if labeled_current_policy_candidate.get("valid"):
+                current_policy_candidate_valid_count += 1
+                current_policy_diff = labeled_current_policy_candidate.get("gt_angle_diff_deg")
+                if current_policy_diff is not None:
+                    current_policy_gt_angle_diffs.append(float(current_policy_diff))
+                    if labeled_current_policy_candidate.get("gt_direction_correct"):
+                        current_policy_candidate_direction_correct_count += 1
+                    if labeled_current_policy_candidate.get("gt_correct"):
+                        current_policy_candidate_correct_count += 1
+        if current_policy_diff is not None and best_diff is not None:
+            events_with_current_policy_and_candidates += 1
+            # A small tolerance keeps numeric jitter from being interpreted as
+            # a meaningful Stage18 intervention headroom signal.
+            tolerance = 1e-6
+            if current_policy_diff + tolerance < best_diff:
+                current_policy_better_than_best_candidate_count += 1
+            elif best_diff + tolerance < current_policy_diff:
+                best_candidate_better_than_current_policy_count += 1
+            else:
+                current_policy_tied_best_candidate_count += 1
         correct_ids = [item.get("candidate_id") for item in labeled_candidates if item.get("gt_correct")]
         positive_candidates = [item for item in labeled_candidates if item.get("gt_correct")]
         gt_positive_candidate_count += len(positive_candidates)
@@ -573,6 +638,12 @@ def collect_labels(
             "current_xy": [float(current_xy[0]), float(current_xy[1])],
             "current_compass": _safe_float(compass[0]),
             "gt": gt,
+            "current_policy_candidate": labeled_current_policy_candidate,
+            "current_policy_gt_angle_diff_deg": current_policy_diff,
+            "current_policy_gt_direction_correct": bool(
+                labeled_current_policy_candidate.get("gt_direction_correct")
+            ),
+            "current_policy_gt_correct": bool(labeled_current_policy_candidate.get("gt_correct")),
             "correct_candidate_ids": correct_ids,
             "correct_candidate_id": correct_ids[0] if correct_ids else None,
             "best_angle_candidate_id": best_id,
@@ -621,6 +692,50 @@ def collect_labels(
             float(sum(waypoint_gt_angle_diffs) / len(waypoint_gt_angle_diffs))
             if waypoint_gt_angle_diffs
             else None
+        ),
+        "current_policy_candidate_valid_count": int(current_policy_candidate_valid_count),
+        "current_policy_candidate_valid_rate": float(
+            current_policy_candidate_valid_count / max(1, status_counts.get("ok", 0))
+        ),
+        "current_policy_gt_angle_diff_mean_deg": (
+            float(sum(current_policy_gt_angle_diffs) / len(current_policy_gt_angle_diffs))
+            if current_policy_gt_angle_diffs
+            else None
+        ),
+        "current_policy_gt_angle_diff_median_deg": _percentile(
+            current_policy_gt_angle_diffs,
+            0.5,
+        ),
+        "current_policy_gt_direction_correct_count": int(
+            current_policy_candidate_direction_correct_count
+        ),
+        "current_policy_gt_direction_correct_rate": float(
+            current_policy_candidate_direction_correct_count
+            / max(1, current_policy_candidate_valid_count)
+        ),
+        "current_policy_gt_correct_count": int(current_policy_candidate_correct_count),
+        "current_policy_gt_correct_rate": float(
+            current_policy_candidate_correct_count / max(1, current_policy_candidate_valid_count)
+        ),
+        "events_with_current_policy_and_candidates": int(
+            events_with_current_policy_and_candidates
+        ),
+        "current_policy_better_than_best_candidate_count": int(
+            current_policy_better_than_best_candidate_count
+        ),
+        "current_policy_better_than_best_candidate_rate": float(
+            current_policy_better_than_best_candidate_count
+            / max(1, events_with_current_policy_and_candidates)
+        ),
+        "best_candidate_better_than_current_policy_count": int(
+            best_candidate_better_than_current_policy_count
+        ),
+        "best_candidate_better_than_current_policy_rate": float(
+            best_candidate_better_than_current_policy_count
+            / max(1, events_with_current_policy_and_candidates)
+        ),
+        "current_policy_tied_best_candidate_count": int(
+            current_policy_tied_best_candidate_count
         ),
         "nearest_index_transition_count": int(nearest_index_transition_count),
         "nearest_index_backward_count": int(nearest_index_backward_count),

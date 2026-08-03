@@ -856,6 +856,12 @@ class SparseOccSemanticMemory:
         yaw = float(pose_state["yaw"])
         current_angle = decision.get("waypoint_direction_angle_deg")
         current_goal_grid = decision.get("goal_grid")
+        current_policy_candidate = self._build_current_policy_candidate(
+            decision,
+            start_grid=start_grid,
+            yaw=yaw,
+            context=context,
+        )
         goal_progress_state = self._semantic_goal_progress_state()
         semantic_nodes = self._semantic_memory_nodes(
             start_grid,
@@ -961,6 +967,13 @@ class SparseOccSemanticMemory:
                 "current_waypoint_goal_state": decision.get("goal_state"),
                 "current_waypoint_semantic_dead_zone": decision.get("semantic_dead_zone"),
                 "current_waypoint_semantic_dead_zone_score": decision.get("semantic_dead_zone_score"),
+                "current_policy_candidate": current_policy_candidate,
+                "current_policy_candidate_valid": bool(
+                    (current_policy_candidate or {}).get("valid")
+                ),
+                "current_policy_candidate_reason": (
+                    current_policy_candidate or {}
+                ).get("reason"),
                 "raw_candidate_count": int(len(raw_candidates)),
                 "candidate_count": int(len(candidates)),
                 "candidate_type_counts": dict(candidate_types),
@@ -1004,6 +1017,102 @@ class SparseOccSemanticMemory:
         self.candidate_probe_events.append(event)
         self._write_event(event)
         return event
+
+    def _build_current_policy_candidate(
+        self,
+        decision: Dict[str, Any],
+        *,
+        start_grid: Iterable[int],
+        yaw: float,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Normalize the frozen policy's current waypoint as a Stage18 candidate.
+
+        Stage17 ranks only OccMem-generated candidates.  Stage18 needs the
+        current S2/NextDiT intent as a comparable reference so a later adapter
+        can learn keep/intervene/abstain instead of blindly replacing S2.
+        """
+        candidate: Dict[str, Any] = {
+            "candidate_id": "S2",
+            "candidate_index": -1,
+            "candidate_type": "current_policy",
+            "source": "s2_current_waypoint",
+            "valid": False,
+            "reason": None,
+            "pixel_goal": self._jsonable(context.get("s2_pixel_goal") or decision.get("pixel_goal")),
+            "vlmap_waypoint_valid": context.get("vlmap_waypoint_valid"),
+            "vlmap_waypoint_reason": context.get("vlmap_waypoint_reason"),
+            "occ_waypoint_valid": decision.get("valid"),
+            "occ_waypoint_reason": decision.get("reason"),
+        }
+        if not decision:
+            candidate["reason"] = "missing_current_waypoint_decision"
+            return candidate
+        if not bool(decision.get("valid")):
+            candidate["reason"] = str(decision.get("reason") or "invalid_current_waypoint")
+            return candidate
+        goal_grid = decision.get("goal_grid")
+        try:
+            row, col = [int(v) for v in list(goal_grid)[:2]]
+        except (TypeError, ValueError):
+            candidate["reason"] = "invalid_current_waypoint_grid"
+            return candidate
+        state = str(decision.get("goal_state") or self._cell_state(row, col))
+        direction = self._direction_to_cell(start_grid, [row, col], yaw)
+        bucket = str(decision.get("waypoint_direction_bucket") or direction.get("bucket") or "unknown")
+        angle = decision.get("waypoint_direction_angle_deg")
+        if angle is None:
+            angle = direction.get("angle_deg")
+        distance_m = decision.get("waypoint_distance_m")
+        if distance_m is None:
+            distance_m = direction.get("distance_m")
+        visit_count = self._nearby_visit_count(
+            [row, col],
+            int(self.config.waypoint_revisit_radius_cells),
+        )
+        revisit_risk = min(1.0, float(visit_count) / 3.0)
+        geometry_safe = state != "occupied"
+        xy = self._grid_to_xy([row, col])
+        candidate.update(
+            {
+                "valid": True,
+                "reason": "ok",
+                "grid": [int(row), int(col)],
+                "xy": [float(xy[0]), float(xy[1])],
+                "start_grid": self._jsonable(start_grid),
+                "goal_state": state,
+                "geometry_safe": bool(geometry_safe),
+                "active_gate_safe": bool(geometry_safe and bucket != "back"),
+                "direction_bucket": bucket,
+                "direction_angle_deg": angle,
+                "distance_m": None if distance_m is None else float(distance_m),
+                "frontier_distance_m": decision.get("frontier_distance_m"),
+                "nearby_visit_count": int(visit_count),
+                "revisit_risk": float(revisit_risk),
+                "points_to_revisited_region": bool(visit_count > 0),
+                "semantic_dead_zone": decision.get("semantic_dead_zone"),
+                "semantic_dead_zone_score": decision.get("semantic_dead_zone_score"),
+                "semantic_recent_unique_count": decision.get("semantic_recent_unique_count"),
+                "semantic_recent_high_conf_count": decision.get("semantic_recent_high_conf_count"),
+                "semantic_recent_terms": decision.get("semantic_recent_terms"),
+                "semantic_last_top_match": decision.get("semantic_last_top_match"),
+                "semantic_last_top_score": decision.get("semantic_last_top_score"),
+                "semantic_last_stagnation": decision.get("semantic_last_stagnation"),
+                "semantic_stagnation_active": decision.get("semantic_stagnation_active"),
+                "frontier_dominant_direction": decision.get("frontier_dominant_direction"),
+                "frontier_dominant_angle_deg": decision.get("frontier_dominant_angle_deg"),
+                "frontier_dominant_count": decision.get("frontier_dominant_count"),
+                "frontier_direction_counts": decision.get("frontier_direction_counts"),
+                "waypoint_aligns_with_dominant_frontier": decision.get(
+                    "waypoint_aligns_with_dominant_frontier"
+                ),
+                "waypoint_aligns_with_high_conf_keyframe": decision.get(
+                    "waypoint_aligns_with_high_conf_keyframe"
+                ),
+                "nearest_high_conf_keyframe": decision.get("nearest_high_conf_keyframe"),
+            }
+        )
+        return candidate
 
     def _score_progress_ranker_shadow(self, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not bool(self.config.progress_ranker_shadow_enable):
@@ -2322,6 +2431,11 @@ class SparseOccSemanticMemory:
         candidate_target_frontier_escape_sum = 0
         candidate_target_frontier_intent_safe_sum = 0
         candidate_target_frontier_doorway_like_sum = 0
+        current_policy_candidate_valid_count = 0
+        current_policy_candidate_geometry_safe_count = 0
+        current_policy_candidate_active_gate_safe_count = 0
+        current_policy_candidate_revisited_count = 0
+        current_policy_candidate_dead_zone_count = 0
         progress_ranker_shadow_enabled_count = 0
         progress_ranker_shadow_valid_count = 0
         progress_ranker_shadow_error_count = 0
@@ -2370,6 +2484,17 @@ class SparseOccSemanticMemory:
             candidate_target_frontier_doorway_like_sum += int(
                 event.get("candidate_target_frontier_doorway_like_count", 0) or 0
             )
+            current_candidate = event.get("current_policy_candidate") or {}
+            if current_candidate.get("valid"):
+                current_policy_candidate_valid_count += 1
+                if current_candidate.get("geometry_safe"):
+                    current_policy_candidate_geometry_safe_count += 1
+                if current_candidate.get("active_gate_safe"):
+                    current_policy_candidate_active_gate_safe_count += 1
+                if current_candidate.get("points_to_revisited_region"):
+                    current_policy_candidate_revisited_count += 1
+                if current_candidate.get("semantic_dead_zone"):
+                    current_policy_candidate_dead_zone_count += 1
             shadow = event.get("progress_ranker_shadow") or {}
             if shadow.get("enabled"):
                 progress_ranker_shadow_enabled_count += 1
@@ -2513,6 +2638,38 @@ class SparseOccSemanticMemory:
             ),
             "candidate_probe_type_counts": dict(candidate_type_counts),
             "candidate_probe_direction_counts": dict(candidate_direction_counts),
+            "current_policy_candidate_valid_count": int(current_policy_candidate_valid_count),
+            "current_policy_candidate_valid_rate": (
+                float(current_policy_candidate_valid_count / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "current_policy_candidate_geometry_safe_count": int(
+                current_policy_candidate_geometry_safe_count
+            ),
+            "current_policy_candidate_geometry_safe_rate": (
+                float(current_policy_candidate_geometry_safe_count / current_policy_candidate_valid_count)
+                if current_policy_candidate_valid_count else None
+            ),
+            "current_policy_candidate_active_gate_safe_count": int(
+                current_policy_candidate_active_gate_safe_count
+            ),
+            "current_policy_candidate_active_gate_safe_rate": (
+                float(
+                    current_policy_candidate_active_gate_safe_count
+                    / current_policy_candidate_valid_count
+                )
+                if current_policy_candidate_valid_count else None
+            ),
+            "current_policy_candidate_revisited_count": int(current_policy_candidate_revisited_count),
+            "current_policy_candidate_revisited_rate": (
+                float(current_policy_candidate_revisited_count / current_policy_candidate_valid_count)
+                if current_policy_candidate_valid_count else None
+            ),
+            "current_policy_candidate_dead_zone_count": int(current_policy_candidate_dead_zone_count),
+            "current_policy_candidate_dead_zone_rate": (
+                float(current_policy_candidate_dead_zone_count / current_policy_candidate_valid_count)
+                if current_policy_candidate_valid_count else None
+            ),
             "progress_ranker_shadow_enabled_count": int(progress_ranker_shadow_enabled_count),
             "progress_ranker_shadow_valid_count": int(progress_ranker_shadow_valid_count),
             "progress_ranker_shadow_error_count": int(progress_ranker_shadow_error_count),
