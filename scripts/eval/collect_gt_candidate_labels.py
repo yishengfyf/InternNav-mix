@@ -476,6 +476,9 @@ def collect_labels(
     gt_positive_candidate_count = 0
     completed_gt_positive_count = 0
     current_policy_candidate_valid_count = 0
+    current_policy_candidate_observed_count = 0
+    current_policy_candidate_missing_count = 0
+    current_policy_candidate_reason_counts = Counter()
     current_policy_candidate_direction_correct_count = 0
     current_policy_candidate_correct_count = 0
     current_policy_better_than_best_candidate_count = 0
@@ -592,10 +595,15 @@ def collect_labels(
                 best_diff = diff
                 best_id = item.get("candidate_id")
             labeled_candidates.append(item)
-        current_policy_candidate = dict(event.get("current_policy_candidate") or {})
+        raw_current_policy_candidate = event.get("current_policy_candidate")
+        current_policy_candidate = dict(raw_current_policy_candidate or {})
         labeled_current_policy_candidate = current_policy_candidate
         current_policy_diff = None
-        if current_policy_candidate:
+        current_policy_candidate_observed = isinstance(raw_current_policy_candidate, dict) and bool(
+            raw_current_policy_candidate
+        )
+        if current_policy_candidate_observed:
+            current_policy_candidate_observed_count += 1
             labeled_current_policy_candidate = _label_candidate_direction(
                 current_policy_candidate,
                 gt_angle,
@@ -610,6 +618,11 @@ def collect_labels(
                         current_policy_candidate_direction_correct_count += 1
                     if labeled_current_policy_candidate.get("gt_correct"):
                         current_policy_candidate_correct_count += 1
+        else:
+            current_policy_candidate_missing_count += 1
+            current_policy_candidate_reason_counts[
+                str(event.get("reason") or "missing")
+            ] += 1
         if current_policy_diff is not None and best_diff is not None:
             events_with_current_policy_and_candidates += 1
             # A small tolerance keeps numeric jitter from being interpreted as
@@ -639,6 +652,12 @@ def collect_labels(
             "current_compass": _safe_float(compass[0]),
             "gt": gt,
             "current_policy_candidate": labeled_current_policy_candidate,
+            "current_policy_candidate_observed": bool(current_policy_candidate_observed),
+            "current_policy_candidate_missing_reason": (
+                None
+                if current_policy_candidate_observed
+                else str(event.get("reason") or "missing")
+            ),
             "current_policy_gt_angle_diff_deg": current_policy_diff,
             "current_policy_gt_direction_correct": bool(
                 labeled_current_policy_candidate.get("gt_direction_correct")
@@ -694,8 +713,21 @@ def collect_labels(
             else None
         ),
         "current_policy_candidate_valid_count": int(current_policy_candidate_valid_count),
+        "current_policy_candidate_observed_count": int(
+            current_policy_candidate_observed_count
+        ),
+        "current_policy_candidate_missing_count": int(
+            current_policy_candidate_missing_count
+        ),
+        "current_policy_candidate_invalid_count": int(
+            max(0, current_policy_candidate_observed_count - current_policy_candidate_valid_count)
+        ),
+        "current_policy_candidate_reason_counts": dict(
+            current_policy_candidate_reason_counts
+        ),
         "current_policy_candidate_valid_rate": float(
-            current_policy_candidate_valid_count / max(1, status_counts.get("ok", 0))
+            current_policy_candidate_valid_count
+            / max(1, current_policy_candidate_observed_count)
         ),
         "current_policy_gt_angle_diff_mean_deg": (
             float(sum(current_policy_gt_angle_diffs) / len(current_policy_gt_angle_diffs))
