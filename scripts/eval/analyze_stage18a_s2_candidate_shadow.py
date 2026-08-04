@@ -135,6 +135,19 @@ def _is_risky(candidate: Optional[Mapping[str, Any]]) -> bool:
     return False
 
 
+def _select_best_safe_angle(candidates: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    safe_candidates = [
+        item
+        for item in candidates
+        if item.get("gt_angle_diff_deg") is not None and not _is_risky(item)
+    ]
+    if not safe_candidates:
+        return None
+    return dict(
+        min(safe_candidates, key=lambda item: _safe_float(item.get("gt_angle_diff_deg"), 1e9))
+    )
+
+
 def _summarize_policy(selections: Sequence[Optional[Mapping[str, Any]]]) -> Dict[str, Any]:
     valid = [item for item in selections if item]
     angles = [_angle(item) for item in valid]
@@ -173,6 +186,7 @@ def analyze(
         candidate_score = _select_best(candidates, "score")
         target_frontier = _select_best(candidates, "target_frontier_score")
         oracle_best_angle = _select_best_angle(candidates)
+        safe_oracle_best_angle = _select_best_safe_angle(candidates)
         ranker = _shadow_selected(row, "ranker_selected")
         ranker_resilience = _shadow_selected(row, "ranker_resilience_selected")
 
@@ -181,6 +195,7 @@ def analyze(
             "candidate_score": candidate_score,
             "target_frontier": target_frontier,
             "oracle_best_angle": oracle_best_angle,
+            "safe_oracle_best_angle": safe_oracle_best_angle,
             "ranker": ranker,
             "ranker_resilience": ranker_resilience,
         }
@@ -189,6 +204,7 @@ def analyze(
 
         current_angle = _angle(current)
         oracle_angle = _angle(oracle_best_angle)
+        safe_oracle_angle = _angle(safe_oracle_best_angle)
         target_angle = _angle(target_frontier)
         if current_angle is not None and oracle_angle is not None:
             change_counts["comparable_current_oracle"] += 1
@@ -196,6 +212,16 @@ def analyze(
                 change_counts["oracle_safe_intervention_headroom"] += 1
             if current_angle + float(advantage_margin_deg) < oracle_angle:
                 change_counts["current_policy_should_keep"] += 1
+        if current_angle is not None:
+            change_counts["comparable_current_safe_oracle"] += 1
+            if safe_oracle_angle is None:
+                change_counts["safe_oracle_unavailable"] += 1
+            elif safe_oracle_angle + float(advantage_margin_deg) < current_angle:
+                change_counts["safe_oracle_intervention_headroom"] += 1
+            elif current_angle + float(advantage_margin_deg) < safe_oracle_angle:
+                change_counts["safe_oracle_keep_current"] += 1
+            else:
+                change_counts["safe_oracle_ambiguous"] += 1
         if current and target_frontier:
             change_counts["comparable_current_target_frontier"] += 1
             if str(current.get("candidate_id")) != str(target_frontier.get("candidate_id")):
@@ -218,12 +244,25 @@ def analyze(
             split_stats[split]["current_correct"] += int(_is_correct(current))
         if oracle_best_angle:
             split_stats[split]["oracle_correct"] += int(_is_correct(oracle_best_angle))
+        if safe_oracle_best_angle:
+            split_stats[split]["safe_oracle_available"] += 1
+            split_stats[split]["safe_oracle_correct"] += int(_is_correct(safe_oracle_best_angle))
         if current_angle is not None and oracle_angle is not None:
             split_stats[split]["current_oracle_comparable"] += 1
             if oracle_angle + float(advantage_margin_deg) < current_angle and not _is_risky(oracle_best_angle):
                 split_stats[split]["oracle_safe_headroom"] += 1
             if current_angle + float(advantage_margin_deg) < oracle_angle:
                 split_stats[split]["current_should_keep"] += 1
+        if current_angle is not None:
+            split_stats[split]["current_safe_oracle_comparable"] += 1
+            if safe_oracle_angle is None:
+                split_stats[split]["safe_oracle_unavailable"] += 1
+            elif safe_oracle_angle + float(advantage_margin_deg) < current_angle:
+                split_stats[split]["safe_oracle_headroom"] += 1
+            elif current_angle + float(advantage_margin_deg) < safe_oracle_angle:
+                split_stats[split]["safe_oracle_keep"] += 1
+            else:
+                split_stats[split]["safe_oracle_ambiguous"] += 1
 
     summary: Dict[str, Any] = {
         "labels_path": str(labels_path),
@@ -251,6 +290,25 @@ def analyze(
                 change_counts["target_frontier_safe_intervention_headroom"]
                 / max(1, change_counts["comparable_current_target_frontier"])
             ),
+            "safe_oracle_available_rate": float(
+                (
+                    change_counts["comparable_current_safe_oracle"]
+                    - change_counts["safe_oracle_unavailable"]
+                )
+                / max(1, change_counts["comparable_current_safe_oracle"])
+            ),
+            "safe_oracle_intervention_headroom_rate": float(
+                change_counts["safe_oracle_intervention_headroom"]
+                / max(1, change_counts["comparable_current_safe_oracle"])
+            ),
+            "safe_oracle_keep_current_rate": float(
+                change_counts["safe_oracle_keep_current"]
+                / max(1, change_counts["comparable_current_safe_oracle"])
+            ),
+            "safe_oracle_ambiguous_rate": float(
+                change_counts["safe_oracle_ambiguous"]
+                / max(1, change_counts["comparable_current_safe_oracle"])
+            ),
             "target_frontier_would_win_rate": float(
                 change_counts["target_frontier_would_win"]
                 / max(1, change_counts["target_frontier_would_change_current"])
@@ -277,6 +335,22 @@ def analyze(
                 "current_should_keep_rate": float(
                     counter["current_should_keep"]
                     / max(1, counter["current_oracle_comparable"])
+                ),
+                "safe_oracle_available_rate": float(
+                    counter["safe_oracle_available"]
+                    / max(1, counter["current_safe_oracle_comparable"])
+                ),
+                "safe_oracle_headroom_rate": float(
+                    counter["safe_oracle_headroom"]
+                    / max(1, counter["current_safe_oracle_comparable"])
+                ),
+                "safe_oracle_keep_rate": float(
+                    counter["safe_oracle_keep"]
+                    / max(1, counter["current_safe_oracle_comparable"])
+                ),
+                "safe_oracle_ambiguous_rate": float(
+                    counter["safe_oracle_ambiguous"]
+                    / max(1, counter["current_safe_oracle_comparable"])
                 ),
             }
             for split, counter in sorted(split_stats.items())
