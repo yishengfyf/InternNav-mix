@@ -116,7 +116,17 @@ def _set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _class_weights(dataset: InterventionDataset, device: torch.device) -> torch.Tensor:
+def _class_weights(
+    dataset: InterventionDataset,
+    device: torch.device,
+    *,
+    cap: float,
+    disabled: bool,
+) -> torch.Tensor:
+    if disabled:
+        return torch.ones((len(DECISION_NAMES),), dtype=torch.float32, device=device)
+    if cap <= 0.0:
+        raise ValueError("--class-weight-cap must be positive")
     counts = dataset.decision_counts()
     total = float(len(dataset))
     weights = []
@@ -124,7 +134,7 @@ def _class_weights(dataset: InterventionDataset, device: torch.device) -> torch.
         count = float(counts.get(label, 0))
         if count <= 0.0:
             raise ValueError(f"Training split lacks decision class {DECISION_NAMES[label]}")
-        weights.append(min(8.0, total / (float(len(DECISION_NAMES)) * count)))
+        weights.append(min(float(cap), total / (float(len(DECISION_NAMES)) * count)))
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
@@ -134,12 +144,55 @@ def _balanced_sampler(dataset: InterventionDataset) -> WeightedRandomSampler:
     return WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True)
 
 
-def _decision_metrics(labels: List[int], predictions: List[int]) -> Dict[str, float]:
-    result: Dict[str, float] = {"decision_accuracy": 0.0}
+def _apply_intervention_margin(
+    decision_logits: torch.Tensor,
+    *,
+    intervene_logit_margin: float,
+) -> torch.Tensor:
+    predictions = decision_logits.argmax(dim=1)
+    if intervene_logit_margin <= 0.0:
+        return predictions
+    intervene_index = DECISION_NAMES.index("intervene")
+    non_intervene_indices = [
+        index for index, name in enumerate(DECISION_NAMES) if name != "intervene"
+    ]
+    intervene_scores = decision_logits[:, intervene_index]
+    non_intervene_logits = decision_logits[:, non_intervene_indices]
+    best_non_scores, best_non_offsets = non_intervene_logits.max(dim=1)
+    best_non_predictions = torch.tensor(
+        non_intervene_indices,
+        dtype=torch.long,
+        device=decision_logits.device,
+    )[best_non_offsets]
+    weak_intervene = (
+        (predictions == intervene_index)
+        & ((intervene_scores - best_non_scores) < float(intervene_logit_margin))
+    )
+    return torch.where(weak_intervene, best_non_predictions, predictions)
+
+
+def _decision_metrics(labels: List[int], predictions: List[int]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"decision_accuracy": 0.0}
     if not labels:
         return result
     result["decision_accuracy"] = sum(a == b for a, b in zip(labels, predictions)) / len(labels)
     f1_values = []
+    label_counts = Counter(labels)
+    prediction_counts = Counter(predictions)
+    confusion = [
+        [
+            sum(true == row and predicted == column for true, predicted in zip(labels, predictions))
+            for column in range(len(DECISION_NAMES))
+        ]
+        for row in range(len(DECISION_NAMES))
+    ]
+    result["label_counts"] = {
+        name: int(label_counts.get(index, 0)) for index, name in enumerate(DECISION_NAMES)
+    }
+    result["prediction_counts"] = {
+        name: int(prediction_counts.get(index, 0)) for index, name in enumerate(DECISION_NAMES)
+    }
+    result["confusion_matrix"] = confusion
     for index, name in enumerate(DECISION_NAMES):
         true_positive = sum(a == index and b == index for a, b in zip(labels, predictions))
         false_positive = sum(a != index and b == index for a, b in zip(labels, predictions))
@@ -152,7 +205,43 @@ def _decision_metrics(labels: List[int], predictions: List[int]) -> Dict[str, fl
         result[f"{name}_f1"] = f1
         f1_values.append(f1)
     result["macro_f1"] = sum(f1_values) / len(f1_values)
+    intervene_index = DECISION_NAMES.index("intervene")
+    result["predicted_intervene_count"] = int(prediction_counts.get(intervene_index, 0))
+    result["intervene_prediction_rate"] = float(
+        prediction_counts.get(intervene_index, 0) / max(1, len(predictions))
+    )
     return result
+
+
+def _selection_score(
+    metrics: Dict[str, Any],
+    *,
+    selection_metric: str,
+    max_selection_intervene_rate: float,
+) -> float:
+    if selection_metric == "legacy":
+        return 0.5 * metrics["intervene_f1"] + 0.5 * metrics["candidate_top1_accuracy"]
+    if selection_metric == "macro_f1":
+        return float(metrics["macro_f1"])
+    if selection_metric == "precision_first":
+        return (
+            0.70 * float(metrics["intervene_precision"])
+            + 0.15 * float(metrics["intervene_recall"])
+            + 0.15 * float(metrics["abstain_f1"])
+        )
+    if selection_metric == "conservative_intervene":
+        over_intervention = max(
+            0.0,
+            float(metrics["intervene_prediction_rate"]) - float(max_selection_intervene_rate),
+        )
+        return (
+            0.55 * float(metrics["intervene_precision"])
+            + 0.20 * float(metrics["intervene_f1"])
+            + 0.15 * float(metrics["abstain_f1"])
+            + 0.10 * float(metrics["keep_f1"])
+            - 0.75 * over_intervention
+        )
+    raise ValueError(f"Unknown selection metric: {selection_metric}")
 
 
 @torch.no_grad()
@@ -162,13 +251,15 @@ def evaluate(
     device: torch.device,
     class_weights: torch.Tensor,
     candidate_loss_weight: float,
-) -> Dict[str, float]:
+    intervene_logit_margin: float,
+) -> Dict[str, Any]:
     model.eval()
     total_examples = 0
     total_loss = total_decision_loss = total_candidate_loss = 0.0
     labels: List[int] = []
     predictions: List[int] = []
     candidate_total = candidate_correct = 0
+    candidate_multi_choice_total = candidate_multi_choice_correct = 0
     for batch in loader:
         pair_features = batch["candidate_pair_features"].to(device, non_blocking=True)
         candidate_mask = batch["candidate_mask"].to(device, non_blocking=True)
@@ -187,6 +278,16 @@ def evaluate(
                 (predicted_targets == target_indices[intervene_mask]).sum().item()
             )
             candidate_total += int(intervene_mask.sum().item())
+            candidate_counts = candidate_mask[intervene_mask].sum(dim=1)
+            multi_choice_mask = candidate_counts > 1
+            if multi_choice_mask.any():
+                candidate_multi_choice_correct += int(
+                    (
+                        predicted_targets[multi_choice_mask]
+                        == target_indices[intervene_mask][multi_choice_mask]
+                    ).sum().item()
+                )
+                candidate_multi_choice_total += int(multi_choice_mask.sum().item())
         loss = decision_loss + float(candidate_loss_weight) * candidate_loss
         batch_size = int(decision_labels.shape[0])
         total_examples += batch_size
@@ -194,14 +295,22 @@ def evaluate(
         total_decision_loss += float(decision_loss.item()) * batch_size
         total_candidate_loss += float(candidate_loss.item()) * batch_size
         labels.extend(int(value) for value in decision_labels.detach().cpu().tolist())
-        predictions.extend(int(value) for value in decision_logits.argmax(dim=1).detach().cpu().tolist())
+        calibrated_predictions = _apply_intervention_margin(
+            decision_logits,
+            intervene_logit_margin=intervene_logit_margin,
+        )
+        predictions.extend(int(value) for value in calibrated_predictions.detach().cpu().tolist())
 
-    metrics = {
+    metrics: Dict[str, Any] = {
         "loss": total_loss / max(1, total_examples),
         "decision_loss": total_decision_loss / max(1, total_examples),
         "candidate_loss": total_candidate_loss / max(1, total_examples),
         "candidate_top1_accuracy": candidate_correct / max(1, candidate_total),
         "candidate_examples": float(candidate_total),
+        "candidate_multi_choice_top1_accuracy": (
+            candidate_multi_choice_correct / max(1, candidate_multi_choice_total)
+        ),
+        "candidate_multi_choice_examples": float(candidate_multi_choice_total),
         "examples": float(total_examples),
     }
     metrics.update(_decision_metrics(labels, predictions))
@@ -220,13 +329,26 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--candidate-loss-weight", type=float, default=1.0)
+    parser.add_argument("--class-weight-cap", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=18)
     parser.add_argument("--smoke-steps", type=int, default=0)
     parser.add_argument("--disable-balanced-sampler", action="store_true")
+    parser.add_argument("--disable-class-weights", action="store_true")
+    parser.add_argument("--intervene-logit-margin", type=float, default=0.0)
+    parser.add_argument(
+        "--selection-metric",
+        choices=("legacy", "macro_f1", "precision_first", "conservative_intervene"),
+        default="conservative_intervene",
+    )
+    parser.add_argument("--max-selection-intervene-rate", type=float, default=0.10)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("Stage18b adapter training requires one CUDA GPU.")
+    if args.intervene_logit_margin < 0.0:
+        raise ValueError("--intervene-logit-margin must be non-negative")
+    if not 0.0 <= args.max_selection_intervene_rate <= 1.0:
+        raise ValueError("--max-selection-intervene-rate must be in [0, 1]")
     _set_seed(args.seed)
     device = torch.device("cuda")
     summary_path = args.data_dir / "summary.json"
@@ -270,9 +392,43 @@ def main() -> None:
         dropout=args.dropout,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    class_weights = _class_weights(train_dataset, device)
+    class_weights = _class_weights(
+        train_dataset,
+        device,
+        cap=args.class_weight_cap,
+        disabled=args.disable_class_weights,
+    )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    training_config = {
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "hidden_dim": args.hidden_dim,
+        "dropout": args.dropout,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "candidate_loss_weight": args.candidate_loss_weight,
+        "seed": args.seed,
+        "disable_balanced_sampler": args.disable_balanced_sampler,
+        "disable_class_weights": args.disable_class_weights,
+        "class_weight_cap": args.class_weight_cap,
+        "class_weights": class_weights.detach().cpu().tolist(),
+        "intervene_logit_margin": args.intervene_logit_margin,
+        "selection_metric": args.selection_metric,
+        "max_selection_intervene_rate": args.max_selection_intervene_rate,
+        "train_decision_counts": {
+            name: int(train_dataset.decision_counts().get(index, 0))
+            for index, name in enumerate(DECISION_NAMES)
+        },
+        "val_decision_counts": {
+            name: int(val_dataset.decision_counts().get(index, 0))
+            for index, name in enumerate(DECISION_NAMES)
+        },
+    }
+    (args.output_dir / "training_config.json").write_text(
+        json.dumps(training_config, indent=2) + "\n",
+        encoding="utf-8",
+    )
     history: List[Dict[str, Any]] = []
     best_score = float("-inf")
     global_step = 0
@@ -309,11 +465,17 @@ def main() -> None:
             device,
             class_weights,
             args.candidate_loss_weight,
+            args.intervene_logit_margin,
         )
         metrics.update({"epoch": epoch, "global_step": global_step})
+        metrics["selection_score"] = _selection_score(
+            metrics,
+            selection_metric=args.selection_metric,
+            max_selection_intervene_rate=args.max_selection_intervene_rate,
+        )
         history.append(metrics)
         print(json.dumps(metrics, sort_keys=True))
-        selection_score = 0.5 * metrics["intervene_f1"] + 0.5 * metrics["candidate_top1_accuracy"]
+        selection_score = float(metrics["selection_score"])
         if selection_score > best_score:
             best_score = selection_score
             torch.save(
@@ -325,6 +487,7 @@ def main() -> None:
                     "dropout": args.dropout,
                     "decision_names": list(DECISION_NAMES),
                     "dataset_summary": dataset_summary,
+                    "training_config": training_config,
                     "class_weights": class_weights.detach().cpu().tolist(),
                     "metrics": metrics,
                 },
