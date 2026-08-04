@@ -29,12 +29,23 @@ from torch.utils.data import DataLoader, Dataset
 from progress_ranker_model import ProgressCandidateRanker
 
 
+DEFAULT_BASELINE_HEURISTICS = (
+    "candidate::score",
+    "candidate::target_frontier_score",
+    "candidate::goal_progress_score",
+    "candidate::frontier_progress_score",
+    "candidate::semantic_progress_score",
+)
+
+
 class AdvantageEventDataset(Dataset):
     """Event-level dataset with a variable-size safe candidate set."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, feature_names: Optional[Sequence[str]] = None):
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         self.feature_dim: Optional[int] = None
+        self.feature_names = list(feature_names or [])
+        self.feature_index = {name: index for index, name in enumerate(self.feature_names)}
         with path.open("r", encoding="utf-8") as handle:
             for lineno, line in enumerate(handle, start=1):
                 line = line.strip()
@@ -63,12 +74,20 @@ class AdvantageEventDataset(Dataset):
 
         self.items: List[Dict[str, Any]] = []
         for event_key, rows in sorted(grouped.items()):
+            features = [row["features"] for row in rows]
+            heuristic_scores: Dict[str, List[float]] = {}
+            for name in DEFAULT_BASELINE_HEURISTICS:
+                index = self.feature_index.get(name)
+                if index is None:
+                    continue
+                heuristic_scores[name] = [float(row_features[index]) for row_features in features]
             self.items.append(
                 {
                     "event_key": event_key,
-                    "features": [row["features"] for row in rows],
+                    "features": features,
                     "labels": [int(row["label"]) for row in rows],
                     "candidate_ids": [row.get("candidate_id") for row in rows],
+                    "heuristic_scores": heuristic_scores,
                 }
             )
 
@@ -115,6 +134,60 @@ def collate_events(items: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "labels": labels,
         "mask": mask,
         "event_keys": event_keys,
+    }
+
+
+class PairwiseDeltaDataset(Dataset):
+    """Positive-vs-negative candidate deltas from event-level supervision."""
+
+    def __init__(self, event_dataset: AdvantageEventDataset, *, include_reverse: bool = True):
+        self.items: List[Dict[str, Any]] = []
+        self.feature_dim = int(event_dataset.feature_dim or 0)
+        for event in event_dataset.items:
+            features = event["features"]
+            labels = [int(label) for label in event["labels"]]
+            positives = [index for index, label in enumerate(labels) if label == 1]
+            negatives = [index for index, label in enumerate(labels) if label == 0]
+            if not positives or not negatives:
+                continue
+            for positive_index in positives:
+                for negative_index in negatives:
+                    positive_features = features[positive_index]
+                    negative_features = features[negative_index]
+                    delta = [
+                        float(pos_value) - float(neg_value)
+                        for pos_value, neg_value in zip(positive_features, negative_features)
+                    ]
+                    self.items.append(
+                        {
+                            "features": delta,
+                            "label": 1.0,
+                            "event_key": event["event_key"],
+                        }
+                    )
+                    if include_reverse:
+                        self.items.append(
+                            {
+                                "features": [-float(value) for value in delta],
+                                "label": 0.0,
+                                "event_key": event["event_key"],
+                            }
+                        )
+        if not self.items:
+            raise ValueError("No positive-vs-negative pairs found for pairwise-delta training.")
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        return self.items[index]
+
+
+def collate_pairwise_deltas(items: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "features": torch.tensor([item["features"] for item in items], dtype=torch.float32),
+        "labels": torch.tensor([float(item["label"]) for item in items], dtype=torch.float32),
+        "event_keys": [str(item["event_key"]) for item in items],
     }
 
 
@@ -326,6 +399,90 @@ def _group_metrics(
     }
 
 
+def _expected_first_positive_mrr(candidate_count: int, positive_count: int) -> float:
+    if candidate_count <= 0 or positive_count <= 0:
+        return 0.0
+    # Probability that the first positive appears at rank r under a random
+    # permutation: choose the remaining positives after rank r from later slots.
+    denominator = float(math_comb(candidate_count, positive_count))
+    expected = 0.0
+    for rank in range(1, candidate_count - positive_count + 2):
+        ways = math_comb(candidate_count - rank, positive_count - 1)
+        expected += (float(ways) / max(1.0, denominator)) * (1.0 / float(rank))
+    return expected
+
+
+def math_comb(n: int, k: int) -> int:
+    if k < 0 or k > n:
+        return 0
+    k = min(k, n - k)
+    numerator = 1
+    denominator = 1
+    for value in range(1, k + 1):
+        numerator *= n - value + 1
+        denominator *= value
+    return numerator // max(1, denominator)
+
+
+def _random_baseline(dataset: AdvantageEventDataset) -> Dict[str, float]:
+    positive_events = []
+    multi_candidate_positive_events = []
+    for item in dataset.items:
+        labels = [int(label) for label in item["labels"]]
+        positive_count = sum(label == 1 for label in labels)
+        if positive_count <= 0:
+            continue
+        positive_events.append(labels)
+        if len(labels) > 1:
+            multi_candidate_positive_events.append(labels)
+
+    def summarize(groups: Sequence[Sequence[int]], prefix: str) -> Dict[str, float]:
+        top1 = mrr = 0.0
+        for labels in groups:
+            positive_count = sum(label == 1 for label in labels)
+            top1 += float(positive_count) / max(1.0, float(len(labels)))
+            mrr += _expected_first_positive_mrr(len(labels), positive_count)
+        return {
+            f"{prefix}_top1_positive": top1 / max(1, len(groups)),
+            f"{prefix}_mrr": mrr / max(1, len(groups)),
+        }
+
+    result = {
+        "random_positive_event_count": float(len(positive_events)),
+        "random_multi_candidate_positive_event_count": float(len(multi_candidate_positive_events)),
+    }
+    result.update(summarize(positive_events, "random_event"))
+    result.update(summarize(multi_candidate_positive_events, "random_multi_candidate_event"))
+    return result
+
+
+def _heuristic_baselines(dataset: AdvantageEventDataset) -> Dict[str, Dict[str, float]]:
+    baselines: Dict[str, Dict[str, float]] = {"random": _random_baseline(dataset)}
+    names = sorted(
+        {
+            name
+            for item in dataset.items
+            for name in (item.get("heuristic_scores") or {}).keys()
+        }
+    )
+    for name in names:
+        flat_labels: List[int] = []
+        flat_scores: List[float] = []
+        flat_event_keys: List[str] = []
+        for item in dataset.items:
+            scores = (item.get("heuristic_scores") or {}).get(name)
+            if scores is None:
+                continue
+            labels = [int(label) for label in item["labels"]]
+            event_key = str(item["event_key"])
+            flat_labels.extend(labels)
+            flat_scores.extend(float(score) for score in scores)
+            flat_event_keys.extend([event_key] * len(labels))
+        if flat_labels:
+            baselines[name] = _group_metrics(flat_labels, flat_scores, flat_event_keys)
+    return baselines
+
+
 def _selection_score(metrics: Dict[str, Any], selection_metric: str) -> float:
     if selection_metric == "f1":
         return float(metrics["f1"])
@@ -369,6 +526,65 @@ def _flatten_event_batch(
     return flat_labels, flat_scores, flat_event_keys
 
 
+def _pairwise_delta_candidate_scores(
+    model: nn.Module,
+    features: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Score candidates by average learned pairwise win probability."""
+
+    batch_size, max_candidates, _ = features.shape
+    output = torch.zeros((batch_size, max_candidates), dtype=torch.float32, device=features.device)
+    for row in range(batch_size):
+        valid_indices = torch.nonzero(mask[row], as_tuple=False).flatten()
+        if int(valid_indices.numel()) <= 1:
+            continue
+        row_features = features[row, valid_indices]
+        scores = []
+        for index in range(row_features.shape[0]):
+            competitor_indices = [
+                competitor
+                for competitor in range(row_features.shape[0])
+                if competitor != index
+            ]
+            deltas = row_features[index].unsqueeze(0) - row_features[competitor_indices]
+            win_prob = torch.sigmoid(model(deltas)).mean()
+            scores.append(win_prob)
+        output[row, valid_indices] = torch.stack(scores)
+    return output
+
+
+def _pairwise_delta_loss_from_event_batch(
+    model: nn.Module,
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    deltas: List[torch.Tensor] = []
+    targets: List[torch.Tensor] = []
+    for row in range(features.shape[0]):
+        row_mask = mask[row]
+        positives = torch.nonzero(row_mask & (labels[row] > 0.0), as_tuple=False).flatten()
+        negatives = torch.nonzero(row_mask & (labels[row] <= 0.0), as_tuple=False).flatten()
+        if int(positives.numel()) == 0 or int(negatives.numel()) == 0:
+            continue
+        pos_features = features[row, positives]
+        neg_features = features[row, negatives]
+        pair_deltas = pos_features.unsqueeze(1) - neg_features.unsqueeze(0)
+        pair_deltas = pair_deltas.reshape(-1, features.shape[-1])
+        deltas.append(pair_deltas)
+        targets.append(torch.ones(pair_deltas.shape[0], dtype=torch.float32, device=features.device))
+        reverse_deltas = -pair_deltas
+        deltas.append(reverse_deltas)
+        targets.append(torch.zeros(reverse_deltas.shape[0], dtype=torch.float32, device=features.device))
+    if not deltas:
+        return model(features).sum() * 0.0
+    all_deltas = torch.cat(deltas, dim=0)
+    all_targets = torch.cat(targets, dim=0)
+    logits = model(all_deltas)
+    return F.binary_cross_entropy_with_logits(logits, all_targets)
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -382,6 +598,7 @@ def evaluate(
     bce_loss_weight: float,
     listwise_loss_weight: float,
     pairwise_loss_weight: float,
+    pairwise_delta: bool,
 ) -> Dict[str, Any]:
     model.eval()
     total_loss = total_bce = total_listwise = total_pairwise = total_examples = 0.0
@@ -392,17 +609,28 @@ def evaluate(
         features = batch["features"].to(device, non_blocking=True)
         batch_labels = batch["labels"].to(device, non_blocking=True)
         mask = batch["mask"].to(device, non_blocking=True)
-        logits = model(features)
-        loss, parts = _combined_loss(
-            logits,
-            batch_labels,
-            mask,
-            loss_mode=loss_mode,
-            pos_weight=pos_weight,
-            bce_loss_weight=bce_loss_weight,
-            listwise_loss_weight=listwise_loss_weight,
-            pairwise_loss_weight=pairwise_loss_weight,
-        )
+        if pairwise_delta:
+            logits = _pairwise_delta_candidate_scores(model, features, mask)
+            loss = _pairwise_delta_loss_from_event_batch(model, features, batch_labels, mask)
+            parts = {
+                "bce_loss": float(loss.detach().item()),
+                "listwise_loss": float(_listwise_loss(logits, batch_labels, mask).detach().item()),
+                "pairwise_loss": float(_pairwise_loss(logits, batch_labels, mask).detach().item()),
+            }
+            score_tensor = logits
+        else:
+            logits = model(features)
+            loss, parts = _combined_loss(
+                logits,
+                batch_labels,
+                mask,
+                loss_mode=loss_mode,
+                pos_weight=pos_weight,
+                bce_loss_weight=bce_loss_weight,
+                listwise_loss_weight=listwise_loss_weight,
+                pairwise_loss_weight=pairwise_loss_weight,
+            )
+            score_tensor = torch.sigmoid(logits)
         batch_size = float(features.shape[0])
         total_loss += float(loss.item()) * batch_size
         total_bce += float(parts["bce_loss"]) * batch_size
@@ -411,7 +639,7 @@ def evaluate(
         total_examples += batch_size
         flat_labels, flat_scores, flat_event_keys = _flatten_event_batch(
             batch_labels,
-            torch.sigmoid(logits),
+            score_tensor,
             mask,
             batch["event_keys"],
         )
@@ -455,7 +683,7 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
         "--loss-mode",
-        choices=("bce", "listwise", "pairwise", "hybrid"),
+        choices=("bce", "listwise", "pairwise", "hybrid", "pairwise_delta"),
         default="bce",
     )
     parser.add_argument("--bce-loss-weight", type=float, default=0.25)
@@ -476,6 +704,11 @@ def main() -> None:
         default="precision_first",
     )
     parser.add_argument("--eval-before-train", action="store_true")
+    parser.add_argument(
+        "--eval-train",
+        action="store_true",
+        help="Also evaluate the train event split after each epoch for overfit diagnostics.",
+    )
     parser.add_argument("--seed", type=int, default=18)
     parser.add_argument("--smoke-steps", type=int, default=0)
     args = parser.parse_args()
@@ -497,18 +730,29 @@ def main() -> None:
     dataset_summary = json.loads(summary_path.read_text(encoding="utf-8"))
     if dataset_summary.get("task") != "candidate_advantage_not_active_gate":
         raise ValueError("Stage18c trainer expects a candidate-advantage dataset.")
+    feature_names = dataset_summary.get("feature_names") or []
 
-    train_dataset = AdvantageEventDataset(args.data_dir / "train.jsonl")
-    val_dataset = AdvantageEventDataset(args.data_dir / "val.jsonl")
+    train_dataset = AdvantageEventDataset(args.data_dir / "train.jsonl", feature_names)
+    val_dataset = AdvantageEventDataset(args.data_dir / "val.jsonl", feature_names)
     if train_dataset.feature_dim != val_dataset.feature_dim:
         raise ValueError("Train/val feature dimensions differ")
     if train_dataset.label_counts().get(1, 0) <= 0 or val_dataset.label_counts().get(1, 0) <= 0:
         raise ValueError("Stage18c train and val splits must both contain positives.")
+    train_baselines = _heuristic_baselines(train_dataset)
+    val_baselines = _heuristic_baselines(val_dataset)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_events,
+    )
+    train_eval_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=collate_events,
@@ -521,6 +765,18 @@ def main() -> None:
         pin_memory=True,
         collate_fn=collate_events,
     )
+    pairwise_train_dataset = None
+    pairwise_train_loader = None
+    if args.loss_mode == "pairwise_delta":
+        pairwise_train_dataset = PairwiseDeltaDataset(train_dataset)
+        pairwise_train_loader = DataLoader(
+            pairwise_train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collate_pairwise_deltas,
+        )
     model = ProgressCandidateRanker(int(train_dataset.feature_dim), args.hidden_dim, args.dropout).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     pos_weight = _pos_weight(
@@ -549,7 +805,11 @@ def main() -> None:
         "thresholds": args.thresholds,
         "selection_metric": args.selection_metric,
         "eval_before_train": args.eval_before_train,
+        "eval_train": args.eval_train,
         "seed": args.seed,
+        "pairwise_delta_train_pairs": (
+            None if pairwise_train_dataset is None else len(pairwise_train_dataset)
+        ),
         "train_label_counts": {
             "negative": int(train_dataset.label_counts().get(0, 0)),
             "positive": int(train_dataset.label_counts().get(1, 0)),
@@ -560,6 +820,8 @@ def main() -> None:
         },
         "train_event_counts": train_dataset.event_counts(),
         "val_event_counts": val_dataset.event_counts(),
+        "train_baselines": train_baselines,
+        "val_baselines": val_baselines,
     }
     (args.output_dir / "training_config.json").write_text(
         json.dumps(training_config, indent=2) + "\n",
@@ -583,9 +845,31 @@ def main() -> None:
             bce_loss_weight=args.bce_loss_weight,
             listwise_loss_weight=args.listwise_loss_weight,
             pairwise_loss_weight=args.pairwise_loss_weight,
+            pairwise_delta=args.loss_mode == "pairwise_delta",
         )
         metrics.update({"epoch": epoch, "global_step": global_step})
         metrics["selection_score"] = _selection_score(metrics, args.selection_metric)
+        metrics["split"] = "val"
+        metrics["val_baselines"] = val_baselines
+        if args.eval_train:
+            train_metrics = evaluate(
+                model,
+                train_eval_loader,
+                device,
+                pos_weight=pos_weight,
+                eval_threshold=args.eval_threshold,
+                thresholds=args.thresholds,
+                loss_mode=args.loss_mode,
+                bce_loss_weight=args.bce_loss_weight,
+                listwise_loss_weight=args.listwise_loss_weight,
+                pairwise_loss_weight=args.pairwise_loss_weight,
+                pairwise_delta=args.loss_mode == "pairwise_delta",
+            )
+            train_metrics.update({"epoch": epoch, "global_step": global_step})
+            train_metrics["selection_score"] = _selection_score(train_metrics, args.selection_metric)
+            train_metrics["split"] = "train"
+            train_metrics["train_baselines"] = train_baselines
+            metrics["train_metrics"] = train_metrics
         history.append(metrics)
         print(json.dumps(metrics, sort_keys=True))
         if metrics["selection_score"] > best_score:
@@ -612,28 +896,43 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        for batch in train_loader:
-            features = batch["features"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
-            mask = batch["mask"].to(device, non_blocking=True)
-            scores = model(features)
-            loss, _ = _combined_loss(
-                scores,
-                labels,
-                mask,
-                loss_mode=args.loss_mode,
-                pos_weight=pos_weight,
-                bce_loss_weight=args.bce_loss_weight,
-                listwise_loss_weight=args.listwise_loss_weight,
-                pairwise_loss_weight=args.pairwise_loss_weight,
-            )
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            global_step += 1
-            if args.smoke_steps and global_step >= args.smoke_steps:
-                break
+        if args.loss_mode == "pairwise_delta":
+            assert pairwise_train_loader is not None
+            for batch in pairwise_train_loader:
+                features = batch["features"].to(device, non_blocking=True)
+                labels = batch["labels"].to(device, non_blocking=True)
+                logits = model(features)
+                loss = F.binary_cross_entropy_with_logits(logits, labels)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                global_step += 1
+                if args.smoke_steps and global_step >= args.smoke_steps:
+                    break
+        else:
+            for batch in train_loader:
+                features = batch["features"].to(device, non_blocking=True)
+                labels = batch["labels"].to(device, non_blocking=True)
+                mask = batch["mask"].to(device, non_blocking=True)
+                scores = model(features)
+                loss, _ = _combined_loss(
+                    scores,
+                    labels,
+                    mask,
+                    loss_mode=args.loss_mode,
+                    pos_weight=pos_weight,
+                    bce_loss_weight=args.bce_loss_weight,
+                    listwise_loss_weight=args.listwise_loss_weight,
+                    pairwise_loss_weight=args.pairwise_loss_weight,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                global_step += 1
+                if args.smoke_steps and global_step >= args.smoke_steps:
+                    break
 
         evaluate_and_save(epoch=epoch)
         if args.smoke_steps and global_step >= args.smoke_steps:
