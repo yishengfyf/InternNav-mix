@@ -175,6 +175,35 @@ _TARGET_FRONTIER_TRANSITION_TERMS = {
     "patio",
 }
 
+_SEMANTIC_RESILIENCE_OBSTACLE_TERMS = {
+    "barrier",
+    "cabinet",
+    "closet",
+    "column",
+    "counter",
+    "curtain",
+    "door",  # closed / blocked doors are useful local obstacle evidence.
+    "drawer",
+    "fireplace",
+    "railing",
+    "shelf",
+    "shelving",
+    "shower",
+    "table",
+    "wall",
+    "window",
+}
+
+_SEMANTIC_RESILIENCE_PASSAGE_TERMS = {
+    "archway",
+    "corridor",
+    "door",
+    "entryway",
+    "hall",
+    "hallway",
+    "stairs",
+}
+
 
 def _as_intrinsic3(intrinsic: np.ndarray) -> np.ndarray:
     intrinsic = np.asarray(intrinsic, dtype=np.float32)
@@ -324,6 +353,17 @@ class SparseOccMemoryConfig:
     candidate_probe_target_frontier_candidate_threshold: float = 0.35
     candidate_probe_target_frontier_intent_max_deviation_deg: float = 75.0
     candidate_probe_target_frontier_intent_penalty_weight: float = 0.45
+    semantic_resilience_shadow_enable: bool = False
+    semantic_resilience_local_radius_cells: int = 18
+    semantic_resilience_min_observed_cells: int = 24
+    semantic_resilience_occupied_ratio_threshold: float = 0.28
+    semantic_resilience_blocked_bucket_threshold: float = 0.45
+    semantic_resilience_frontier_escape_threshold: int = 4
+    semantic_resilience_min_backtrack_distance_m: float = 0.75
+    semantic_resilience_max_backtrack_distance_m: float = 4.0
+    semantic_resilience_backtrack_min_step_gap: int = 6
+    semantic_resilience_backtrack_score_weight: float = 1.35
+    semantic_resilience_candidate_source_score: float = 2.40
     progress_ranker_shadow_enable: bool = False
     progress_ranker_shadow_checkpoint: str = ""
     progress_ranker_shadow_device: str = "cpu"
@@ -868,6 +908,12 @@ class SparseOccSemanticMemory:
             yaw,
             goal_progress_state=goal_progress_state,
         )
+        semantic_resilience_state = self._semantic_resilience_local_state(
+            start_grid,
+            yaw,
+            semantic_nodes=semantic_nodes,
+            current_policy_candidate=current_policy_candidate,
+        )
         raw_candidates: List[Dict[str, Any]] = []
         raw_candidates.extend(
             self._frontier_query_candidates(
@@ -899,6 +945,17 @@ class SparseOccSemanticMemory:
                 goal_progress_state=goal_progress_state,
             )
         )
+        raw_candidates.extend(
+            self._semantic_resilience_backtrack_candidates(
+                start_grid,
+                yaw,
+                current_angle=current_angle,
+                current_goal_grid=current_goal_grid,
+                semantic_nodes=semantic_nodes,
+                goal_progress_state=goal_progress_state,
+                resilience_state=semantic_resilience_state,
+            )
+        )
         candidates = self._select_query_candidates(raw_candidates)
         for idx, item in enumerate(candidates):
             item["candidate_index"] = int(idx)
@@ -919,6 +976,10 @@ class SparseOccSemanticMemory:
         target_frontier_escape_count = 0
         target_frontier_intent_safe_count = 0
         target_frontier_doorway_like_count = 0
+        semantic_resilience_candidate_count = 0
+        semantic_resilience_recommended_count = 0
+        semantic_resilience_obstacle_count = 0
+        semantic_resilience_passage_count = 0
         for item in candidates:
             candidate_types[str(item.get("candidate_type", "unknown"))] += 1
             direction_counts[str(item.get("direction_bucket", "unknown"))] += 1
@@ -952,6 +1013,14 @@ class SparseOccSemanticMemory:
                 self.config.candidate_probe_target_frontier_doorway_threshold
             ):
                 target_frontier_doorway_like_count += 1
+            if item.get("semantic_resilience_candidate"):
+                semantic_resilience_candidate_count += 1
+            if item.get("semantic_resilience_recommended"):
+                semantic_resilience_recommended_count += 1
+            if item.get("semantic_resilience_obstacle_term_count", 0):
+                semantic_resilience_obstacle_count += 1
+            if item.get("semantic_resilience_passage_term_count", 0):
+                semantic_resilience_passage_count += 1
         bev_path = None
         if self.config.candidate_probe_save_bev and candidates:
             bev_path = self._write_candidate_bev_snapshot(candidates, context)
@@ -997,6 +1066,41 @@ class SparseOccSemanticMemory:
                 ),
                 "candidate_target_frontier_doorway_like_count": int(
                     target_frontier_doorway_like_count
+                ),
+                "semantic_resilience_state": semantic_resilience_state,
+                "semantic_resilience_enabled": bool(
+                    semantic_resilience_state.get("enabled")
+                ),
+                "semantic_resilience_recovery_trigger": bool(
+                    semantic_resilience_state.get("recovery_trigger")
+                ),
+                "semantic_resilience_local_trap": bool(
+                    semantic_resilience_state.get("local_trap")
+                ),
+                "semantic_resilience_trigger_reasons": semantic_resilience_state.get(
+                    "trigger_reasons"
+                ),
+                "semantic_resilience_recovery_context_tags": semantic_resilience_state.get(
+                    "recovery_context_tags"
+                ),
+                "semantic_resilience_raw_candidate_count": int(
+                    sum(
+                        1
+                        for item in raw_candidates
+                        if item.get("semantic_resilience_candidate")
+                    )
+                ),
+                "candidate_semantic_resilience_count": int(
+                    semantic_resilience_candidate_count
+                ),
+                "candidate_semantic_resilience_recommended_count": int(
+                    semantic_resilience_recommended_count
+                ),
+                "candidate_semantic_resilience_obstacle_count": int(
+                    semantic_resilience_obstacle_count
+                ),
+                "candidate_semantic_resilience_passage_count": int(
+                    semantic_resilience_passage_count
                 ),
                 "semantic_memory_node_count": int(len(semantic_nodes)),
                 "instruction_terms": self._instruction_terms(),
@@ -1128,6 +1232,465 @@ class SparseOccSemanticMemory:
                 "reason": "error",
                 "error": str(exc),
             }
+
+    def _semantic_resilience_term_kind(self, term: Any) -> Optional[str]:
+        canonical = self._canonical_semantic_term(term)
+        if not canonical:
+            canonical = str(term or "").lower().strip().replace("_", " ")
+        if not canonical:
+            return None
+        tokens = set(re.findall(r"[a-z0-9]+", canonical))
+        if canonical in _SEMANTIC_RESILIENCE_OBSTACLE_TERMS or tokens.intersection(
+            _SEMANTIC_RESILIENCE_OBSTACLE_TERMS
+        ):
+            return "obstacle"
+        if canonical in _SEMANTIC_RESILIENCE_PASSAGE_TERMS or tokens.intersection(
+            _SEMANTIC_RESILIENCE_PASSAGE_TERMS
+        ):
+            return "passage"
+        return None
+
+    def _semantic_resilience_semantic_counts(
+        self,
+        cell: Iterable[int],
+        semantic_nodes: List[Dict[str, Any]],
+        *,
+        radius_m: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if not semantic_nodes:
+            return {
+                "obstacle_term_count": 0,
+                "passage_term_count": 0,
+                "nearest_obstacle_term": None,
+                "nearest_obstacle_distance_m": None,
+                "nearest_passage_term": None,
+                "nearest_passage_distance_m": None,
+            }
+        if radius_m is None:
+            radius_m = max(
+                self.cs,
+                float(self.config.semantic_resilience_local_radius_cells) * self.cs,
+            )
+        center_xy = self._grid_to_xy(cell)
+        obstacle_count = 0
+        passage_count = 0
+        nearest_obstacle = (None, None)
+        nearest_passage = (None, None)
+        for node in semantic_nodes:
+            node_xy = np.asarray(node.get("xy", [0.0, 0.0])[:2], dtype=np.float32)
+            distance = float(np.linalg.norm(center_xy - node_xy))
+            if distance > float(radius_m):
+                continue
+            term = node.get("semantic_top_match")
+            kind = self._semantic_resilience_term_kind(term)
+            if kind == "obstacle":
+                obstacle_count += 1
+                if nearest_obstacle[1] is None or distance < float(nearest_obstacle[1]):
+                    nearest_obstacle = (term, distance)
+            elif kind == "passage":
+                passage_count += 1
+                if nearest_passage[1] is None or distance < float(nearest_passage[1]):
+                    nearest_passage = (term, distance)
+        return {
+            "obstacle_term_count": int(obstacle_count),
+            "passage_term_count": int(passage_count),
+            "nearest_obstacle_term": nearest_obstacle[0],
+            "nearest_obstacle_distance_m": nearest_obstacle[1],
+            "nearest_passage_term": nearest_passage[0],
+            "nearest_passage_distance_m": nearest_passage[1],
+        }
+
+    def _semantic_resilience_local_state(
+        self,
+        start_grid: Iterable[int],
+        yaw: float,
+        *,
+        semantic_nodes: List[Dict[str, Any]],
+        current_policy_candidate: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        enabled = bool(self.config.semantic_resilience_shadow_enable)
+        result: Dict[str, Any] = {
+            "enabled": enabled,
+            "valid": False,
+            "reason": None,
+            "recovery_trigger": False,
+            "local_trap": False,
+            "trigger_reasons": [],
+            "recovery_context_tags": [],
+        }
+        if not enabled:
+            result["reason"] = "disabled"
+            return result
+        try:
+            row0, col0 = [int(v) for v in list(start_grid)[:2]]
+        except (TypeError, ValueError):
+            result["reason"] = "invalid_start_grid"
+            return result
+
+        radius = max(1, int(self.config.semantic_resilience_local_radius_cells))
+        frontier_set = self._frontier_cell_set()
+        buckets = ("front", "left", "right", "back")
+        state_counts = {
+            bucket: {"occupied": 0, "free": 0, "unknown": 0, "frontier": 0}
+            for bucket in buckets
+        }
+        total_counts = {"occupied": 0, "free": 0, "unknown": 0, "frontier": 0}
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if dr * dr + dc * dc > radius * radius:
+                    continue
+                row = row0 + dr
+                col = col0 + dc
+                if row < 0 or row >= self.gs or col < 0 or col >= self.gs:
+                    continue
+                direction = self._direction_to_cell([row0, col0], [row, col], yaw)
+                bucket = direction.get("bucket")
+                if bucket not in state_counts:
+                    continue
+                state = self._cell_state(row, col)
+                state_counts[bucket][state] += 1
+                total_counts[state] += 1
+                if (row, col) in frontier_set:
+                    state_counts[bucket]["frontier"] += 1
+                    total_counts["frontier"] += 1
+
+        observed_count = int(total_counts["occupied"] + total_counts["free"])
+        total_count = int(total_counts["occupied"] + total_counts["free"] + total_counts["unknown"])
+        local_occupied_ratio = (
+            float(total_counts["occupied"] / observed_count) if observed_count else 0.0
+        )
+        local_unknown_ratio = (
+            float(total_counts["unknown"] / total_count) if total_count else 0.0
+        )
+        blocked_bucket_threshold = float(self.config.semantic_resilience_blocked_bucket_threshold)
+        bucket_pressure: Dict[str, float] = {}
+        blocked_buckets = []
+        for bucket in buckets:
+            counts = state_counts[bucket]
+            observed = int(counts["occupied"] + counts["free"])
+            pressure = float(counts["occupied"] / observed) if observed else 0.0
+            bucket_pressure[bucket] = pressure
+            if observed > 0 and pressure >= blocked_bucket_threshold and counts["occupied"] >= 3:
+                blocked_buckets.append(bucket)
+
+        non_back_blocked = [bucket for bucket in blocked_buckets if bucket != "back"]
+        frontier_escape_count = int(
+            sum(state_counts[bucket]["frontier"] for bucket in ("front", "left", "right"))
+        )
+        current = current_policy_candidate or {}
+        current_valid = bool(current.get("valid"))
+        current_dead_zone = bool(current.get("semantic_dead_zone"))
+        current_stagnation = bool(current.get("semantic_stagnation_active"))
+        current_revisited = bool(current.get("points_to_revisited_region"))
+        current_unsafe = bool(current_valid and not current.get("geometry_safe"))
+        current_not_active_safe = bool(current_valid and not current.get("active_gate_safe"))
+        current_policy_problem = bool(
+            current_dead_zone
+            or current_stagnation
+            or current_revisited
+            or current_unsafe
+            or current_not_active_safe
+        )
+        min_observed = int(self.config.semantic_resilience_min_observed_cells)
+        occupied_threshold = float(self.config.semantic_resilience_occupied_ratio_threshold)
+        frontier_escape_threshold = int(self.config.semantic_resilience_frontier_escape_threshold)
+        front_blocked = "front" in blocked_buckets
+        side_blocked = "left" in blocked_buckets or "right" in blocked_buckets
+        local_trap = bool(
+            observed_count >= min_observed
+            and (
+                (front_blocked and side_blocked and frontier_escape_count <= frontier_escape_threshold)
+                or len(non_back_blocked) >= 3
+                or (
+                    local_occupied_ratio >= occupied_threshold
+                    and len(non_back_blocked) >= 2
+                    and frontier_escape_count <= frontier_escape_threshold
+                )
+            )
+        )
+
+        semantic_counts = self._semantic_resilience_semantic_counts(
+            [row0, col0],
+            semantic_nodes,
+        )
+        trigger_reasons = []
+        if local_trap:
+            trigger_reasons.append("local_trap")
+        if current_dead_zone:
+            trigger_reasons.append("semantic_dead_zone")
+        if current_stagnation:
+            trigger_reasons.append("semantic_stagnation")
+        if current_revisited:
+            trigger_reasons.append("current_points_to_revisited_region")
+        if current_unsafe:
+            trigger_reasons.append("current_waypoint_occupied")
+        if current_not_active_safe and not current_unsafe:
+            trigger_reasons.append("current_waypoint_not_active_safe")
+        if semantic_counts["obstacle_term_count"] > 0 and (local_trap or len(non_back_blocked) >= 2):
+            trigger_reasons.append("semantic_obstacle_near_trap")
+
+        recovery_trigger = bool(
+            local_trap
+            or (
+                (current_dead_zone or current_stagnation)
+                and (
+                    frontier_escape_count <= frontier_escape_threshold
+                    or len(non_back_blocked) >= 2
+                    or current_policy_problem
+                )
+            )
+            or (current_policy_problem and len(non_back_blocked) >= 2)
+        )
+        recovery_context_tags = []
+        if local_trap:
+            recovery_context_tags.append("spatial_constriction")
+        if frontier_escape_count <= frontier_escape_threshold:
+            recovery_context_tags.append("limited_frontier_escape")
+        if current_dead_zone or current_stagnation:
+            recovery_context_tags.append("semantic_uncertainty_or_stagnation")
+        if current_revisited:
+            recovery_context_tags.append("revisit_loop_risk")
+        if current_unsafe or current_not_active_safe:
+            recovery_context_tags.append("policy_memory_conflict")
+        if semantic_counts["obstacle_term_count"] > 0:
+            recovery_context_tags.append("semantic_obstacle_context")
+        if semantic_counts["passage_term_count"] > 0:
+            recovery_context_tags.append("semantic_passage_context")
+        if current_policy_problem and not recovery_context_tags:
+            recovery_context_tags.append("current_policy_risk")
+        result.update(
+            {
+                "valid": True,
+                "reason": "ok",
+                "radius_cells": int(radius),
+                "radius_m": float(radius * self.cs),
+                "observed_cell_count": int(observed_count),
+                "total_checked_cell_count": int(total_count),
+                "local_occupied_ratio_observed": float(local_occupied_ratio),
+                "local_unknown_ratio": float(local_unknown_ratio),
+                "local_frontier_count": int(total_counts["frontier"]),
+                "frontier_escape_count": int(frontier_escape_count),
+                "bucket_state_counts": state_counts,
+                "bucket_occupied_pressure": bucket_pressure,
+                "blocked_buckets": blocked_buckets,
+                "non_back_blocked_bucket_count": int(len(non_back_blocked)),
+                "current_policy_valid": bool(current_valid),
+                "current_policy_problem": bool(current_policy_problem),
+                "current_policy_dead_zone": bool(current_dead_zone),
+                "current_policy_stagnation": bool(current_stagnation),
+                "current_policy_revisited": bool(current_revisited),
+                "current_policy_unsafe": bool(current_unsafe),
+                "current_policy_not_active_safe": bool(current_not_active_safe),
+                "semantic_obstacle_term_count": int(semantic_counts["obstacle_term_count"]),
+                "semantic_passage_term_count": int(semantic_counts["passage_term_count"]),
+                "nearest_semantic_obstacle_term": semantic_counts["nearest_obstacle_term"],
+                "nearest_semantic_obstacle_distance_m": semantic_counts[
+                    "nearest_obstacle_distance_m"
+                ],
+                "nearest_semantic_passage_term": semantic_counts["nearest_passage_term"],
+                "nearest_semantic_passage_distance_m": semantic_counts[
+                    "nearest_passage_distance_m"
+                ],
+                "local_trap": bool(local_trap),
+                "recovery_trigger": bool(recovery_trigger),
+                "trigger_reasons": trigger_reasons,
+                "recovery_context_tags": recovery_context_tags,
+            }
+        )
+        return result
+
+    def _semantic_resilience_open_score(self, cell: Iterable[int], *, radius_cells: int = 6) -> float:
+        try:
+            row0, col0 = [int(v) for v in list(cell)[:2]]
+        except (TypeError, ValueError):
+            return 0.0
+        radius = max(1, int(radius_cells))
+        free_count = 0
+        occupied_count = 0
+        checked = 0
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if dr * dr + dc * dc > radius * radius:
+                    continue
+                row = row0 + dr
+                col = col0 + dc
+                if row < 0 or row >= self.gs or col < 0 or col >= self.gs:
+                    continue
+                checked += 1
+                state = self._cell_state(row, col)
+                if state == "free":
+                    free_count += 1
+                elif state == "occupied":
+                    occupied_count += 1
+        if checked <= 0:
+            return 0.0
+        free_ratio = float(free_count / checked)
+        occupied_ratio = float(occupied_count / checked)
+        return max(0.0, min(1.0, free_ratio * (1.0 - occupied_ratio)))
+
+    def _semantic_resilience_backtrack_candidates(
+        self,
+        start_grid: Iterable[int],
+        yaw: float,
+        *,
+        current_angle: Any,
+        current_goal_grid: Any,
+        semantic_nodes: List[Dict[str, Any]],
+        goal_progress_state: Optional[Dict[str, Any]],
+        resilience_state: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not bool(self.config.semantic_resilience_shadow_enable):
+            return []
+        if not bool((resilience_state or {}).get("recovery_trigger")):
+            return []
+        if len(self.pose_trace) < 2:
+            return []
+        min_distance = max(0.0, float(self.config.semantic_resilience_min_backtrack_distance_m))
+        max_distance = max(min_distance, float(self.config.semantic_resilience_max_backtrack_distance_m))
+        min_step_gap = max(0, int(self.config.semantic_resilience_backtrack_min_step_gap))
+        source_score = float(self.config.semantic_resilience_candidate_source_score)
+        weight = float(self.config.semantic_resilience_backtrack_score_weight)
+        start_xy = self._grid_to_xy(start_grid)
+        latest_pose = self.pose_trace[-1]
+        latest_step = self._safe_int(latest_pose.get("step_id"))
+
+        sources: List[Tuple[str, Dict[str, Any]]] = []
+        for node in reversed(self.keyframes):
+            sources.append(("keyframe", node))
+        for node in reversed(self.pose_trace[:-1]):
+            sources.append(("pose_trace", node))
+
+        candidates: List[Dict[str, Any]] = []
+        seen_cells = set()
+        for source_type, node in sources:
+            row = self._safe_int(node.get("row"))
+            col = self._safe_int(node.get("col"))
+            if row is None or col is None:
+                continue
+            cell = (int(row), int(col))
+            if cell in seen_cells:
+                continue
+            seen_cells.add(cell)
+            if self._cell_state(row, col) == "occupied":
+                continue
+            xy = self._grid_to_xy([row, col])
+            distance = float(np.linalg.norm(xy - start_xy))
+            if distance < min_distance or distance > max_distance:
+                continue
+            step = self._safe_int(node.get("step_id"))
+            step_gap = None
+            if latest_step is not None and step is not None:
+                step_gap = int(latest_step - step)
+                if step_gap < min_step_gap:
+                    continue
+
+            semantic = self._semantic_evidence_for_cell(
+                [row, col],
+                start_grid,
+                yaw,
+                semantic_nodes,
+            )
+            candidate = self._build_query_candidate(
+                [row, col],
+                "resilience_backtrack",
+                start_grid,
+                yaw,
+                current_angle=current_angle,
+                current_goal_grid=current_goal_grid,
+                source_score=source_score,
+                semantic=semantic,
+                goal_progress_state=goal_progress_state,
+            )
+            if candidate is None:
+                continue
+            semantic_counts = self._semantic_resilience_semantic_counts(
+                [row, col],
+                semantic_nodes,
+                radius_m=max(1.0, float(self.config.candidate_probe_semantic_bind_radius_m)),
+            )
+            open_score = self._semantic_resilience_open_score([row, col])
+            distance_center = 0.5 * (min_distance + max_distance)
+            distance_score = 1.0 - min(
+                1.0,
+                abs(distance - distance_center) / max(1e-6, distance_center - min_distance),
+            )
+            trap_score = 1.0 if resilience_state.get("local_trap") else 0.0
+            dead_zone_score = 1.0 if (
+                resilience_state.get("current_policy_dead_zone")
+                or resilience_state.get("current_policy_stagnation")
+            ) else 0.0
+            passage_score = 1.0 if semantic_counts["passage_term_count"] > 0 else 0.0
+            obstacle_context_score = 1.0 if resilience_state.get("semantic_obstacle_term_count", 0) else 0.0
+            resilience_score = max(
+                0.0,
+                min(
+                    1.0,
+                    0.30 * trap_score
+                    + 0.25 * dead_zone_score
+                    + 0.20 * open_score
+                    + 0.10 * passage_score
+                    + 0.10 * obstacle_context_score
+                    + 0.05 * distance_score,
+                ),
+            )
+            candidate["score"] = float(candidate.get("score", 0.0) or 0.0) + weight * resilience_score
+            candidate.update(
+                {
+                    "semantic_resilience_candidate": True,
+                    "semantic_resilience_recommended": True,
+                    "semantic_resilience_reason": "backtrack_to_recent_safe_observation",
+                    "semantic_resilience_source": source_type,
+                    "semantic_resilience_source_step_id": step,
+                    "semantic_resilience_step_gap": step_gap,
+                    "semantic_resilience_backtrack_distance_m": float(distance),
+                    "semantic_resilience_open_score": float(open_score),
+                    "semantic_resilience_distance_score": float(distance_score),
+                    "semantic_resilience_score": float(resilience_score),
+                    "semantic_resilience_trigger_reasons": list(
+                        (resilience_state or {}).get("trigger_reasons") or []
+                    ),
+                    "semantic_resilience_recovery_context_tags": list(
+                        (resilience_state or {}).get("recovery_context_tags") or []
+                    ),
+                    "semantic_resilience_local_trap": bool(
+                        (resilience_state or {}).get("local_trap")
+                    ),
+                    "semantic_resilience_recovery_trigger": bool(
+                        (resilience_state or {}).get("recovery_trigger")
+                    ),
+                    "semantic_resilience_active_safe": bool(candidate.get("geometry_safe")),
+                    "semantic_resilience_obstacle_term_count": int(
+                        semantic_counts["obstacle_term_count"]
+                    ),
+                    "semantic_resilience_passage_term_count": int(
+                        semantic_counts["passage_term_count"]
+                    ),
+                    "semantic_resilience_nearest_obstacle_term": semantic_counts[
+                        "nearest_obstacle_term"
+                    ],
+                    "semantic_resilience_nearest_obstacle_distance_m": semantic_counts[
+                        "nearest_obstacle_distance_m"
+                    ],
+                    "semantic_resilience_nearest_passage_term": semantic_counts[
+                        "nearest_passage_term"
+                    ],
+                    "semantic_resilience_nearest_passage_distance_m": semantic_counts[
+                        "nearest_passage_distance_m"
+                    ],
+                }
+            )
+            candidates.append(candidate)
+
+        candidates.sort(
+            key=lambda item: (
+                bool(item.get("geometry_safe")),
+                float(item.get("semantic_resilience_score", 0.0) or 0.0),
+                float(item.get("semantic_resilience_open_score", 0.0) or 0.0),
+                float(item.get("score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        return candidates[:1]
 
     def bfs_to_semantic_frontier(
         self,
@@ -2332,6 +2895,27 @@ class SparseOccSemanticMemory:
             if too_close:
                 continue
             selected.append(candidate)
+        if bool(self.config.semantic_resilience_shadow_enable):
+            resilience_candidates = [
+                item
+                for item in raw_candidates
+                if item.get("semantic_resilience_candidate")
+            ]
+            if resilience_candidates and not any(
+                item.get("semantic_resilience_candidate") for item in selected
+            ):
+                best_resilience = max(
+                    resilience_candidates,
+                    key=lambda item: (
+                        bool(item.get("geometry_safe")),
+                        float(item.get("semantic_resilience_score", 0.0) or 0.0),
+                        float(item.get("score", 0.0) or 0.0),
+                    ),
+                )
+                if len(selected) < max_candidates:
+                    selected.append(best_resilience)
+                elif selected:
+                    selected[-1] = best_resilience
         return selected
 
     def finish_episode(self, *, metrics: Optional[Dict[str, Any]] = None, steps: Optional[int] = None) -> Dict[str, Any]:
@@ -2431,6 +3015,18 @@ class SparseOccSemanticMemory:
         candidate_target_frontier_escape_sum = 0
         candidate_target_frontier_intent_safe_sum = 0
         candidate_target_frontier_doorway_like_sum = 0
+        semantic_resilience_enabled_event_count = 0
+        semantic_resilience_recovery_trigger_count = 0
+        semantic_resilience_local_trap_count = 0
+        semantic_resilience_raw_candidate_sum = 0
+        candidate_semantic_resilience_sum = 0
+        candidate_semantic_resilience_recommended_sum = 0
+        candidate_semantic_resilience_obstacle_sum = 0
+        candidate_semantic_resilience_passage_sum = 0
+        semantic_resilience_obstacle_event_count = 0
+        semantic_resilience_passage_event_count = 0
+        semantic_resilience_reason_counts: Dict[str, int] = defaultdict(int)
+        semantic_resilience_context_tag_counts: Dict[str, int] = defaultdict(int)
         current_policy_candidate_valid_count = 0
         current_policy_candidate_geometry_safe_count = 0
         current_policy_candidate_active_gate_safe_count = 0
@@ -2484,6 +3080,38 @@ class SparseOccSemanticMemory:
             candidate_target_frontier_doorway_like_sum += int(
                 event.get("candidate_target_frontier_doorway_like_count", 0) or 0
             )
+            if event.get("semantic_resilience_enabled"):
+                semantic_resilience_enabled_event_count += 1
+            if event.get("semantic_resilience_recovery_trigger"):
+                semantic_resilience_recovery_trigger_count += 1
+            if event.get("semantic_resilience_local_trap"):
+                semantic_resilience_local_trap_count += 1
+            semantic_resilience_raw_candidate_sum += int(
+                event.get("semantic_resilience_raw_candidate_count", 0) or 0
+            )
+            candidate_semantic_resilience_sum += int(
+                event.get("candidate_semantic_resilience_count", 0) or 0
+            )
+            candidate_semantic_resilience_recommended_sum += int(
+                event.get("candidate_semantic_resilience_recommended_count", 0) or 0
+            )
+            candidate_semantic_resilience_obstacle_sum += int(
+                event.get("candidate_semantic_resilience_obstacle_count", 0) or 0
+            )
+            candidate_semantic_resilience_passage_sum += int(
+                event.get("candidate_semantic_resilience_passage_count", 0) or 0
+            )
+            state = event.get("semantic_resilience_state") or {}
+            if int(state.get("semantic_obstacle_term_count", 0) or 0) > 0:
+                semantic_resilience_obstacle_event_count += 1
+            if int(state.get("semantic_passage_term_count", 0) or 0) > 0:
+                semantic_resilience_passage_event_count += 1
+            for reason in event.get("semantic_resilience_trigger_reasons") or []:
+                semantic_resilience_reason_counts[str(reason)] += 1
+            for tag in event.get("semantic_resilience_recovery_context_tags") or state.get(
+                "recovery_context_tags"
+            ) or []:
+                semantic_resilience_context_tag_counts[str(tag)] += 1
             current_candidate = event.get("current_policy_candidate") or {}
             if current_candidate.get("valid"):
                 current_policy_candidate_valid_count += 1
@@ -2635,6 +3263,62 @@ class SparseOccSemanticMemory:
             "candidate_probe_mean_target_frontier_doorway_like_count": (
                 float(candidate_target_frontier_doorway_like_sum / candidate_event_count)
                 if candidate_event_count else None
+            ),
+            "semantic_resilience_enabled_event_count": int(
+                semantic_resilience_enabled_event_count
+            ),
+            "semantic_resilience_recovery_trigger_count": int(
+                semantic_resilience_recovery_trigger_count
+            ),
+            "semantic_resilience_recovery_trigger_rate": (
+                float(semantic_resilience_recovery_trigger_count / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "semantic_resilience_local_trap_count": int(
+                semantic_resilience_local_trap_count
+            ),
+            "semantic_resilience_local_trap_rate": (
+                float(semantic_resilience_local_trap_count / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "semantic_resilience_raw_candidate_count": int(
+                semantic_resilience_raw_candidate_sum
+            ),
+            "semantic_resilience_candidate_count": int(
+                candidate_semantic_resilience_sum
+            ),
+            "semantic_resilience_candidate_rate": (
+                float(candidate_semantic_resilience_sum / candidate_count_sum)
+                if candidate_count_sum else None
+            ),
+            "semantic_resilience_recommended_candidate_count": int(
+                candidate_semantic_resilience_recommended_sum
+            ),
+            "semantic_resilience_obstacle_event_count": int(
+                semantic_resilience_obstacle_event_count
+            ),
+            "semantic_resilience_obstacle_event_rate": (
+                float(semantic_resilience_obstacle_event_count / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "semantic_resilience_passage_event_count": int(
+                semantic_resilience_passage_event_count
+            ),
+            "semantic_resilience_passage_event_rate": (
+                float(semantic_resilience_passage_event_count / candidate_event_count)
+                if candidate_event_count else None
+            ),
+            "semantic_resilience_candidate_obstacle_count": int(
+                candidate_semantic_resilience_obstacle_sum
+            ),
+            "semantic_resilience_candidate_passage_count": int(
+                candidate_semantic_resilience_passage_sum
+            ),
+            "semantic_resilience_trigger_reason_counts": dict(
+                semantic_resilience_reason_counts
+            ),
+            "semantic_resilience_context_tag_counts": dict(
+                semantic_resilience_context_tag_counts
             ),
             "candidate_probe_type_counts": dict(candidate_type_counts),
             "candidate_probe_direction_counts": dict(candidate_direction_counts),
@@ -3873,6 +4557,7 @@ class SparseOccSemanticMemory:
             "semantic_frontier": (255, 160, 80),
             "semantic_keyframe": (240, 105, 255),
             "open_floor": (90, 220, 225),
+            "resilience_backtrack": (115, 255, 125),
         }
         for candidate in candidates:
             candidate["bev_pixel"] = None
