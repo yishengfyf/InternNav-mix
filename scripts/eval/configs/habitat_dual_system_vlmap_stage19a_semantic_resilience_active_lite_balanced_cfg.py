@@ -44,7 +44,10 @@ vlmap_cfg["occ_memory_semantic_resilience_active_lite_cooldown_steps"] = int(
     os.environ.get("STAGE19_COOLDOWN_STEPS", "45")
 )
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_utility_threshold"] = float(
-    os.environ.get("STAGE19_UTILITY_THRESHOLD", "0.60")
+    os.environ.get("STAGE19_UTILITY_THRESHOLD", "0.58")
+)
+vlmap_cfg["occ_memory_semantic_resilience_active_lite_local_trap_utility_threshold"] = float(
+    os.environ.get("STAGE19_LOCAL_TRAP_UTILITY_THRESHOLD", "0.62")
 )
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_open_threshold"] = float(
     os.environ.get("STAGE19_OPEN_THRESHOLD", "0.65")

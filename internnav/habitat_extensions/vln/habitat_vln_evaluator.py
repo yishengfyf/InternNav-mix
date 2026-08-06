@@ -12,7 +12,7 @@ import random
 import re
 from collections import OrderedDict
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import habitat
@@ -3484,7 +3484,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "utility_threshold": float(
                 vlmap_safety_cfg.get(
                     "occ_memory_semantic_resilience_active_lite_utility_threshold",
-                    0.60,
+                    0.58,
+                )
+            ),
+            "local_trap_utility_threshold": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_local_trap_utility_threshold",
+                    0.62,
                 )
             ),
             "open_threshold": float(
@@ -3603,6 +3609,50 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             reverse=True,
         )
         return candidates[0]
+
+    def _semantic_resilience_active_lite_utility_threshold(
+        self,
+        cfg: dict,
+        *,
+        trigger_reasons: Optional[list] = None,
+        context_tags: Optional[list] = None,
+    ) -> Tuple[float, str]:
+        base_threshold = float(cfg.get("utility_threshold", 0.58))
+        reasons = {str(item) for item in list(trigger_reasons or [])}
+        tags = {str(item) for item in list(context_tags or [])}
+
+        # Stage19a relaxed smoke showed that pure local-trap / spatial
+        # constriction triggers can be false positives on otherwise successful
+        # S2 trajectories.  Keep those cases stricter, while allowing
+        # semantic-stagnation + policy-memory-conflict candidates to use the
+        # base recovery threshold.
+        local_trap_like = bool("local_trap" in reasons or "spatial_constriction" in tags)
+        stronger_failure_signal = bool(
+            reasons.intersection(
+                {
+                    "current_waypoint_occupied",
+                    "current_waypoint_not_active_safe",
+                    "current_points_to_revisited_region",
+                    "semantic_obstacle_near_trap",
+                }
+            )
+            or tags.intersection(
+                {
+                    "policy_memory_conflict",
+                    "revisit_loop_risk",
+                    "semantic_obstacle_context",
+                }
+            )
+        )
+        if local_trap_like and not stronger_failure_signal:
+            return (
+                max(
+                    base_threshold,
+                    float(cfg.get("local_trap_utility_threshold", 0.62)),
+                ),
+                "local_trap_strict",
+            )
+        return base_threshold, "default"
 
     def _semantic_resilience_active_lite_actions(self, candidate: dict, cfg: dict) -> list:
         actions = []
@@ -3746,7 +3796,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             open_score = float(candidate.get("semantic_resilience_open_score", 0.0) or 0.0)
             distance = float(candidate.get("semantic_resilience_backtrack_distance_m", -1.0) or -1.0)
             step_gap = candidate.get("semantic_resilience_step_gap")
-            if utility < float(cfg.get("utility_threshold", 0.60)):
+            utility_threshold, utility_threshold_context = (
+                self._semantic_resilience_active_lite_utility_threshold(
+                    cfg,
+                    trigger_reasons=trigger_reasons,
+                    context_tags=context_tags,
+                )
+            )
+            status["utility_threshold_used"] = float(utility_threshold)
+            status["utility_threshold_context"] = str(utility_threshold_context)
+            if utility < float(utility_threshold):
                 status["reason"] = "low_recovery_utility"
             elif open_score < float(cfg.get("open_threshold", 0.65)):
                 status["reason"] = "low_open_score"
