@@ -3654,6 +3654,134 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
         return base_threshold, "default"
 
+    def _semantic_resilience_failure_profile(
+        self,
+        candidate: Optional[dict],
+        *,
+        trigger_reasons: Optional[list] = None,
+        context_tags: Optional[list] = None,
+        current_problem: bool = False,
+    ) -> dict:
+        candidate = dict(candidate or {})
+        reasons = {str(item) for item in list(trigger_reasons or [])}
+        tags = {str(item) for item in list(context_tags or [])}
+
+        failure_type = "unknown"
+        recommended_primitive = "hold_s2"
+        failure_risk = "low"
+        rationale = []
+
+        revisit_signal = bool(
+            reasons.intersection({"current_points_to_revisited_region"})
+            or tags.intersection({"revisit_loop_risk"})
+            or bool(candidate.get("points_to_revisited_region"))
+        )
+        stuck_signal = bool(
+            reasons.intersection(
+                {
+                    "current_waypoint_occupied",
+                    "current_waypoint_not_active_safe",
+                    "semantic_obstacle_near_trap",
+                }
+            )
+            or tags.intersection({"semantic_obstacle_context"})
+            or str(candidate.get("goal_state") or "") == "occupied"
+            or float(candidate.get("semantic_resilience_obstacle_term_count", 0.0) or 0.0)
+            > float(candidate.get("semantic_resilience_passage_term_count", 0.0) or 0.0)
+        )
+        local_trap_signal = bool("local_trap" in reasons or "spatial_constriction" in tags)
+        stagnation_signal = bool(
+            reasons.intersection({"semantic_dead_zone", "semantic_stagnation"})
+            or tags.intersection({"semantic_uncertainty_or_stagnation"})
+        )
+        obstacle_context = bool(tags.intersection({"semantic_obstacle_context"}))
+
+        if revisit_signal:
+            failure_type = "semantic_drift_revisit"
+            recommended_primitive = "backtrack_reobserve"
+            failure_risk = "high"
+            rationale.append("revisit_signal")
+        elif stuck_signal or obstacle_context:
+            failure_type = "stuck_collision"
+            recommended_primitive = "reorient_reobserve"
+            failure_risk = "high"
+            rationale.append("stuck_or_obstacle")
+        elif local_trap_signal:
+            failure_type = "local_trap"
+            recommended_primitive = "reorient_reobserve"
+            failure_risk = "medium"
+            rationale.append("local_trap")
+        elif stagnation_signal:
+            failure_type = "semantic_stagnation"
+            recommended_primitive = "reobserve"
+            failure_risk = "medium"
+            rationale.append("semantic_stagnation")
+        elif current_problem:
+            failure_type = "policy_conflict"
+            recommended_primitive = "reobserve"
+            failure_risk = "medium"
+            rationale.append("current_problem")
+
+        if (
+            failure_type == "stuck_collision"
+            and bool(candidate.get("active_gate_safe"))
+            and float(candidate.get("semantic_resilience_open_score", 0.0) or 0.0) >= 0.80
+        ):
+            rationale.append("strong_open_safe")
+
+        return {
+            "failure_type": failure_type,
+            "recommended_primitive": recommended_primitive,
+            "failure_risk": failure_risk,
+            "failure_rationale": rationale,
+        }
+
+    def _summarize_stage19_episode_failure_type(
+        self,
+        metrics: dict,
+        *,
+        failure_type_counts: Optional[dict] = None,
+        step_id: Optional[int] = None,
+        collision_count: Optional[float] = None,
+    ) -> tuple:
+        failure_type_counts = dict(failure_type_counts or {})
+        if bool(metrics.get("success")):
+            return "success", "none"
+
+        distance = float(metrics.get("distance_to_goal", float("inf")) or float("inf"))
+        oracle_success = bool(metrics.get("oracle_success"))
+        if oracle_success and distance <= 1.5:
+            return "near_goal_no_stop", "stop_advisor"
+
+        if failure_type_counts:
+            priority = {
+                "stuck_collision": 4,
+                "semantic_drift_revisit": 3,
+                "local_trap": 2,
+                "semantic_stagnation": 1,
+                "policy_conflict": 0,
+                "unknown": -1,
+            }
+            dominant_type = max(
+                failure_type_counts.items(),
+                key=lambda item: (int(item[1]), priority.get(str(item[0]), -1)),
+            )[0]
+            primitive_map = {
+                "stuck_collision": "reorient_reobserve",
+                "semantic_drift_revisit": "backtrack_reobserve",
+                "local_trap": "reorient_reobserve",
+                "semantic_stagnation": "reobserve",
+                "policy_conflict": "reobserve",
+                "unknown": "hold_s2",
+            }
+            return str(dominant_type), primitive_map.get(str(dominant_type), "hold_s2")
+
+        if collision_count is not None and float(collision_count) >= 25.0:
+            return "stuck_collision", "reorient_reobserve"
+        if step_id is not None and int(step_id) >= 500:
+            return "semantic_stagnation", "reobserve"
+        return "unknown", "hold_s2"
+
     def _semantic_resilience_active_lite_actions(self, candidate: dict, cfg: dict) -> list:
         actions = []
         angle = candidate.get("direction_angle_deg")
@@ -3761,6 +3889,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "recovery_context_tags": context_tags,
             "candidate": candidate,
         }
+        status.update(
+            self._semantic_resilience_failure_profile(
+                candidate,
+                trigger_reasons=trigger_reasons,
+                context_tags=context_tags,
+                current_problem=current_problem,
+            )
+        )
         if not cfg.get("enable"):
             status["reason"] = "disabled"
             return status
@@ -4855,6 +4991,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             stage19_semantic_resilience_active_last_step = None
             stage19_semantic_resilience_active_action_sum = 0
             stage19_semantic_resilience_active_reason_counts = {}
+            stage19_semantic_resilience_failure_type_counts = {}
+            stage19_semantic_resilience_recommended_primitive_counts = {}
 
             done = False
             flag = False
@@ -6258,6 +6396,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 int(stage19_semantic_resilience_active_reason_counts.get(reason, 0))
                                 + 1
                             )
+                            failure_type = str(stage19_active_status.get("failure_type") or "unknown")
+                            stage19_semantic_resilience_failure_type_counts[failure_type] = (
+                                int(stage19_semantic_resilience_failure_type_counts.get(failure_type, 0))
+                                + 1
+                            )
+                            recommended_primitive = str(
+                                stage19_active_status.get("recommended_primitive") or "hold_s2"
+                            )
+                            stage19_semantic_resilience_recommended_primitive_counts[
+                                recommended_primitive
+                            ] = (
+                                int(
+                                    stage19_semantic_resilience_recommended_primitive_counts.get(
+                                        recommended_primitive, 0
+                                    )
+                                )
+                                + 1
+                            )
                             if stage19_active_status.get("applied"):
                                 stage19_semantic_resilience_active_applied_count += 1
                                 stage19_semantic_resilience_active_last_step = int(step_id)
@@ -7095,6 +7251,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["stage19_semantic_resilience_active_reason_counts"] = dict(
                     stage19_semantic_resilience_active_reason_counts
+                )
+                result["stage19_semantic_resilience_failure_type_counts"] = dict(
+                    stage19_semantic_resilience_failure_type_counts
+                )
+                result["stage19_semantic_resilience_recommended_primitive_counts"] = dict(
+                    stage19_semantic_resilience_recommended_primitive_counts
+                )
+                episode_failure_type, episode_recommended_primitive = (
+                    self._summarize_stage19_episode_failure_type(
+                        metrics,
+                        failure_type_counts=stage19_semantic_resilience_failure_type_counts,
+                        step_id=step_id,
+                        collision_count=metrics.get("collision_count"),
+                    )
+                )
+                result["stage19_semantic_resilience_episode_failure_type"] = episode_failure_type
+                result["stage19_semantic_resilience_episode_recommended_primitive"] = (
+                    episode_recommended_primitive
                 )
             if self._get_failure_prediction_cfg().get("enable"):
                 result["failure_prediction_event_count"] = failure_prediction_summary.get("event_count")
