@@ -180,7 +180,13 @@ def _candidate_summary(candidate: Mapping[str, Any]) -> Dict[str, Any]:
             "semantic_resilience_backtrack_distance_m"
         ),
         "semantic_resilience_source": candidate.get("semantic_resilience_source"),
+        "semantic_resilience_source_step_id": candidate.get(
+            "semantic_resilience_source_step_id"
+        ),
         "semantic_resilience_step_gap": candidate.get("semantic_resilience_step_gap"),
+        "semantic_resilience_recovery_context_tags": candidate.get(
+            "semantic_resilience_recovery_context_tags"
+        ),
         "semantic_resilience_obstacle_term_count": candidate.get(
             "semantic_resilience_obstacle_term_count"
         ),
@@ -400,6 +406,8 @@ def analyze(
                 "geometry_safe": bool(current.get("geometry_safe")),
                 "active_gate_safe": bool(current.get("active_gate_safe")),
                 "goal_state": current.get("goal_state"),
+                "grid": current.get("grid") or event.get("current_waypoint_goal_grid"),
+                "xy": current.get("xy"),
                 "frontier_distance_m": current.get("frontier_distance_m"),
                 "distance_m": current.get("distance_m"),
                 "semantic_dead_zone": bool(state.get("current_policy_dead_zone")),
@@ -442,8 +450,14 @@ def analyze(
                 "episode_id": event.get("episode_id"),
                 "step_id": event.get("step_id"),
                 "event_key": _event_key(event),
+                "instruction": event.get("instruction"),
+                "start_grid": event.get("start_grid"),
+                "start_yaw": event.get("start_yaw"),
                 "trigger": trigger,
                 "trigger_reasons": event.get("semantic_resilience_trigger_reasons") or [],
+                "recovery_context_tags": event.get("semantic_resilience_recovery_context_tags")
+                or state.get("recovery_context_tags")
+                or [],
                 "success": success,
                 "spl": spl,
                 "ne": ne,

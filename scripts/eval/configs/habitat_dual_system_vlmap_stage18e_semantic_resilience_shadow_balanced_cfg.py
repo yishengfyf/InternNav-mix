@@ -68,6 +68,34 @@ vlmap_cfg["occ_memory_candidate_probe_max_candidates"] = int(
     os.environ.get("STAGE18E_MAX_CANDIDATES", "5")
 )
 
+# Optional visualization snapshots for a small presentation/debug run.  These
+# are off by default because balanced500 already takes hours; enable them only
+# for a balanced40/typical-case run when we want RGB/depth/PLY artifacts.
+visual_validation = os.environ.get("STAGE18_VIS_VALIDATION", "0") == "1"
+vlmap_cfg["occ_memory_validation_enable"] = visual_validation
+vlmap_cfg["occ_memory_validation_every_updates"] = int(
+    os.environ.get("STAGE18_VIS_VALIDATION_EVERY", "20")
+)
+vlmap_cfg["occ_memory_validation_max_snapshots"] = int(
+    os.environ.get("STAGE18_VIS_VALIDATION_MAX", "3")
+)
+vlmap_cfg["occ_memory_validation_save_rgb_depth"] = visual_validation
+vlmap_cfg["occ_memory_validation_save_current_rgb_ply"] = visual_validation
+vlmap_cfg["occ_memory_validation_save_memory_ply"] = visual_validation
+vlmap_cfg["occ_memory_validation_save_final_memory_ply"] = visual_validation
+vlmap_cfg["occ_memory_validation_max_current_points"] = int(
+    os.environ.get("STAGE18_VIS_MAX_CURRENT_POINTS", "60000")
+)
+vlmap_cfg["occ_memory_validation_max_memory_points"] = int(
+    os.environ.get("STAGE18_VIS_MAX_MEMORY_POINTS", "80000")
+)
+vlmap_cfg["occ_memory_validation_max_occupied_points"] = int(
+    os.environ.get("STAGE18_VIS_MAX_OCCUPIED_POINTS", "50000")
+)
+vlmap_cfg["occ_memory_validation_max_free_points"] = int(
+    os.environ.get("STAGE18_VIS_MAX_FREE_POINTS", "30000")
+)
+
 # Stage18e does not need S2 to answer the candidate-selection prompt; disabling
 # it keeps the run closer to pure logging and avoids extra LLM call latency.
 vlmap_cfg["occ_memory_candidate_selection_enable"] = False
