@@ -3442,6 +3442,345 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._write_occ_memory_recovery_event(status)
         return status
 
+    def _get_semantic_resilience_active_lite_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "enable": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_enable",
+                    False,
+                )
+            ),
+            "shadow_only": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_shadow_only",
+                    True,
+                )
+            ),
+            "min_step": max(
+                0,
+                int(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_min_step",
+                        30,
+                    )
+                ),
+            ),
+            "max_interventions_per_episode": int(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_max_interventions_per_episode",
+                    1,
+                )
+            ),
+            "cooldown_steps": max(
+                0,
+                int(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_cooldown_steps",
+                        45,
+                    )
+                ),
+            ),
+            "utility_threshold": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_utility_threshold",
+                    0.60,
+                )
+            ),
+            "open_threshold": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_open_threshold",
+                    0.65,
+                )
+            ),
+            "min_backtrack_m": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_min_backtrack_m",
+                    1.0,
+                )
+            ),
+            "max_backtrack_m": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_max_backtrack_m",
+                    3.5,
+                )
+            ),
+            "max_step_gap": int(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_max_step_gap",
+                    45,
+                )
+            ),
+            "require_current_problem": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_require_current_problem",
+                    True,
+                )
+            ),
+            "require_geometry_safe": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_require_geometry_safe",
+                    True,
+                )
+            ),
+            "max_turn_steps": max(
+                0,
+                int(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_max_turn_steps",
+                        4,
+                    )
+                ),
+            ),
+            "forward_steps": max(
+                0,
+                int(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_forward_steps",
+                        0,
+                    )
+                ),
+            ),
+            "allow_forward_to_backtrack": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_allow_forward_to_backtrack",
+                    False,
+                )
+            ),
+            "forward_open_threshold": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_forward_open_threshold",
+                    0.80,
+                )
+            ),
+            "append_reobserve_action": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_append_reobserve_action",
+                    True,
+                )
+            ),
+            "clear_goal": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_clear_goal",
+                    True,
+                )
+            ),
+            "log_all_considered": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_log_all_considered",
+                    True,
+                )
+            ),
+        }
+
+    def _write_semantic_resilience_active_lite_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "stage19_semantic_resilience_active_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _best_semantic_resilience_backtrack_candidate(self, candidate_event: Optional[dict]) -> Optional[dict]:
+        candidates = []
+        for item in list((candidate_event or {}).get("candidates") or []):
+            if str(item.get("candidate_type") or "") != "resilience_backtrack":
+                continue
+            if not bool(item.get("semantic_resilience_candidate")):
+                continue
+            candidates.append(dict(item))
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda item: (
+                bool(item.get("geometry_safe")),
+                float(item.get("semantic_resilience_score", 0.0) or 0.0),
+                float(item.get("semantic_resilience_open_score", 0.0) or 0.0),
+                float(item.get("score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        return candidates[0]
+
+    def _semantic_resilience_active_lite_actions(self, candidate: dict, cfg: dict) -> list:
+        actions = []
+        angle = candidate.get("direction_angle_deg")
+        if angle is None:
+            bucket = str(candidate.get("direction_bucket") or "unknown")
+            angle = {
+                "front": 0.0,
+                "left": 90.0,
+                "right": -90.0,
+                "back": 180.0,
+            }.get(bucket, 0.0)
+        try:
+            angle = float(angle)
+        except (TypeError, ValueError):
+            angle = 0.0
+        while angle > 180.0:
+            angle -= 360.0
+        while angle <= -180.0:
+            angle += 360.0
+
+        turn_angle = max(
+            1e-6,
+            abs(float(getattr(self.config.habitat.simulator, "turn_angle", 15.0))),
+        )
+        max_turn_steps = max(0, int(cfg.get("max_turn_steps", 4)))
+        turn_steps = min(max_turn_steps, int(math.ceil(abs(angle) / turn_angle)))
+        if turn_steps > 0:
+            turn_action = action_code.LEFT if angle > 0.0 else action_code.RIGHT
+            actions.extend([int(turn_action)] * int(turn_steps))
+
+        forward_steps = int(cfg.get("forward_steps", 0) or 0)
+        open_score = float(candidate.get("semantic_resilience_open_score", 0.0) or 0.0)
+        can_forward = bool(
+            forward_steps > 0
+            and bool(candidate.get("geometry_safe"))
+            and open_score >= float(cfg.get("forward_open_threshold", 0.80))
+            and (
+                bool(candidate.get("active_gate_safe"))
+                or bool(cfg.get("allow_forward_to_backtrack", False))
+            )
+        )
+        if can_forward:
+            actions.extend([int(action_code.FORWARD)] * int(forward_steps))
+
+        if bool(cfg.get("append_reobserve_action", True)):
+            actions.append(int(action_code.LOOKDOWN))
+
+        return [int(item) for item in actions if int(item) in (1, 2, 3, 5)]
+
+    def _maybe_apply_semantic_resilience_active_lite(
+        self,
+        candidate_event: Optional[dict],
+        *,
+        step_id: int,
+        active_count: int,
+        last_active_step: Optional[int],
+    ) -> dict:
+        cfg = self._get_semantic_resilience_active_lite_cfg()
+        state = dict((candidate_event or {}).get("semantic_resilience_state") or {})
+        trigger_reasons = list(
+            (candidate_event or {}).get("semantic_resilience_trigger_reasons")
+            or state.get("trigger_reasons")
+            or []
+        )
+        context_tags = list(
+            (candidate_event or {}).get("semantic_resilience_recovery_context_tags")
+            or state.get("recovery_context_tags")
+            or []
+        )
+        recovery_trigger = bool(
+            (candidate_event or {}).get("semantic_resilience_recovery_trigger")
+            or state.get("recovery_trigger")
+        )
+        current_problem = bool(
+            state.get("current_policy_problem")
+            or any(
+                reason
+                in {
+                    "current_waypoint_occupied",
+                    "current_waypoint_not_active_safe",
+                    "semantic_dead_zone",
+                    "semantic_stagnation",
+                    "current_points_to_revisited_region",
+                    "local_trap",
+                    "semantic_obstacle_near_trap",
+                }
+                for reason in trigger_reasons
+            )
+        )
+        candidate = self._best_semantic_resilience_backtrack_candidate(candidate_event)
+        status = {
+            "event_type": "stage19_semantic_resilience_active",
+            "step_id": int(step_id),
+            "enabled": bool(cfg.get("enable")),
+            "shadow_only": bool(cfg.get("shadow_only")),
+            "considered": False,
+            "applied": False,
+            "reason": None,
+            "actions": [],
+            "active_intervention_index": int(active_count + 1),
+            "active_intervention_budget": int(cfg.get("max_interventions_per_episode", 1)),
+            "recovery_trigger": bool(recovery_trigger),
+            "current_problem": bool(current_problem),
+            "trigger_reasons": trigger_reasons,
+            "recovery_context_tags": context_tags,
+            "candidate": candidate,
+        }
+        if not cfg.get("enable"):
+            status["reason"] = "disabled"
+            return status
+        if not candidate_event:
+            status["reason"] = "missing_candidate_event"
+            return status
+        status["considered"] = bool(recovery_trigger or candidate is not None)
+        if not status["considered"]:
+            status["reason"] = "no_recovery_trigger"
+            return status
+        if cfg.get("shadow_only"):
+            status["reason"] = "shadow_only"
+            self._write_semantic_resilience_active_lite_event(status)
+            return status
+        if int(step_id) < int(cfg.get("min_step", 30)):
+            status["reason"] = "too_early"
+        elif candidate is None:
+            status["reason"] = "missing_backtrack_candidate"
+        elif int(cfg.get("max_interventions_per_episode", 1)) >= 0 and active_count >= int(
+            cfg.get("max_interventions_per_episode", 1)
+        ):
+            status["reason"] = "budget_exhausted"
+        elif last_active_step is not None and int(step_id) - int(last_active_step) < int(
+            cfg.get("cooldown_steps", 45)
+        ):
+            status["reason"] = "cooldown"
+        elif bool(cfg.get("require_current_problem", True)) and not current_problem:
+            status["reason"] = "current_policy_not_problematic"
+        elif bool(cfg.get("require_geometry_safe", True)) and not bool(candidate.get("geometry_safe")):
+            status["reason"] = "candidate_not_geometry_safe"
+        else:
+            utility = float(candidate.get("semantic_resilience_score", 0.0) or 0.0)
+            open_score = float(candidate.get("semantic_resilience_open_score", 0.0) or 0.0)
+            distance = float(candidate.get("semantic_resilience_backtrack_distance_m", -1.0) or -1.0)
+            step_gap = candidate.get("semantic_resilience_step_gap")
+            if utility < float(cfg.get("utility_threshold", 0.60)):
+                status["reason"] = "low_recovery_utility"
+            elif open_score < float(cfg.get("open_threshold", 0.65)):
+                status["reason"] = "low_open_score"
+            elif distance < float(cfg.get("min_backtrack_m", 1.0)) or distance > float(
+                cfg.get("max_backtrack_m", 3.5)
+            ):
+                status["reason"] = "backtrack_distance_out_of_range"
+            elif step_gap is not None and int(step_gap) > int(cfg.get("max_step_gap", 45)):
+                status["reason"] = "backtrack_step_gap_too_large"
+            else:
+                actions = self._semantic_resilience_active_lite_actions(candidate, cfg)
+                if not actions:
+                    status["reason"] = "empty_recovery_actions"
+                else:
+                    status.update(
+                        {
+                            "applied": True,
+                            "reason": "applied",
+                            "actions": actions,
+                            "action_plan": {
+                                "mode": "reorient_reobserve",
+                                "clear_goal": bool(cfg.get("clear_goal", True)),
+                                "forward_steps": int(cfg.get("forward_steps", 0) or 0),
+                                "append_reobserve_action": bool(
+                                    cfg.get("append_reobserve_action", True)
+                                ),
+                            },
+                        }
+                    )
+
+        if bool(cfg.get("log_all_considered", True)) or status.get("applied"):
+            self._write_semantic_resilience_active_lite_event(status)
+        return status
+
     def _normalize_candidate_actions(self, actions, horizon: Optional[int] = None) -> list:
         normalized = [int(item) for item in list(actions or [])]
         if len(normalized) < MAX_STEPS:
@@ -4450,6 +4789,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             occ_memory_recovery_state = self._init_occ_memory_recovery_state()
             occ_memory_recovery_active_count = 0
             failure_prediction_state = self._init_failure_prediction_state()
+            stage19_semantic_resilience_active_considered_count = 0
+            stage19_semantic_resilience_active_applied_count = 0
+            stage19_semantic_resilience_active_suppressed_count = 0
+            stage19_semantic_resilience_active_first_step = None
+            stage19_semantic_resilience_active_last_step = None
+            stage19_semantic_resilience_active_action_sum = 0
+            stage19_semantic_resilience_active_reason_counts = {}
 
             done = False
             flag = False
@@ -5687,6 +6033,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 f"shift={som_event.get('pixel_shift')}"
                             )
                         candidate_probe_cfg = self._get_occ_memory_candidate_probe_cfg()
+                        stage19_candidate_event = None
                         if candidate_probe_cfg.get("enable"):
                             candidate_context = {
                                 "step_id": step_id,
@@ -5709,6 +6056,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 current_waypoint_decision=occ_waypoint_decision,
                                 context=candidate_context,
                             )
+                            stage19_candidate_event = candidate_event
                             if candidate_event.get("reason") == "max_events_per_episode":
                                 occ_memory_candidate_probe_skipped_count += 1
                             elif candidate_event.get("enabled"):
@@ -5838,6 +6186,60 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         _, _, lookup_done, _ = self.env.step(action_code.LOOKUP)
                         observations, _, lookup_done_2, _ = self.env.step(action_code.LOOKUP)
                         done = done or lookup_done or lookup_done_2
+                        stage19_active_status = self._maybe_apply_semantic_resilience_active_lite(
+                            stage19_candidate_event,
+                            step_id=step_id,
+                            active_count=stage19_semantic_resilience_active_applied_count,
+                            last_active_step=stage19_semantic_resilience_active_last_step,
+                        )
+                        if stage19_active_status.get("considered"):
+                            stage19_semantic_resilience_active_considered_count += 1
+                            reason = str(stage19_active_status.get("reason") or "unknown")
+                            stage19_semantic_resilience_active_reason_counts[reason] = (
+                                int(stage19_semantic_resilience_active_reason_counts.get(reason, 0))
+                                + 1
+                            )
+                            if stage19_active_status.get("applied"):
+                                stage19_semantic_resilience_active_applied_count += 1
+                                stage19_semantic_resilience_active_last_step = int(step_id)
+                                if stage19_semantic_resilience_active_first_step is None:
+                                    stage19_semantic_resilience_active_first_step = int(step_id)
+                                recovery_actions = [
+                                    int(item)
+                                    for item in list(stage19_active_status.get("actions") or [])
+                                    if int(item) in (1, 2, 3, 5)
+                                ]
+                                stage19_semantic_resilience_active_action_sum += int(
+                                    len(recovery_actions)
+                                )
+                                vlmap_recovery_actions = recovery_actions
+                                if self._get_semantic_resilience_active_lite_cfg().get("clear_goal"):
+                                    pixel_goal = None
+                                    output_ids = None
+                                    traj_latents = None
+                                    pix_goal_image = None
+                                    pix_goal_depth = None
+                                    messages = []
+                                    input_images = []
+                                    llm_outputs = ""
+                                    local_actions = []
+                                    action_seq = []
+                                    pending_vlmap_waypoint_feedback = ""
+                                    pending_vlmap_semantic_hint = ""
+                                    pending_occ_memory_guidance_hint = ""
+                                    action = None
+                                    forward_action = 0
+                                    draw_pixel_goal = False
+                                    flag = False
+                                print(
+                                    "[Stage19][SemanticResilience][ActiveLite] "
+                                    f"queue recovery actions {vlmap_recovery_actions} "
+                                    f"reason={stage19_active_status.get('reason')} "
+                                    f"candidate={((stage19_active_status.get('candidate') or {}).get('candidate_id'))}"
+                                )
+                                continue
+                            else:
+                                stage19_semantic_resilience_active_suppressed_count += 1
                         if semantic_decision.get("stagnation_hint_required"):
                             if not pending_vlmap_semantic_hint:
                                 pending_vlmap_semantic_hint = (
@@ -6607,6 +7009,33 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 result["occ_memory_recovery_active_reason_counts"] = (
                     occ_memory_recovery_summary.get("active_reason_counts")
+                )
+            if self._get_semantic_resilience_active_lite_cfg().get("enable"):
+                result["stage19_semantic_resilience_active_enabled"] = True
+                result["stage19_semantic_resilience_active_shadow_only"] = bool(
+                    self._get_semantic_resilience_active_lite_cfg().get("shadow_only")
+                )
+                result["stage19_semantic_resilience_active_considered_count"] = int(
+                    stage19_semantic_resilience_active_considered_count
+                )
+                result["stage19_semantic_resilience_active_applied_count"] = int(
+                    stage19_semantic_resilience_active_applied_count
+                )
+                result["stage19_semantic_resilience_active_suppressed_count"] = int(
+                    stage19_semantic_resilience_active_suppressed_count
+                )
+                result["stage19_semantic_resilience_active_first_step"] = (
+                    stage19_semantic_resilience_active_first_step
+                )
+                result["stage19_semantic_resilience_active_last_step"] = (
+                    stage19_semantic_resilience_active_last_step
+                )
+                result["stage19_semantic_resilience_active_mean_action_count"] = (
+                    float(stage19_semantic_resilience_active_action_sum)
+                    / max(1, int(stage19_semantic_resilience_active_applied_count))
+                )
+                result["stage19_semantic_resilience_active_reason_counts"] = dict(
+                    stage19_semantic_resilience_active_reason_counts
                 )
             if self._get_failure_prediction_cfg().get("enable"):
                 result["failure_prediction_event_count"] = failure_prediction_summary.get("event_count")
