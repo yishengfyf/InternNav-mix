@@ -39,10 +39,12 @@ if [[ -z "${STAGE17_EPISODE_IDS:-}" ]]; then
   exit 1
 fi
 
-if [[ -z "${STAGE17_BALANCED_RUN_NAME:-}" ]]; then
-  echo "STAGE17_BALANCED_RUN_NAME must be set." >&2
+BALANCED_RUN_NAME="${STAGE17_BALANCED_RUN_NAME:-${STAGE20_BALANCED_RUN_NAME:-}}"
+if [[ -z "${BALANCED_RUN_NAME}" ]]; then
+  echo "STAGE17_BALANCED_RUN_NAME or STAGE20_BALANCED_RUN_NAME must be set." >&2
   exit 1
 fi
+export STAGE17_BALANCED_RUN_NAME="${BALANCED_RUN_NAME}"
 
 torchrun \
   --standalone \

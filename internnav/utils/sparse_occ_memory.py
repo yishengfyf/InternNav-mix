@@ -370,8 +370,16 @@ class SparseOccMemoryConfig:
     semantic_anchor_include_threshold_hits: bool = True
     semantic_anchor_include_pixel_goal: bool = True
     semantic_anchor_include_view_center: bool = True
+    semantic_anchor_include_view_left: bool = False
+    semantic_anchor_include_view_right: bool = False
+    semantic_anchor_include_view_upper: bool = False
+    semantic_anchor_include_view_lower: bool = False
     semantic_anchor_view_center_x: float = 0.50
     semantic_anchor_view_center_y: float = 0.56
+    semantic_anchor_view_left_x: float = 0.32
+    semantic_anchor_view_right_x: float = 0.68
+    semantic_anchor_view_upper_y: float = 0.36
+    semantic_anchor_view_lower_y: float = 0.74
     semantic_anchor_merge_radius_cells: int = 6
     semantic_anchor_local_radius_cells: int = 6
     semantic_anchor_max_anchors_per_episode: int = 256
@@ -846,6 +854,50 @@ class SparseOccSemanticMemory:
             sources.append(
                 {
                     "source": "view_center",
+                    "pixel": [float(px), float(py)],
+                    "image_width": int(image_w),
+                    "image_height": int(image_h),
+                }
+            )
+        if bool(self.config.semantic_anchor_include_view_left):
+            px = float(image_w) * float(self.config.semantic_anchor_view_left_x)
+            py = float(image_h) * float(self.config.semantic_anchor_view_center_y)
+            sources.append(
+                {
+                    "source": "view_left",
+                    "pixel": [float(px), float(py)],
+                    "image_width": int(image_w),
+                    "image_height": int(image_h),
+                }
+            )
+        if bool(self.config.semantic_anchor_include_view_right):
+            px = float(image_w) * float(self.config.semantic_anchor_view_right_x)
+            py = float(image_h) * float(self.config.semantic_anchor_view_center_y)
+            sources.append(
+                {
+                    "source": "view_right",
+                    "pixel": [float(px), float(py)],
+                    "image_width": int(image_w),
+                    "image_height": int(image_h),
+                }
+            )
+        if bool(self.config.semantic_anchor_include_view_upper):
+            px = float(image_w) * float(self.config.semantic_anchor_view_center_x)
+            py = float(image_h) * float(self.config.semantic_anchor_view_upper_y)
+            sources.append(
+                {
+                    "source": "view_upper",
+                    "pixel": [float(px), float(py)],
+                    "image_width": int(image_w),
+                    "image_height": int(image_h),
+                }
+            )
+        if bool(self.config.semantic_anchor_include_view_lower):
+            px = float(image_w) * float(self.config.semantic_anchor_view_center_x)
+            py = float(image_h) * float(self.config.semantic_anchor_view_lower_y)
+            sources.append(
+                {
+                    "source": "view_lower",
                     "pixel": [float(px), float(py)],
                     "image_width": int(image_w),
                     "image_height": int(image_h),
