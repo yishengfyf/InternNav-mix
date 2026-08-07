@@ -3674,59 +3674,69 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         revisit_signal = bool(
             reasons.intersection({"current_points_to_revisited_region"})
             or tags.intersection({"revisit_loop_risk"})
-            or bool(candidate.get("points_to_revisited_region"))
         )
-        stuck_signal = bool(
-            reasons.intersection(
-                {
-                    "current_waypoint_occupied",
-                    "current_waypoint_not_active_safe",
-                    "semantic_obstacle_near_trap",
-                }
-            )
-            or tags.intersection({"semantic_obstacle_context"})
+        hard_stuck_signal = bool(
+            reasons.intersection({"current_waypoint_occupied", "current_waypoint_not_active_safe"})
             or str(candidate.get("goal_state") or "") == "occupied"
-            or float(candidate.get("semantic_resilience_obstacle_term_count", 0.0) or 0.0)
-            > float(candidate.get("semantic_resilience_passage_term_count", 0.0) or 0.0)
+        )
+        obstacle_term_count = float(
+            candidate.get("semantic_resilience_obstacle_term_count", 0.0) or 0.0
+        )
+        passage_term_count = float(
+            candidate.get("semantic_resilience_passage_term_count", 0.0) or 0.0
+        )
+        semantic_obstacle_signal = bool(
+            "semantic_obstacle_near_trap" in reasons
+            or tags.intersection({"semantic_obstacle_context"})
+            or obstacle_term_count > max(1.0, passage_term_count)
         )
         local_trap_signal = bool("local_trap" in reasons or "spatial_constriction" in tags)
         stagnation_signal = bool(
             reasons.intersection({"semantic_dead_zone", "semantic_stagnation"})
             or tags.intersection({"semantic_uncertainty_or_stagnation"})
         )
-        obstacle_context = bool(tags.intersection({"semantic_obstacle_context"}))
 
-        if revisit_signal:
-            failure_type = "semantic_drift_revisit"
-            recommended_primitive = "backtrack_reobserve"
-            failure_risk = "high"
-            rationale.append("revisit_signal")
-        elif stuck_signal or obstacle_context:
+        strong_open_safe = bool(
+            bool(candidate.get("active_gate_safe"))
+            and float(candidate.get("semantic_resilience_open_score", 0.0) or 0.0) >= 0.80
+        )
+
+        if hard_stuck_signal or (local_trap_signal and semantic_obstacle_signal):
             failure_type = "stuck_collision"
-            recommended_primitive = "reorient_reobserve"
+            recommended_primitive = (
+                "one_safe_forward_reobserve" if strong_open_safe else "reorient_reobserve"
+            )
             failure_risk = "high"
-            rationale.append("stuck_or_obstacle")
+            rationale.append("hard_stuck_or_obstacle_trap")
         elif local_trap_signal:
             failure_type = "local_trap"
             recommended_primitive = "reorient_reobserve"
             failure_risk = "medium"
             rationale.append("local_trap")
+        elif revisit_signal:
+            failure_type = "semantic_drift_revisit"
+            recommended_primitive = "backtrack_reobserve"
+            failure_risk = "high"
+            rationale.append("revisit_signal")
         elif stagnation_signal:
             failure_type = "semantic_stagnation"
             recommended_primitive = "reobserve"
             failure_risk = "medium"
             rationale.append("semantic_stagnation")
+        elif semantic_obstacle_signal:
+            failure_type = "stuck_collision"
+            recommended_primitive = (
+                "one_safe_forward_reobserve" if strong_open_safe else "reorient_reobserve"
+            )
+            failure_risk = "high"
+            rationale.append("semantic_obstacle")
         elif current_problem:
             failure_type = "policy_conflict"
             recommended_primitive = "reobserve"
             failure_risk = "medium"
             rationale.append("current_problem")
 
-        if (
-            failure_type == "stuck_collision"
-            and bool(candidate.get("active_gate_safe"))
-            and float(candidate.get("semantic_resilience_open_score", 0.0) or 0.0) >= 0.80
-        ):
+        if failure_type == "stuck_collision" and strong_open_safe:
             rationale.append("strong_open_safe")
 
         return {
@@ -3741,10 +3751,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         metrics: dict,
         *,
         failure_type_counts: Optional[dict] = None,
+        recommended_primitive_counts: Optional[dict] = None,
         step_id: Optional[int] = None,
         collision_count: Optional[float] = None,
     ) -> tuple:
         failure_type_counts = dict(failure_type_counts or {})
+        recommended_primitive_counts = dict(recommended_primitive_counts or {})
         if bool(metrics.get("success")):
             return "success", "none"
 
@@ -3774,6 +3786,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "policy_conflict": "reobserve",
                 "unknown": "hold_s2",
             }
+            if recommended_primitive_counts:
+                dominant_primitive = max(
+                    recommended_primitive_counts.items(),
+                    key=lambda item: int(item[1]),
+                )[0]
+                return str(dominant_type), str(dominant_primitive)
             return str(dominant_type), primitive_map.get(str(dominant_type), "hold_s2")
 
         if collision_count is not None and float(collision_count) >= 25.0:
@@ -3838,6 +3856,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         step_id: int,
         active_count: int,
         last_active_step: Optional[int],
+        scene_id: Optional[str] = None,
+        episode_id: Optional[int] = None,
     ) -> dict:
         cfg = self._get_semantic_resilience_active_lite_cfg()
         state = dict((candidate_event or {}).get("semantic_resilience_state") or {})
@@ -3874,6 +3894,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         candidate = self._best_semantic_resilience_backtrack_candidate(candidate_event)
         status = {
             "event_type": "stage19_semantic_resilience_active",
+            "scene_id": scene_id,
+            "episode_id": episode_id,
             "step_id": int(step_id),
             "enabled": bool(cfg.get("enable")),
             "shadow_only": bool(cfg.get("shadow_only")),
@@ -6388,6 +6410,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             step_id=step_id,
                             active_count=stage19_semantic_resilience_active_applied_count,
                             last_active_step=stage19_semantic_resilience_active_last_step,
+                            scene_id=scene_id,
+                            episode_id=episode_id,
                         )
                         if stage19_active_status.get("considered"):
                             stage19_semantic_resilience_active_considered_count += 1
@@ -7262,6 +7286,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     self._summarize_stage19_episode_failure_type(
                         metrics,
                         failure_type_counts=stage19_semantic_resilience_failure_type_counts,
+                        recommended_primitive_counts=(
+                            stage19_semantic_resilience_recommended_primitive_counts
+                        ),
                         step_id=step_id,
                         collision_count=metrics.get("collision_count"),
                     )

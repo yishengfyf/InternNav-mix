@@ -59,22 +59,25 @@ def _episode_key(row: Mapping[str, Any]) -> str:
     return f"{row.get('scene_id')}|{row.get('episode_id')}"
 
 
-def _find_memory_event_files(paths: Sequence[Path]) -> List[Path]:
+def _has_episode_identity(row: Mapping[str, Any]) -> bool:
+    return row.get("scene_id") is not None and row.get("episode_id") is not None
+
+
+def _find_stage19_event_files(paths: Sequence[Path]) -> List[Path]:
     found = []
     seen = set()
     for path in paths:
         candidates = []
-        if path.is_file() and path.name == "memory_events.jsonl":
+        if path.is_file() and path.name == "stage19_semantic_resilience_active_events.jsonl":
             candidates.append(path)
         if path.is_dir():
             candidates.extend(
                 [
-                    path / "occ_memory" / "memory_events.jsonl",
-                    path / "memory_events.jsonl",
-                    path / "vlmap_safety_debug" / "run_001" / "occ_memory" / "memory_events.jsonl",
+                    path / "stage19_semantic_resilience_active_events.jsonl",
+                    path / "vlmap_safety_debug" / "run_001" / "stage19_semantic_resilience_active_events.jsonl",
                 ]
             )
-            candidates.extend(path.rglob("memory_events.jsonl"))
+            candidates.extend(path.rglob("stage19_semantic_resilience_active_events.jsonl"))
         for candidate in candidates:
             resolved = candidate.resolve()
             if resolved in seen or not candidate.exists():
@@ -148,7 +151,8 @@ def _summarize_events(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     ]
     return {
         "query_events": len(rows),
-        "episodes": len({_episode_key(row) for row in rows}),
+        "episodes": len({_episode_key(row) for row in rows if _has_episode_identity(row)}),
+        "events_with_episode_identity": sum(1 for row in rows if _has_episode_identity(row)),
         "considered_count": len(considered_rows),
         "considered_rate": _rate(len(considered_rows), len(rows)),
         "applied_count": len(applied_rows),
@@ -163,12 +167,84 @@ def _summarize_events(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _summarize_progress(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {"episodes": 0}
+
+    def _values(key: str) -> List[float]:
+        return [_safe_float(row.get(key)) for row in rows if row.get(key) is not None]
+
+    collision_values = _values("collision_count")
+    return {
+        "episodes": len(rows),
+        "success_mean": _mean_or_none(_values("success")),
+        "spl_mean": _mean_or_none(_values("spl")),
+        "ne_mean": _mean_or_none(_values("ne")),
+        "steps_mean": _mean_or_none(_values("steps")),
+        "collision_count_sum": float(sum(collision_values)) if collision_values else None,
+        "collision_count_mean": _mean_or_none(collision_values),
+    }
+
+
+def _candidate_brief(candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "candidate_id": candidate.get("candidate_id"),
+        "candidate_type": candidate.get("candidate_type"),
+        "goal_state": candidate.get("goal_state"),
+        "geometry_safe": candidate.get("geometry_safe"),
+        "active_gate_safe": candidate.get("active_gate_safe"),
+        "direction_bucket": candidate.get("direction_bucket"),
+        "semantic_resilience_score": candidate.get("semantic_resilience_score"),
+        "semantic_resilience_open_score": candidate.get("semantic_resilience_open_score"),
+        "semantic_resilience_backtrack_distance_m": candidate.get(
+            "semantic_resilience_backtrack_distance_m"
+        ),
+        "semantic_resilience_step_gap": candidate.get("semantic_resilience_step_gap"),
+        "semantic_resilience_source": candidate.get("semantic_resilience_source"),
+        "semantic_resilience_nearest_obstacle_term": candidate.get(
+            "semantic_resilience_nearest_obstacle_term"
+        ),
+        "semantic_resilience_nearest_passage_term": candidate.get(
+            "semantic_resilience_nearest_passage_term"
+        ),
+        "matched_landmark": candidate.get("matched_landmark"),
+        "landmark_status": candidate.get("landmark_status"),
+    }
+
+
+def _examples_by_failure_type(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    max_examples_per_type: int = 5,
+) -> Dict[str, List[Dict[str, Any]]]:
+    examples: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        failure_type = str(row.get("failure_type") or "unknown")
+        if len(examples[failure_type]) >= max_examples_per_type:
+            continue
+        examples[failure_type].append(
+            {
+                "scene_id": row.get("scene_id"),
+                "episode_id": row.get("episode_id"),
+                "step_id": row.get("step_id"),
+                "reason": row.get("reason"),
+                "recommended_primitive": row.get("recommended_primitive"),
+                "failure_risk": row.get("failure_risk"),
+                "failure_rationale": row.get("failure_rationale"),
+                "trigger_reasons": row.get("trigger_reasons"),
+                "recovery_context_tags": row.get("recovery_context_tags"),
+                "candidate": _candidate_brief(row.get("candidate") or {}),
+            }
+        )
+    return {key: value for key, value in sorted(examples.items())}
+
+
 def analyze(paths: Sequence[Path]) -> Dict[str, Any]:
-    memory_files = _find_memory_event_files(paths)
-    if not memory_files:
+    event_files = _find_stage19_event_files(paths)
+    if not event_files:
         raise FileNotFoundError(
-            "No memory_events.jsonl found. Pass the Stage19b run root, "
-            "vlmap_safety_debug dir, run dir, or memory_events.jsonl itself."
+            "No stage19_semantic_resilience_active_events.jsonl found. Pass the "
+            "Stage19b run root, vlmap_safety_debug dir, run dir, or event file itself."
         )
     progress = _progress_by_episode(_find_progress_files(paths))
 
@@ -182,13 +258,9 @@ def analyze(paths: Sequence[Path]) -> Dict[str, Any]:
     episode_failure_type_counts = Counter()
     episode_recommended_primitive_counts = Counter()
 
-    for path in memory_files:
+    for path in event_files:
         for event in _read_jsonl(path):
-            event_type = event.get("event_type")
-            if event_type == "occ_memory_episode_summary":
-                episode_summary_events.append(dict(event))
-                continue
-            if event_type != "stage19_semantic_resilience_active":
+            if event.get("event_type") != "stage19_semantic_resilience_active":
                 continue
             item = dict(event)
             query_events.append(item)
@@ -214,6 +286,12 @@ def analyze(paths: Sequence[Path]) -> Dict[str, Any]:
     for event in query_events:
         grouped_by_shadow["shadow_only" if event.get("shadow_only") else "active"].append(event)
 
+    progress_by_failure_type = defaultdict(list)
+    for row in progress.values():
+        progress_by_failure_type[
+            str(row.get("stage19_semantic_resilience_episode_failure_type") or "missing")
+        ].append(row)
+
     step_values = [
         _safe_int(event.get("step_id"))
         for event in query_events
@@ -221,7 +299,7 @@ def analyze(paths: Sequence[Path]) -> Dict[str, Any]:
     ]
     result = {
         "task": "stage19b_semantic_resilience_shadow_taxonomy",
-        "memory_event_files": [str(path) for path in memory_files],
+        "stage19_event_files": [str(path) for path in event_files],
         "progress_episode_count": len(progress),
         "episode_summary_count": len(episode_summary_events),
         "query_summary": _summarize_events(query_events),
@@ -236,6 +314,11 @@ def analyze(paths: Sequence[Path]) -> Dict[str, Any]:
         "active_reason_counts": dict(active_reason_counts),
         "episode_failure_type_counts": dict(episode_failure_type_counts),
         "episode_recommended_primitive_counts": dict(episode_recommended_primitive_counts),
+        "progress_by_episode_failure_type": {
+            name: _summarize_progress(rows)
+            for name, rows in sorted(progress_by_failure_type.items())
+        },
+        "examples_by_failure_type": _examples_by_failure_type(query_events),
         "step_min": min(step_values) if step_values else None,
         "step_max": max(step_values) if step_values else None,
     }
