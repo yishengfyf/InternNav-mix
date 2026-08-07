@@ -6,6 +6,7 @@ import os
 import re
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
