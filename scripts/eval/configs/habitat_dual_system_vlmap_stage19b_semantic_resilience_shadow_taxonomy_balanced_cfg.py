@@ -35,6 +35,14 @@ vlmap_cfg["occ_memory_semantic_resilience_active_lite_shadow_only"] = (
     )
     == "1"
 )
+allowed_failure_types = [
+    item.strip()
+    for item in os.environ.get("STAGE19B_ALLOWED_FAILURE_TYPES", "").split(",")
+    if item.strip()
+]
+vlmap_cfg["occ_memory_semantic_resilience_active_lite_allowed_failure_types"] = (
+    allowed_failure_types
+)
 
 run_name = os.environ.get(
     "STAGE19B_BALANCED_RUN_NAME",

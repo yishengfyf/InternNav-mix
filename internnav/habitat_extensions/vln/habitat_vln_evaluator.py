@@ -3577,6 +3577,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     True,
                 )
             ),
+            "allowed_failure_types": tuple(
+                str(item).strip()
+                for item in list(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_allowed_failure_types",
+                        [],
+                    )
+                    or []
+                )
+                if str(item).strip()
+            ),
         }
 
     def _write_semantic_resilience_active_lite_event(self, event: dict) -> None:
@@ -3928,6 +3939,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         status["considered"] = bool(recovery_trigger or candidate is not None)
         if not status["considered"]:
             status["reason"] = "no_recovery_trigger"
+            return status
+        allowed_failure_types = {
+            str(item)
+            for item in list(cfg.get("allowed_failure_types") or [])
+            if str(item)
+        }
+        if allowed_failure_types and str(status.get("failure_type") or "unknown") not in allowed_failure_types:
+            status["reason"] = "failure_type_not_allowed"
+            if bool(cfg.get("shadow_only")) or bool(cfg.get("log_all_considered", True)):
+                self._write_semantic_resilience_active_lite_event(status)
             return status
         if cfg.get("shadow_only"):
             status["reason"] = "shadow_only"
