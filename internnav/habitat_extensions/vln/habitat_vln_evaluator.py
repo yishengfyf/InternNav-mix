@@ -697,6 +697,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "gps": observations.get("gps"),
             "compass": observations.get("compass"),
         }
+        try:
+            image_arr = np.asarray(semantic_image)
+            if image_arr.ndim >= 2:
+                context["image_height"] = int(image_arr.shape[0])
+                context["image_width"] = int(image_arr.shape[1])
+        except Exception:
+            pass
         decision = self.vlmap_semantic.match_observation(semantic_image, context=context)
         if decision.get("status") == "ok" and decision.get("top_match"):
             print(
@@ -5358,7 +5365,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_count=episode_count,
                             observation_source=semantic_source,
                         )
-                        self.occ_memory.record_semantic(semantic_decision)
+                        self.occ_memory.record_semantic(
+                            semantic_decision,
+                            obs={
+                                "rgb": rgb,
+                                "depth": current_depth_m,
+                                "gps": observations.get("gps"),
+                                "compass": observations.get("compass"),
+                            },
+                            depth=current_depth_m,
+                            context={
+                                "step_id": step_id,
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "episode_index": episode_index,
+                                "episode_count": episode_count,
+                                "pixel_goal": pixel_goal,
+                                "image_width": int(rgb.shape[1]) if hasattr(rgb, "shape") and len(rgb.shape) >= 2 else None,
+                                "image_height": int(rgb.shape[0]) if hasattr(rgb, "shape") and len(rgb.shape) >= 2 else None,
+                            },
+                        )
 
                         # Stage 2 VLMap advisor: check the S2 waypoint before asking
                         # NextDiT/System1 to turn it into local trajectory actions.

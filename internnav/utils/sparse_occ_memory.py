@@ -364,6 +364,17 @@ class SparseOccMemoryConfig:
     semantic_resilience_backtrack_min_step_gap: int = 6
     semantic_resilience_backtrack_score_weight: float = 1.35
     semantic_resilience_candidate_source_score: float = 2.40
+    semantic_anchor_enable: bool = False
+    semantic_anchor_min_score: float = 0.20
+    semantic_anchor_max_terms_per_event: int = 3
+    semantic_anchor_include_threshold_hits: bool = True
+    semantic_anchor_include_pixel_goal: bool = True
+    semantic_anchor_include_view_center: bool = True
+    semantic_anchor_view_center_x: float = 0.50
+    semantic_anchor_view_center_y: float = 0.56
+    semantic_anchor_merge_radius_cells: int = 6
+    semantic_anchor_local_radius_cells: int = 6
+    semantic_anchor_max_anchors_per_episode: int = 256
     progress_ranker_shadow_enable: bool = False
     progress_ranker_shadow_checkpoint: str = ""
     progress_ranker_shadow_device: str = "cpu"
@@ -474,6 +485,7 @@ class SparseOccSemanticMemory:
         self.pose_trace: List[Dict[str, Any]] = []
         self.keyframes: List[Dict[str, Any]] = []
         self.semantic_events: List[Dict[str, Any]] = []
+        self.semantic_anchors: List[Dict[str, Any]] = []
         self.waypoint_events: List[Dict[str, Any]] = []
         self.candidate_probe_events: List[Dict[str, Any]] = []
         self.candidate_selection_events: List[Dict[str, Any]] = []
@@ -641,9 +653,17 @@ class SparseOccSemanticMemory:
         )
         return event
 
-    def record_semantic(self, decision: Dict[str, Any]) -> None:
+    def record_semantic(
+        self,
+        decision: Dict[str, Any],
+        *,
+        obs: Optional[Dict[str, Any]] = None,
+        depth: Optional[np.ndarray] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not self.enabled or not decision:
             return
+        context = dict(context or {})
         step_id = decision.get("step_id")
         top_margin = decision.get("top_margin")
         if top_margin is None:
@@ -684,7 +704,351 @@ class SparseOccSemanticMemory:
             self.keyframes[-1]["semantic_top_margin"] = top_margin
             self.keyframes[-1]["high_conf_semantic"] = bool(decision.get("high_conf_semantic"))
             self.keyframes[-1]["last_semantic_step_id"] = step_id
+        anchor_summary = self._record_semantic_anchors(
+            decision,
+            obs=obs,
+            depth=depth,
+            context=context,
+        )
+        if anchor_summary.get("enabled"):
+            event["semantic_anchor_summary"] = anchor_summary
         self._write_event(event)
+
+    def _semantic_anchor_terms(self, decision: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not bool(self.config.semantic_anchor_enable):
+            return []
+        min_score = float(self.config.semantic_anchor_min_score)
+        max_terms = max(1, int(self.config.semantic_anchor_max_terms_per_event))
+        by_term: Dict[str, Dict[str, Any]] = {}
+
+        def add_term(term: Any, score: Any = None, *, source: str = "unknown", term_type: Any = None) -> None:
+            canonical = self._canonical_semantic_term(term)
+            if not canonical:
+                return
+            try:
+                score_float = float(score)
+            except (TypeError, ValueError):
+                score_float = 0.0
+            if score_float < min_score and source != "rank1":
+                return
+            previous = by_term.get(canonical)
+            item = {
+                "term": canonical,
+                "raw_term": str(term),
+                "score": float(score_float),
+                "source": source,
+                "term_type": term_type,
+                "semantic_kind": self._semantic_anchor_kind(canonical, term_type=term_type),
+            }
+            if previous is None or float(item["score"]) > float(previous.get("score", 0.0) or 0.0):
+                by_term[canonical] = item
+
+        add_term(
+            decision.get("top_match"),
+            decision.get("top_score"),
+            source="rank1",
+        )
+        for score_item in list(decision.get("scores") or []):
+            add_term(
+                score_item.get("term"),
+                score_item.get("score"),
+                source="score_item",
+                term_type=score_item.get("term_type"),
+            )
+        if bool(self.config.semantic_anchor_include_threshold_hits):
+            score_by_term = {
+                self._canonical_semantic_term(item.get("term")): item
+                for item in list(decision.get("scores") or [])
+                if item.get("term")
+            }
+            for term in list(decision.get("threshold_hits") or []):
+                canonical = self._canonical_semantic_term(term)
+                score_item = score_by_term.get(canonical, {})
+                add_term(
+                    term,
+                    score_item.get("score", decision.get("top_score")),
+                    source="threshold_hit",
+                    term_type=score_item.get("term_type"),
+                )
+        return sorted(
+            by_term.values(),
+            key=lambda item: (
+                float(item.get("score", 0.0) or 0.0),
+                item.get("source") == "rank1",
+            ),
+            reverse=True,
+        )[:max_terms]
+
+    def _semantic_anchor_kind(self, term: Any, *, term_type: Any = None) -> str:
+        canonical = self._canonical_semantic_term(term)
+        tokens = set(re.findall(r"[a-z0-9]+", canonical or ""))
+        is_obstacle = bool(
+            canonical in _SEMANTIC_RESILIENCE_OBSTACLE_TERMS
+            or tokens.intersection(_SEMANTIC_RESILIENCE_OBSTACLE_TERMS)
+        )
+        is_passage = bool(
+            canonical in _SEMANTIC_RESILIENCE_PASSAGE_TERMS
+            or tokens.intersection(_SEMANTIC_RESILIENCE_PASSAGE_TERMS)
+        )
+        if is_obstacle and is_passage:
+            return "obstacle_passage"
+        if is_obstacle:
+            return "obstacle"
+        if is_passage:
+            return "passage"
+        if canonical in _GOAL_PROGRESS_SPECIFIC_ROOMS or str(term_type or "") == "room":
+            return "room"
+        if canonical in _GOAL_PROGRESS_LANDMARK_TERMS or str(term_type or "") == "object":
+            return "landmark"
+        return "semantic"
+
+    def _semantic_anchor_pixel_sources(
+        self,
+        decision: Dict[str, Any],
+        depth: np.ndarray,
+        context: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        depth_arr = np.asarray(depth)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        h, w = depth_arr.shape[:2]
+        image_w = int(
+            context.get("image_width")
+            or decision.get("image_width")
+            or self.config.waypoint_source_image_width
+            or w
+        )
+        image_h = int(
+            context.get("image_height")
+            or decision.get("image_height")
+            or self.config.waypoint_source_image_height
+            or h
+        )
+        sources: List[Dict[str, Any]] = []
+        if bool(self.config.semantic_anchor_include_pixel_goal):
+            pixel_goal = decision.get("pixel_goal") or context.get("pixel_goal") or context.get("s2_pixel_goal")
+            if pixel_goal is not None:
+                try:
+                    px, py = [float(v) for v in list(pixel_goal)[:2]]
+                    sources.append(
+                        {
+                            "source": "pixel_goal",
+                            "pixel": [float(px), float(py)],
+                            "image_width": int(image_w),
+                            "image_height": int(image_h),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    pass
+        if bool(self.config.semantic_anchor_include_view_center):
+            px = float(image_w) * float(self.config.semantic_anchor_view_center_x)
+            py = float(image_h) * float(self.config.semantic_anchor_view_center_y)
+            sources.append(
+                {
+                    "source": "view_center",
+                    "pixel": [float(px), float(py)],
+                    "image_width": int(image_w),
+                    "image_height": int(image_h),
+                }
+            )
+        return sources
+
+    def _semantic_anchor_local_context(self, cell: Iterable[int]) -> Dict[str, Any]:
+        try:
+            row0, col0 = [int(v) for v in list(cell)[:2]]
+        except (TypeError, ValueError):
+            return {}
+        radius = max(1, int(self.config.semantic_anchor_local_radius_cells))
+        counts = {"free": 0, "occupied": 0, "unknown": 0}
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if dr * dr + dc * dc > radius * radius:
+                    continue
+                row = row0 + dr
+                col = col0 + dc
+                if row < 0 or row >= self.gs or col < 0 or col >= self.gs:
+                    continue
+                counts[self._cell_state(row, col)] += 1
+        total = max(1, int(sum(counts.values())))
+        return {
+            "local_radius_cells": int(radius),
+            "local_free_count": int(counts["free"]),
+            "local_occupied_count": int(counts["occupied"]),
+            "local_unknown_count": int(counts["unknown"]),
+            "local_free_ratio": float(counts["free"] / total),
+            "local_occupied_ratio": float(counts["occupied"] / total),
+            "local_unknown_ratio": float(counts["unknown"] / total),
+            "open_score": float(self._semantic_resilience_open_score([row0, col0])),
+        }
+
+    def _merge_or_add_semantic_anchor(self, anchor: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+        row = int(anchor["grid"][0])
+        col = int(anchor["grid"][1])
+        term = str(anchor.get("semantic_top_match") or "")
+        merge_radius = max(0, int(self.config.semantic_anchor_merge_radius_cells))
+        best_index = None
+        best_distance = None
+        for idx, existing in enumerate(self.semantic_anchors):
+            if str(existing.get("semantic_top_match") or "") != term:
+                continue
+            erow, ecol = [int(v) for v in list(existing.get("grid") or [0, 0])[:2]]
+            distance = math.sqrt(float((row - erow) ** 2 + (col - ecol) ** 2))
+            if distance <= merge_radius and (best_distance is None or distance < best_distance):
+                best_index = idx
+                best_distance = distance
+        if best_index is None:
+            max_anchors = int(self.config.semantic_anchor_max_anchors_per_episode)
+            if max_anchors >= 0 and len(self.semantic_anchors) >= max_anchors:
+                return anchor, "max_anchors"
+            anchor = dict(anchor)
+            anchor["anchor_id"] = f"SA{len(self.semantic_anchors):04d}"
+            anchor["observation_count"] = 1
+            anchor["score_sum"] = float(anchor.get("semantic_top_score", 0.0) or 0.0)
+            anchor["score_max"] = float(anchor.get("semantic_top_score", 0.0) or 0.0)
+            anchor["score_mean"] = float(anchor.get("semantic_top_score", 0.0) or 0.0)
+            anchor["source_counts"] = {str(anchor.get("anchor_source") or "unknown"): 1}
+            self.semantic_anchors.append(anchor)
+            return anchor, "added"
+
+        existing = self.semantic_anchors[best_index]
+        score = float(anchor.get("semantic_top_score", 0.0) or 0.0)
+        count = int(existing.get("observation_count", 1) or 1) + 1
+        existing["observation_count"] = int(count)
+        existing["last_step_id"] = anchor.get("last_step_id")
+        existing["last_grid"] = anchor.get("grid")
+        existing["last_xy"] = anchor.get("xy")
+        existing["last_anchor_source"] = anchor.get("anchor_source")
+        existing["score_sum"] = float(existing.get("score_sum", 0.0) or 0.0) + score
+        existing["score_max"] = max(float(existing.get("score_max", 0.0) or 0.0), score)
+        existing["score_mean"] = float(existing["score_sum"] / max(1, count))
+        existing["high_conf_semantic"] = bool(
+            existing.get("high_conf_semantic") or anchor.get("high_conf_semantic")
+        )
+        source_counts = dict(existing.get("source_counts") or {})
+        source = str(anchor.get("anchor_source") or "unknown")
+        source_counts[source] = int(source_counts.get(source, 0)) + 1
+        existing["source_counts"] = source_counts
+        for key in (
+            "goal_state",
+            "semantic_kind",
+            "local_free_count",
+            "local_occupied_count",
+            "local_unknown_count",
+            "local_free_ratio",
+            "local_occupied_ratio",
+            "local_unknown_ratio",
+            "open_score",
+        ):
+            existing[key] = anchor.get(key, existing.get(key))
+        return existing, "merged"
+
+    def _record_semantic_anchors(
+        self,
+        decision: Dict[str, Any],
+        *,
+        obs: Optional[Dict[str, Any]],
+        depth: Optional[np.ndarray],
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        summary = {
+            "enabled": bool(self.config.semantic_anchor_enable),
+            "valid": False,
+            "reason": None,
+            "added": 0,
+            "merged": 0,
+            "invalid": 0,
+            "max_anchors": 0,
+        }
+        if not bool(self.config.semantic_anchor_enable):
+            summary["reason"] = "disabled"
+            return summary
+        if obs is None or depth is None or self.camera_intrinsic is None:
+            summary["reason"] = "missing_obs_depth_or_intrinsic"
+            return summary
+        pose_tf = self._pose_from_obs(obs)
+        if pose_tf is None or self.init_base_tf is None:
+            summary["reason"] = "missing_pose_or_memory"
+            return summary
+        terms = self._semantic_anchor_terms(decision)
+        if not terms:
+            summary["reason"] = "no_semantic_terms"
+            return summary
+        sources = self._semantic_anchor_pixel_sources(decision, depth, context)
+        if not sources:
+            summary["reason"] = "no_pixel_sources"
+            return summary
+
+        projected_sources: List[Dict[str, Any]] = []
+        for source in sources:
+            source_context = {
+                **context,
+                "image_width": source.get("image_width"),
+                "image_height": source.get("image_height"),
+            }
+            target = self._pixel_goal_to_grid(source.get("pixel"), depth, pose_tf, source_context)
+            if target is None:
+                summary["invalid"] += 1
+                continue
+            projected_sources.append({**source, "target": target})
+        if not projected_sources:
+            summary["reason"] = "projection_failed"
+            return summary
+
+        for source in projected_sources:
+            target = dict(source.get("target") or {})
+            grid = list(target.get("goal_grid") or [])
+            if len(grid) < 2:
+                summary["invalid"] += 1
+                continue
+            row, col = int(grid[0]), int(grid[1])
+            xy = self._grid_to_xy([row, col])
+            direction = self._direction_to_cell(target.get("start_grid"), [row, col], float(target.get("start_yaw", 0.0) or 0.0))
+            local_context = self._semantic_anchor_local_context([row, col])
+            goal_state = self._cell_state(row, col)
+            for term in terms:
+                anchor = {
+                    "event_type": "occ_memory_semantic_anchor",
+                    **self.episode_meta,
+                    "step_id": decision.get("step_id") or context.get("step_id"),
+                    "last_step_id": decision.get("step_id") or context.get("step_id"),
+                    "anchor_source": source.get("source"),
+                    "source_pixel": source.get("pixel"),
+                    "source_image_width": source.get("image_width"),
+                    "source_image_height": source.get("image_height"),
+                    "semantic_top_match": term.get("term"),
+                    "semantic_raw_term": term.get("raw_term"),
+                    "semantic_top_score": float(term.get("score", 0.0) or 0.0),
+                    "semantic_kind": term.get("semantic_kind"),
+                    "semantic_term_source": term.get("source"),
+                    "high_conf_semantic": bool(decision.get("high_conf_semantic")),
+                    "grid": [int(row), int(col)],
+                    "xy": [float(xy[0]), float(xy[1])],
+                    "world_z": target.get("goal_world_z"),
+                    "depth_m": target.get("depth_m"),
+                    "goal_state": goal_state,
+                    "direction_bucket": direction.get("bucket"),
+                    "direction_angle_deg": direction.get("angle_deg"),
+                    "distance_m": direction.get("distance_m"),
+                    **local_context,
+                }
+                stored, operation = self._merge_or_add_semantic_anchor(anchor)
+                if operation == "added":
+                    summary["added"] += 1
+                elif operation == "merged":
+                    summary["merged"] += 1
+                elif operation == "max_anchors":
+                    summary["max_anchors"] += 1
+                event = dict(anchor)
+                event["anchor_id"] = stored.get("anchor_id")
+                event["anchor_operation"] = operation
+                event["observation_count"] = stored.get("observation_count")
+                event["score_mean"] = stored.get("score_mean")
+                event["score_max"] = stored.get("score_max")
+                self._write_event(event)
+        summary["valid"] = bool(summary["added"] or summary["merged"])
+        summary["reason"] = "ok" if summary["valid"] else "no_anchors_recorded"
+        summary["anchor_count"] = int(len(self.semantic_anchors))
+        return summary
 
     def record_guidance_event(
         self,
@@ -2206,6 +2570,8 @@ class SparseOccSemanticMemory:
             sources.append(("semantic_event", event))
         for node in self.keyframes:
             sources.append(("keyframe", node))
+        for anchor in self.semantic_anchors:
+            sources.append(("semantic_anchor", anchor))
         for source_type, item in sources:
             term = item.get("top_match") or item.get("semantic_top_match")
             if not term:
@@ -3190,6 +3556,16 @@ class SparseOccSemanticMemory:
             )
         high_conf_keyframes = [node for node in self.keyframes if node.get("high_conf_semantic")]
         high_conf_events = [event for event in self.semantic_events if event.get("high_conf_semantic")]
+        semantic_anchor_kind_counts: Dict[str, int] = defaultdict(int)
+        semantic_anchor_source_counts: Dict[str, int] = defaultdict(int)
+        semantic_anchor_term_counts: Dict[str, int] = defaultdict(int)
+        semantic_anchor_high_conf_count = 0
+        for anchor in self.semantic_anchors:
+            semantic_anchor_kind_counts[str(anchor.get("semantic_kind") or "unknown")] += 1
+            semantic_anchor_source_counts[str(anchor.get("anchor_source") or "unknown")] += 1
+            semantic_anchor_term_counts[str(anchor.get("semantic_top_match") or "unknown")] += 1
+            if anchor.get("high_conf_semantic"):
+                semantic_anchor_high_conf_count += 1
         summary = {
             "event_type": "occ_memory_episode_summary",
             **self.episode_meta,
@@ -3208,6 +3584,12 @@ class SparseOccSemanticMemory:
             "semantic_event_count": int(len(self.semantic_events)),
             "semantic_high_conf_event_count": int(len(high_conf_events)),
             "semantic_high_conf_keyframe_count": int(len(high_conf_keyframes)),
+            "semantic_anchor_enabled": bool(self.config.semantic_anchor_enable),
+            "semantic_anchor_count": int(len(self.semantic_anchors)),
+            "semantic_anchor_high_conf_count": int(semantic_anchor_high_conf_count),
+            "semantic_anchor_kind_counts": dict(semantic_anchor_kind_counts),
+            "semantic_anchor_source_counts": dict(semantic_anchor_source_counts),
+            "semantic_anchor_top_terms": dict(semantic_anchor_term_counts),
             "waypoint_probe_count": int(len(self.waypoint_events)),
             "candidate_probe_event_count": int(candidate_event_count),
             "candidate_probe_valid_event_count": int(candidate_valid_event_count),
@@ -4482,11 +4864,29 @@ class SparseOccSemanticMemory:
                 x, y = to_xy(row, col)
                 rad = max(2, scale)
                 draw.ellipse((x - rad, y - rad, x + rad, y + rad), fill=(110, 185, 255))
+        anchor_colors = {
+            "obstacle": (255, 90, 90),
+            "obstacle_passage": (255, 170, 70),
+            "passage": (80, 230, 160),
+            "room": (170, 135, 255),
+            "landmark": (255, 120, 230),
+            "semantic": (230, 230, 120),
+        }
+        for anchor in self.semantic_anchors:
+            grid = anchor.get("grid") or []
+            if len(grid) < 2:
+                continue
+            row, col = int(grid[0]), int(grid[1])
+            if r0 <= row < r1 and c0 <= col < c1:
+                x, y = to_xy(row, col)
+                rad = max(3, scale + 1)
+                color = anchor_colors.get(str(anchor.get("semantic_kind") or "semantic"), (230, 230, 120))
+                draw.rectangle((x - rad, y - rad, x + rad, y + rad), fill=color)
         if self.last_pose_grid is not None:
             x, y = to_xy(self.last_pose_grid[0], self.last_pose_grid[1])
             rad = max(3, scale + 1)
             draw.ellipse((x - rad, y - rad, x + rad, y + rad), fill=(255, 255, 255))
-        label = f"occ={len(self.occ2d_counts)} free={len(self.free2d_counts)} frontier={len(self.get_frontier_cells(sample_limit=0))}"
+        label = f"occ={len(self.occ2d_counts)} free={len(self.free2d_counts)} frontier={len(self.get_frontier_cells(sample_limit=0))} anchors={len(self.semantic_anchors)}"
         draw.rectangle((0, 0, max(220, len(label) * 7), 18), fill=(18, 18, 18))
         draw.text((4, 3), label, fill=(240, 240, 240))
         suffix = "final" if context.get("final") else f"{self.saved_bev_count:03d}"
@@ -4552,6 +4952,25 @@ class SparseOccSemanticMemory:
             x, y = to_xy(self.last_pose_grid[0], self.last_pose_grid[1])
             rad = max(4, scale + 2)
             draw.ellipse((x - rad, y - rad, x + rad, y + rad), fill=(255, 255, 255))
+        anchor_colors = {
+            "obstacle": (255, 90, 90),
+            "obstacle_passage": (255, 170, 70),
+            "passage": (80, 230, 160),
+            "room": (170, 135, 255),
+            "landmark": (255, 120, 230),
+            "semantic": (230, 230, 120),
+        }
+        for anchor in self.semantic_anchors:
+            grid = anchor.get("grid") or []
+            if len(grid) < 2:
+                continue
+            row, col = int(grid[0]), int(grid[1])
+            if not (r0 <= row < r1 and c0 <= col < c1):
+                continue
+            x, y = to_xy(row, col)
+            rad = max(3, scale + 1)
+            color = anchor_colors.get(str(anchor.get("semantic_kind") or "semantic"), (230, 230, 120))
+            draw.rectangle((x - rad, y - rad, x + rad, y + rad), fill=color)
         color_by_type = {
             "frontier": (255, 225, 80),
             "semantic_frontier": (255, 160, 80),
@@ -4578,7 +4997,8 @@ class SparseOccSemanticMemory:
         label = (
             f"V10 candidates={len(candidates)} "
             f"occ={len(self.occ2d_counts)} free={len(self.free2d_counts)} "
-            f"frontier={len(self.get_frontier_cells(sample_limit=0))}"
+            f"frontier={len(self.get_frontier_cells(sample_limit=0))} "
+            f"anchors={len(self.semantic_anchors)}"
         )
         draw.rectangle((0, 0, max(320, len(label) * 7), 18), fill=(18, 18, 18))
         draw.text((4, 3), label, fill=(240, 240, 240))
@@ -4832,6 +5252,10 @@ class SparseOccSemanticMemory:
         if keyframe_points.shape[0] > 0:
             point_parts.append(keyframe_points)
             color_parts.append(np.tile(np.array([[255, 255, 255]], dtype=np.uint8), (keyframe_points.shape[0], 1)))
+        anchor_points, anchor_colors = self._semantic_anchor_points()
+        if anchor_points.shape[0] > 0:
+            point_parts.append(anchor_points)
+            color_parts.append(anchor_colors)
 
         if point_parts:
             points = np.concatenate(point_parts, axis=0).astype(np.float32, copy=False)
@@ -4852,6 +5276,7 @@ class SparseOccSemanticMemory:
             "memory_frontier_point_count": int(frontier_points.shape[0]),
             "memory_pose_point_count": int(pose_points.shape[0]),
             "memory_keyframe_point_count": int(keyframe_points.shape[0]),
+            "memory_semantic_anchor_point_count": int(anchor_points.shape[0]),
         }
         return points, colors, stats
 
@@ -4911,6 +5336,33 @@ class SparseOccSemanticMemory:
             return np.zeros((0, 3), dtype=np.float32)
         points = [[item["x"], item["y"], 0.14] for item in self.keyframes]
         return np.asarray(points, dtype=np.float32)
+
+    def _semantic_anchor_points(self) -> Tuple[np.ndarray, np.ndarray]:
+        if not self.semantic_anchors:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+        color_by_kind = {
+            "obstacle": np.array([255, 90, 90], dtype=np.uint8),
+            "obstacle_passage": np.array([255, 170, 70], dtype=np.uint8),
+            "passage": np.array([80, 230, 160], dtype=np.uint8),
+            "room": np.array([170, 135, 255], dtype=np.uint8),
+            "landmark": np.array([255, 120, 230], dtype=np.uint8),
+            "semantic": np.array([230, 230, 120], dtype=np.uint8),
+        }
+        points = []
+        colors = []
+        for anchor in self.semantic_anchors:
+            xy = anchor.get("xy")
+            if not xy or len(xy) < 2:
+                grid = anchor.get("grid") or []
+                if len(grid) < 2:
+                    continue
+                xy_arr = self._grid_to_xy(grid)
+                xy = [float(xy_arr[0]), float(xy_arr[1])]
+            points.append([float(xy[0]), float(xy[1]), 0.22])
+            colors.append(color_by_kind.get(str(anchor.get("semantic_kind") or "semantic"), color_by_kind["semantic"]))
+        if not points:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+        return np.asarray(points, dtype=np.float32), np.asarray(colors, dtype=np.uint8)
 
     def _sample_items(self, items: List[Any], limit: int) -> List[Any]:
         if limit < 0 or len(items) <= limit:
