@@ -494,6 +494,22 @@ class SparseOccSemanticMemory:
         self.keyframes: List[Dict[str, Any]] = []
         self.semantic_events: List[Dict[str, Any]] = []
         self.semantic_anchors: List[Dict[str, Any]] = []
+        self.semantic_anchor_added_count = 0
+        self.semantic_anchor_merged_count = 0
+        self.semantic_anchor_max_anchors_count = 0
+        self.semantic_anchor_invalid_count = 0
+        self.semantic_anchor_source_operation_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.semantic_anchor_source_offset_x_px_values: List[float] = []
+        self.semantic_anchor_source_offset_y_px_values: List[float] = []
+        self.semantic_anchor_source_center_distance_px_values: List[float] = []
+        self.semantic_anchor_source_ray_yaw_deg_values: List[float] = []
+        self.semantic_anchor_source_ray_pitch_deg_values: List[float] = []
+        self.semantic_anchor_source_ray_norm_values: List[float] = []
+        self.semantic_anchor_global_bearing_deg_values: List[float] = []
+        self.semantic_anchor_relative_bearing_deg_values: List[float] = []
+        self.semantic_anchor_pose_origin_distance_m_values: List[float] = []
+        self.semantic_anchor_pose_step_distance_m_values: List[float] = []
+        self.semantic_anchor_pose_step_dyaw_deg_values: List[float] = []
         self.waypoint_events: List[Dict[str, Any]] = []
         self.candidate_probe_events: List[Dict[str, Any]] = []
         self.candidate_selection_events: List[Dict[str, Any]] = []
@@ -933,6 +949,113 @@ class SparseOccSemanticMemory:
             "open_score": float(self._semantic_resilience_open_score([row0, col0])),
         }
 
+    def _semantic_anchor_pose_context(self) -> Dict[str, Any]:
+        if not self.pose_trace:
+            return {}
+        pose = self.pose_trace[-1]
+        try:
+            x = float(pose.get("x", 0.0) or 0.0)
+            y = float(pose.get("y", 0.0) or 0.0)
+            z = float(pose.get("z", 0.0) or 0.0)
+            yaw = float(pose.get("yaw", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return {}
+        context = {
+            "pose_local_xy": [float(x), float(y)],
+            "pose_local_z_m": float(z),
+            "pose_local_yaw_deg": float(math.degrees(yaw)),
+            "pose_origin_distance_m": float(math.hypot(x, y)),
+            "pose_step_id": pose.get("step_id"),
+        }
+        if len(self.pose_trace) >= 2:
+            prev = self.pose_trace[-2]
+            try:
+                prev_x = float(prev.get("x", 0.0) or 0.0)
+                prev_y = float(prev.get("y", 0.0) or 0.0)
+                prev_yaw = float(prev.get("yaw", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                prev_x = prev_y = prev_yaw = 0.0
+            step_dx = float(x - prev_x)
+            step_dy = float(y - prev_y)
+            step_dyaw_deg = float(math.degrees(self._wrap_angle(yaw - prev_yaw)))
+            context.update(
+                {
+                    "pose_prev_step_id": prev.get("step_id"),
+                    "pose_step_dx_m": step_dx,
+                    "pose_step_dy_m": step_dy,
+                    "pose_step_distance_m": float(math.hypot(step_dx, step_dy)),
+                    "pose_step_dyaw_deg": step_dyaw_deg,
+                }
+            )
+        return context
+
+    def _semantic_anchor_source_context(
+        self,
+        source: Dict[str, Any],
+        depth: np.ndarray,
+    ) -> Dict[str, Any]:
+        depth_arr = np.asarray(depth)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        h, w = depth_arr.shape[:2]
+        image_w = int(source.get("image_width") or self.config.waypoint_source_image_width or w or 1)
+        image_h = int(source.get("image_height") or self.config.waypoint_source_image_height or h or 1)
+        try:
+            pixel = list(source.get("pixel") or [0.0, 0.0])
+            px = float(pixel[0])
+            py = float(pixel[1])
+        except (TypeError, ValueError, IndexError):
+            px = 0.0
+            py = 0.0
+        center_x = float(image_w) * 0.5
+        center_y = float(image_h) * 0.5
+        offset_x_px = float(px - center_x)
+        offset_y_px = float(py - center_y)
+        context = {
+            "source_offset_x_px": offset_x_px,
+            "source_offset_y_px": offset_y_px,
+            "source_offset_x_norm": float(offset_x_px / max(1.0, float(image_w))),
+            "source_offset_y_norm": float(offset_y_px / max(1.0, float(image_h))),
+            "source_center_distance_px": float(math.hypot(offset_x_px, offset_y_px)),
+        }
+        if self.camera_intrinsic is not None:
+            sx = float(px) * float(w) / max(1.0, float(image_w))
+            sy = float(py) * float(h) / max(1.0, float(image_h))
+            fx = float(self.camera_intrinsic[0, 0])
+            fy = float(self.camera_intrinsic[1, 1])
+            cx = float(self.camera_intrinsic[0, 2])
+            cy = float(self.camera_intrinsic[1, 2])
+            cam_x = (sx + 0.5 - cx) / max(1e-6, fx)
+            cam_y = (sy + 0.5 - cy) / max(1e-6, fy)
+            cam_z = 1.0
+            context.update(
+                {
+                    "source_ray_x": float(cam_x),
+                    "source_ray_y": float(cam_y),
+                    "source_ray_z": float(cam_z),
+                    "source_ray_norm": float(math.sqrt(cam_x * cam_x + cam_y * cam_y + cam_z * cam_z)),
+                    "source_ray_yaw_deg": float(math.degrees(math.atan2(cam_x, cam_z))),
+                    "source_ray_pitch_deg": float(math.degrees(math.atan2(-cam_y, cam_z))),
+                }
+            )
+        return context
+
+    def _basic_stats(self, values: Iterable[Any]) -> Dict[str, Any]:
+        cleaned: List[float] = []
+        for value in values:
+            try:
+                cleaned.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        if not cleaned:
+            return {"count": 0, "mean": None, "min": None, "max": None}
+        return {
+            "count": int(len(cleaned)),
+            "mean": float(mean(cleaned)),
+            "min": float(min(cleaned)),
+            "max": float(max(cleaned)),
+        }
+
     def _merge_or_add_semantic_anchor(self, anchor: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
         row = int(anchor["grid"][0])
         col = int(anchor["grid"][1])
@@ -990,6 +1113,30 @@ class SparseOccSemanticMemory:
             "local_occupied_ratio",
             "local_unknown_ratio",
             "open_score",
+            "pose_local_xy",
+            "pose_local_z_m",
+            "pose_local_yaw_deg",
+            "pose_origin_distance_m",
+            "pose_step_id",
+            "pose_prev_step_id",
+            "pose_step_dx_m",
+            "pose_step_dy_m",
+            "pose_step_distance_m",
+            "pose_step_dyaw_deg",
+            "source_offset_x_px",
+            "source_offset_y_px",
+            "source_offset_x_norm",
+            "source_offset_y_norm",
+            "source_center_distance_px",
+            "source_ray_x",
+            "source_ray_y",
+            "source_ray_z",
+            "source_ray_norm",
+            "source_ray_yaw_deg",
+            "source_ray_pitch_deg",
+            "global_bearing_deg",
+            "relative_bearing_deg",
+            "relative_bearing_angle_deg",
         ):
             existing[key] = anchor.get(key, existing.get(key))
         return existing, "merged"
@@ -1046,16 +1193,23 @@ class SparseOccSemanticMemory:
             summary["reason"] = "projection_failed"
             return summary
 
+        pose_context = self._semantic_anchor_pose_context()
         for source in projected_sources:
             target = dict(source.get("target") or {})
             grid = list(target.get("goal_grid") or [])
             if len(grid) < 2:
                 summary["invalid"] += 1
+                self.semantic_anchor_invalid_count += 1
                 continue
             row, col = int(grid[0]), int(grid[1])
             xy = self._grid_to_xy([row, col])
-            direction = self._direction_to_cell(target.get("start_grid"), [row, col], float(target.get("start_yaw", 0.0) or 0.0))
+            direction = self._direction_to_cell(
+                target.get("start_grid"),
+                [row, col],
+                float(target.get("start_yaw", 0.0) or 0.0),
+            )
             local_context = self._semantic_anchor_local_context([row, col])
+            source_context = self._semantic_anchor_source_context(source, depth)
             goal_state = self._cell_state(row, col)
             for term in terms:
                 anchor = {
@@ -1067,6 +1221,8 @@ class SparseOccSemanticMemory:
                     "source_pixel": source.get("pixel"),
                     "source_image_width": source.get("image_width"),
                     "source_image_height": source.get("image_height"),
+                    **source_context,
+                    **pose_context,
                     "semantic_top_match": term.get("term"),
                     "semantic_raw_term": term.get("raw_term"),
                     "semantic_top_score": float(term.get("score", 0.0) or 0.0),
@@ -1080,22 +1236,75 @@ class SparseOccSemanticMemory:
                     "goal_state": goal_state,
                     "direction_bucket": direction.get("bucket"),
                     "direction_angle_deg": direction.get("angle_deg"),
+                    "global_bearing_deg": direction.get("world_bearing_deg"),
+                    "relative_bearing_deg": direction.get("angle_deg"),
                     "distance_m": direction.get("distance_m"),
                     **local_context,
                 }
                 stored, operation = self._merge_or_add_semantic_anchor(anchor)
+                source_name = str(source.get("source") or "unknown")
                 if operation == "added":
                     summary["added"] += 1
+                    self.semantic_anchor_added_count += 1
                 elif operation == "merged":
                     summary["merged"] += 1
+                    self.semantic_anchor_merged_count += 1
                 elif operation == "max_anchors":
                     summary["max_anchors"] += 1
+                    self.semantic_anchor_max_anchors_count += 1
+                else:
+                    self.semantic_anchor_invalid_count += 1
+                self.semantic_anchor_source_operation_counts[source_name][str(operation)] += 1
+                if source_context:
+                    if source_context.get("source_offset_x_px") is not None:
+                        self.semantic_anchor_source_offset_x_px_values.append(
+                            float(source_context["source_offset_x_px"])
+                        )
+                    if source_context.get("source_offset_y_px") is not None:
+                        self.semantic_anchor_source_offset_y_px_values.append(
+                            float(source_context["source_offset_y_px"])
+                        )
+                if source_context.get("source_ray_yaw_deg") is not None:
+                    self.semantic_anchor_source_ray_yaw_deg_values.append(
+                        float(source_context["source_ray_yaw_deg"])
+                    )
+                if source_context.get("source_ray_pitch_deg") is not None:
+                    self.semantic_anchor_source_ray_pitch_deg_values.append(
+                        float(source_context["source_ray_pitch_deg"])
+                    )
+                if source_context.get("source_center_distance_px") is not None:
+                    self.semantic_anchor_source_center_distance_px_values.append(
+                        float(source_context["source_center_distance_px"])
+                    )
+                if source_context.get("source_ray_norm") is not None:
+                    self.semantic_anchor_source_ray_norm_values.append(
+                        float(source_context["source_ray_norm"])
+                    )
+                if direction.get("world_bearing_deg") is not None:
+                    self.semantic_anchor_global_bearing_deg_values.append(
+                        float(direction["world_bearing_deg"])
+                    )
+                if direction.get("angle_deg") is not None:
+                    self.semantic_anchor_relative_bearing_deg_values.append(float(direction["angle_deg"]))
+                if pose_context.get("pose_origin_distance_m") is not None:
+                    self.semantic_anchor_pose_origin_distance_m_values.append(
+                        float(pose_context["pose_origin_distance_m"])
+                    )
+                if pose_context.get("pose_step_distance_m") is not None:
+                    self.semantic_anchor_pose_step_distance_m_values.append(
+                        float(pose_context["pose_step_distance_m"])
+                    )
+                if pose_context.get("pose_step_dyaw_deg") is not None:
+                    self.semantic_anchor_pose_step_dyaw_deg_values.append(
+                        float(pose_context["pose_step_dyaw_deg"])
+                    )
                 event = dict(anchor)
                 event["anchor_id"] = stored.get("anchor_id")
                 event["anchor_operation"] = operation
                 event["observation_count"] = stored.get("observation_count")
                 event["score_mean"] = stored.get("score_mean")
                 event["score_max"] = stored.get("score_max")
+                event["source_counts"] = stored.get("source_counts")
                 self._write_event(event)
         summary["valid"] = bool(summary["added"] or summary["merged"])
         summary["reason"] = "ok" if summary["valid"] else "no_anchors_recorded"
@@ -3618,6 +3827,10 @@ class SparseOccSemanticMemory:
             semantic_anchor_term_counts[str(anchor.get("semantic_top_match") or "unknown")] += 1
             if anchor.get("high_conf_semantic"):
                 semantic_anchor_high_conf_count += 1
+        semantic_anchor_source_operation_counts = {
+            str(source): dict(ops)
+            for source, ops in self.semantic_anchor_source_operation_counts.items()
+        }
         summary = {
             "event_type": "occ_memory_episode_summary",
             **self.episode_meta,
@@ -3638,10 +3851,52 @@ class SparseOccSemanticMemory:
             "semantic_high_conf_keyframe_count": int(len(high_conf_keyframes)),
             "semantic_anchor_enabled": bool(self.config.semantic_anchor_enable),
             "semantic_anchor_count": int(len(self.semantic_anchors)),
+            "semantic_anchor_added_count": int(self.semantic_anchor_added_count),
+            "semantic_anchor_merged_count": int(self.semantic_anchor_merged_count),
+            "semantic_anchor_max_anchors_count": int(self.semantic_anchor_max_anchors_count),
+            "semantic_anchor_invalid_count": int(self.semantic_anchor_invalid_count),
+            "semantic_anchor_merge_rate": (
+                float(self.semantic_anchor_merged_count)
+                / max(1, int(self.semantic_anchor_added_count + self.semantic_anchor_merged_count))
+            ),
             "semantic_anchor_high_conf_count": int(semantic_anchor_high_conf_count),
             "semantic_anchor_kind_counts": dict(semantic_anchor_kind_counts),
             "semantic_anchor_source_counts": dict(semantic_anchor_source_counts),
+            "semantic_anchor_source_operation_counts": semantic_anchor_source_operation_counts,
             "semantic_anchor_top_terms": dict(semantic_anchor_term_counts),
+            "semantic_anchor_source_offset_x_px_stats": self._basic_stats(
+                self.semantic_anchor_source_offset_x_px_values
+            ),
+            "semantic_anchor_source_offset_y_px_stats": self._basic_stats(
+                self.semantic_anchor_source_offset_y_px_values
+            ),
+            "semantic_anchor_source_center_distance_px_stats": self._basic_stats(
+                self.semantic_anchor_source_center_distance_px_values
+            ),
+            "semantic_anchor_source_ray_norm_stats": self._basic_stats(
+                self.semantic_anchor_source_ray_norm_values
+            ),
+            "semantic_anchor_source_ray_yaw_deg_stats": self._basic_stats(
+                self.semantic_anchor_source_ray_yaw_deg_values
+            ),
+            "semantic_anchor_source_ray_pitch_deg_stats": self._basic_stats(
+                self.semantic_anchor_source_ray_pitch_deg_values
+            ),
+            "semantic_anchor_global_bearing_deg_stats": self._basic_stats(
+                self.semantic_anchor_global_bearing_deg_values
+            ),
+            "semantic_anchor_relative_bearing_deg_stats": self._basic_stats(
+                self.semantic_anchor_relative_bearing_deg_values
+            ),
+            "semantic_anchor_pose_origin_distance_m_stats": self._basic_stats(
+                self.semantic_anchor_pose_origin_distance_m_values
+            ),
+            "semantic_anchor_pose_step_distance_m_stats": self._basic_stats(
+                self.semantic_anchor_pose_step_distance_m_values
+            ),
+            "semantic_anchor_pose_step_dyaw_deg_stats": self._basic_stats(
+                self.semantic_anchor_pose_step_dyaw_deg_values
+            ),
             "waypoint_probe_count": int(len(self.waypoint_events)),
             "candidate_probe_event_count": int(candidate_event_count),
             "candidate_probe_valid_event_count": int(candidate_valid_event_count),
@@ -4678,7 +4933,12 @@ class SparseOccSemanticMemory:
         dy = float(target_xy[1] - start_xy[1])
         distance = float(math.hypot(dx, dy))
         if distance <= 1e-6:
-            return {"bucket": "same", "angle_deg": 0.0, "distance_m": 0.0}
+            return {
+                "bucket": "same",
+                "angle_deg": 0.0,
+                "world_bearing_deg": 0.0,
+                "distance_m": 0.0,
+            }
         world_angle = math.atan2(dy, dx)
         rel_angle = self._wrap_angle(world_angle - float(yaw))
         rel_deg = math.degrees(rel_angle)
@@ -4686,6 +4946,7 @@ class SparseOccSemanticMemory:
         return {
             "bucket": bucket,
             "angle_deg": float(rel_deg),
+            "world_bearing_deg": float(math.degrees(world_angle)),
             "distance_m": distance,
         }
 
@@ -4811,12 +5072,18 @@ class SparseOccSemanticMemory:
         delta = target - start
         distance = float(np.linalg.norm(delta))
         if distance <= 1e-6:
-            return {"bucket": "same", "angle_deg": 0.0, "distance_m": 0.0}
+            return {
+                "bucket": "same",
+                "angle_deg": 0.0,
+                "world_bearing_deg": 0.0,
+                "distance_m": 0.0,
+            }
         world_angle = math.atan2(float(delta[1]), float(delta[0]))
         rel_deg = math.degrees(self._wrap_angle(world_angle - float(yaw)))
         return {
             "bucket": self._angle_to_direction_bucket(rel_deg),
             "angle_deg": float(rel_deg),
+            "world_bearing_deg": float(math.degrees(world_angle)),
             "distance_m": distance,
         }
 
