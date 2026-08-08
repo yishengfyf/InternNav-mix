@@ -35,7 +35,7 @@ vlmap_cfg["occ_memory_semantic_resilience_active_lite_allowed_failure_types"] = 
     item.strip()
     for item in os.environ.get(
         "STAGE20D_ALLOWED_FAILURE_TYPES",
-        "stuck_collision,semantic_stagnation",
+        "stuck_collision",
     ).split(",")
     if item.strip()
 ]
@@ -49,7 +49,7 @@ vlmap_cfg["occ_memory_semantic_resilience_active_lite_cooldown_steps"] = int(
     os.environ.get("STAGE20D_COOLDOWN_STEPS", "45")
 )
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_utility_threshold"] = float(
-    os.environ.get("STAGE20D_UTILITY_THRESHOLD", "0.58")
+    os.environ.get("STAGE20D_UTILITY_THRESHOLD", "0.57")
 )
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_local_trap_utility_threshold"] = float(
     os.environ.get("STAGE20D_LOCAL_TRAP_UTILITY_THRESHOLD", "0.62")
@@ -72,10 +72,13 @@ vlmap_cfg["occ_memory_semantic_resilience_active_lite_require_current_problem"] 
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_require_geometry_safe"] = (
     os.environ.get("STAGE20D_REQUIRE_GEOMETRY_SAFE", "1") != "0"
 )
+vlmap_cfg["occ_memory_semantic_resilience_active_lite_require_active_gate_safe"] = (
+    os.environ.get("STAGE20D_REQUIRE_ACTIVE_GATE_SAFE", "1") != "0"
+)
 
 # Conservative first smoke: turn/reobserve only.
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_max_turn_steps"] = int(
-    os.environ.get("STAGE20D_MAX_TURN_STEPS", "4")
+    os.environ.get("STAGE20D_MAX_TURN_STEPS", "2")
 )
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_forward_steps"] = int(
     os.environ.get("STAGE20D_FORWARD_STEPS", "0")
@@ -90,7 +93,7 @@ vlmap_cfg["occ_memory_semantic_resilience_active_lite_append_reobserve_action"] 
     os.environ.get("STAGE20D_APPEND_REOBSERVE", "1") != "0"
 )
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_clear_goal"] = (
-    os.environ.get("STAGE20D_CLEAR_GOAL", "1") != "0"
+    os.environ.get("STAGE20D_CLEAR_GOAL", "0") != "0"
 )
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_log_all_considered"] = True
 

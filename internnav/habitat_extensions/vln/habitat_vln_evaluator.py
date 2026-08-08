@@ -3536,6 +3536,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     True,
                 )
             ),
+            "require_active_gate_safe": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_require_active_gate_safe",
+                    False,
+                )
+            ),
             "max_turn_steps": max(
                 0,
                 int(
@@ -3977,6 +3983,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             status["reason"] = "current_policy_not_problematic"
         elif bool(cfg.get("require_geometry_safe", True)) and not bool(candidate.get("geometry_safe")):
             status["reason"] = "candidate_not_geometry_safe"
+        elif bool(cfg.get("require_active_gate_safe", False)) and not bool(candidate.get("active_gate_safe")):
+            status["reason"] = "candidate_not_active_gate_safe"
         else:
             utility = float(candidate.get("semantic_resilience_score", 0.0) or 0.0)
             open_score = float(candidate.get("semantic_resilience_open_score", 0.0) or 0.0)
