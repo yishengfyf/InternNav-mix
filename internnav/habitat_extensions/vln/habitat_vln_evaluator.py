@@ -3542,6 +3542,85 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     False,
                 )
             ),
+            "evaluate_gate_when_shadow_only": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_evaluate_gate_when_shadow_only",
+                    False,
+                )
+            ),
+            "allowed_recommended_primitives": tuple(
+                str(item).strip()
+                for item in list(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_allowed_recommended_primitives",
+                        [],
+                    )
+                    or []
+                )
+                if str(item).strip()
+            ),
+            "require_any_trigger_reasons": tuple(
+                str(item).strip()
+                for item in list(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_require_any_trigger_reasons",
+                        [],
+                    )
+                    or []
+                )
+                if str(item).strip()
+            ),
+            "require_all_trigger_reasons": tuple(
+                str(item).strip()
+                for item in list(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_require_all_trigger_reasons",
+                        [],
+                    )
+                    or []
+                )
+                if str(item).strip()
+            ),
+            "require_any_context_tags": tuple(
+                str(item).strip()
+                for item in list(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_require_any_context_tags",
+                        [],
+                    )
+                    or []
+                )
+                if str(item).strip()
+            ),
+            "require_all_context_tags": tuple(
+                str(item).strip()
+                for item in list(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_require_all_context_tags",
+                        [],
+                    )
+                    or []
+                )
+                if str(item).strip()
+            ),
+            "require_target_frontier_intent_safe": bool(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_require_target_frontier_intent_safe",
+                    False,
+                )
+            ),
+            "min_target_frontier_score": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_min_target_frontier_score",
+                    0.0,
+                )
+            ),
+            "max_completed_landmark_penalty": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_max_completed_landmark_penalty",
+                    1.0,
+                )
+            ),
             "max_turn_steps": max(
                 0,
                 int(
@@ -3963,7 +4042,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if bool(cfg.get("shadow_only")) or bool(cfg.get("log_all_considered", True)):
                 self._write_semantic_resilience_active_lite_event(status)
             return status
-        if cfg.get("shadow_only"):
+        allowed_primitives = {
+            str(item)
+            for item in list(cfg.get("allowed_recommended_primitives") or [])
+            if str(item)
+        }
+        if allowed_primitives and str(status.get("recommended_primitive") or "hold_s2") not in allowed_primitives:
+            status["reason"] = "recommended_primitive_not_allowed"
+            if bool(cfg.get("shadow_only")) or bool(cfg.get("log_all_considered", True)):
+                self._write_semantic_resilience_active_lite_event(status)
+            return status
+        evaluate_shadow_gate = bool(
+            cfg.get("shadow_only") and cfg.get("evaluate_gate_when_shadow_only")
+        )
+        if cfg.get("shadow_only") and not evaluate_shadow_gate:
             status["reason"] = "shadow_only"
             self._write_semantic_resilience_active_lite_event(status)
             return status
@@ -3986,10 +4078,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         elif bool(cfg.get("require_active_gate_safe", False)) and not bool(candidate.get("active_gate_safe")):
             status["reason"] = "candidate_not_active_gate_safe"
         else:
+            trigger_reason_set = {str(item) for item in list(trigger_reasons or [])}
+            context_tag_set = {str(item) for item in list(context_tags or [])}
+            require_any_trigger_reasons = {
+                str(item) for item in list(cfg.get("require_any_trigger_reasons") or [])
+            }
+            require_all_trigger_reasons = {
+                str(item) for item in list(cfg.get("require_all_trigger_reasons") or [])
+            }
+            require_any_context_tags = {
+                str(item) for item in list(cfg.get("require_any_context_tags") or [])
+            }
+            require_all_context_tags = {
+                str(item) for item in list(cfg.get("require_all_context_tags") or [])
+            }
             utility = float(candidate.get("semantic_resilience_score", 0.0) or 0.0)
             open_score = float(candidate.get("semantic_resilience_open_score", 0.0) or 0.0)
             distance = float(candidate.get("semantic_resilience_backtrack_distance_m", -1.0) or -1.0)
             step_gap = candidate.get("semantic_resilience_step_gap")
+            target_frontier_score = float(candidate.get("target_frontier_score", 0.0) or 0.0)
+            completed_landmark_penalty = float(candidate.get("completed_landmark_penalty", 0.0) or 0.0)
             utility_threshold, utility_threshold_context = (
                 self._semantic_resilience_active_lite_utility_threshold(
                     cfg,
@@ -3999,7 +4107,33 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
             status["utility_threshold_used"] = float(utility_threshold)
             status["utility_threshold_context"] = str(utility_threshold_context)
-            if utility < float(utility_threshold):
+            if require_any_trigger_reasons and not trigger_reason_set.intersection(
+                require_any_trigger_reasons
+            ):
+                status["reason"] = "missing_required_trigger_reason"
+            elif require_all_trigger_reasons and not require_all_trigger_reasons.issubset(
+                trigger_reason_set
+            ):
+                status["reason"] = "missing_required_trigger_reason"
+            elif require_any_context_tags and not context_tag_set.intersection(
+                require_any_context_tags
+            ):
+                status["reason"] = "missing_required_context_tag"
+            elif require_all_context_tags and not require_all_context_tags.issubset(
+                context_tag_set
+            ):
+                status["reason"] = "missing_required_context_tag"
+            elif bool(cfg.get("require_target_frontier_intent_safe", False)) and not bool(
+                candidate.get("target_frontier_intent_safe")
+            ):
+                status["reason"] = "target_frontier_intent_not_safe"
+            elif target_frontier_score < float(cfg.get("min_target_frontier_score", 0.0)):
+                status["reason"] = "low_target_frontier_score"
+            elif completed_landmark_penalty > float(
+                cfg.get("max_completed_landmark_penalty", 1.0)
+            ):
+                status["reason"] = "completed_landmark_penalty_too_high"
+            elif utility < float(utility_threshold):
                 status["reason"] = "low_recovery_utility"
             elif open_score < float(cfg.get("open_threshold", 0.65)):
                 status["reason"] = "low_open_score"
@@ -4013,9 +4147,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 actions = self._semantic_resilience_active_lite_actions(candidate, cfg)
                 if not actions:
                     status["reason"] = "empty_recovery_actions"
+                elif evaluate_shadow_gate:
+                    status.update(
+                        {
+                            "would_apply": True,
+                            "reason": "shadow_gate_pass",
+                            "shadow_actions": actions,
+                            "action_plan": {
+                                "mode": "reorient_reobserve",
+                                "clear_goal": bool(cfg.get("clear_goal", True)),
+                                "forward_steps": int(cfg.get("forward_steps", 0) or 0),
+                                "append_reobserve_action": bool(
+                                    cfg.get("append_reobserve_action", True)
+                                ),
+                            },
+                        }
+                    )
                 else:
                     status.update(
                         {
+                            "would_apply": True,
                             "applied": True,
                             "reason": "applied",
                             "actions": actions,
