@@ -45,6 +45,7 @@ from internnav.habitat_extensions.vln.utils import (
 )
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
+from internnav.semantic_recovery_triage import classify_semantic_recovery_triage
 from internnav.utils.sparse_occ_memory import SparseOccSemanticMemory
 from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
@@ -3902,160 +3903,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         context_tags: Optional[list] = None,
         step_id: int = 0,
     ) -> dict:
-        """Classify recovery candidates by multi-evidence consistency.
-
-        Stage20g proved that a single strict gate can protect successful
-        episodes, but it also hides most stuck-collision candidates.  The V2
-        gate keeps a hard abstain path and separates high-precision intervention
-        candidates from a wider pool that should be learned/reranked later.
-        """
-        reasons = {str(item) for item in list(trigger_reasons or [])}
-        tags = {str(item) for item in list(context_tags or [])}
-        candidate = dict(candidate or {})
-        if not bool(cfg.get("v2_evidence_gate_enable", False)):
-            return {"enabled": False, "tier": "disabled", "reason": "disabled"}
-        if not candidate:
-            return {"enabled": True, "tier": "abstain", "reason": "missing_candidate"}
-
-        geometry_safe = bool(candidate.get("geometry_safe"))
-        active_gate_safe = bool(candidate.get("active_gate_safe"))
-        target_frontier_intent_safe = bool(candidate.get("target_frontier_intent_safe"))
-        target_frontier_escape = bool(candidate.get("target_frontier_escape_candidate"))
-        open_score = float(candidate.get("semantic_resilience_open_score", 0.0) or 0.0)
-        target_frontier_score = float(candidate.get("target_frontier_score", 0.0) or 0.0)
-        doorway_score = float(candidate.get("target_frontier_doorway_like_score", 0.0) or 0.0)
-        completed_penalty = float(candidate.get("completed_landmark_penalty", 0.0) or 0.0)
-        step_gap = candidate.get("semantic_resilience_step_gap")
-        try:
-            step_gap_value = None if step_gap is None else int(step_gap)
-        except (TypeError, ValueError):
-            step_gap_value = None
-        nearby_visits = int(candidate.get("nearby_visit_count", 0) or 0)
-        direction_bucket = str(candidate.get("direction_bucket") or "unknown")
-
-        s2_policy_conflict = bool(
-            reasons.intersection({"current_waypoint_occupied", "current_waypoint_not_active_safe"})
-            or "policy_memory_conflict" in tags
+        return classify_semantic_recovery_triage(
+            candidate,
+            cfg,
+            failure_type=failure_type,
+            recommended_primitive=recommended_primitive,
+            trigger_reasons=trigger_reasons,
+            context_tags=context_tags,
+            step_id=step_id,
         )
-        obstacle_context = bool(
-            "semantic_obstacle_near_trap" in reasons
-            or "semantic_obstacle_context" in tags
-            or int(candidate.get("semantic_resilience_obstacle_term_count", 0) or 0) > 0
-        )
-        spatial_constriction = bool(
-            "local_trap" in reasons
-            or tags.intersection({"spatial_constriction", "limited_frontier_escape"})
-        )
-        semantic_only = bool(
-            reasons.intersection({"semantic_dead_zone", "semantic_stagnation"})
-            and not spatial_constriction
-            and not obstacle_context
-            and not s2_policy_conflict
-        )
-        persistence = bool(
-            nearby_visits >= int(cfg.get("v2_evidence_gate_min_nearby_visits", 3))
-            or (
-                step_gap_value is not None
-                and step_gap_value >= int(cfg.get("v2_evidence_gate_min_step_gap", 20))
-            )
-        )
-        frontier_like_anchor = bool(
-            target_frontier_intent_safe
-            or target_frontier_escape
-            or target_frontier_score
-            >= float(cfg.get("v2_evidence_gate_min_target_frontier_score", 0.10))
-            or doorway_score >= float(cfg.get("v2_evidence_gate_min_doorway_score", 0.60))
-        )
-        escape_anchor_safe = bool(
-            geometry_safe
-            and active_gate_safe
-            and completed_penalty <= float(cfg.get("max_completed_landmark_penalty", 1.0))
-            and open_score >= float(cfg.get("v2_evidence_gate_min_open_score", 0.70))
-            and frontier_like_anchor
-        )
-        back_only_without_anchor = bool(direction_bucket == "back" and not frontier_like_anchor)
-
-        evidence = {
-            "enabled": True,
-            "failure_type_allowed": str(failure_type) == "stuck_collision",
-            "primitive_allowed": str(recommended_primitive)
-            in {"reorient_reobserve", "one_safe_forward_reobserve"},
-            "s2_policy_conflict": bool(s2_policy_conflict),
-            "obstacle_context": bool(obstacle_context),
-            "spatial_constriction": bool(spatial_constriction),
-            "semantic_only": bool(semantic_only),
-            "persistence": bool(persistence),
-            "geometry_safe": bool(geometry_safe),
-            "active_gate_safe": bool(active_gate_safe),
-            "frontier_like_anchor": bool(frontier_like_anchor),
-            "escape_anchor_safe": bool(escape_anchor_safe),
-            "completed_landmark_penalty": float(completed_penalty),
-            "back_only_without_anchor": bool(back_only_without_anchor),
-            "open_score": float(open_score),
-            "target_frontier_score": float(target_frontier_score),
-            "target_frontier_doorway_like_score": float(doorway_score),
-            "semantic_resilience_step_gap": step_gap_value,
-            "nearby_visit_count": int(nearby_visits),
-        }
-
-        hard_abstain_reasons = []
-        if not evidence["failure_type_allowed"]:
-            hard_abstain_reasons.append("failure_type_not_stuck_collision")
-        if not evidence["primitive_allowed"]:
-            hard_abstain_reasons.append("primitive_not_recovery")
-        if not geometry_safe:
-            hard_abstain_reasons.append("candidate_not_geometry_safe")
-        if completed_penalty > float(cfg.get("max_completed_landmark_penalty", 1.0)):
-            hard_abstain_reasons.append("completed_landmark_penalty")
-        if semantic_only:
-            hard_abstain_reasons.append("semantic_only_no_spatial_conflict")
-        if back_only_without_anchor:
-            hard_abstain_reasons.append("back_only_without_anchor")
-
-        strict_intervention = bool(
-            not hard_abstain_reasons
-            and s2_policy_conflict
-            and obstacle_context
-            and spatial_constriction
-            and persistence
-            and escape_anchor_safe
-        )
-        adapter_candidate = bool(
-            not strict_intervention
-            and not hard_abstain_reasons
-            and s2_policy_conflict
-            and obstacle_context
-            and geometry_safe
-            and open_score >= float(cfg.get("v2_evidence_gate_min_open_score", 0.70))
-            and (active_gate_safe or frontier_like_anchor)
-        )
-
-        if strict_intervention:
-            tier = "strict_intervention"
-            reason = "multi_evidence_consistent"
-        elif adapter_candidate:
-            tier = "adapter_candidate"
-            reason = "needs_ranker_or_more_context"
-        else:
-            tier = "abstain"
-            reason = ",".join(hard_abstain_reasons) if hard_abstain_reasons else "insufficient_evidence"
-
-        evidence["tier"] = tier
-        evidence["reason"] = reason
-        evidence["hard_abstain_reasons"] = hard_abstain_reasons
-        evidence["evidence_vote_count"] = int(
-            sum(
-                bool(evidence.get(name))
-                for name in (
-                    "s2_policy_conflict",
-                    "obstacle_context",
-                    "spatial_constriction",
-                    "persistence",
-                    "escape_anchor_safe",
-                )
-            )
-        )
-        return evidence
 
     def _summarize_stage19_episode_failure_type(
         self,
