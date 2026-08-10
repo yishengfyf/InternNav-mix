@@ -290,7 +290,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         if ndtws is not None:
             result["ndtws"] = ndtws  # shape [N_local]
-        return result
+
+        # Distributed all_gather requires every rank to use the same dtype.
+        # A one-episode rank can otherwise infer float32/float64 differently
+        # from the Python/NumPy scalar type returned by Habitat metrics.
+        return {
+            name: tensor.to(device=self.device, dtype=torch.float32)
+            for name, tensor in result.items()
+        }
 
     def _get_vlmap_run_dir(self) -> Optional[str]:
         if self._vlmap_run_dir is not None:

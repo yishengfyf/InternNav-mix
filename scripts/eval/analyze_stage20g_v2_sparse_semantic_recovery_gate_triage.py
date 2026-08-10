@@ -126,6 +126,9 @@ def analyze(paths, *, replay_missing=True, triage_config=None):
     embedded_replay_compared_count = 0
     embedded_replay_agreement_count = 0
     embedded_replay_mismatches = []
+    applied_tier_counts = Counter()
+    applied_records = []
+    non_strict_applied_records = []
 
     for row in events:
         embedded_gate = dict(row.get("v2_evidence_gate") or {})
@@ -157,6 +160,7 @@ def analyze(paths, *, replay_missing=True, triage_config=None):
             tier = replayed_tier
             source = "replayed"
         else:
+            gate = {}
             tier = "missing"
             source = "missing"
 
@@ -189,6 +193,22 @@ def analyze(paths, *, replay_missing=True, triage_config=None):
             candidate_records[tier].append(
                 _compact_candidate_record(row, gate, progress_row, source)
             )
+        if bool(row.get("applied")):
+            applied_record = _compact_candidate_record(
+                row, gate, progress_row, source
+            )
+            applied_record.update(
+                {
+                    "actions": list(row.get("actions") or []),
+                    "action_count": len(list(row.get("actions") or [])),
+                    "action_plan": dict(row.get("action_plan") or {}),
+                    "shadow_only": bool(row.get("shadow_only")),
+                }
+            )
+            applied_tier_counts[tier] += 1
+            applied_records.append(applied_record)
+            if tier != "strict_intervention":
+                non_strict_applied_records.append(applied_record)
 
     final_episode_keys = set(progress)
     failed_stuck_keys = {
@@ -219,6 +239,17 @@ def analyze(paths, *, replay_missing=True, triage_config=None):
                 embedded_replay_agreement_count, embedded_replay_compared_count
             ),
             "mismatches": embedded_replay_mismatches,
+        },
+        "active_safety_audit": {
+            "applied_event_count": len(applied_records),
+            "applied_tier_counts": dict(applied_tier_counts),
+            "strict_applied_event_count": applied_tier_counts.get(
+                "strict_intervention", 0
+            ),
+            "non_strict_applied_event_count": len(non_strict_applied_records),
+            "all_applied_events_are_strict": not non_strict_applied_records,
+            "applied_records": applied_records,
+            "violations": non_strict_applied_records,
         },
         "tier_counts": dict(tier_counts),
         "tier_episode_counts": {tier: len(keys) for tier, keys in tier_episode_keys.items()},
