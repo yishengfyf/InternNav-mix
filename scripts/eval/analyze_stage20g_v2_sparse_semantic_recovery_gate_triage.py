@@ -202,6 +202,12 @@ def analyze(paths, *, replay_missing=True, triage_config=None):
                     "actions": list(row.get("actions") or []),
                     "action_count": len(list(row.get("actions") or [])),
                     "action_plan": dict(row.get("action_plan") or {}),
+                    "execution_mode": str(
+                        row.get("execution_mode")
+                        or (row.get("action_plan") or {}).get("mode")
+                        or "action_sequence"
+                    ),
+                    "pixel_goal_plan": dict(row.get("pixel_goal_plan") or {}),
                     "shadow_only": bool(row.get("shadow_only")),
                 }
             )

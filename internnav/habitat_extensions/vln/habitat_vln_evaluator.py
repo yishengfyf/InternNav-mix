@@ -3700,6 +3700,59 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     True,
                 )
             ),
+            "allowed_v2_evidence_tiers": tuple(
+                str(item).strip()
+                for item in list(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_allowed_v2_evidence_tiers",
+                        [],
+                    )
+                    or []
+                )
+                if str(item).strip()
+            ),
+            "allowed_direction_buckets": tuple(
+                str(item).strip().lower()
+                for item in list(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_semantic_resilience_active_lite_allowed_direction_buckets",
+                        [],
+                    )
+                    or []
+                )
+                if str(item).strip()
+            ),
+            "execution_mode": str(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_execution_mode",
+                    "action_sequence",
+                )
+                or "action_sequence"
+            ).lower(),
+            "direction_y_ratio": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_direction_y_ratio",
+                    0.75,
+                )
+            ),
+            "direction_front_x_ratio": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_direction_front_x_ratio",
+                    0.50,
+                )
+            ),
+            "direction_left_x_ratio": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_direction_left_x_ratio",
+                    0.25,
+                )
+            ),
+            "direction_right_x_ratio": float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_semantic_resilience_active_lite_direction_right_x_ratio",
+                    0.75,
+                )
+            ),
             "v2_evidence_gate_min_open_score": float(
                 vlmap_safety_cfg.get(
                     "occ_memory_semantic_resilience_active_lite_v2_evidence_gate_min_open_score",
@@ -4023,6 +4076,47 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         return [int(item) for item in actions if int(item) in (1, 2, 3, 5)]
 
+    def _semantic_resilience_active_lite_directional_pixel_goal(
+        self, candidate: dict, cfg: dict
+    ) -> dict:
+        direction = str(candidate.get("direction_bucket") or "").lower()
+        x_ratios = {
+            "front": float(cfg.get("direction_front_x_ratio", 0.50)),
+            "left": float(cfg.get("direction_left_x_ratio", 0.25)),
+            "right": float(cfg.get("direction_right_x_ratio", 0.75)),
+        }
+        if direction not in x_ratios:
+            return {
+                "valid": False,
+                "reason": "direction_not_actionable",
+                "direction": direction,
+                "pixel_goal": None,
+            }
+        image_w = max(1, int(getattr(self.model_args, "resize_w", 384) or 384))
+        image_h = max(1, int(getattr(self.model_args, "resize_h", 384) or 384))
+        pixel_goal = [
+            int(
+                round(
+                    max(0.0, min(1.0, x_ratios[direction]))
+                    * float(image_w - 1)
+                )
+            ),
+            int(
+                round(
+                    max(0.0, min(1.0, float(cfg.get("direction_y_ratio", 0.75))))
+                    * float(image_h - 1)
+                )
+            ),
+        ]
+        return {
+            "valid": True,
+            "reason": "ok",
+            "direction": direction,
+            "pixel_goal": pixel_goal,
+            "image_width": int(image_w),
+            "image_height": int(image_h),
+        }
+
     def _maybe_apply_semantic_resilience_active_lite(
         self,
         candidate_event: Optional[dict],
@@ -4116,6 +4210,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             status["v2_evidence_gate"] = v2_evidence_gate
             status["v2_evidence_tier"] = str(v2_evidence_gate.get("tier") or "unknown")
             status["v2_evidence_reason"] = str(v2_evidence_gate.get("reason") or "unknown")
+        execution_mode = str(cfg.get("execution_mode") or "action_sequence").lower()
+        status["execution_mode"] = execution_mode
         allowed_failure_types = {
             str(item)
             for item in list(cfg.get("allowed_failure_types") or [])
@@ -4159,6 +4255,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             status["reason"] = "current_policy_not_problematic"
         elif bool(cfg.get("require_geometry_safe", True)) and not bool(candidate.get("geometry_safe")):
             status["reason"] = "candidate_not_geometry_safe"
+        elif cfg.get("allowed_direction_buckets") and str(
+            candidate.get("direction_bucket") or "unknown"
+        ).lower() not in set(cfg.get("allowed_direction_buckets") or ()):
+            status["reason"] = "candidate_direction_not_allowed"
         elif bool(cfg.get("require_active_gate_safe", False)) and not bool(candidate.get("active_gate_safe")):
             status["reason"] = "candidate_not_active_gate_safe"
         else:
@@ -4190,15 +4290,28 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
             )
             v2_evidence_gate = dict(status.get("v2_evidence_gate") or {})
+            v2_tier = str(v2_evidence_gate.get("tier") or "")
+            allowed_v2_tiers = {
+                str(item) for item in tuple(cfg.get("allowed_v2_evidence_tiers") or ())
+            }
             status["utility_threshold_used"] = float(utility_threshold)
             status["utility_threshold_context"] = str(utility_threshold_context)
             if (
                 bool(v2_evidence_gate.get("enabled"))
-                and bool(cfg.get("v2_evidence_gate_require_strict_intervention", True))
-                and str(v2_evidence_gate.get("tier") or "") != "strict_intervention"
+                and allowed_v2_tiers
+                and v2_tier not in allowed_v2_tiers
             ):
-                tier = str(v2_evidence_gate.get("tier") or "unknown")
-                if tier == "adapter_candidate":
+                if v2_tier == "adapter_candidate":
+                    status["reason"] = "v2_adapter_candidate_hold"
+                else:
+                    status["reason"] = "v2_evidence_abstain"
+            elif (
+                bool(v2_evidence_gate.get("enabled"))
+                and not allowed_v2_tiers
+                and bool(cfg.get("v2_evidence_gate_require_strict_intervention", True))
+                and v2_tier != "strict_intervention"
+            ):
+                if v2_tier == "adapter_candidate":
                     status["reason"] = "v2_adapter_candidate_hold"
                 else:
                     status["reason"] = "v2_evidence_abstain"
@@ -4239,17 +4352,31 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             elif step_gap is not None and int(step_gap) > int(cfg.get("max_step_gap", 45)):
                 status["reason"] = "backtrack_step_gap_too_large"
             else:
-                actions = self._semantic_resilience_active_lite_actions(candidate, cfg)
-                if not actions:
-                    status["reason"] = "empty_recovery_actions"
+                pixel_goal_plan = None
+                actions = []
+                if execution_mode == "directional_pixel_goal":
+                    pixel_goal_plan = self._semantic_resilience_active_lite_directional_pixel_goal(
+                        candidate, cfg
+                    )
+                    if not pixel_goal_plan.get("valid"):
+                        status["reason"] = str(
+                            pixel_goal_plan.get("reason") or "invalid_directional_pixel_goal"
+                        )
+                else:
+                    actions = self._semantic_resilience_active_lite_actions(candidate, cfg)
+                    if not actions:
+                        status["reason"] = "empty_recovery_actions"
+                if status.get("reason") is not None:
+                    pass
                 elif evaluate_shadow_gate:
                     status.update(
                         {
                             "would_apply": True,
                             "reason": "shadow_gate_pass",
                             "shadow_actions": actions,
+                            "pixel_goal_plan": pixel_goal_plan,
                             "action_plan": {
-                                "mode": "reorient_reobserve",
+                                "mode": execution_mode,
                                 "clear_goal": bool(cfg.get("clear_goal", True)),
                                 "forward_steps": int(cfg.get("forward_steps", 0) or 0),
                                 "append_reobserve_action": bool(
@@ -4262,11 +4389,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     status.update(
                         {
                             "would_apply": True,
-                            "applied": True,
-                            "reason": "applied",
+                            "applied": execution_mode != "directional_pixel_goal",
+                            "execution_pending": execution_mode
+                            == "directional_pixel_goal",
+                            "reason": (
+                                "execution_pending"
+                                if execution_mode == "directional_pixel_goal"
+                                else "applied"
+                            ),
                             "actions": actions,
+                            "pixel_goal_plan": pixel_goal_plan,
                             "action_plan": {
-                                "mode": "reorient_reobserve",
+                                "mode": execution_mode,
                                 "clear_goal": bool(cfg.get("clear_goal", True)),
                                 "forward_steps": int(cfg.get("forward_steps", 0) or 0),
                                 "append_reobserve_action": bool(
@@ -4276,7 +4410,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         }
                     )
 
-        if bool(cfg.get("log_all_considered", True)) or status.get("applied"):
+        if (
+            not status.get("execution_pending")
+            and (bool(cfg.get("log_all_considered", True)) or status.get("applied"))
+        ):
             self._write_semantic_resilience_active_lite_event(status)
         return status
 
@@ -6716,11 +6853,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         )
                         if stage19_active_status.get("considered"):
                             stage19_semantic_resilience_active_considered_count += 1
-                            reason = str(stage19_active_status.get("reason") or "unknown")
-                            stage19_semantic_resilience_active_reason_counts[reason] = (
-                                int(stage19_semantic_resilience_active_reason_counts.get(reason, 0))
-                                + 1
-                            )
                             failure_type = str(stage19_active_status.get("failure_type") or "unknown")
                             stage19_semantic_resilience_failure_type_counts[failure_type] = (
                                 int(stage19_semantic_resilience_failure_type_counts.get(failure_type, 0))
@@ -6739,47 +6871,143 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 )
                                 + 1
                             )
-                            if stage19_active_status.get("applied"):
-                                stage19_semantic_resilience_active_applied_count += 1
-                                stage19_semantic_resilience_active_last_step = int(step_id)
-                                if stage19_semantic_resilience_active_first_step is None:
-                                    stage19_semantic_resilience_active_first_step = int(step_id)
+                            if stage19_active_status.get(
+                                "applied"
+                            ) or stage19_active_status.get("execution_pending"):
+                                execution_mode = str(
+                                    stage19_active_status.get("execution_mode")
+                                    or "action_sequence"
+                                ).lower()
                                 recovery_actions = [
                                     int(item)
                                     for item in list(stage19_active_status.get("actions") or [])
                                     if int(item) in (1, 2, 3, 5)
                                 ]
-                                stage19_semantic_resilience_active_action_sum += int(
-                                    len(recovery_actions)
-                                )
-                                vlmap_recovery_actions = recovery_actions
-                                if self._get_semantic_resilience_active_lite_cfg().get("clear_goal"):
-                                    pixel_goal = None
-                                    output_ids = None
-                                    traj_latents = None
-                                    pix_goal_image = None
-                                    pix_goal_depth = None
-                                    messages = []
-                                    input_images = []
-                                    llm_outputs = ""
-                                    local_actions = []
-                                    action_seq = []
-                                    pending_vlmap_waypoint_feedback = ""
-                                    pending_vlmap_semantic_hint = ""
-                                    pending_occ_memory_guidance_hint = ""
-                                    action = None
-                                    forward_action = 0
-                                    draw_pixel_goal = False
-                                    flag = False
+                                execution_succeeded = True
+                                if execution_mode == "directional_pixel_goal":
+                                    pixel_goal_plan = dict(
+                                        stage19_active_status.get("pixel_goal_plan") or {}
+                                    )
+                                    planned_goal = list(pixel_goal_plan.get("pixel_goal") or [])
+                                    try:
+                                        if len(planned_goal) != 2:
+                                            raise ValueError("invalid_pixel_goal")
+                                        if output_ids is None or output_ids.ndim != 2:
+                                            raise ValueError("missing_base_s2_output_ids")
+                                        if inputs is None or inputs.input_ids.ndim != 2:
+                                            raise ValueError("missing_base_s2_input_ids")
+                                        goal_x, goal_y = (
+                                            int(planned_goal[0]),
+                                            int(planned_goal[1]),
+                                        )
+                                        generated_ids = self.processor.tokenizer(
+                                            f"{goal_y} {goal_x}",
+                                            add_special_tokens=False,
+                                            return_tensors="pt",
+                                        ).input_ids.to(output_ids.device)
+                                        if generated_ids.numel() <= 0:
+                                            raise ValueError("empty_directional_goal_tokens")
+                                        prompt_len = int(inputs.input_ids.shape[1])
+                                        output_ids = torch.cat(
+                                            [output_ids[:, :prompt_len], generated_ids],
+                                            dim=1,
+                                        )
+                                        pixel_goal = [goal_x, goal_y]
+                                        local_actions = []
+                                        action_seq = []
+                                        vlmap_recovery_actions = []
+                                        traj_latents = None
+                                        draw_pixel_goal = True
+                                        pending_vlmap_waypoint_feedback = ""
+                                        pending_vlmap_semantic_hint = ""
+                                        pending_occ_memory_guidance_hint = ""
+                                        action = None
+                                        forward_action = 0
+                                        flag = False
+                                    except Exception as exc:
+                                        execution_succeeded = False
+                                        stage19_active_status.update(
+                                            {
+                                                "applied": False,
+                                                "execution_pending": False,
+                                                "reason": "directional_pixel_goal_execution_failed",
+                                                "execution_error_type": type(exc).__name__,
+                                                "execution_error": str(exc),
+                                            }
+                                        )
+                                    else:
+                                        stage19_active_status.update(
+                                            {
+                                                "applied": True,
+                                                "execution_pending": False,
+                                                "reason": "applied",
+                                                "executed_pixel_goal": list(pixel_goal),
+                                            }
+                                        )
+                                    self._write_semantic_resilience_active_lite_event(
+                                        stage19_active_status
+                                    )
+                                else:
+                                    vlmap_recovery_actions = recovery_actions
+                                    if self._get_semantic_resilience_active_lite_cfg().get(
+                                        "clear_goal"
+                                    ):
+                                        pixel_goal = None
+                                        output_ids = None
+                                        traj_latents = None
+                                        pix_goal_image = None
+                                        pix_goal_depth = None
+                                        messages = []
+                                        input_images = []
+                                        llm_outputs = ""
+                                        local_actions = []
+                                        action_seq = []
+                                        pending_vlmap_waypoint_feedback = ""
+                                        pending_vlmap_semantic_hint = ""
+                                        pending_occ_memory_guidance_hint = ""
+                                        action = None
+                                        forward_action = 0
+                                        draw_pixel_goal = False
+                                        flag = False
+                                if execution_succeeded:
+                                    stage19_semantic_resilience_active_applied_count += 1
+                                    stage19_semantic_resilience_active_last_step = int(step_id)
+                                    if stage19_semantic_resilience_active_first_step is None:
+                                        stage19_semantic_resilience_active_first_step = int(step_id)
+                                    stage19_semantic_resilience_active_action_sum += int(
+                                        len(recovery_actions)
+                                    )
+                                    reason = str(
+                                        stage19_active_status.get("reason") or "unknown"
+                                    )
+                                    stage19_semantic_resilience_active_reason_counts[reason] = (
+                                        int(
+                                            stage19_semantic_resilience_active_reason_counts.get(
+                                                reason, 0
+                                            )
+                                        )
+                                        + 1
+                                    )
+                                    print(
+                                        "[Stage19][SemanticResilience][ActiveLite] "
+                                        f"apply {execution_mode} "
+                                        f"actions={vlmap_recovery_actions} pixel_goal={pixel_goal} "
+                                        f"reason={stage19_active_status.get('reason')} "
+                                        f"candidate={((stage19_active_status.get('candidate') or {}).get('candidate_id'))}"
+                                    )
+                                    continue
                                 print(
                                     "[Stage19][SemanticResilience][ActiveLite] "
-                                    f"queue recovery actions {vlmap_recovery_actions} "
+                                    f"suppress {execution_mode}; "
                                     f"reason={stage19_active_status.get('reason')} "
-                                    f"candidate={((stage19_active_status.get('candidate') or {}).get('candidate_id'))}"
+                                    f"error={stage19_active_status.get('execution_error')}"
                                 )
-                                continue
-                            else:
-                                stage19_semantic_resilience_active_suppressed_count += 1
+                            reason = str(stage19_active_status.get("reason") or "unknown")
+                            stage19_semantic_resilience_active_reason_counts[reason] = (
+                                int(stage19_semantic_resilience_active_reason_counts.get(reason, 0))
+                                + 1
+                            )
+                            stage19_semantic_resilience_active_suppressed_count += 1
                         if semantic_decision.get("stagnation_hint_required"):
                             if not pending_vlmap_semantic_hint:
                                 pending_vlmap_semantic_hint = (
