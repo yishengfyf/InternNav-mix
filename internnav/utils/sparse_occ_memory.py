@@ -1499,6 +1499,7 @@ class SparseOccSemanticMemory:
         decision = dict(current_waypoint_decision or {})
         event = {
             "event_type": "occ_memory_query_candidates",
+            "event_schema_version": "stage21a_v1",
             **self.episode_meta,
             **context,
             "enabled": bool(self.enabled and self.config.candidate_probe_enable),
@@ -1655,6 +1656,10 @@ class SparseOccSemanticMemory:
                 "valid": bool(candidates),
                 "reason": "ok" if candidates else "no_candidates",
                 "start_grid": [int(start_grid[0]), int(start_grid[1])],
+                "start_xy": [
+                    float(pose_state["xy"][0]),
+                    float(pose_state["xy"][1]),
+                ],
                 "start_yaw": yaw,
                 "current_waypoint_goal_grid": self._jsonable(current_goal_grid),
                 "current_waypoint_direction_angle_deg": current_angle,

@@ -6692,7 +6692,38 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         candidate_probe_cfg = self._get_occ_memory_candidate_probe_cfg()
                         stage19_candidate_event = None
                         if candidate_probe_cfg.get("enable"):
+                            base_eval_seed = getattr(self.model_args, "eval_random_seed", None)
+                            episode_eval_seed = None
+                            if base_eval_seed is not None and bool(
+                                getattr(self.model_args, "eval_seed_per_episode", False)
+                            ):
+                                episode_seed_mode = getattr(
+                                    self.model_args,
+                                    "eval_episode_seed_mode",
+                                    "episode_index",
+                                )
+                                episode_seed_offset = (
+                                    int(episode_id)
+                                    if episode_seed_mode == "episode_id"
+                                    else int(episode_index)
+                                )
+                                episode_eval_seed = (
+                                    int(base_eval_seed)
+                                    + episode_seed_offset
+                                    + int(getattr(self, "rank", 0)) * 100000
+                                )
+                            habitat_dataset_cfg = getattr(
+                                getattr(self.config, "habitat", None),
+                                "dataset",
+                                None,
+                            )
                             candidate_context = {
+                                "split": getattr(habitat_dataset_cfg, "split", None),
+                                "rank": int(getattr(self, "rank", 0)),
+                                "local_rank": int(getattr(self, "local_rank", 0)),
+                                "world_size": int(getattr(self, "world_size", 1)),
+                                "eval_random_seed": base_eval_seed,
+                                "episode_eval_seed": episode_eval_seed,
                                 "step_id": step_id,
                                 "scene_id": scene_id,
                                 "episode_id": episode_id,

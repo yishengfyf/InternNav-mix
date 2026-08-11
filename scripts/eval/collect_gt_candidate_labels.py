@@ -505,10 +505,18 @@ def collect_labels(
             metadata = reference_metadata.get(metadata_key)
         traj_event = _nearest_traj_event(traj_by_key.get(key, []), step)
         base_row = {
+            "event_schema_version": event.get("event_schema_version"),
+            "split": event.get("split"),
+            "rank": event.get("rank"),
+            "local_rank": event.get("local_rank"),
+            "world_size": event.get("world_size"),
+            "eval_random_seed": event.get("eval_random_seed"),
+            "episode_eval_seed": event.get("episode_eval_seed"),
             "scene_id": event.get("scene_id"),
             "episode_id": event.get("episode_id"),
             "episode_index": event.get("episode_index"),
             "step_id": step,
+            "start_xy": event.get("start_xy"),
             "candidate_count": _safe_int(event.get("candidate_count")),
             "current_waypoint_direction_angle_deg": event.get("current_waypoint_direction_angle_deg"),
             "current_waypoint_direction_bucket": event.get("current_waypoint_direction_bucket"),
