@@ -7425,8 +7425,63 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
 
                         depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
-                        with torch.no_grad():
-                            dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+                        try:
+                            # A directional recovery rewrites output_ids after the
+                            # original S2 latent was consumed. Re-encode that goal
+                            # before asking frozen NextDiT for a new local trajectory.
+                            if traj_latents is None:
+                                if output_ids is None or inputs is None:
+                                    raise ValueError("missing_directional_replan_inputs")
+                                pixel_values = inputs.pixel_values
+                                image_grid_thw = torch.cat(
+                                    [thw.unsqueeze(0) for thw in inputs.image_grid_thw],
+                                    dim=0,
+                                )
+                                with torch.no_grad():
+                                    traj_latents = self.model.generate_latents(
+                                        output_ids, pixel_values, image_grid_thw
+                                    )
+                            with torch.no_grad():
+                                dp_actions = self.model.generate_traj(
+                                    traj_latents, images_dp, depths_dp
+                                )
+                        except Exception as exc:
+                            print(
+                                "[Stage19][SemanticResilience][ActiveLite] "
+                                "suppress local trajectory regeneration; "
+                                f"error={type(exc).__name__}: {exc}",
+                                flush=True,
+                            )
+                            if stage19_active_status.get("applied"):
+                                stage19_active_status.update(
+                                    {
+                                        "post_apply_execution_failure": True,
+                                        "post_apply_execution_failure_reason": (
+                                            "directional_replan_generation_failed"
+                                        ),
+                                        "post_apply_execution_error_type": type(exc).__name__,
+                                        "post_apply_execution_error": str(exc),
+                                    }
+                                )
+                                self._write_semantic_resilience_active_lite_event(
+                                    {
+                                        **stage19_active_status,
+                                        "event_type": "stage19_semantic_resilience_execution",
+                                        "reason": "directional_replan_generation_failed",
+                                    }
+                                )
+                            pixel_goal = None
+                            output_ids = None
+                            traj_latents = None
+                            pix_goal_image = None
+                            pix_goal_depth = None
+                            local_actions = []
+                            action_seq = []
+                            action = None
+                            forward_action = 0
+                            draw_pixel_goal = False
+                            flag = False
+                            continue
 
                         nextdit_probe_dp_actions = dp_actions.detach().clone() if hasattr(dp_actions, "detach") else None
                         action_list = traj_to_actions(dp_actions)

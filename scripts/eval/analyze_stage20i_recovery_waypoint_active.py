@@ -74,9 +74,15 @@ def analyze(active_paths, *, baseline_progress=None):
     execution_failure_records = []
     for path in _active_event_files(active_paths):
         for row in _read_json_records(path):
-            if row.get("event_type") != "stage19_semantic_resilience_active":
+            if row.get("event_type") not in {
+                "stage19_semantic_resilience_active",
+                "stage19_semantic_resilience_execution",
+            }:
                 continue
-            if str(row.get("reason") or "") != "directional_pixel_goal_execution_failed":
+            if str(row.get("reason") or "") not in {
+                "directional_pixel_goal_execution_failed",
+                "directional_replan_generation_failed",
+            }:
                 continue
             candidate = dict(row.get("candidate") or {})
             execution_failure_records.append(
@@ -91,7 +97,8 @@ def analyze(active_paths, *, baseline_progress=None):
                     "direction": candidate.get("direction_bucket"),
                     "pixel_goal_plan": dict(row.get("pixel_goal_plan") or {}),
                     "execution_error_type": row.get("execution_error_type"),
-                    "execution_error": row.get("execution_error"),
+                    "execution_error": row.get("execution_error")
+                    or row.get("post_apply_execution_error"),
                 }
             )
     active_audit = summary.get("v2_triage_summary", {}).get("active_safety_audit", {})
