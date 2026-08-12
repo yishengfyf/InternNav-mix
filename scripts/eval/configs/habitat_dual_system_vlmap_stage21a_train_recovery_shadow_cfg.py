@@ -89,6 +89,13 @@ vlmap_cfg[
 ] = True
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_log_all_considered"] = True
 
+# Save at most one representative RGB + S2 decision JSON per episode when the
+# agent exhibits a long repeated-action or low-displacement stagnation window.
+vlmap_cfg["stuck_snapshot_enable"] = True
+vlmap_cfg["stuck_snapshot_min_step"] = 30
+vlmap_cfg["stuck_snapshot_action_window_steps"] = 32
+vlmap_cfg["stuck_snapshot_repeat_ratio"] = 0.90
+
 # Preserve JSONL evidence but disable high-volume visualization/PLY output for
 # overnight runs. These switches materially reduce disk use and serialization.
 vlmap_cfg["occ_memory_validation_enable"] = False

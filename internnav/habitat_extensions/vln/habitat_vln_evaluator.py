@@ -334,6 +334,113 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             with open(os.path.join(run_dir, 'progress.json'), 'a', encoding="utf-8") as f:
                 f.write(json.dumps(self._jsonable(result), ensure_ascii=False) + "\n")
 
+    def _maybe_save_stuck_snapshot(
+        self,
+        *,
+        state: dict,
+        event: Optional[dict],
+        rgb: np.ndarray,
+        step_id: int,
+        scene_id: str,
+        episode_id: int,
+        instruction: str,
+        action,
+        pixel_goal,
+        local_actions,
+        action_seq,
+        llm_outputs: str,
+    ) -> Optional[dict]:
+        """Save one representative RGB and S2 decision for a stuck episode."""
+        cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        if not bool(cfg.get("stuck_snapshot_enable", False)) or state.get("stuck_snapshot_saved"):
+            return None
+        event = dict(event or {})
+        action_value = None if action is None else int(action)
+        history = state.setdefault("stuck_snapshot_action_history", [])
+        if action_value is not None:
+            history.append(action_value)
+        window = max(4, int(cfg.get("stuck_snapshot_action_window_steps", 32)))
+        if len(history) > window:
+            del history[:-window]
+        min_step = max(0, int(cfg.get("stuck_snapshot_min_step", 30)))
+        repeated_ratio = 0.0
+        dominant_action = None
+        if history:
+            dominant_action = max(set(history), key=history.count)
+            repeated_ratio = float(history.count(dominant_action) / len(history))
+        repeat_trigger = bool(
+            len(history) >= window
+            and repeated_ratio >= float(cfg.get("stuck_snapshot_repeat_ratio", 0.90))
+        )
+        stagnation_trigger = bool(
+            event.get("map_stagnation_recovery_gate")
+            or event.get("total_map_stagnation_trigger")
+            or (
+                event.get("low_displacement")
+                and int(event.get("total_stagnation_streak", 0) or 0) >= window
+            )
+        )
+        if int(step_id) < min_step or not (repeat_trigger or stagnation_trigger):
+            return None
+        run_dir = self._get_vlmap_run_dir() or self.output_path
+        snapshot_dir = os.path.join(run_dir, "stuck_snapshots")
+        os.makedirs(snapshot_dir, exist_ok=True)
+        stem = f"{scene_id}_{int(episode_id)}_step{int(step_id)}"
+        image_path = os.path.join(snapshot_dir, f"{stem}.jpg")
+        metadata_path = os.path.join(snapshot_dir, f"{stem}.json")
+        snapshot_image = Image.fromarray(np.asarray(rgb, dtype=np.uint8)).convert("RGB")
+        draw = ImageDraw.Draw(snapshot_image)
+        if isinstance(pixel_goal, (list, tuple)) and len(pixel_goal) >= 2:
+            goal_x, goal_y = int(pixel_goal[0]), int(pixel_goal[1])
+            draw.ellipse(
+                (goal_x - 8, goal_y - 8, goal_x + 8, goal_y + 8),
+                outline=(255, 0, 0),
+                width=4,
+            )
+        draw.rectangle((0, 0, snapshot_image.width, 30), fill=(0, 0, 0))
+        draw.text(
+            (8, 8),
+            f"step={int(step_id)} action={action_value} repeat={repeated_ratio:.2f}",
+            fill=(255, 255, 0),
+        )
+        snapshot_image.save(image_path, quality=92)
+        metadata = {
+            "event_type": "stuck_snapshot",
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "step_id": int(step_id),
+            "instruction": instruction,
+            "trigger_reasons": [
+                reason for reason, enabled in (
+                    ("repeated_action", repeat_trigger),
+                    ("map_or_pose_stagnation", stagnation_trigger),
+                ) if enabled
+            ],
+            "current_action": action_value,
+            "dominant_action": dominant_action,
+            "action_window": list(history),
+            "dominant_action_ratio": repeated_ratio,
+            "pixel_goal": pixel_goal,
+            "local_actions": list(local_actions or []),
+            "action_seq": list(action_seq or []),
+            "s2_output": str(llm_outputs or ""),
+            "s2_decision": {
+                "pixel_goal": pixel_goal,
+                "queued_local_actions": list(local_actions or []),
+                "queued_system2_actions": list(action_seq or []),
+                "raw_output": str(llm_outputs or ""),
+            },
+            "recovery_shadow_event": event,
+            "rgb_file": os.path.basename(image_path),
+        }
+        with open(metadata_path, "w", encoding="utf-8") as stream:
+            json.dump(self._jsonable(metadata), stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        state["stuck_snapshot_saved"] = True
+        state["stuck_snapshot_path"] = metadata_path
+        print(f"[StuckSnapshot] saved {metadata_path}")
+        return metadata
+
     def _jsonable(self, value):
         if isinstance(value, dict):
             return {str(k): self._jsonable(v) for k, v in value.items()}
@@ -7716,6 +7823,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     vis_frames.append(frame)
 
                 print("step_id", step_id, "action", action)
+
+                self._maybe_save_stuck_snapshot(
+                    state=occ_memory_recovery_state,
+                    event=occ_memory_recovery_event,
+                    rgb=rgb,
+                    step_id=step_id,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    instruction=episode_instruction,
+                    action=action,
+                    pixel_goal=pixel_goal,
+                    local_actions=local_actions,
+                    action_seq=action_seq,
+                    llm_outputs=llm_outputs,
+                )
 
                 if vis_writer is not None:
                     vis = np.asarray(save_raw_image).copy()
