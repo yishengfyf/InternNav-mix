@@ -27,7 +27,7 @@ package_failure() {
   if [[ "${PIPELINE_COMPLETE}" == "1" || "${exit_status}" == "0" ]]; then
     return
   fi
-  local failure_name="stage21a_train_recovery_shadow_failure_return_${PIPELINE_TAG}"
+  local failure_name="stage21a_r2_recovery_decision_state_shadow_failure_return_${PIPELINE_TAG}"
   local failure_dest="${RETURN_ROOT}/${failure_name}"
   mkdir -p "${failure_dest}/partial_runs" "${failure_dest}/partial_datasets" \
     "${failure_dest}/episode_manifests"
@@ -70,7 +70,7 @@ test -f "${EPISODES_FILE}"
 mkdir -p "${MANIFEST_DIR}" "${DATASET_ROOT}" "${RETURN_ROOT}"
 
 for episode_count in 4 40 500; do
-  python scripts/eval/select_balanced_r2r_episodes.py \
+  python3 scripts/eval/select_balanced_r2r_episodes.py \
     --episodes-file "${EPISODES_FILE}" \
     --output "${MANIFEST_DIR}/train_balanced_${episode_count}_episode_ids.json" \
     --summary-output "${MANIFEST_DIR}/train_balanced_${episode_count}_episode_ids_summary.json" \
@@ -86,7 +86,7 @@ run_and_audit() {
   local eval_port=$4
   local master_port=$5
   local expected_run_dirs=$6
-  local run_name="compare_vlmap_stage21a_train_recovery_shadow_${label}_${PIPELINE_TAG}"
+  local run_name="compare_vlmap_stage21a_r2_recovery_decision_state_shadow_${label}_${PIPELINE_TAG}"
   local manifest="${MANIFEST_DIR}/train_balanced_${episode_count}_episode_ids.json"
   local run_root="logs/habitat/${run_name}"
   local dataset_dir="${DATASET_ROOT}/${run_name}"
@@ -104,7 +104,7 @@ run_and_audit() {
   MASTER_PORT="${master_port}" \
   bash scripts/eval/bash/stage21_torchrun_eval.sh
 
-  python scripts/eval/build_stage21_candidate_recoverability_dataset.py \
+  python3 scripts/eval/build_stage21_candidate_recoverability_dataset.py \
     --run-root "${run_root}" \
     --episodes-file "${EPISODES_FILE}" \
     --output-dir "${dataset_dir}" \
@@ -115,7 +115,7 @@ run_and_audit() {
     --split-key scene \
     --split-seed 21
 
-  python - "${run_root}" "${dataset_dir}" "${episode_count}" "${expected_run_dirs}" <<'PY'
+  python3 - "${run_root}" "${dataset_dir}" "${episode_count}" "${expected_run_dirs}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -141,6 +141,25 @@ assert summary["split_audit"]["scene_overlap_count"] == 0, summary["split_audit"
 candidate_rows = summary["candidate_recoverability_rows"]
 assert candidate_rows["status"] == "ok", candidate_rows
 assert candidate_rows["counts"]["candidate_rows"] > 0, candidate_rows
+assert candidate_rows["gt_leakage_scan"]["passed"] is True, candidate_rows
+assert candidate_rows["active_gate_safe_used_as_recovery_target"] is False, candidate_rows
+assert summary["event_schema_version"] == "stage21a_r2_v2", summary
+if expected_episodes >= 40:
+    assert summary["task_rows"]["recovery_proxy"] > 0, summary["task_rows"]
+    coverage = candidate_rows["recovery_feature_coverage"]
+    for field in (
+        "recovery_feature_schema_version", "anchor_visible_free_ratio",
+        "anchor_branch_count", "anchor_short_cycle_risk",
+        "current_to_anchor_free_ratio_gain", "current_to_anchor_branch_gain",
+    ):
+        assert coverage["rates"][field] >= 0.95, (field, coverage)
+for filename in (
+    "progress_rows.jsonl", "recovery_proxy_rows.jsonl", "safety_rows.jsonl",
+    "progress_rows_train.jsonl", "progress_rows_val.jsonl",
+    "recovery_proxy_rows_train.jsonl", "recovery_proxy_rows_val.jsonl",
+    "safety_rows_train.jsonl", "safety_rows_val.jsonl",
+):
+    assert (dataset_dir / filename).is_file(), filename
 print(json.dumps({
     "run_root": str(run_root),
     "dataset_dir": str(dataset_dir),
@@ -148,6 +167,9 @@ print(json.dumps({
     "run_dir_count": summary["run_dir_count"],
     "reference_join_rate": summary["reference_join_rate"],
     "candidate_rows": candidate_rows["counts"]["candidate_rows"],
+    "recovery_proxy_rows": summary["task_rows"]["recovery_proxy"],
+    "safety_rows": summary["task_rows"]["safety"],
+    "recovery_feature_coverage": candidate_rows["recovery_feature_coverage"],
     "positive_vs_negative_pairs": candidate_rows["counts"]["positive_vs_negative_pairs"],
     "active_applied": summary["active_safety_check"]["applied_count"],
 }, indent=2))
@@ -172,7 +194,7 @@ RUN_NAME_500=${LAST_RUN_NAME}
 RUN_ROOT_500=${LAST_RUN_ROOT}
 DATASET_DIR_500=${LAST_DATASET_DIR}
 
-RETURN_NAME="stage21a_train_recovery_shadow_a0_500ep_return_${PIPELINE_TAG}"
+RETURN_NAME="stage21a_r2_recovery_decision_state_shadow_500ep_return_${PIPELINE_TAG}"
 DEST="${RETURN_ROOT}/${RETURN_NAME}"
 test ! -e "${DEST}"
 mkdir -p "${DEST}/smoke_runs" "${DEST}/datasets" "${DEST}/episode_manifests"

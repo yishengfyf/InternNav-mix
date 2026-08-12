@@ -365,6 +365,10 @@ class SparseOccMemoryConfig:
     semantic_resilience_backtrack_min_step_gap: int = 6
     semantic_resilience_backtrack_score_weight: float = 1.35
     semantic_resilience_candidate_source_score: float = 2.40
+    semantic_resilience_anchor_feature_radius_cells: int = 8
+    semantic_resilience_anchor_semantic_radius_m: float = 2.50
+    semantic_resilience_cycle_window_steps: int = 48
+    semantic_resilience_cycle_radius_cells: int = 8
     semantic_anchor_enable: bool = False
     semantic_anchor_min_score: float = 0.20
     semantic_anchor_max_terms_per_event: int = 3
@@ -647,6 +651,8 @@ class SparseOccSemanticMemory:
         self.occupied_update_count += occupied_added
         self.free_update_count += free_added
         self.frontier_cache = None
+        self.frontier_set_cache = None
+        self._refresh_latest_keyframe_information(context)
         frontier_count = None
         if self.config.save_bev and self.update_count % max(1, int(self.config.bev_every_updates)) == 0:
             frontier_count = len(self.get_frontier_cells(sample_limit=0))
@@ -1499,7 +1505,8 @@ class SparseOccSemanticMemory:
         decision = dict(current_waypoint_decision or {})
         event = {
             "event_type": "occ_memory_query_candidates",
-            "event_schema_version": "stage21a_v1",
+            "event_schema_version": "stage21a_r2_v2",
+            "recovery_feature_schema_version": "v2",
             **self.episode_meta,
             **context,
             "enabled": bool(self.enabled and self.config.candidate_probe_enable),
@@ -2159,6 +2166,244 @@ class SparseOccSemanticMemory:
         occupied_ratio = float(occupied_count / checked)
         return max(0.0, min(1.0, free_ratio * (1.0 - occupied_ratio)))
 
+    @staticmethod
+    def _normalized_entropy(counts: Iterable[int]) -> float:
+        values = [max(0, int(value)) for value in counts]
+        total = sum(values)
+        active = sum(value > 0 for value in values)
+        if total <= 0 or active <= 1:
+            return 0.0
+        entropy = 0.0
+        for value in values:
+            if value <= 0:
+                continue
+            probability = float(value / total)
+            entropy -= probability * math.log(probability)
+        return float(entropy / math.log(len(values)))
+
+    @staticmethod
+    def _relative_sector(dr: int, dc: int) -> str:
+        if abs(dr) >= abs(dc):
+            return "north" if dr < 0 else "south"
+        return "west" if dc < 0 else "east"
+
+    def _anchor_spatial_information(
+        self,
+        cell: Iterable[int],
+        *,
+        radius_cells: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        row0, col0 = [int(v) for v in list(cell)[:2]]
+        radius = max(
+            1,
+            int(
+                self.config.semantic_resilience_anchor_feature_radius_cells
+                if radius_cells is None
+                else radius_cells
+            ),
+        )
+        frontier_set = self._frontier_cell_set() if self.config.frontier_enable else set()
+        state_counts = {"free": 0, "occupied": 0, "unknown": 0, "frontier": 0}
+        sector_counts = {"north": 0, "south": 0, "east": 0, "west": 0}
+        checked = 0
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if dr == 0 and dc == 0:
+                    continue
+                if dr * dr + dc * dc > radius * radius:
+                    continue
+                row = row0 + dr
+                col = col0 + dc
+                if row < 0 or row >= self.gs or col < 0 or col >= self.gs:
+                    continue
+                checked += 1
+                state = self._cell_state(row, col)
+                state_counts[state] += 1
+                is_frontier = (row, col) in frontier_set
+                if is_frontier:
+                    state_counts["frontier"] += 1
+                if state == "free" or is_frontier:
+                    sector_counts[self._relative_sector(dr, dc)] += 1
+        observed = state_counts["free"] + state_counts["occupied"]
+        return {
+            "radius_cells": int(radius),
+            "checked_cell_count": int(checked),
+            "free_count": int(state_counts["free"]),
+            "occupied_count": int(state_counts["occupied"]),
+            "unknown_count": int(state_counts["unknown"]),
+            "frontier_count": int(state_counts["frontier"]),
+            "visible_free_ratio": float(state_counts["free"] / max(1, checked)),
+            "occupied_ratio_observed": float(
+                state_counts["occupied"] / max(1, observed)
+            ),
+            "branch_count": int(sum(value > 0 for value in sector_counts.values())),
+            "direction_entropy": float(
+                self._normalized_entropy(sector_counts.values())
+            ),
+            "sector_counts": dict(sector_counts),
+        }
+
+    def _anchor_trace_information(
+        self,
+        cell: Iterable[int],
+        *,
+        latest_step: Optional[int],
+    ) -> Dict[str, Any]:
+        row0, col0 = [int(v) for v in list(cell)[:2]]
+        radius = max(1, int(self.config.semantic_resilience_cycle_radius_cells))
+        window = max(2, int(self.config.semantic_resilience_cycle_window_steps))
+        recent = self.pose_trace[-window:]
+        near_flags = [
+            bool(
+                (int(item.get("row", row0)) - row0) ** 2
+                + (int(item.get("col", col0)) - col0) ** 2
+                <= radius * radius
+            )
+            for item in recent
+        ]
+        returns = 0
+        was_near = False
+        for is_near in near_flags:
+            if is_near and not was_near:
+                returns += 1
+            was_near = is_near
+        near_steps = []
+        for item, is_near in zip(recent, near_flags):
+            step = self._safe_int(item.get("step_id"))
+            if is_near and step is not None:
+                near_steps.append(step)
+        last_visit_step = max(near_steps) if near_steps else None
+        last_visit_age = None
+        if latest_step is not None and last_visit_step is not None:
+            last_visit_age = max(0, int(latest_step - last_visit_step))
+        outgoing_sectors = set()
+        for index, is_near in enumerate(near_flags[:-1]):
+            if not is_near or near_flags[index + 1]:
+                continue
+            next_pose = recent[index + 1]
+            dr = int(next_pose.get("row", row0)) - row0
+            dc = int(next_pose.get("col", col0)) - col0
+            if dr != 0 or dc != 0:
+                outgoing_sectors.add(self._relative_sector(dr, dc))
+        cycle_count = max(0, returns - 1)
+        return {
+            "trace_window_steps": int(window),
+            "near_pose_count": int(sum(near_flags)),
+            "return_count": int(returns),
+            "recent_cycle_count": int(cycle_count),
+            "short_cycle_risk": float(min(1.0, cycle_count / 2.0)),
+            "last_visit_step": last_visit_step,
+            "last_visit_age_steps": last_visit_age,
+            "outgoing_trace_direction_count": int(len(outgoing_sectors)),
+            "outgoing_trace_directions": sorted(outgoing_sectors),
+        }
+
+    def _anchor_semantic_information(
+        self,
+        cell: Iterable[int],
+        semantic_nodes: Iterable[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        anchor_xy = self._grid_to_xy(cell)
+        radius_m = max(
+            0.25, float(self.config.semantic_resilience_anchor_semantic_radius_m)
+        )
+        terms = set()
+        instruction_relevant_count = 0
+        high_conf_count = 0
+        next_landmark_count = 0
+        passage_count = 0
+        for node in semantic_nodes:
+            xy = node.get("xy")
+            if not isinstance(xy, (list, tuple)) or len(xy) < 2:
+                continue
+            node_xy = np.asarray([float(xy[0]), float(xy[1])], dtype=np.float32)
+            if float(np.linalg.norm(node_xy - anchor_xy)) > radius_m:
+                continue
+            term = self._canonical_semantic_term(node.get("semantic_top_match"))
+            if term:
+                terms.add(term)
+            if float(node.get("instruction_relevance", 0.0) or 0.0) > 0.0:
+                instruction_relevant_count += 1
+            if bool(node.get("high_conf_semantic")):
+                high_conf_count += 1
+            if float(node.get("next_landmark_relevance", 0.0) or 0.0) > 0.0:
+                next_landmark_count += 1
+            if self._semantic_resilience_term_kind(term) == "passage":
+                passage_count += 1
+        return {
+            "semantic_radius_m": float(radius_m),
+            "semantic_unique_count": int(len(terms)),
+            "semantic_terms": sorted(terms),
+            "instruction_relevant_count": int(instruction_relevant_count),
+            "high_conf_landmark_count": int(high_conf_count),
+            "next_landmark_count": int(next_landmark_count),
+            "passage_semantic_count": int(passage_count),
+        }
+
+    def _recovery_anchor_features(
+        self,
+        cell: Iterable[int],
+        start_grid: Iterable[int],
+        *,
+        source_type: str,
+        source_node: Dict[str, Any],
+        semantic_nodes: Iterable[Dict[str, Any]],
+        latest_step: Optional[int],
+    ) -> Dict[str, Any]:
+        anchor_spatial = self._anchor_spatial_information(cell)
+        current_spatial = self._anchor_spatial_information(start_grid)
+        trace = self._anchor_trace_information(cell, latest_step=latest_step)
+        semantic = self._anchor_semantic_information(cell, semantic_nodes)
+        return {
+            "recovery_feature_schema_version": "v2",
+            "anchor_source_is_keyframe": bool(source_type == "keyframe"),
+            "anchor_visible_free_ratio": anchor_spatial["visible_free_ratio"],
+            "anchor_occupied_ratio_observed": anchor_spatial[
+                "occupied_ratio_observed"
+            ],
+            "anchor_frontier_count": anchor_spatial["frontier_count"],
+            "anchor_branch_count": anchor_spatial["branch_count"],
+            "anchor_direction_entropy": anchor_spatial["direction_entropy"],
+            "anchor_semantic_unique_count": semantic["semantic_unique_count"],
+            "anchor_instruction_relevant_count": semantic[
+                "instruction_relevant_count"
+            ],
+            "anchor_high_conf_landmark_count": semantic[
+                "high_conf_landmark_count"
+            ],
+            "anchor_next_landmark_count": semantic["next_landmark_count"],
+            "anchor_passage_semantic_count": semantic["passage_semantic_count"],
+            "anchor_outgoing_trace_direction_count": trace[
+                "outgoing_trace_direction_count"
+            ],
+            "anchor_last_visit_step": trace["last_visit_step"],
+            "anchor_last_visit_age_steps": trace["last_visit_age_steps"],
+            "anchor_recent_return_count": trace["return_count"],
+            "anchor_recent_cycle_count": trace["recent_cycle_count"],
+            "anchor_short_cycle_risk": trace["short_cycle_risk"],
+            "current_visible_free_ratio": current_spatial["visible_free_ratio"],
+            "current_frontier_count": current_spatial["frontier_count"],
+            "current_branch_count": current_spatial["branch_count"],
+            "current_direction_entropy": current_spatial["direction_entropy"],
+            "current_to_anchor_free_ratio_gain": float(
+                anchor_spatial["visible_free_ratio"]
+                - current_spatial["visible_free_ratio"]
+            ),
+            "current_to_anchor_frontier_gain": int(
+                anchor_spatial["frontier_count"] - current_spatial["frontier_count"]
+            ),
+            "current_to_anchor_branch_gain": int(
+                anchor_spatial["branch_count"] - current_spatial["branch_count"]
+            ),
+            "current_to_anchor_direction_entropy_gain": float(
+                anchor_spatial["direction_entropy"]
+                - current_spatial["direction_entropy"]
+            ),
+            "anchor_semantic_top_match": source_node.get("semantic_top_match"),
+            "anchor_semantic_top_score": source_node.get("semantic_top_score"),
+            "anchor_high_conf_semantic": bool(source_node.get("high_conf_semantic")),
+        }
+
     def _semantic_resilience_backtrack_candidates(
         self,
         start_grid: Iterable[int],
@@ -2265,6 +2510,14 @@ class SparseOccSemanticMemory:
                 ),
             )
             candidate["score"] = float(candidate.get("score", 0.0) or 0.0) + weight * resilience_score
+            recovery_features = self._recovery_anchor_features(
+                [row, col],
+                start_grid,
+                source_type=source_type,
+                source_node=node,
+                semantic_nodes=semantic_nodes,
+                latest_step=latest_step,
+            )
             candidate.update(
                 {
                     "semantic_resilience_candidate": True,
@@ -2308,6 +2561,7 @@ class SparseOccSemanticMemory:
                     "semantic_resilience_nearest_passage_distance_m": semantic_counts[
                         "nearest_passage_distance_m"
                     ],
+                    **recovery_features,
                 }
             )
             candidates.append(candidate)
@@ -4313,9 +4567,29 @@ class SparseOccSemanticMemory:
                 "yaw": float(yaw),
                 "semantic_top_match": self.last_semantic_decision.get("top_match"),
                 "semantic_top_score": self.last_semantic_decision.get("top_score"),
+                "keyframe_feature_schema_version": "v2",
             }
         )
         self.last_keyframe_xy = xy
+
+    def _refresh_latest_keyframe_information(self, context: Dict[str, Any]) -> None:
+        if not self.keyframes:
+            return
+        latest = self.keyframes[-1]
+        step_id = self._safe_int(context.get("step_id"))
+        keyframe_step = self._safe_int(latest.get("step_id"))
+        if step_id is not None and keyframe_step is not None and step_id != keyframe_step:
+            return
+        spatial = self._anchor_spatial_information([latest["row"], latest["col"]])
+        latest.update(
+            {
+                "keyframe_visible_free_ratio": spatial["visible_free_ratio"],
+                "keyframe_occupied_ratio_observed": spatial["occupied_ratio_observed"],
+                "keyframe_frontier_count": spatial["frontier_count"],
+                "keyframe_branch_count": spatial["branch_count"],
+                "keyframe_direction_entropy": spatial["direction_entropy"],
+            }
+        )
 
     def _pixel_goal_to_grid(
         self,

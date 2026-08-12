@@ -165,3 +165,79 @@ def test_candidate_rows_use_relative_s2_value_and_keep_outcome_as_context(tmp_pa
     assert rows[1]["offline_labels"]["advantage_vs_s2_m"] < 0.0
     assert rows[0]["episode_outcome_context_only"] == {"success": 0.0}
     assert "success" not in rows[0]["online_inputs"]
+    assert stage21_dataset._contains_gt_field(rows[0]["online_inputs"]) is False
+
+
+def test_recovery_proxy_restores_decision_state_instead_of_rejecting_backtrack():
+    base = {
+        "candidate_type": "resilience_backtrack",
+        "semantic_resilience_candidate": True,
+        "geometry_safe": True,
+        "active_gate_safe": False,
+        "direction_bucket": "back",
+        "points_to_revisited_region": True,
+        "landmark_status": "completed",
+        "completed_landmark_penalty": 1.0,
+        "distance_m": 3.0,
+        "anchor_occupied_ratio_observed": 0.05,
+        "semantic_resilience_local_trap": True,
+        "semantic_resilience_recovery_trigger": True,
+        "current_to_anchor_free_ratio_gain": 0.20,
+        "current_to_anchor_frontier_gain": 12,
+        "current_to_anchor_branch_gain": 2,
+        "current_to_anchor_direction_entropy_gain": 0.35,
+        "anchor_branch_count": 4,
+        "anchor_direction_entropy": 0.9,
+        "anchor_outgoing_trace_direction_count": 3,
+        "anchor_instruction_relevant_count": 2,
+        "anchor_semantic_unique_count": 4,
+        "anchor_high_conf_landmark_count": 2,
+        "anchor_passage_semantic_count": 2,
+        "anchor_next_landmark_count": 1,
+        "instruction_relevant": True,
+        "next_landmark_relevance": 0.5,
+        "anchor_short_cycle_risk": 0.0,
+    }
+    proxy = stage21_dataset._recovery_proxy(
+        base, route_progress_advantage_m=-3.0
+    )
+
+    assert proxy["hard_safe_proxy"] is True
+    assert proxy["recovery_proxy_class"] != "unsafe"
+    assert proxy["recovery_proxy_route_w0"] > 0.65
+    assert abs(
+        proxy["recovery_proxy_route_w005"] - proxy["recovery_proxy_route_w0"]
+    ) <= 0.05 + 1e-9
+
+
+def test_recovery_proxy_penalizes_short_cycles_and_rewards_observability():
+    weak = {
+        "geometry_safe": True,
+        "distance_m": 3.0,
+        "anchor_occupied_ratio_observed": 0.1,
+    }
+    informative = {
+        **weak,
+        "semantic_resilience_local_trap": True,
+        "current_to_anchor_free_ratio_gain": 0.2,
+        "current_to_anchor_frontier_gain": 12,
+        "current_to_anchor_branch_gain": 2,
+        "current_to_anchor_direction_entropy_gain": 0.35,
+        "anchor_branch_count": 4,
+        "anchor_direction_entropy": 1.0,
+        "anchor_outgoing_trace_direction_count": 3,
+    }
+    clean = stage21_dataset._recovery_proxy(
+        informative, route_progress_advantage_m=0.0
+    )
+    cycling = stage21_dataset._recovery_proxy(
+        {**informative, "anchor_short_cycle_risk": 1.0},
+        route_progress_advantage_m=0.0,
+    )
+    weak_proxy = stage21_dataset._recovery_proxy(
+        weak, route_progress_advantage_m=0.0
+    )
+
+    assert clean["recovery_proxy_route_w0"] > weak_proxy["recovery_proxy_route_w0"]
+    assert cycling["recovery_proxy_route_w0"] < clean["recovery_proxy_route_w0"]
+    assert clean["proxy_is_causal_success_label"] is False
