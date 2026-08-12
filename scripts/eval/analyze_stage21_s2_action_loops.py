@@ -7,6 +7,7 @@ import argparse
 import json
 from collections import Counter
 from pathlib import Path
+from typing import Optional
 
 
 FORBIDDEN_GT_KEYS = {
@@ -109,6 +110,10 @@ def build_audit(run_root: Path, expected_episodes: int) -> dict:
             for key in events_by_episode
         },
         "triage_tier_counts": dict(tier_counts),
+        "strict_intervention_rate": (
+            tier_counts.get("strict_intervention", 0) / len(start_events)
+            if start_events else None
+        ),
         "failure_type_counts": dict(failure_counts),
         "candidate_coverage_rate": (
             (len(start_events) - len(missing_candidate)) / len(start_events)
@@ -138,6 +143,47 @@ def build_audit(run_root: Path, expected_episodes: int) -> dict:
     return summary
 
 
+def apply_automatic_gates(
+    summary: dict,
+    *,
+    minimum_loop_events: int = 0,
+    maximum_success_trigger_rate: Optional[float] = None,
+    maximum_strict_tier_rate: Optional[float] = None,
+    strict_rate_minimum_events: int = 1,
+) -> dict:
+    loop_event_count_failure = summary["loop_event_count"] < minimum_loop_events
+    success_trigger_rate_failure = bool(
+        maximum_success_trigger_rate is not None
+        and summary["success_trigger_episode_rate"] > maximum_success_trigger_rate
+    )
+    strict_rate_checked = summary["loop_event_count"] >= strict_rate_minimum_events
+    strict_rate_failure = bool(
+        maximum_strict_tier_rate is not None
+        and strict_rate_checked
+        and summary["strict_intervention_rate"] is not None
+        and summary["strict_intervention_rate"] > maximum_strict_tier_rate
+    )
+    summary["automatic_gate_thresholds"] = {
+        "minimum_loop_events": minimum_loop_events,
+        "maximum_success_trigger_rate": maximum_success_trigger_rate,
+        "maximum_strict_tier_rate": maximum_strict_tier_rate,
+        "strict_rate_minimum_events": strict_rate_minimum_events,
+    }
+    summary["automatic_gate_failures"] = {
+        "minimum_loop_events": loop_event_count_failure,
+        "maximum_success_trigger_rate": success_trigger_rate_failure,
+        "maximum_strict_tier_rate": strict_rate_failure,
+    }
+    summary["strict_rate_gate_checked"] = strict_rate_checked
+    summary["passed"] = bool(
+        summary["passed"]
+        and not loop_event_count_failure
+        and not success_trigger_rate_failure
+        and not strict_rate_failure
+    )
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, required=True)
@@ -147,6 +193,10 @@ def main() -> None:
     parser.add_argument("--forbid-episode", action="append", default=[])
     parser.add_argument("--max-first-step", action="append", default=[])
     parser.add_argument("--min-candidate-coverage", type=float)
+    parser.add_argument("--min-loop-events", type=int, default=0)
+    parser.add_argument("--max-success-trigger-rate", type=float)
+    parser.add_argument("--max-strict-tier-rate", type=float)
+    parser.add_argument("--strict-rate-min-events", type=int, default=1)
     parser.add_argument("--require-all", action="store_true")
     args = parser.parse_args()
 
@@ -180,6 +230,13 @@ def main() -> None:
         and not forbidden_present
         and not max_step_failures
         and not candidate_coverage_failure
+    )
+    apply_automatic_gates(
+        summary,
+        minimum_loop_events=args.min_loop_events,
+        maximum_success_trigger_rate=args.max_success_trigger_rate,
+        maximum_strict_tier_rate=args.max_strict_tier_rate,
+        strict_rate_minimum_events=args.strict_rate_min_events,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

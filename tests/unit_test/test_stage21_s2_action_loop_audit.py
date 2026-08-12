@@ -76,3 +76,55 @@ def test_loop_audit_allows_unsaved_snapshot_beyond_episode_budget(tmp_path):
 
     assert summary["passed"] is True
     assert summary["missing_rgb_snapshots"] == []
+
+
+def test_loop_audit_reports_automatic_gate_rates(tmp_path):
+    run_root = tmp_path / "run"
+    debug_dir = run_root / "vlmap_safety_debug" / "run_001"
+    debug_dir.mkdir(parents=True)
+    (run_root / "progress.json").write_text(
+        "\n".join(
+            json.dumps({"scene_id": "scene", "episode_id": episode_id, "success": 1.0})
+            for episode_id in (7, 8)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    events = []
+    for episode_id, tier in ((7, "strict_intervention"), (8, "adapter_candidate")):
+        event = {
+            "event_schema_version": "stage21a_s2_loop_v1",
+            "scene_id": "scene",
+            "episode_id": episode_id,
+            "step_id": 54,
+            "transition": "start",
+            "shadow_only": True,
+            "applied": False,
+            "candidate": {"geometry_safe": True},
+            "triage_tier": tier,
+            "rgb_snapshot_expected": False,
+        }
+        events.append(json.dumps(event))
+    (debug_dir / "s2_action_loop_events.jsonl").write_text(
+        "\n".join(events) + "\n", encoding="utf-8"
+    )
+
+    summary = loop_audit.build_audit(run_root, 2)
+
+    assert summary["success_trigger_episode_rate"] == 1.0
+    assert summary["strict_intervention_rate"] == 0.5
+
+    loop_audit.apply_automatic_gates(
+        summary,
+        minimum_loop_events=2,
+        maximum_success_trigger_rate=0.20,
+        maximum_strict_tier_rate=0.75,
+        strict_rate_minimum_events=2,
+    )
+
+    assert summary["passed"] is False
+    assert summary["automatic_gate_failures"] == {
+        "minimum_loop_events": False,
+        "maximum_success_trigger_rate": True,
+        "maximum_strict_tier_rate": False,
+    }

@@ -134,6 +134,8 @@ ONLINE_CANDIDATE_FIELDS = {
     "anchor_last_visit_age_steps",
     "anchor_recent_return_count",
     "anchor_recent_cycle_count",
+    "anchor_revisit_interval_min_steps",
+    "anchor_revisit_interval_mean_steps",
     "anchor_short_cycle_risk",
     "current_visible_free_ratio",
     "current_frontier_count",

@@ -241,3 +241,21 @@ def test_recovery_proxy_penalizes_short_cycles_and_rewards_observability():
     assert clean["recovery_proxy_route_w0"] > weak_proxy["recovery_proxy_route_w0"]
     assert cycling["recovery_proxy_route_w0"] < clean["recovery_proxy_route_w0"]
     assert clean["proxy_is_causal_success_label"] is False
+
+
+def test_online_candidate_keeps_cycle_intervals_without_gt_fields():
+    candidate = {
+        "candidate_id": "anchor",
+        "anchor_recent_cycle_count": 2,
+        "anchor_revisit_interval_min_steps": 17,
+        "anchor_revisit_interval_mean_steps": 23.5,
+        "gt_route_progress_m": 1.25,
+    }
+
+    online = stage21_dataset._online_candidate(candidate)
+
+    assert online["anchor_recent_cycle_count"] == 2
+    assert online["anchor_revisit_interval_min_steps"] == 17
+    assert online["anchor_revisit_interval_mean_steps"] == 23.5
+    assert "gt_route_progress_m" not in online
+    assert stage21_dataset._contains_gt_field(online) is False
