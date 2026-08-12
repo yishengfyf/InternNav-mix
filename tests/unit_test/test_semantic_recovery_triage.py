@@ -99,6 +99,27 @@ def test_s2_turn_loop_uses_decision_state_restoration_without_frontier():
     assert result["back_only_without_anchor"] is False
 
 
+def test_open_s2_semantic_loop_is_adapter_not_strict():
+    result = _classify(
+        _candidate(
+            current_visible_free_ratio=0.71,
+            anchor_visible_free_ratio=0.96,
+            current_executable_exit_count=4,
+            anchor_executable_exit_count=4,
+            current_to_anchor_branch_gain=0,
+            current_to_anchor_free_ratio_gain=0.25,
+        ),
+        failure_type="s2_turn_loop_semantic",
+        recommended_primitive="reobserve",
+        trigger_reasons=["s2_repeated_turn_generation", "s2_low_translation"],
+        context_tags=["s2_policy_loop", "decision_state_restoration"],
+    )
+
+    assert result["tier"] == "adapter_candidate"
+    assert result["restoration_anchor"] is True
+    assert result["spatial_constriction"] is False
+
+
 def test_stale_anchor_cannot_enter_strict_or_adapter_tier():
     result = _classify(_candidate(semantic_resilience_step_gap=245), step_id=285)
 

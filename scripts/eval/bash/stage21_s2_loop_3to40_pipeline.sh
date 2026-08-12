@@ -14,6 +14,7 @@ MANIFEST_DIR=${STAGE21_MANIFEST_DIR:-data/stage21}
 DATASET_ROOT=${STAGE21_DATASET_ROOT:-data/stage21/datasets}
 RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
 PIPELINE_LOG=${STAGE21_PIPELINE_LOG:-}
+REUSE_3EP_RUN_ROOT=${STAGE21_REUSE_3EP_RUN_ROOT:-}
 
 PIPELINE_COMPLETE=0
 RUN_ROOT_3=""
@@ -52,16 +53,23 @@ python3 scripts/eval/select_balanced_r2r_episodes.py \
   --summary-output "${MANIFEST_DIR}/train_balanced_40_episode_ids_summary.json" \
   --max-episodes 40 --seed 21 --shuffle-within-scene
 
-RUN_NAME_3="compare_vlmap_stage21a_s2_loop_failure3_${PIPELINE_TAG}"
-RUN_ROOT_3="logs/habitat/${RUN_NAME_3}"
-CURRENT_RUN_ROOT="${RUN_ROOT_3}"
-test ! -e "${RUN_ROOT_3}"
-CUDA_VISIBLE_DEVICES=${STAGE21_SMOKE_CUDA_VISIBLE_DEVICES:-0} \
-STAGE21_EPISODE_IDS="${FAILURE_MANIFEST}" STAGE21_RUN_NAME="${RUN_NAME_3}" \
-STAGE21_EVAL_PORT=${STAGE21_SMOKE_EVAL_PORT:-2451} NPROC_PER_NODE=1 \
-MASTER_PORT=${STAGE21_SMOKE_MASTER_PORT:-2452} \
-bash scripts/eval/bash/stage21_torchrun_eval.sh \
-  --config scripts/eval/configs/habitat_dual_system_vlmap_stage21a_r3_failure_snapshot_probe_cfg.py
+if [[ -n "${REUSE_3EP_RUN_ROOT}" ]]; then
+  RUN_ROOT_3="${REUSE_3EP_RUN_ROOT}"
+  test -d "${RUN_ROOT_3}"
+  test -f "${RUN_ROOT_3}/progress.json"
+  echo "STAGE21_REUSE_3EP_RUN_ROOT=${RUN_ROOT_3}"
+else
+  RUN_NAME_3="compare_vlmap_stage21a_s2_loop_failure3_${PIPELINE_TAG}"
+  RUN_ROOT_3="logs/habitat/${RUN_NAME_3}"
+  CURRENT_RUN_ROOT="${RUN_ROOT_3}"
+  test ! -e "${RUN_ROOT_3}"
+  CUDA_VISIBLE_DEVICES=${STAGE21_SMOKE_CUDA_VISIBLE_DEVICES:-0} \
+  STAGE21_EPISODE_IDS="${FAILURE_MANIFEST}" STAGE21_RUN_NAME="${RUN_NAME_3}" \
+  STAGE21_EVAL_PORT=${STAGE21_SMOKE_EVAL_PORT:-2451} NPROC_PER_NODE=1 \
+  MASTER_PORT=${STAGE21_SMOKE_MASTER_PORT:-2452} \
+  bash scripts/eval/bash/stage21_torchrun_eval.sh \
+    --config scripts/eval/configs/habitat_dual_system_vlmap_stage21a_r3_failure_snapshot_probe_cfg.py
+fi
 
 python3 scripts/eval/analyze_stage21_s2_action_loops.py \
   --run-root "${RUN_ROOT_3}" --expected-episodes 3 \

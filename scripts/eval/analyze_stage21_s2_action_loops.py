@@ -72,7 +72,16 @@ def build_audit(run_root: Path, expected_episodes: int) -> dict:
     missing_rgb = [
         {"episode": _episode_key(row), "step_id": row.get("step_id")}
         for path, row in start_entries
-        if not row.get("rgb_file") or not (path.parent / str(row["rgb_file"])).is_file()
+        if bool(
+            row.get(
+                "rgb_snapshot_expected",
+                int(row.get("loop_index", 0) or 0) <= 2,
+            )
+        )
+        and (
+            not row.get("rgb_file")
+            or not (path.parent / str(row["rgb_file"])).is_file()
+        )
     ]
     triggered_success_episodes = {
         _episode_key(row)

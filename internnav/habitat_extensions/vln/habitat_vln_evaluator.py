@@ -420,15 +420,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         current_exit_count = int(
             (candidate or {}).get("current_executable_exit_count", 0) or 0
         )
-        obstacle_term_count = int(
-            (candidate or {}).get("semantic_resilience_obstacle_term_count", 0) or 0
-        )
         obstructed = bool(
             candidate is not None
             and (
-                current_exit_count <= 0
+                current_exit_count <= 1
                 or current_free_ratio < 0.45
-                or obstacle_term_count > 0
             )
         )
         failure_type = (
@@ -474,7 +470,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "gt_fields_used": [],
         }
         max_snapshots = max(0, int(cfg.get("max_snapshots_per_episode", 2)))
-        if int(transition.get("loop_index", 0) or 0) <= max_snapshots:
+        snapshot_expected = bool(
+            int(transition.get("loop_index", 0) or 0) <= max_snapshots
+        )
+        event["rgb_snapshot_expected"] = snapshot_expected
+        if snapshot_expected:
             log_dir = self._get_vlmap_run_dir() or self.output_path
             snapshot_dir = os.path.join(log_dir, "s2_action_loop_snapshots")
             os.makedirs(snapshot_dir, exist_ok=True)
