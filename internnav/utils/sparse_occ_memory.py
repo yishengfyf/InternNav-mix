@@ -2317,10 +2317,23 @@ class SparseOccSemanticMemory:
                 returns += 1
             was_near = is_near
         near_steps = []
+        visit_start_steps = []
+        visit_end_steps = []
+        active_visit = False
         for item, is_near in zip(recent, near_flags):
             step = self._safe_int(item.get("step_id"))
             if is_near and step is not None:
                 near_steps.append(step)
+            if is_near and not active_visit:
+                if step is not None:
+                    visit_start_steps.append(step)
+                active_visit = True
+            elif not is_near and active_visit:
+                if near_steps:
+                    visit_end_steps.append(near_steps[-1])
+                active_visit = False
+        if active_visit and near_steps:
+            visit_end_steps.append(near_steps[-1])
         last_visit_step = max(near_steps) if near_steps else None
         last_visit_age = None
         if latest_step is not None and last_visit_step is not None:
@@ -2334,6 +2347,9 @@ class SparseOccSemanticMemory:
             dc = int(next_pose.get("col", col0)) - col0
             if dr != 0 or dc != 0:
                 outgoing_sectors.add(self._relative_sector(dr, dc))
+        revisit_intervals = [
+            int(b - a) for a, b in zip(visit_start_steps, visit_start_steps[1:]) if b > a
+        ]
         cycle_count = max(0, returns - 1)
         return {
             "trace_window_steps": int(window),
@@ -2345,9 +2361,7 @@ class SparseOccSemanticMemory:
             "last_visit_age_steps": last_visit_age,
             "outgoing_trace_direction_count": int(len(outgoing_sectors)),
             "outgoing_trace_directions": sorted(outgoing_sectors),
-            "revisit_interval_steps": [
-                int(b - a) for a, b in zip(near_steps, near_steps[1:]) if b > a
-            ],
+            "revisit_interval_steps": revisit_intervals,
         }
 
     def _anchor_semantic_information(

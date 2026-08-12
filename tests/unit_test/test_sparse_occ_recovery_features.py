@@ -51,3 +51,18 @@ def test_a_b_a_trace_sets_short_cycle_risk():
     assert info["return_count"] == 2
     assert info["recent_cycle_count"] == 1
     assert info["short_cycle_risk"] > 0.0
+
+
+def test_revisit_interval_uses_visit_segments_not_consecutive_near_steps():
+    memory = _memory()
+    memory.pose_trace = [
+        {"row": 32, "col": 32, "step_id": 1},
+        {"row": 32, "col": 32, "step_id": 2},
+        {"row": 32, "col": 36, "step_id": 3},
+        {"row": 32, "col": 36, "step_id": 4},
+        {"row": 32, "col": 32, "step_id": 9},
+    ]
+
+    info = memory._anchor_trace_information((32, 32), latest_step=9)
+
+    assert info["revisit_interval_steps"] == [8]

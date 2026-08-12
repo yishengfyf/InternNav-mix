@@ -657,6 +657,30 @@ def _build_task_rows(
         _safe_float(row["offline_labels"].get("short_horizon_executability_proxy"))
         for row in task_rows["safety"]
     ]
+    recovery_candidates = [
+        (row.get("online_inputs") or {}).get("candidate", {})
+        for row in recovery_rows
+    ]
+    revisit_intervals = [
+        _safe_float(candidate.get("anchor_revisit_interval_min_steps"))
+        for candidate in recovery_candidates
+        if candidate.get("anchor_revisit_interval_min_steps") is not None
+    ]
+    cycle_nonzero_count = sum(
+        _safe_float(candidate.get("anchor_recent_cycle_count")) > 0.0
+        for candidate in recovery_candidates
+    )
+    cycle_interval_inconsistent_count = sum(
+        (
+            _safe_float(candidate.get("anchor_recent_cycle_count")) > 0.0
+            and candidate.get("anchor_revisit_interval_min_steps") is None
+        )
+        or (
+            _safe_float(candidate.get("anchor_recent_cycle_count")) <= 0.0
+            and candidate.get("anchor_revisit_interval_min_steps") is not None
+        )
+        for candidate in recovery_candidates
+    )
     recovery_feature_fields = (
         "recovery_feature_schema_version",
         "anchor_visible_free_ratio",
@@ -707,6 +731,26 @@ def _build_task_rows(
                     bool(row["offline_labels"].get("geometry_safe_target"))
                     for row in task_rows["safety"]
                 )
+            ),
+        },
+        "cycle_feature_audit": {
+            "recovery_row_count": len(recovery_candidates),
+            "nonzero_cycle_count": int(cycle_nonzero_count),
+            "interval_observed_count": len(revisit_intervals),
+            "interval_min_steps": min(revisit_intervals) if revisit_intervals else None,
+            "interval_mean_steps": (
+                sum(revisit_intervals) / len(revisit_intervals)
+                if revisit_intervals else None
+            ),
+            "interval_at_or_below_one_count": sum(
+                interval <= 1.0 for interval in revisit_intervals
+            ),
+            "cycle_interval_inconsistent_count": int(
+                cycle_interval_inconsistent_count
+            ),
+            "passed": bool(
+                not any(interval <= 1.0 for interval in revisit_intervals)
+                and cycle_interval_inconsistent_count == 0
             ),
         },
         "recovery_feature_coverage": {
