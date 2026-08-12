@@ -349,19 +349,43 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         local_actions,
         action_seq,
         llm_outputs: str,
+        action_source: str = "unknown",
+        pre_safety_action=None,
+        vlmap_safety_decision: Optional[dict] = None,
+        last_s2_query_step: Optional[int] = None,
+        episode_eval_seed: Optional[int] = None,
+        environment_step_applied: bool = True,
+        force: bool = False,
     ) -> Optional[dict]:
         """Save one representative RGB and S2 decision for a stuck episode."""
         cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
         if not bool(cfg.get("stuck_snapshot_enable", False)) or state.get("stuck_snapshot_saved"):
             return None
         event = dict(event or {})
+        goal_key = None
+        if isinstance(pixel_goal, (list, tuple)) and len(pixel_goal) >= 2:
+            goal_key = (int(pixel_goal[0]), int(pixel_goal[1]))
+        if goal_key != state.get("stuck_snapshot_last_pixel_goal"):
+            state["stuck_snapshot_last_pixel_goal"] = goal_key
+            state["stuck_snapshot_pixel_goal_start_step"] = (
+                None if goal_key is None else int(step_id)
+            )
+            state["stuck_snapshot_pixel_goal_change_count"] = int(
+                state.get("stuck_snapshot_pixel_goal_change_count", 0) or 0
+            ) + 1
+        if last_s2_query_step is not None:
+            state["stuck_snapshot_last_s2_query_step"] = int(last_s2_query_step)
         action_value = None if action is None else int(action)
         history = state.setdefault("stuck_snapshot_action_history", [])
+        source_history = state.setdefault("stuck_snapshot_action_source_history", [])
         if action_value is not None:
             history.append(action_value)
+            source_history.append(str(action_source or "unknown"))
         window = max(4, int(cfg.get("stuck_snapshot_action_window_steps", 32)))
         if len(history) > window:
             del history[:-window]
+        if len(source_history) > window:
+            del source_history[:-window]
         min_step = max(0, int(cfg.get("stuck_snapshot_min_step", 30)))
         repeated_ratio = 0.0
         dominant_action = None
@@ -380,8 +404,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 and int(event.get("total_stagnation_streak", 0) or 0) >= window
             )
         )
-        if int(step_id) < min_step or not (repeat_trigger or stagnation_trigger):
+        if not force and (
+            int(step_id) < min_step or not (repeat_trigger or stagnation_trigger)
+        ):
             return None
+        pixel_goal_start_step = state.get("stuck_snapshot_pixel_goal_start_step")
+        pixel_goal_age_steps = (
+            None
+            if pixel_goal_start_step is None
+            else max(0, int(step_id) - int(pixel_goal_start_step))
+        )
+        effective_last_s2_query_step = state.get("stuck_snapshot_last_s2_query_step")
+        s2_query_age_steps = (
+            None
+            if effective_last_s2_query_step is None
+            else max(0, int(step_id) - int(effective_last_s2_query_step))
+        )
+        dominant_action_source = None
+        if source_history:
+            dominant_action_source = max(set(source_history), key=source_history.count)
         run_dir = self._get_vlmap_run_dir() or self.output_path
         snapshot_dir = os.path.join(run_dir, "stuck_snapshots")
         os.makedirs(snapshot_dir, exist_ok=True)
@@ -414,15 +455,40 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 reason for reason, enabled in (
                     ("repeated_action", repeat_trigger),
                     ("map_or_pose_stagnation", stagnation_trigger),
+                    ("forced_episode_end", force),
                 ) if enabled
             ],
             "current_action": action_value,
+            "pre_safety_action": (
+                None if pre_safety_action is None else int(pre_safety_action)
+            ),
+            "action_source": str(action_source or "unknown"),
+            "action_name_map": {
+                "0": "STOP",
+                "1": "FORWARD",
+                "2": "LEFT",
+                "3": "RIGHT",
+                "4": "LOOKUP",
+                "5": "LOOKDOWN",
+            },
+            "dominant_action_source": dominant_action_source,
+            "action_source_window": list(source_history),
+            "environment_step_applied": bool(environment_step_applied),
             "dominant_action": dominant_action,
             "action_window": list(history),
             "dominant_action_ratio": repeated_ratio,
             "pixel_goal": pixel_goal,
+            "pixel_goal_age_steps": pixel_goal_age_steps,
+            "pixel_goal_change_count": int(
+                state.get("stuck_snapshot_pixel_goal_change_count", 0) or 0
+            ),
+            "last_s2_query_step": effective_last_s2_query_step,
+            "s2_query_age_steps": s2_query_age_steps,
+            "episode_eval_seed": episode_eval_seed,
             "local_actions": list(local_actions or []),
             "action_seq": list(action_seq or []),
+            "local_action_queue_length": len(local_actions or []),
+            "system2_action_queue_length": len(action_seq or []),
             "s2_output": str(llm_outputs or ""),
             "s2_decision": {
                 "pixel_goal": pixel_goal,
@@ -430,6 +496,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "queued_system2_actions": list(action_seq or []),
                 "raw_output": str(llm_outputs or ""),
             },
+            "vlmap_safety_decision": dict(vlmap_safety_decision or {}),
             "recovery_shadow_event": event,
             "rgb_file": os.path.basename(image_path),
         }
@@ -519,10 +586,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         if label:
             print(f"[HabitatVLN] fixed eval random seed ({label}): {seed}")
 
-    def _seed_eval_rng_for_episode(self, episode_index: int, episode_id: int) -> None:
+    def _get_eval_episode_seed(
+        self,
+        episode_index: int,
+        episode_id: int,
+        scene_id: Optional[str] = None,
+    ) -> Optional[int]:
+        overrides = dict(getattr(self.model_args, "eval_episode_seed_overrides", None) or {})
+        if overrides:
+            keys = []
+            if scene_id is not None:
+                keys.append(f"{scene_id}/{int(episode_id)}")
+            keys.extend((str(int(episode_id)), int(episode_id)))
+            for key in keys:
+                if key in overrides:
+                    return int(overrides[key])
         base_seed = getattr(self.model_args, "eval_random_seed", None)
         if base_seed is None or not bool(getattr(self.model_args, "eval_seed_per_episode", False)):
-            return
+            return None
 
         mode = getattr(self.model_args, "eval_episode_seed_mode", "episode_index")
         if mode == "episode_id":
@@ -533,8 +614,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             raise ValueError(f"Invalid eval_episode_seed_mode: {mode}")
 
         rank_offset = int(getattr(self, "rank", 0)) * 100000
-        episode_seed = int(base_seed) + episode_offset + rank_offset
+        return int(base_seed) + episode_offset + rank_offset
+
+    def _seed_eval_rng_for_episode(
+        self,
+        episode_index: int,
+        episode_id: int,
+        scene_id: Optional[str] = None,
+    ) -> Optional[int]:
+        episode_seed = self._get_eval_episode_seed(episode_index, episode_id, scene_id)
+        if episode_seed is None:
+            return None
         self._seed_eval_rng(episode_seed, f"episode_index={episode_index}, episode_id={episode_id}")
+        return episode_seed
 
     def calc_metrics(self, global_metrics: dict) -> dict:
         """
@@ -5367,7 +5459,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             scene_id = episode.scene_id.split('/')[-2]
             episode_id = int(episode.episode_id)
             episode_instruction = episode.instruction.instruction_text
-            self._seed_eval_rng_for_episode(episode_index, episode_id)
+            episode_eval_seed = self._seed_eval_rng_for_episode(
+                episode_index, episode_id, scene_id
+            )
             print("episode start", episode_instruction)
             self.vlmap_safety.reset()
             self._vlmap_last_nav_action = None
@@ -5411,7 +5505,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             input_images = []
             output_ids = None
             llm_outputs = ""
+            last_s2_query_step = None
             action = None
+            action_source = "not_selected"
+            pre_safety_action = None
+            vlmap_safety_decision = {}
             messages = []
             local_actions = []
             vlmap_recovery_actions = []
@@ -5769,6 +5867,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
+                    last_s2_query_step = int(step_id)
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     s2_candidate_probe_s2_query_count += 1
@@ -6800,25 +6899,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         stage19_candidate_event = None
                         if candidate_probe_cfg.get("enable"):
                             base_eval_seed = getattr(self.model_args, "eval_random_seed", None)
-                            episode_eval_seed = None
-                            if base_eval_seed is not None and bool(
-                                getattr(self.model_args, "eval_seed_per_episode", False)
-                            ):
-                                episode_seed_mode = getattr(
-                                    self.model_args,
-                                    "eval_episode_seed_mode",
-                                    "episode_index",
-                                )
-                                episode_seed_offset = (
-                                    int(episode_id)
-                                    if episode_seed_mode == "episode_id"
-                                    else int(episode_index)
-                                )
-                                episode_eval_seed = (
-                                    int(base_eval_seed)
-                                    + episode_seed_offset
-                                    + int(getattr(self, "rank", 0)) * 100000
-                                )
                             habitat_dataset_cfg = getattr(
                                 getattr(self.config, "habitat", None),
                                 "dataset",
@@ -7536,7 +7616,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         if action == action_code.STOP:
                             pixel_goal = None
                             output_ids = None
+                            pre_safety_action = action
                             action = action_code.LEFT
+                            self._maybe_save_stuck_snapshot(
+                                state=occ_memory_recovery_state,
+                                event=occ_memory_recovery_event,
+                                rgb=rgb,
+                                step_id=step_id,
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                instruction=episode_instruction,
+                                action=action,
+                                pixel_goal=pixel_goal,
+                                local_actions=local_actions,
+                                action_seq=action_seq,
+                                llm_outputs=llm_outputs,
+                                action_source="nextdit_stop_fallback_left",
+                                pre_safety_action=pre_safety_action,
+                                last_s2_query_step=last_s2_query_step,
+                                episode_eval_seed=episode_eval_seed,
+                                environment_step_applied=True,
+                            )
                             observations, _, done, _ = self.env.step(action)
                             step_id += 1
                             messages = []
@@ -7547,12 +7647,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
 
+                action_source = "fallback_stop"
                 if len(vlmap_recovery_actions) != 0:
                     action = vlmap_recovery_actions.pop(0)
+                    action_source = "vlmap_recovery_queue"
                     print("vlmap_recovery_action", action, flush=True)
                 elif len(action_seq) != 0:
                     action = action_seq[0]
                     action_seq.pop(0)
+                    action_source = "system2_action_queue"
                 elif pixel_goal is not None:
                     if len(local_actions) == 0:
                         # Regenerate local actions from the active System1 trajectory generator.
@@ -7755,8 +7858,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             continue
                         print("local_actions", local_actions)
                         action = local_actions.pop(0)
+                        action_source = "nextdit_regenerated_local_queue"
                     else:
                         action = local_actions.pop(0)
+                        action_source = "nextdit_local_queue"
 
                     forward_action += 1
                     if forward_action > MAX_STEPS:
@@ -7768,6 +7873,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         local_actions = []
                         continue
                     if action == action_code.STOP:
+                        self._maybe_save_stuck_snapshot(
+                            state=occ_memory_recovery_state,
+                            event=occ_memory_recovery_event,
+                            rgb=rgb,
+                            step_id=step_id,
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            instruction=episode_instruction,
+                            action=action,
+                            pixel_goal=pixel_goal,
+                            local_actions=local_actions,
+                            action_seq=action_seq,
+                            llm_outputs=llm_outputs,
+                            action_source="nextdit_local_stop_discarded",
+                            pre_safety_action=action,
+                            last_s2_query_step=last_s2_query_step,
+                            episode_eval_seed=episode_eval_seed,
+                            environment_step_applied=False,
+                        )
                         pixel_goal = None
                         output_ids = None
                         messages = []
@@ -7778,6 +7902,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 else:
                     action = 0
 
+                pre_safety_action = action
                 action, vlmap_safety_changed, vlmap_safety_decision = self._postprocess_habitat_action_with_vlmap_safety(
                     action,
                     observations,
@@ -7837,6 +7962,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     local_actions=local_actions,
                     action_seq=action_seq,
                     llm_outputs=llm_outputs,
+                    action_source=action_source,
+                    pre_safety_action=pre_safety_action,
+                    vlmap_safety_decision=vlmap_safety_decision,
+                    last_s2_query_step=last_s2_query_step,
+                    episode_eval_seed=episode_eval_seed,
+                    environment_step_applied=True,
                 )
 
                 if vis_writer is not None:
@@ -7869,6 +8000,36 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             # ---------- 3. End of episode -----------
             # collect the metric result of this episode and write progress to the output_path/progress.json
+
+            stuck_snapshot_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+            force_snapshot_keys = {
+                str(item)
+                for item in stuck_snapshot_cfg.get(
+                    "stuck_snapshot_force_episode_keys", []
+                )
+            }
+            if f"{scene_id}/{episode_id}" in force_snapshot_keys:
+                self._maybe_save_stuck_snapshot(
+                    state=occ_memory_recovery_state,
+                    event=occ_memory_recovery_event,
+                    rgb=rgb,
+                    step_id=step_id,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    instruction=episode_instruction,
+                    action=action,
+                    pixel_goal=pixel_goal,
+                    local_actions=local_actions,
+                    action_seq=action_seq,
+                    llm_outputs=llm_outputs,
+                    action_source=action_source,
+                    pre_safety_action=pre_safety_action,
+                    vlmap_safety_decision=vlmap_safety_decision,
+                    last_s2_query_step=last_s2_query_step,
+                    episode_eval_seed=episode_eval_seed,
+                    environment_step_applied=True,
+                    force=True,
+                )
 
             process_bar.update(1)
 
@@ -8814,7 +8975,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             scene_id = episode.scene_id.split('/')[-2]
             episode_id = int(episode.episode_id)
             episode_instruction = episode.instruction.instruction_text
-            self._seed_eval_rng_for_episode(episode_index, episode_id)
+            self._seed_eval_rng_for_episode(episode_index, episode_id, scene_id)
             print("episode start", episode_instruction)
 
             agent_state = self.env._env.sim.get_agent_state()
