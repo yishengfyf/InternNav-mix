@@ -153,13 +153,15 @@ assert candidate_rows["status"] == "ok", candidate_rows
 assert candidate_rows["counts"]["candidate_rows"] > 0, candidate_rows
 assert candidate_rows["gt_leakage_scan"]["passed"] is True, candidate_rows
 assert candidate_rows["active_gate_safe_used_as_recovery_target"] is False, candidate_rows
-assert summary["event_schema_version"] == "stage21a_r2_v2", summary
+assert summary["event_schema_version"] == "stage21a_r3_v3", summary
 if expected_episodes >= 40:
     assert summary["task_rows"]["recovery_proxy"] > 0, summary["task_rows"]
     coverage = candidate_rows["recovery_feature_coverage"]
     for field in (
         "recovery_feature_schema_version", "anchor_visible_free_ratio",
-        "anchor_branch_count", "anchor_short_cycle_risk",
+        "anchor_branch_count", "anchor_executable_exit_count",
+        "anchor_connected_component_count", "anchor_branch_depth_mean",
+        "anchor_short_cycle_risk",
         "current_to_anchor_free_ratio_gain", "current_to_anchor_branch_gain",
     ):
         assert coverage["rates"][field] >= 0.95, (field, coverage)

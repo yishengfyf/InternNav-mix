@@ -26,6 +26,18 @@ def test_open_multi_sector_anchor_has_high_branch_count():
     assert info["direction_entropy"] > 0.95
 
 
+def test_isolated_free_cells_do_not_become_executable_exits():
+    memory = _memory()
+    center = (32, 32)
+    for cell in ((30, 32), (34, 32), (32, 30), (32, 34)):
+        memory.free2d_counts[cell] = 1
+
+    info = memory._anchor_spatial_information(center)
+
+    assert info["branch_count"] == 0
+    assert info["connected_component_count"] == 4
+
+
 def test_a_b_a_trace_sets_short_cycle_risk():
     memory = _memory()
     memory.pose_trace = [

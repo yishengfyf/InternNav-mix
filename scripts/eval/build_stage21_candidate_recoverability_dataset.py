@@ -120,6 +120,9 @@ ONLINE_CANDIDATE_FIELDS = {
     "anchor_occupied_ratio_observed",
     "anchor_frontier_count",
     "anchor_branch_count",
+    "anchor_executable_exit_count",
+    "anchor_connected_component_count",
+    "anchor_branch_depth_mean",
     "anchor_direction_entropy",
     "anchor_semantic_unique_count",
     "anchor_instruction_relevant_count",
@@ -135,6 +138,9 @@ ONLINE_CANDIDATE_FIELDS = {
     "current_visible_free_ratio",
     "current_frontier_count",
     "current_branch_count",
+    "current_executable_exit_count",
+    "current_connected_component_count",
+    "current_branch_depth_mean",
     "current_direction_entropy",
     "current_to_anchor_free_ratio_gain",
     "current_to_anchor_frontier_gain",
@@ -335,14 +341,26 @@ def _recovery_proxy(
         0.0,
     )
     occupied_ratio = _clamp(candidate.get("anchor_occupied_ratio_observed"))
-    distance_safe = 1.0 if 0.50 <= distance_m <= 6.0 else (0.5 if distance_m <= 8.0 else 0.0)
+    distance_safe = (
+        0.0 if distance_m <= 0.25 else
+        1.0 if 0.75 <= distance_m <= 4.0 else
+        max(0.0, 1.0 - abs(distance_m - 2.25) / 5.75)
+    )
     anchor_age = _safe_float(candidate.get("anchor_last_visit_age_steps"), 0.0)
     freshness = 1.0 if anchor_age <= 48.0 else _clamp(1.0 - (anchor_age - 48.0) / 96.0)
-    executability = (
-        0.55 * float(geometry_safe)
+    collision_risk = _clamp(candidate.get("revisit_risk"))
+    unknown_ratio = _clamp(
+        _safe_float(candidate.get("target_frontier_local_unknown_count"), 0.0),
+        0.0,
+        50.0,
+    ) / 50.0
+    executability = _clamp(
+        0.35 * float(geometry_safe)
         + 0.20 * (1.0 - occupied_ratio)
         + 0.15 * distance_safe
-        + 0.10 * freshness
+        + 0.15 * freshness
+        + 0.10 * (1.0 - collision_risk)
+        + 0.05 * (1.0 - unknown_ratio)
     )
     free_gain = _positive_gain(candidate.get("current_to_anchor_free_ratio_gain"), 0.20)
     frontier_gain = _positive_gain(candidate.get("current_to_anchor_frontier_gain"), 12.0)
@@ -363,9 +381,13 @@ def _recovery_proxy(
         + 0.12 * _clamp(candidate.get("anchor_semantic_top_score"))
     )
     replanning = _clamp(
-        0.45 * _positive_gain(candidate.get("anchor_branch_count"), 4.0)
-        + 0.35 * _positive_gain(candidate.get("anchor_outgoing_trace_direction_count"), 3.0)
-        + 0.20 * _clamp(candidate.get("anchor_direction_entropy"))
+        0.35 * _positive_gain(
+            candidate.get("anchor_executable_exit_count", candidate.get("anchor_branch_count")),
+            3.0,
+        )
+        + 0.25 * _positive_gain(candidate.get("anchor_connected_component_count"), 2.0)
+        + 0.25 * _positive_gain(candidate.get("anchor_outgoing_trace_direction_count"), 3.0)
+        + 0.15 * _clamp(candidate.get("anchor_direction_entropy"))
     )
     stage_consistency = _clamp(
         0.45 * _clamp(candidate.get("next_landmark_relevance"))
@@ -631,6 +653,10 @@ def _build_task_rows(
         / max(1, len(recovery_rows))
         for name in component_names
     }
+    safety_values = [
+        _safe_float(row["offline_labels"].get("short_horizon_executability_proxy"))
+        for row in task_rows["safety"]
+    ]
     recovery_feature_fields = (
         "recovery_feature_schema_version",
         "anchor_visible_free_ratio",
@@ -640,6 +666,8 @@ def _build_task_rows(
         "anchor_semantic_unique_count",
         "anchor_recent_cycle_count",
         "anchor_short_cycle_risk",
+        "anchor_revisit_interval_min_steps",
+        "anchor_revisit_interval_mean_steps",
         "current_to_anchor_free_ratio_gain",
         "current_to_anchor_branch_gain",
     )
@@ -667,6 +695,20 @@ def _build_task_rows(
             "passed": all(value == 0 for value in leakage_by_task.values()),
         },
         "recovery_proxy_component_means": component_means,
+        "safety_proxy_audit": {
+            "row_count": len(safety_values),
+            "mean": sum(safety_values) / max(1, len(safety_values)),
+            "min": min(safety_values) if safety_values else None,
+            "max": max(safety_values) if safety_values else None,
+            "exact_one_rate": sum(value >= 0.999999 for value in safety_values)
+            / max(1, len(safety_values)),
+            "geometry_safe_target_distribution": dict(
+                Counter(
+                    bool(row["offline_labels"].get("geometry_safe_target"))
+                    for row in task_rows["safety"]
+                )
+            ),
+        },
         "recovery_feature_coverage": {
             "row_count": len(recovery_rows),
             "non_null_counts": feature_non_null_counts,
@@ -831,7 +873,7 @@ def build_stage21_dataset(
     )
     summary = {
         "task": "stage21_candidate_recoverability_dataset",
-        "event_schema_version": "stage21a_r2_v2",
+        "event_schema_version": "stage21a_r3_v3",
         "run_root": str(Path(run_root).resolve()),
         "run_dirs": [str(path) for path in run_dirs],
         "run_dir_count": len(run_dirs),

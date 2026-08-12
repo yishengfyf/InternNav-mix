@@ -369,6 +369,7 @@ class SparseOccMemoryConfig:
     semantic_resilience_anchor_semantic_radius_m: float = 2.50
     semantic_resilience_cycle_window_steps: int = 48
     semantic_resilience_cycle_radius_cells: int = 8
+    semantic_resilience_branch_min_run_cells: int = 2
     semantic_anchor_enable: bool = False
     semantic_anchor_min_score: float = 0.20
     semantic_anchor_max_terms_per_event: int = 3
@@ -1505,8 +1506,8 @@ class SparseOccSemanticMemory:
         decision = dict(current_waypoint_decision or {})
         event = {
             "event_type": "occ_memory_query_candidates",
-            "event_schema_version": "stage21a_r2_v2",
-            "recovery_feature_schema_version": "v2",
+            "event_schema_version": "stage21a_r3_v3",
+            "recovery_feature_schema_version": "v3",
             **self.episode_meta,
             **context,
             "enabled": bool(self.enabled and self.config.candidate_probe_enable),
@@ -2205,6 +2206,7 @@ class SparseOccSemanticMemory:
         frontier_set = self._frontier_cell_set() if self.config.frontier_enable else set()
         state_counts = {"free": 0, "occupied": 0, "unknown": 0, "frontier": 0}
         sector_counts = {"north": 0, "south": 0, "east": 0, "west": 0}
+        sector_run_lengths = {key: 0 for key in sector_counts}
         checked = 0
         for dr in range(-radius, radius + 1):
             for dc in range(-radius, radius + 1):
@@ -2223,7 +2225,49 @@ class SparseOccSemanticMemory:
                 if is_frontier:
                     state_counts["frontier"] += 1
                 if state == "free" or is_frontier:
-                    sector_counts[self._relative_sector(dr, dc)] += 1
+                    sector = self._relative_sector(dr, dc)
+                    sector_counts[sector] += 1
+                    # Count a direction as an executable exit only when the
+                    # immediate ray has at least N consecutive traversable
+                    # cells. This avoids every wide radius becoming 4 branches.
+        # Measure consecutive traversable cells along the four cardinal rays.
+        for sector, (dr_step, dc_step) in {
+            "north": (-1, 0), "south": (1, 0),
+            "west": (0, -1), "east": (0, 1),
+        }.items():
+            run = 0
+            for distance in range(1, radius + 1):
+                rr, cc = row0 + dr_step * distance, col0 + dc_step * distance
+                if not (0 <= rr < self.gs and 0 <= cc < self.gs):
+                    break
+                state = self._cell_state(rr, cc)
+                if state != "free" and (rr, cc) not in frontier_set:
+                    break
+                run += 1
+            sector_run_lengths[sector] = run
+        min_run = max(1, int(self.config.semantic_resilience_branch_min_run_cells))
+        executable_exit_count = sum(
+            run >= min_run for run in sector_run_lengths.values()
+        )
+        connected_component_count = 0
+        traversable = {
+            (row0 + dr, col0 + dc)
+            for dr in range(-radius, radius + 1)
+            for dc in range(-radius, radius + 1)
+            if (dr or dc) and dr * dr + dc * dc <= radius * radius
+            and 0 <= row0 + dr < self.gs and 0 <= col0 + dc < self.gs
+            and (self._cell_state(row0 + dr, col0 + dc) == "free"
+                 or (row0 + dr, col0 + dc) in frontier_set)
+        }
+        while traversable:
+            connected_component_count += 1
+            stack = [traversable.pop()]
+            while stack:
+                rr, cc = stack.pop()
+                for nr, nc in ((rr - 1, cc), (rr + 1, cc), (rr, cc - 1), (rr, cc + 1)):
+                    if (nr, nc) in traversable:
+                        traversable.remove((nr, nc))
+                        stack.append((nr, nc))
         observed = state_counts["free"] + state_counts["occupied"]
         return {
             "radius_cells": int(radius),
@@ -2236,7 +2280,12 @@ class SparseOccSemanticMemory:
             "occupied_ratio_observed": float(
                 state_counts["occupied"] / max(1, observed)
             ),
-            "branch_count": int(sum(value > 0 for value in sector_counts.values())),
+            "branch_count": int(executable_exit_count),
+            "executable_exit_count": int(executable_exit_count),
+            "connected_component_count": int(connected_component_count),
+            "branch_depth_mean": float(
+                sum(sector_run_lengths.values()) / max(1, len(sector_run_lengths))
+            ),
             "direction_entropy": float(
                 self._normalized_entropy(sector_counts.values())
             ),
@@ -2296,6 +2345,9 @@ class SparseOccSemanticMemory:
             "last_visit_age_steps": last_visit_age,
             "outgoing_trace_direction_count": int(len(outgoing_sectors)),
             "outgoing_trace_directions": sorted(outgoing_sectors),
+            "revisit_interval_steps": [
+                int(b - a) for a, b in zip(near_steps, near_steps[1:]) if b > a
+            ],
         }
 
     def _anchor_semantic_information(
@@ -2308,10 +2360,10 @@ class SparseOccSemanticMemory:
             0.25, float(self.config.semantic_resilience_anchor_semantic_radius_m)
         )
         terms = set()
-        instruction_relevant_count = 0
-        high_conf_count = 0
-        next_landmark_count = 0
-        passage_count = 0
+        instruction_terms = set()
+        high_conf_terms = set()
+        next_landmark_terms = set()
+        passage_terms = set()
         for node in semantic_nodes:
             xy = node.get("xy")
             if not isinstance(xy, (list, tuple)) or len(xy) < 2:
@@ -2323,21 +2375,21 @@ class SparseOccSemanticMemory:
             if term:
                 terms.add(term)
             if float(node.get("instruction_relevance", 0.0) or 0.0) > 0.0:
-                instruction_relevant_count += 1
+                instruction_terms.add(term or f"node:{len(instruction_terms)}")
             if bool(node.get("high_conf_semantic")):
-                high_conf_count += 1
+                high_conf_terms.add(term or f"node:{len(high_conf_terms)}")
             if float(node.get("next_landmark_relevance", 0.0) or 0.0) > 0.0:
-                next_landmark_count += 1
+                next_landmark_terms.add(term or f"node:{len(next_landmark_terms)}")
             if self._semantic_resilience_term_kind(term) == "passage":
-                passage_count += 1
+                passage_terms.add(term or f"node:{len(passage_terms)}")
         return {
             "semantic_radius_m": float(radius_m),
             "semantic_unique_count": int(len(terms)),
             "semantic_terms": sorted(terms),
-            "instruction_relevant_count": int(instruction_relevant_count),
-            "high_conf_landmark_count": int(high_conf_count),
-            "next_landmark_count": int(next_landmark_count),
-            "passage_semantic_count": int(passage_count),
+            "instruction_relevant_count": int(len(instruction_terms)),
+            "high_conf_landmark_count": int(len(high_conf_terms)),
+            "next_landmark_count": int(len(next_landmark_terms)),
+            "passage_semantic_count": int(len(passage_terms)),
         }
 
     def _recovery_anchor_features(
@@ -2355,7 +2407,7 @@ class SparseOccSemanticMemory:
         trace = self._anchor_trace_information(cell, latest_step=latest_step)
         semantic = self._anchor_semantic_information(cell, semantic_nodes)
         return {
-            "recovery_feature_schema_version": "v2",
+            "recovery_feature_schema_version": "v3",
             "anchor_source_is_keyframe": bool(source_type == "keyframe"),
             "anchor_visible_free_ratio": anchor_spatial["visible_free_ratio"],
             "anchor_occupied_ratio_observed": anchor_spatial[
@@ -2363,6 +2415,11 @@ class SparseOccSemanticMemory:
             ],
             "anchor_frontier_count": anchor_spatial["frontier_count"],
             "anchor_branch_count": anchor_spatial["branch_count"],
+            "anchor_executable_exit_count": anchor_spatial["executable_exit_count"],
+            "anchor_connected_component_count": anchor_spatial[
+                "connected_component_count"
+            ],
+            "anchor_branch_depth_mean": anchor_spatial["branch_depth_mean"],
             "anchor_direction_entropy": anchor_spatial["direction_entropy"],
             "anchor_semantic_unique_count": semantic["semantic_unique_count"],
             "anchor_instruction_relevant_count": semantic[
@@ -2381,9 +2438,24 @@ class SparseOccSemanticMemory:
             "anchor_recent_return_count": trace["return_count"],
             "anchor_recent_cycle_count": trace["recent_cycle_count"],
             "anchor_short_cycle_risk": trace["short_cycle_risk"],
+            "anchor_revisit_interval_min_steps": (
+                min(trace["revisit_interval_steps"])
+                if trace["revisit_interval_steps"] else None
+            ),
+            "anchor_revisit_interval_mean_steps": (
+                float(sum(trace["revisit_interval_steps"]) / len(trace["revisit_interval_steps"]))
+                if trace["revisit_interval_steps"] else None
+            ),
             "current_visible_free_ratio": current_spatial["visible_free_ratio"],
             "current_frontier_count": current_spatial["frontier_count"],
             "current_branch_count": current_spatial["branch_count"],
+            "current_executable_exit_count": current_spatial[
+                "executable_exit_count"
+            ],
+            "current_connected_component_count": current_spatial[
+                "connected_component_count"
+            ],
+            "current_branch_depth_mean": current_spatial["branch_depth_mean"],
             "current_direction_entropy": current_spatial["direction_entropy"],
             "current_to_anchor_free_ratio_gain": float(
                 anchor_spatial["visible_free_ratio"]
@@ -4567,7 +4639,7 @@ class SparseOccSemanticMemory:
                 "yaw": float(yaw),
                 "semantic_top_match": self.last_semantic_decision.get("top_match"),
                 "semantic_top_score": self.last_semantic_decision.get("top_score"),
-                "keyframe_feature_schema_version": "v2",
+                "keyframe_feature_schema_version": "v3",
             }
         )
         self.last_keyframe_xy = xy
