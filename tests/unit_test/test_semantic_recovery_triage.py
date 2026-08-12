@@ -63,11 +63,40 @@ def test_semantic_only_signal_abstains():
     assert "semantic_only_no_spatial_conflict" in result["hard_abstain_reasons"]
 
 
-def test_completed_landmark_candidate_abstains():
+def test_completed_landmark_is_route_soft_feature_for_safe_restoration():
     result = _classify(_candidate(completed_landmark_penalty=1.0))
 
-    assert result["tier"] == "abstain"
-    assert "completed_landmark_penalty" in result["hard_abstain_reasons"]
+    assert result["tier"] == "strict_intervention"
+    assert result["completed_landmark_route_soft_penalty"] == 1.0
+    assert "completed_landmark_penalty" not in result["hard_abstain_reasons"]
+
+
+def test_s2_turn_loop_uses_decision_state_restoration_without_frontier():
+    result = _classify(
+        _candidate(
+            active_gate_safe=False,
+            target_frontier_intent_safe=False,
+            target_frontier_escape_candidate=False,
+            target_frontier_score=0.0,
+            target_frontier_doorway_like_score=0.0,
+            completed_landmark_penalty=1.0,
+            direction_bucket="back",
+            current_visible_free_ratio=0.20,
+            anchor_visible_free_ratio=0.91,
+            current_executable_exit_count=0,
+            anchor_executable_exit_count=4,
+            current_to_anchor_branch_gain=4,
+            current_to_anchor_free_ratio_gain=0.71,
+        ),
+        failure_type="s2_turn_loop_obstructed",
+        recommended_primitive="reorient_reobserve",
+        trigger_reasons=["s2_repeated_turn_generation", "s2_low_translation", "local_trap"],
+        context_tags=["s2_policy_loop", "decision_state_restoration", "spatial_constriction"],
+    )
+
+    assert result["tier"] == "strict_intervention"
+    assert result["restoration_anchor"] is True
+    assert result["back_only_without_anchor"] is False
 
 
 def test_stale_anchor_cannot_enter_strict_or_adapter_tier():

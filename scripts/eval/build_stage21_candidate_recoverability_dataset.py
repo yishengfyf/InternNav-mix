@@ -277,6 +277,24 @@ def _load_triage(run_dirs: Sequence[Path]) -> Tuple[Dict[Tuple[str, str, int], D
                     "recommended_primitive": row.get("recommended_primitive"),
                 },
             )
+        loop_path = run_dir / "s2_action_loop_events.jsonl"
+        for row in _read_json_records(loop_path):
+            if row.get("transition") != "start":
+                continue
+            counts["s2_action_loop_events"] += 1
+            tier = str(row.get("triage_tier") or "unknown")
+            counts[f"s2_action_loop_tier={tier}"] += 1
+            if bool(row.get("applied")):
+                counts["applied"] += 1
+            key = _event_key(row)
+            triage_by_event[key] = {
+                "tier": tier,
+                "reason": row.get("triage_reason"),
+                "considered": True,
+                "applied": bool(row.get("applied")),
+                "failure_type": row.get("failure_type"),
+                "recommended_primitive": row.get("recommended_primitive"),
+            }
     return triage_by_event, counts
 
 

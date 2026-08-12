@@ -1549,6 +1549,26 @@ class SparseOccSemanticMemory:
             semantic_nodes=semantic_nodes,
             current_policy_candidate=current_policy_candidate,
         )
+        if bool(context.get("s2_action_loop_detected")):
+            trigger_reasons = list(semantic_resilience_state.get("trigger_reasons") or [])
+            recovery_context_tags = list(
+                semantic_resilience_state.get("recovery_context_tags") or []
+            )
+            for reason in ("s2_repeated_turn_generation", "s2_low_translation"):
+                if reason not in trigger_reasons:
+                    trigger_reasons.append(reason)
+            for tag in ("s2_policy_loop", "decision_state_restoration"):
+                if tag not in recovery_context_tags:
+                    recovery_context_tags.append(tag)
+            semantic_resilience_state.update(
+                {
+                    "recovery_trigger": True,
+                    "current_policy_problem": True,
+                    "trigger_reasons": trigger_reasons,
+                    "recovery_context_tags": recovery_context_tags,
+                    "s2_action_loop_detected": True,
+                }
+            )
         raw_candidates: List[Dict[str, Any]] = []
         raw_candidates.extend(
             self._frontier_query_candidates(

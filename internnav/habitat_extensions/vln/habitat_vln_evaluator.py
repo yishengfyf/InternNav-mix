@@ -46,6 +46,7 @@ from internnav.habitat_extensions.vln.utils import (
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 from internnav.semantic_recovery_triage import classify_semantic_recovery_triage
+from internnav.s2_action_loop import init_s2_action_loop_state, observe_s2_action_query
 from internnav.utils.sparse_occ_memory import SparseOccSemanticMemory
 from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
@@ -333,6 +334,182 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             os.makedirs(run_dir, exist_ok=True)
             with open(os.path.join(run_dir, 'progress.json'), 'a', encoding="utf-8") as f:
                 f.write(json.dumps(self._jsonable(result), ensure_ascii=False) + "\n")
+
+    def _get_s2_action_loop_cfg(self) -> dict:
+        vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        return {
+            "enable": bool(vlmap_safety_cfg.get("s2_action_loop_enable", False)),
+            "shadow_only": bool(vlmap_safety_cfg.get("s2_action_loop_shadow_only", True)),
+            "min_same_turn_generations": int(
+                vlmap_safety_cfg.get("s2_action_loop_min_same_turn_generations", 5)
+            ),
+            "min_cumulative_turn_actions": int(
+                vlmap_safety_cfg.get("s2_action_loop_min_cumulative_turn_actions", 12)
+            ),
+            "min_step_span": int(vlmap_safety_cfg.get("s2_action_loop_min_step_span", 6)),
+            "min_episode_step": int(
+                vlmap_safety_cfg.get("s2_action_loop_min_episode_step", 30)
+            ),
+            "max_translation_m": float(
+                vlmap_safety_cfg.get("s2_action_loop_max_translation_m", 0.35)
+            ),
+            "max_snapshots_per_episode": int(
+                vlmap_safety_cfg.get("s2_action_loop_max_snapshots_per_episode", 2)
+            ),
+        }
+
+    def _write_s2_action_loop_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "s2_action_loop_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _observe_s2_action_loop_shadow(
+        self,
+        *,
+        state: dict,
+        output: str,
+        observations: dict,
+        step_id: int,
+        scene_id: str,
+        episode_id: int,
+        episode_index: int,
+        episode_count: int,
+        episode_eval_seed: Optional[int],
+    ) -> Optional[dict]:
+        cfg = self._get_s2_action_loop_cfg()
+        transition = observe_s2_action_query(
+            state,
+            output=output,
+            step_id=step_id,
+            gps=observations.get("gps"),
+            compass=observations.get("compass"),
+            config=cfg,
+        )
+        if not transition or transition.get("transition") != "start":
+            return transition
+
+        candidate_event = self.occ_memory.generate_query_candidates(
+            obs={
+                "gps": observations.get("gps"),
+                "compass": observations.get("compass"),
+            },
+            current_waypoint_decision={},
+            context={
+                "step_id": int(step_id),
+                "scene_id": scene_id,
+                "episode_id": int(episode_id),
+                "episode_index": int(episode_index),
+                "episode_count": int(episode_count),
+                "episode_eval_seed": episode_eval_seed,
+                "s2_action_loop_detected": True,
+                "s2_action_loop_direction": transition.get("turn_direction"),
+                "s2_action_loop_generation_streak": transition.get(
+                    "same_turn_generation_streak"
+                ),
+            },
+        )
+        candidate = self._best_semantic_resilience_backtrack_candidate(candidate_event)
+        current_free_ratio = float(
+            (candidate or {}).get("current_visible_free_ratio", 1.0) or 0.0
+        )
+        current_exit_count = int(
+            (candidate or {}).get("current_executable_exit_count", 0) or 0
+        )
+        obstacle_term_count = int(
+            (candidate or {}).get("semantic_resilience_obstacle_term_count", 0) or 0
+        )
+        obstructed = bool(
+            candidate is not None
+            and (
+                current_exit_count <= 0
+                or current_free_ratio < 0.45
+                or obstacle_term_count > 0
+            )
+        )
+        failure_type = (
+            "s2_turn_loop_obstructed" if obstructed else "s2_turn_loop_semantic"
+        )
+        recommended_primitive = "reorient_reobserve" if obstructed else "reobserve"
+        trigger_reasons = ["s2_repeated_turn_generation", "s2_low_translation"]
+        context_tags = ["s2_policy_loop", "decision_state_restoration"]
+        if obstructed:
+            trigger_reasons.append("local_trap")
+            context_tags.append("spatial_constriction")
+        triage = classify_semantic_recovery_triage(
+            candidate,
+            self._get_semantic_resilience_active_lite_cfg(),
+            failure_type=failure_type,
+            recommended_primitive=recommended_primitive,
+            trigger_reasons=trigger_reasons,
+            context_tags=context_tags,
+            step_id=int(step_id),
+        )
+        event = {
+            "event_type": "s2_action_loop_shadow",
+            "event_schema_version": "stage21a_s2_loop_v1",
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "episode_index": int(episode_index),
+            "episode_count": int(episode_count),
+            "episode_eval_seed": episode_eval_seed,
+            "step_id": int(step_id),
+            "enabled": bool(cfg.get("enable")),
+            "shadow_only": bool(cfg.get("shadow_only", True)),
+            "applied": False,
+            **transition,
+            "failure_type": failure_type,
+            "recommended_primitive": recommended_primitive,
+            "trigger_reasons": trigger_reasons,
+            "recovery_context_tags": context_tags,
+            "candidate_event_reason": candidate_event.get("reason"),
+            "candidate": candidate,
+            "triage": triage,
+            "triage_tier": triage.get("tier"),
+            "triage_reason": triage.get("reason"),
+            "gt_fields_used": [],
+        }
+        max_snapshots = max(0, int(cfg.get("max_snapshots_per_episode", 2)))
+        if int(transition.get("loop_index", 0) or 0) <= max_snapshots:
+            log_dir = self._get_vlmap_run_dir() or self.output_path
+            snapshot_dir = os.path.join(log_dir, "s2_action_loop_snapshots")
+            os.makedirs(snapshot_dir, exist_ok=True)
+            snapshot_name = (
+                f"{scene_id}_{int(episode_id)}_step{int(step_id)}_"
+                f"loop{int(transition.get('loop_index', 0) or 0)}.jpg"
+            )
+            snapshot_path = os.path.join(snapshot_dir, snapshot_name)
+            snapshot_image = Image.fromarray(
+                np.asarray(observations["rgb"], dtype=np.uint8)
+            ).convert("RGB")
+            draw = ImageDraw.Draw(snapshot_image)
+            draw.rectangle((0, 0, snapshot_image.width, 30), fill=(0, 0, 0))
+            draw.text(
+                (8, 8),
+                (
+                    f"S2 loop step={int(step_id)} "
+                    f"turn={transition.get('turn_direction')} "
+                    f"queries={transition.get('same_turn_generation_streak')}"
+                ),
+                fill=(255, 255, 0),
+            )
+            snapshot_image.save(snapshot_path, quality=92)
+            event["rgb_file"] = os.path.relpath(snapshot_path, log_dir)
+        self._write_s2_action_loop_event(event)
+        print(
+            "[S2ActionLoop][Shadow] "
+            f"episode={scene_id}/{episode_id} step={step_id} "
+            f"direction={transition.get('turn_direction')} "
+            f"generations={transition.get('same_turn_generation_streak')} "
+            f"turns={transition.get('cumulative_turn_actions')} "
+            f"tier={triage.get('tier')}",
+            flush=True,
+        )
+        return event
 
     def _maybe_save_stuck_snapshot(
         self,
@@ -5603,6 +5780,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             s2_candidate_probe_unique_candidate_sum = 0
             s2_candidate_probe_mean_pairwise_distance_sum = 0.0
             s2_candidate_probe_max_pairwise_distance = 0.0
+            s2_action_loop_state = init_s2_action_loop_state()
             nextdit_candidate_probe_event_count = 0
             nextdit_candidate_probe_skipped_count = 0
             nextdit_candidate_probe_candidate_sum = 0
@@ -5869,6 +6047,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                     last_s2_query_step = int(step_id)
                     print('step_id:', step_id, 'output text:', llm_outputs)
+
+                    self._observe_s2_action_loop_shadow(
+                        state=s2_action_loop_state,
+                        output=llm_outputs,
+                        observations=observations,
+                        step_id=step_id,
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        episode_index=episode_index,
+                        episode_count=episode_count,
+                        episode_eval_seed=episode_eval_seed,
+                    )
 
                     s2_candidate_probe_s2_query_count += 1
                     s2_candidate_probe_cfg = self._get_s2_candidate_probe_cfg()

@@ -88,6 +88,17 @@ vlmap_cfg[
     "occ_memory_semantic_resilience_active_lite_v2_evidence_gate_require_strict_intervention"
 ] = True
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_log_all_considered"] = True
+vlmap_cfg["occ_memory_semantic_resilience_active_lite_allowed_failure_types"] = [
+    "stuck_collision",
+    "s2_turn_loop_obstructed",
+    "s2_turn_loop_semantic",
+]
+vlmap_cfg["occ_memory_semantic_resilience_active_lite_allowed_recommended_primitives"] = [
+    "reorient_reobserve",
+    "one_safe_forward_reobserve",
+    "reobserve",
+]
+vlmap_cfg["occ_memory_semantic_resilience_active_lite_max_completed_landmark_penalty"] = 1.0
 
 # Save at most one representative RGB + S2 decision JSON per episode when the
 # agent exhibits a long repeated-action or low-displacement stagnation window.
@@ -95,6 +106,19 @@ vlmap_cfg["stuck_snapshot_enable"] = True
 vlmap_cfg["stuck_snapshot_min_step"] = 30
 vlmap_cfg["stuck_snapshot_action_window_steps"] = 32
 vlmap_cfg["stuck_snapshot_repeat_ratio"] = 0.90
+
+# Detect repeated turn generations across separate frozen-S2 queries. This is
+# observation-only: it records a recovery triage event but never changes an
+# action queue, pixel goal, or Habitat action.
+vlmap_cfg["s2_action_loop_enable"] = True
+vlmap_cfg["s2_action_loop_shadow_only"] = True
+vlmap_cfg["s2_action_loop_min_same_turn_generations"] = 5
+vlmap_cfg["s2_action_loop_min_cumulative_turn_actions"] = 12
+vlmap_cfg["s2_action_loop_min_step_span"] = 6
+vlmap_cfg["s2_action_loop_min_episode_step"] = 30
+vlmap_cfg["s2_action_loop_max_translation_m"] = 0.35
+vlmap_cfg["s2_action_loop_max_snapshots_per_episode"] = 2
+vlmap_cfg["occ_memory_candidate_probe_max_events_per_episode"] = 32
 
 # Preserve JSONL evidence but disable high-volume visualization/PLY output for
 # overnight runs. These switches materially reduce disk use and serialization.

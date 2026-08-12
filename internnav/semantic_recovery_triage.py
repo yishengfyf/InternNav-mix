@@ -17,7 +17,7 @@ DEFAULT_SEMANTIC_RECOVERY_TRIAGE_CONFIG = {
     "v2_evidence_gate_min_target_frontier_score": 0.10,
     "v2_evidence_gate_min_step_gap": 20,
     "v2_evidence_gate_min_nearby_visits": 3,
-    "max_completed_landmark_penalty": 0.0,
+    "max_completed_landmark_penalty": 1.0,
     "min_step": 35,
     "min_backtrack_m": 1.0,
     "max_backtrack_m": 4.0,
@@ -100,6 +100,8 @@ def classify_semantic_recovery_triage(
     s2_policy_conflict = bool(
         reasons.intersection({"current_waypoint_occupied", "current_waypoint_not_active_safe"})
         or "policy_memory_conflict" in tags
+        or "s2_repeated_turn_generation" in reasons
+        or "s2_policy_loop" in tags
     )
     obstacle_context = bool(
         "semantic_obstacle_near_trap" in reasons
@@ -109,6 +111,7 @@ def classify_semantic_recovery_triage(
     spatial_constriction = bool(
         "local_trap" in reasons
         or "spatial_constriction" in tags
+        or str(failure_type) == "s2_turn_loop_obstructed"
     )
     semantic_only = bool(
         reasons.intersection({"semantic_dead_zone", "semantic_stagnation"})
@@ -129,14 +132,32 @@ def classify_semantic_recovery_triage(
         or target_frontier_score >= float(config["v2_evidence_gate_min_target_frontier_score"])
         or doorway_score >= float(config["v2_evidence_gate_min_doorway_score"])
     )
+    current_free_ratio = _finite_float(candidate_dict.get("current_visible_free_ratio"))
+    anchor_free_ratio = _finite_float(candidate_dict.get("anchor_visible_free_ratio"))
+    current_exit_count = _optional_int(candidate_dict.get("current_executable_exit_count")) or 0
+    anchor_exit_count = _optional_int(candidate_dict.get("anchor_executable_exit_count")) or 0
+    branch_gain = _finite_float(candidate_dict.get("current_to_anchor_branch_gain"))
+    free_ratio_gain = _finite_float(candidate_dict.get("current_to_anchor_free_ratio_gain"))
+    restoration_anchor = bool(
+        geometry_safe
+        and open_score >= float(config["v2_evidence_gate_min_open_score"])
+        and anchor_free_ratio >= 0.70
+        and anchor_exit_count >= 2
+        and (
+            anchor_exit_count > current_exit_count
+            or branch_gain >= 1.0
+            or free_ratio_gain >= 0.20
+            or anchor_free_ratio - current_free_ratio >= 0.20
+        )
+    )
     escape_anchor_safe = bool(
         geometry_safe
-        and active_gate_safe
-        and completed_penalty <= float(config["max_completed_landmark_penalty"])
         and open_score >= float(config["v2_evidence_gate_min_open_score"])
-        and frontier_like_anchor
+        and (restoration_anchor or (active_gate_safe and frontier_like_anchor))
     )
-    back_only_without_anchor = bool(direction_bucket == "back" and not frontier_like_anchor)
+    back_only_without_anchor = bool(
+        direction_bucket == "back" and not (frontier_like_anchor or restoration_anchor)
+    )
     intervention_time_safe = bool(
         step_id_value is None or step_id_value >= int(config["min_step"])
     )
@@ -151,12 +172,21 @@ def classify_semantic_recovery_triage(
     execution_window_safe = bool(
         intervention_time_safe and backtrack_distance_safe and anchor_fresh
     )
+    s2_loop_failure = str(failure_type) in {
+        "s2_turn_loop_obstructed",
+        "s2_turn_loop_semantic",
+    }
+    strict_hazard_evidence = bool(
+        obstacle_context or str(failure_type) == "s2_turn_loop_obstructed"
+    )
+    adapter_hazard_evidence = bool(obstacle_context or s2_loop_failure)
 
     evidence = {
         "enabled": True,
-        "failure_type_allowed": str(failure_type) == "stuck_collision",
+        "failure_type_allowed": str(failure_type)
+        in {"stuck_collision", "s2_turn_loop_obstructed", "s2_turn_loop_semantic"},
         "primitive_allowed": str(recommended_primitive)
-        in {"reorient_reobserve", "one_safe_forward_reobserve"},
+        in {"reorient_reobserve", "one_safe_forward_reobserve", "reobserve"},
         "s2_policy_conflict": s2_policy_conflict,
         "obstacle_context": obstacle_context,
         "spatial_constriction": spatial_constriction,
@@ -165,12 +195,16 @@ def classify_semantic_recovery_triage(
         "geometry_safe": geometry_safe,
         "active_gate_safe": active_gate_safe,
         "frontier_like_anchor": frontier_like_anchor,
+        "restoration_anchor": restoration_anchor,
         "escape_anchor_safe": escape_anchor_safe,
         "intervention_time_safe": intervention_time_safe,
         "backtrack_distance_safe": backtrack_distance_safe,
         "anchor_fresh": anchor_fresh,
         "execution_window_safe": execution_window_safe,
+        "strict_hazard_evidence": strict_hazard_evidence,
+        "adapter_hazard_evidence": adapter_hazard_evidence,
         "completed_landmark_penalty": completed_penalty,
+        "completed_landmark_route_soft_penalty": completed_penalty,
         "back_only_without_anchor": back_only_without_anchor,
         "open_score": open_score,
         "target_frontier_score": target_frontier_score,
@@ -179,6 +213,12 @@ def classify_semantic_recovery_triage(
         "semantic_resilience_backtrack_distance_m": backtrack_distance,
         "step_id": step_id_value,
         "nearby_visit_count": nearby_visits,
+        "current_visible_free_ratio": current_free_ratio,
+        "anchor_visible_free_ratio": anchor_free_ratio,
+        "current_executable_exit_count": current_exit_count,
+        "anchor_executable_exit_count": anchor_exit_count,
+        "current_to_anchor_branch_gain": branch_gain,
+        "current_to_anchor_free_ratio_gain": free_ratio_gain,
     }
 
     hard_abstain_reasons = []
@@ -188,8 +228,6 @@ def classify_semantic_recovery_triage(
         hard_abstain_reasons.append("primitive_not_recovery")
     if not geometry_safe:
         hard_abstain_reasons.append("candidate_not_geometry_safe")
-    if completed_penalty > float(config["max_completed_landmark_penalty"]):
-        hard_abstain_reasons.append("completed_landmark_penalty")
     if semantic_only:
         hard_abstain_reasons.append("semantic_only_no_spatial_conflict")
     if back_only_without_anchor:
@@ -204,7 +242,7 @@ def classify_semantic_recovery_triage(
     strict_intervention = bool(
         not hard_abstain_reasons
         and s2_policy_conflict
-        and obstacle_context
+        and strict_hazard_evidence
         and spatial_constriction
         and persistence
         and escape_anchor_safe
@@ -214,10 +252,10 @@ def classify_semantic_recovery_triage(
         not strict_intervention
         and not hard_abstain_reasons
         and s2_policy_conflict
-        and obstacle_context
+        and adapter_hazard_evidence
         and geometry_safe
         and open_score >= float(config["v2_evidence_gate_min_open_score"])
-        and (active_gate_safe or frontier_like_anchor)
+        and (active_gate_safe or frontier_like_anchor or restoration_anchor)
     )
 
     if strict_intervention:
