@@ -1,6 +1,6 @@
 #!/bin/bash
-# Gated Stage21a overnight pipeline:
-# 4ep/1GPU smoke -> 40ep/4GPU smoke -> 500ep/4GPU Run A0 -> package.
+# Gated Stage21a pipeline:
+# 4ep/1GPU smoke -> audit -> 40ep/4GPU smoke -> audit -> optional 500ep.
 
 set -euo pipefail
 
@@ -13,6 +13,12 @@ MANIFEST_DIR=${STAGE21_MANIFEST_DIR:-data/stage21}
 DATASET_ROOT=${STAGE21_DATASET_ROOT:-data/stage21/datasets}
 RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
 PIPELINE_LOG=${STAGE21_PIPELINE_LOG:-}
+MAX_EPISODES=${STAGE21_MAX_EPISODES:-500}
+
+if [[ "${MAX_EPISODES}" != "40" && "${MAX_EPISODES}" != "500" ]]; then
+  echo "STAGE21_MAX_EPISODES must be 40 or 500, got ${MAX_EPISODES}." >&2
+  exit 2
+fi
 
 PIPELINE_COMPLETE=0
 CURRENT_RUN_ROOT=""
@@ -69,7 +75,11 @@ trap package_failure EXIT
 test -f "${EPISODES_FILE}"
 mkdir -p "${MANIFEST_DIR}" "${DATASET_ROOT}" "${RETURN_ROOT}"
 
-for episode_count in 4 40 500; do
+EPISODE_COUNTS=(4 40)
+if [[ "${MAX_EPISODES}" == "500" ]]; then
+  EPISODE_COUNTS+=(500)
+fi
+for episode_count in "${EPISODE_COUNTS[@]}"; do
   python3 scripts/eval/select_balanced_r2r_episodes.py \
     --episodes-file "${EPISODES_FILE}" \
     --output "${MANIFEST_DIR}/train_balanced_${episode_count}_episode_ids.json" \
@@ -187,6 +197,38 @@ DATASET_DIR_4=${LAST_DATASET_DIR}
 run_and_audit 40ep_smoke 40 4 2423 2424 4
 RUN_ROOT_40=${LAST_RUN_ROOT}
 DATASET_DIR_40=${LAST_DATASET_DIR}
+
+if [[ "${MAX_EPISODES}" == "40" ]]; then
+  RETURN_NAME="stage21a_r2_recovery_decision_state_shadow_4to40ep_return_${PIPELINE_TAG}"
+  DEST="${RETURN_ROOT}/${RETURN_NAME}"
+  test ! -e "${DEST}"
+  mkdir -p "${DEST}/smoke_runs" "${DEST}/datasets" "${DEST}/episode_manifests"
+
+  # The 40ep audit is the main result; retain the 4ep smoke and both datasets.
+  cp -a "${RUN_ROOT_40}/progress.json" "${RUN_ROOT_40}/result.json" "${DEST}/"
+  cp -a "${RUN_ROOT_40}/vlmap_safety_debug" "${DEST}/"
+  cp -a "${RUN_ROOT_4}" "${DEST}/smoke_runs/4ep"
+  cp -a "${DATASET_DIR_4}" "${DEST}/datasets/4ep"
+  cp -a "${DATASET_DIR_40}" "${DEST}/datasets/40ep"
+  cp -a "${MANIFEST_DIR}"/train_balanced_{4,40}_episode_ids*.json "${DEST}/episode_manifests/"
+  if [[ -n "${PIPELINE_LOG}" && -f "${PIPELINE_LOG}" ]]; then
+    cp -a "${PIPELINE_LOG}" "${DEST}/pipeline.log"
+  fi
+
+  git rev-parse HEAD > "${DEST}/git_commit.txt"
+  git status --short > "${DEST}/git_status_short.txt"
+  printf '%s\n' "${LAST_RUN_NAME}" > "${DEST}/RUN_NAME.txt"
+  printf '%s\n' "40" > "${DEST}/MAX_EPISODES.txt"
+  find "${DEST}" -type f | sort > "${DEST}/RETURN_MANIFEST.txt"
+
+  PIPELINE_COMPLETE=1
+  echo "STAGE21_PIPELINE_STATUS=complete"
+  echo "PIPELINE_STOPPED_AFTER=40ep_audit"
+  echo "RETURN_NAME=${RETURN_NAME}"
+  echo "DEST=$(readlink -f "${DEST}")"
+  du -sh "${DEST}"
+  exit 0
+fi
 
 # This expensive run is reached only when both smoke audits exit successfully.
 run_and_audit a0_500ep 500 4 2425 2426 4
