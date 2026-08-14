@@ -107,7 +107,11 @@ def _predict(model, matrix: np.ndarray, device: torch.device, batch_size: int = 
         batch = torch.as_tensor(matrix[start:start + batch_size], dtype=torch.float32, device=device)
         raw = model(batch)
         for name, value in raw.items():
-            outputs[name].append(value.detach().cpu().numpy())
+            # Progress is a ranking logit (sigmoid is monotonic), while the
+            # scalar/auxiliary heads are audited in probability space to match
+            # the training metrics and proxy targets in [0, 1].
+            tensor = value if name == "progress" else torch.sigmoid(value)
+            outputs[name].append(tensor.detach().cpu().numpy())
     return {name: np.concatenate(values) if values else np.zeros((0,), dtype=np.float32)
             for name, values in outputs.items()}
 
