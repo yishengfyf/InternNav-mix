@@ -36,6 +36,10 @@ vlmap_cfg["occ_memory_semantic_resilience_active_lite_enable"] = True
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_shadow_only"] = True
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_evaluate_gate_when_shadow_only"] = True
 vlmap_cfg["s2_action_loop_shadow_only"] = True
+vlmap_cfg["stuck_snapshot_enable"] = True
+vlmap_cfg["s2_action_loop_max_snapshots_per_episode"] = int(
+    os.environ.get("STAGE21C_LOOP_SNAPSHOTS_PER_EPISODE", "3")
+)
 vlmap_cfg["occ_memory_candidate_probe_max_events_per_episode"] = int(
     os.environ.get("STAGE21C_MAX_EVENTS_PER_EPISODE", "64")
 )
