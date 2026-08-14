@@ -14,7 +14,7 @@ import math
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -142,11 +142,12 @@ def _progress_metrics(rows: Sequence[Mapping[str, Any]], scores: Sequence[float]
 
 
 def _scalar_metrics(rows: Sequence[Mapping[str, Any]], scores: Sequence[float], task: str,
-                    heuristic_name: str) -> Dict[str, float]:
+                    heuristic_name: str, auxiliary_scores: Optional[Sequence[float]] = None) -> Dict[str, float]:
     targets = [task_target(row, task)[0] for row in rows]
     auxiliaries = [task_target(row, task)[1] for row in rows]
     errors = [float(score) - target for score, target in zip(scores, targets)]
-    predictions = [int(float(score) >= 0.5) for score in scores]
+    aux_values = auxiliary_scores if auxiliary_scores is not None else scores
+    predictions = [int(float(score) >= 0.5) for score in aux_values]
     labels = [int(value >= 0.5) for value in auxiliaries]
     heuristic_errors = [heuristic_score(row, task, heuristic_name) - target
                         for row, target in zip(rows, targets)]
@@ -175,7 +176,8 @@ def _group_key(row: Mapping[str, Any], group: str) -> str:
 
 
 def _group_metrics(rows: Sequence[Mapping[str, Any]], scores: Sequence[float], task: str,
-                   heuristic_name: str, group: str) -> Dict[str, Any]:
+                   heuristic_name: str, group: str,
+                   auxiliary_scores: Optional[Sequence[float]] = None) -> Dict[str, Any]:
     grouped: Dict[str, List[int]] = defaultdict(list)
     for index, row in enumerate(rows):
         grouped[_group_key(row, group)].append(index)
@@ -183,10 +185,16 @@ def _group_metrics(rows: Sequence[Mapping[str, Any]], scores: Sequence[float], t
     for key, indices in sorted(grouped.items()):
         subset_rows = [rows[index] for index in indices]
         subset_scores = [scores[index] for index in indices]
+        subset_auxiliary = (
+            [auxiliary_scores[index] for index in indices]
+            if auxiliary_scores is not None else None
+        )
         if task == "progress":
             metrics = _progress_metrics(subset_rows, subset_scores)
         else:
-            metrics = _scalar_metrics(subset_rows, subset_scores, task, heuristic_name)
+            metrics = _scalar_metrics(
+                subset_rows, subset_scores, task, heuristic_name, subset_auxiliary
+            )
         metrics["rows"] = len(indices)
         result[key] = metrics
     return result
@@ -278,11 +286,13 @@ def main() -> None:
                              "by_tier": _group_metrics(rows, learned["progress"], task, heuristic_names[task], "tier"),
                              "disagreement": _shadow_disagreement(rows, learned["progress"])}
         else:
-            metrics[task] = {"overall": _scalar_metrics(rows, learned[task], task, heuristic_names[task]),
-                             "by_scene": _group_metrics(rows, learned[task], task, heuristic_names[task], "scene"),
-                             "by_candidate_type": _group_metrics(rows, learned[task], task, heuristic_names[task], "candidate_type"),
-                             "by_direction": _group_metrics(rows, learned[task], task, heuristic_names[task], "direction"),
-                             "by_tier": _group_metrics(rows, learned[task], task, heuristic_names[task], "tier")}
+            auxiliary_name = "safety_geometry" if task == "safety" else "recovery_promising"
+            metrics[task] = {"overall": _scalar_metrics(
+                                 rows, learned[task], task, heuristic_names[task], learned[auxiliary_name]),
+                             "by_scene": _group_metrics(rows, learned[task], task, heuristic_names[task], "scene", learned[auxiliary_name]),
+                             "by_candidate_type": _group_metrics(rows, learned[task], task, heuristic_names[task], "candidate_type", learned[auxiliary_name]),
+                             "by_direction": _group_metrics(rows, learned[task], task, heuristic_names[task], "direction", learned[auxiliary_name]),
+                             "by_tier": _group_metrics(rows, learned[task], task, heuristic_names[task], "tier", learned[auxiliary_name])}
 
     ablation_names = ("no_delta", "no_current_context", "no_candidate_context", "no_anchor_semantics", "no_type_direction")
     ablations: Dict[str, Any] = {}
@@ -296,7 +306,10 @@ def main() -> None:
             if task == "progress":
                 ablation_metrics[task] = _progress_metrics(rows, output["progress"])
             else:
-                ablation_metrics[task] = _scalar_metrics(rows, output[task], task, heuristic_names[task])
+                auxiliary_name = "safety_geometry" if task == "safety" else "recovery_promising"
+                ablation_metrics[task] = _scalar_metrics(
+                    rows, output[task], task, heuristic_names[task], output[auxiliary_name]
+                )
         ablations[ablation] = ablation_metrics
 
     prediction_path = args.output_dir / "val_predictions.jsonl"
