@@ -36,6 +36,10 @@ vlmap_cfg["occ_memory_semantic_resilience_active_lite_enable"] = True
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_shadow_only"] = True
 vlmap_cfg["occ_memory_semantic_resilience_active_lite_evaluate_gate_when_shadow_only"] = True
 vlmap_cfg["s2_action_loop_shadow_only"] = True
+# Keep Stage21c as the frozen, reproducible control.  Recovery-conditioned
+# re-query belongs to the independent Stage21d config.
+vlmap_cfg["s2_recovery_context_enable"] = False
+vlmap_cfg["s2_loop_strict_active_enable"] = False
 vlmap_cfg["stuck_snapshot_enable"] = True
 vlmap_cfg["s2_action_loop_max_snapshots_per_episode"] = int(
     os.environ.get("STAGE21C_LOOP_SNAPSHOTS_PER_EPISODE", "3")

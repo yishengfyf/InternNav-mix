@@ -10,6 +10,7 @@ import itertools
 import math
 import random
 import re
+import time
 from collections import OrderedDict
 from datetime import datetime
 from typing import Optional, Tuple
@@ -46,7 +47,11 @@ from internnav.habitat_extensions.vln.utils import (
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 from internnav.semantic_recovery_triage import classify_semantic_recovery_triage
-from internnav.s2_action_loop import init_s2_action_loop_state, observe_s2_action_query
+from internnav.s2_action_loop import (
+    init_s2_action_loop_state,
+    normalize_direct_turn_output,
+    observe_s2_action_query,
+)
 from internnav.utils.sparse_occ_memory import SparseOccSemanticMemory
 from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
@@ -337,6 +342,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
     def _get_s2_action_loop_cfg(self) -> dict:
         vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+        raw_variants = vlmap_safety_cfg.get(
+            "s2_recovery_context_shadow_variants", ["text_only", "text_images"]
+        )
+        if isinstance(raw_variants, str):
+            raw_variants = raw_variants.split(",")
+        shadow_variants = tuple(
+            item
+            for item in (str(value).strip().lower() for value in list(raw_variants or []))
+            if item in {"text_only", "text_images"}
+        )
         return {
             "enable": bool(vlmap_safety_cfg.get("s2_action_loop_enable", False)),
             "shadow_only": bool(vlmap_safety_cfg.get("s2_action_loop_shadow_only", True)),
@@ -356,7 +371,431 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "max_snapshots_per_episode": int(
                 vlmap_safety_cfg.get("s2_action_loop_max_snapshots_per_episode", 2)
             ),
+            "recovery_context_enable": bool(
+                vlmap_safety_cfg.get("s2_recovery_context_enable", False)
+            ),
+            "recovery_context_shadow_only": bool(
+                vlmap_safety_cfg.get("s2_recovery_context_shadow_only", True)
+            ),
+            "recovery_context_max_images": int(
+                vlmap_safety_cfg.get("s2_recovery_context_max_images", 3)
+            ),
+            "recovery_context_ttl_queries": int(
+                vlmap_safety_cfg.get("s2_recovery_context_ttl_queries", 2)
+            ),
+            "recovery_context_shadow_variants": shadow_variants,
+            "strict_active_enable": bool(
+                vlmap_safety_cfg.get("s2_loop_strict_active_enable", False)
+            ),
+            "strict_active_max_interventions_per_episode": max(
+                0,
+                int(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_strict_active_max_interventions_per_episode", 1
+                    )
+                ),
+            ),
+            "strict_active_require_active_gate_safe": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_strict_active_require_active_gate_safe", True
+                )
+            ),
+            "strict_active_allowed_directions": tuple(
+                str(value).strip().lower()
+                for value in list(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_strict_active_allowed_directions",
+                        ["front", "left", "right"],
+                    )
+                    or []
+                )
+                if str(value).strip()
+            ),
         }
+
+    def _format_s2_recovery_context(self, context: dict) -> str:
+        """Format a compact, temporary recovery card for an S2 re-query.
+
+        This is deliberately textual and evidence-scoped.  It does not claim
+        that the rejected direction is globally wrong, and it does not expose
+        GT/reference-path fields.  The associated images are appended by the
+        caller in the order listed in ``context['image_roles']``.
+        """
+        event = dict(context or {})
+        failure_type = str(event.get("failure_type") or "unknown")
+        direction = str(event.get("turn_direction") or "unknown")
+        streak = event.get("same_turn_generation_streak")
+        turn_actions = event.get("cumulative_turn_actions")
+        translation = event.get("translation_m")
+        candidate = dict(event.get("candidate") or {})
+        candidate_direction = str(candidate.get("direction_bucket") or "unknown")
+        candidate_distance = candidate.get("distance_m")
+        candidate_open = candidate.get("semantic_resilience_open_score")
+        candidate_safe = candidate.get("geometry_safe")
+        semantic_term = (
+            (candidate.get("semantic_evidence") or {}).get("semantic_top_match")
+            or (candidate.get("semantic_evidence") or {}).get("matched_landmark")
+            or candidate.get("semantic_top_match")
+            or candidate.get("matched_landmark")
+            or candidate.get("anchor_semantic_top_match")
+            or "unknown"
+        )
+        return (
+            "Temporary recovery context (observed local evidence, not ground truth): "
+            f"failure={failure_type}; repeated_turn={direction}; "
+            f"query_streak={streak}; cumulative_turn_actions={turn_actions}; "
+            f"translation_m={translation}; "
+            f"recovery_anchor_direction={candidate_direction}; "
+            f"anchor_distance_m={candidate_distance}; "
+            f"anchor_geometry_safe={candidate_safe}; "
+            f"anchor_open_score={candidate_open}; "
+            f"anchor_semantic={semantic_term}. "
+            "The repeated direction has failed to produce new local progress in "
+            "this recent state. Re-observe the current view, respect the instruction, "
+            "and choose a visible, executable, non-redundant waypoint; do not treat "
+            "this card as a forced left/right command."
+        )
+
+    @staticmethod
+    def _nearest_recovery_frame_record(frame_records: list, step_id) -> Optional[dict]:
+        if step_id is None or not frame_records:
+            return None
+        try:
+            target = int(step_id)
+        except (TypeError, ValueError):
+            return None
+        best = None
+        best_gap = None
+        for item in frame_records:
+            try:
+                gap = abs(int(item.get("step_id")) - target)
+            except (TypeError, ValueError):
+                continue
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best = item
+        return best if isinstance((best or {}).get("image"), Image.Image) else None
+
+    def _build_s2_recovery_context(
+        self,
+        event: Optional[dict],
+        *,
+        frame_records: list,
+        current_image: Image.Image,
+    ) -> Optional[dict]:
+        """Build a short-lived event packet from already executed observations."""
+        cfg = self._get_s2_action_loop_cfg()
+        if not cfg.get("recovery_context_enable") or not event:
+            return None
+        if not isinstance(current_image, Image.Image):
+            return None
+
+        candidate = dict(event.get("candidate") or {})
+        anchor_step = candidate.get("semantic_resilience_source_step_id")
+        roles = []
+        images = []
+        selected_steps = []
+
+        def add(role: str, record: Optional[dict]) -> None:
+            if not record or not isinstance(record.get("image"), Image.Image):
+                return
+            record_step = int(record.get("step_id"))
+            if record_step in selected_steps:
+                return
+            roles.append(str(role))
+            selected_steps.append(record_step)
+            # The frame history shares rgb_list references.  Only the sparse
+            # event packet owns copies, avoiding an episode-long second buffer.
+            images.append(record["image"].copy())
+
+        start_step = event.get("start_step")
+        current_step = event.get("step_id")
+        if start_step != current_step:
+            add(
+                "frame near the first repeated S2 decision",
+                self._nearest_recovery_frame_record(frame_records, start_step),
+            )
+        if anchor_step not in {start_step, current_step}:
+            add(
+                "recent safe recovery anchor frame",
+                self._nearest_recovery_frame_record(frame_records, anchor_step),
+            )
+        # The current loop frame is already the current image in the base S2
+        # query.  Do not append it a second time and accidentally reweight it.
+        max_images = max(0, int(cfg.get("recovery_context_max_images", 2)))
+        images = images[:max_images]
+        roles = roles[: len(images)]
+        selected_steps = selected_steps[: len(images)]
+        return {
+            "event_type": "s2_recovery_context",
+            "event_schema_version": "stage21d_recovery_context_v1",
+            "scene_id": event.get("scene_id"),
+            "episode_id": event.get("episode_id"),
+            "episode_index": event.get("episode_index"),
+            "episode_count": event.get("episode_count"),
+            "episode_eval_seed": event.get("episode_eval_seed"),
+            "failure_type": event.get("failure_type"),
+            "turn_direction": event.get("turn_direction"),
+            "triage_tier": event.get("triage_tier"),
+            "triage_reason": event.get("triage_reason"),
+            "same_turn_generation_streak": event.get("same_turn_generation_streak"),
+            "cumulative_turn_actions": event.get("cumulative_turn_actions"),
+            "translation_m": event.get("translation_m"),
+            "trigger_step": event.get("step_id"),
+            "current_query_step": event.get("step_id"),
+            "first_repeated_decision_step": event.get("start_step"),
+            "safe_anchor_step": anchor_step,
+            "candidate": candidate,
+            "base_current_frame_present": True,
+            "image_roles": roles,
+            "image_steps": selected_steps,
+            "images": images,
+            "remaining_queries": max(1, int(cfg.get("recovery_context_ttl_queries", 2))),
+            "prompt": self._format_s2_recovery_context(event),
+            "action_applied": False,
+            "gt_fields_used": [],
+        }
+
+    def _recovery_context_prompt(self, context: dict, variant: str) -> str:
+        if variant == "text_only":
+            return str(context.get("prompt") or "")
+        roles = list(context.get("image_roles") or [])
+        image_tokens = " ".join(
+            f"{DEFAULT_IMAGE_TOKEN} ({role})" for role in roles
+        )
+        suffix = f" Recovery context images: {image_tokens}." if image_tokens else ""
+        return f"{context.get('prompt', '')}{suffix}"
+
+    @staticmethod
+    def _s2_recovery_change_metrics(base_parse: dict, hinted_parse: dict, context: dict) -> dict:
+        base_valid = bool(base_parse.get("valid"))
+        hinted_valid = bool(hinted_parse.get("valid"))
+        base_stop = bool(base_parse.get("is_stop"))
+        hinted_stop = bool(hinted_parse.get("is_stop"))
+        base_goal = base_parse.get("pixel_goal")
+        hinted_goal = hinted_parse.get("pixel_goal")
+        shift = None
+        if base_valid and hinted_valid and base_goal is not None and hinted_goal is not None:
+            shift = float(
+                np.hypot(
+                    float(hinted_goal[0]) - float(base_goal[0]),
+                    float(hinted_goal[1]) - float(base_goal[1]),
+                )
+            )
+        if not base_valid and not base_stop and hinted_valid:
+            transition = "invalid_or_turn_to_valid_pixel"
+        elif base_valid and hinted_stop:
+            transition = "valid_to_stop"
+        elif base_valid and hinted_valid:
+            transition = "valid_to_valid"
+        elif base_stop and hinted_valid:
+            transition = "stop_to_valid_pixel"
+        elif hinted_stop:
+            transition = "to_stop"
+        elif not hinted_valid:
+            transition = "remains_invalid_or_turn"
+        else:
+            transition = "other"
+        hinted_turn = normalize_direct_turn_output(hinted_parse.get("text"))
+        repeated_direction = str(context.get("turn_direction") or "unknown")
+        return {
+            "base_valid": base_valid,
+            "hinted_valid": hinted_valid,
+            "base_is_stop": base_stop,
+            "hinted_is_stop": hinted_stop,
+            "base_pixel_goal": base_goal,
+            "hinted_pixel_goal": hinted_goal,
+            "base_direction_bucket": base_parse.get("direction_bucket"),
+            "hinted_direction_bucket": hinted_parse.get("direction_bucket"),
+            "change_type": transition,
+            "changed_pixel": bool(base_goal != hinted_goal),
+            "valid_pixel_shift_px": shift,
+            "large_valid_pixel_shift_40px": bool(shift is not None and shift > 40.0),
+            "direction_bucket_changed": bool(
+                base_parse.get("direction_bucket") != hinted_parse.get("direction_bucket")
+            ),
+            "hinted_direct_turn_direction": (
+                None if hinted_turn is None else hinted_turn.get("direction")
+            ),
+            "continues_repeated_error_direction": bool(
+                hinted_turn is not None
+                and str(hinted_turn.get("direction")) == repeated_direction
+            ),
+        }
+
+    def _run_s2_recovery_context_counterfactual(
+        self,
+        *,
+        base_prompt_body: str,
+        final_prompt: str,
+        input_images: list,
+        messages_prefix: Optional[list],
+        base_output: str,
+        context: dict,
+        image_width: int,
+        variant: str,
+        current_query_step: int,
+    ) -> dict:
+        """Shadow-only extra S2 query; the resulting action is never applied."""
+        variant = str(variant).strip().lower()
+        extra_images = list(context.get("images") or []) if variant == "text_images" else []
+        images = list(input_images) + extra_images
+        prompt = (
+            f"{base_prompt_body} {self._recovery_context_prompt(context, variant)} "
+            f"{final_prompt}."
+        )
+        event = {
+            "event_type": "s2_recovery_context_counterfactual",
+            "event_schema_version": "stage21d_recovery_context_v1",
+            "variant": variant,
+            "shadow_only": True,
+            "action_applied": False,
+            "gt_fields_used": [],
+            "base_output": base_output,
+            "scene_id": context.get("scene_id"),
+            "episode_id": context.get("episode_id"),
+            "episode_index": context.get("episode_index"),
+            "episode_count": context.get("episode_count"),
+            "episode_eval_seed": context.get("episode_eval_seed"),
+            "failure_type": context.get("failure_type"),
+            "triage_tier": context.get("triage_tier"),
+            "triage_reason": context.get("triage_reason"),
+            "turn_direction": context.get("turn_direction"),
+            "trigger_step": context.get("trigger_step"),
+            "current_query_step": int(current_query_step),
+            "first_repeated_decision_step": context.get("first_repeated_decision_step"),
+            "safe_anchor_step": context.get("safe_anchor_step"),
+            "base_current_frame_present": bool(context.get("base_current_frame_present")),
+            "image_roles": list(context.get("image_roles") or []) if extra_images else [],
+            "image_steps": list(context.get("image_steps") or []) if extra_images else [],
+            "extra_image_count": len(extra_images),
+        }
+        rng_state = self._capture_torch_rng_state()
+        started = time.perf_counter()
+        try:
+            hinted_output = self._generate_s2_text_from_prompt_instruction(
+                prompt,
+                images,
+                messages_prefix=messages_prefix,
+                max_new_tokens=128,
+            )
+            base_parse = self._parse_s2_candidate_output(
+                base_output, image_width=image_width
+            )
+            hinted_parse = self._parse_s2_candidate_output(
+                hinted_output, image_width=image_width
+            )
+            event.update({"status": "ok", "hinted_output": hinted_output})
+            event.update(self._s2_recovery_change_metrics(base_parse, hinted_parse, context))
+        except Exception as exc:
+            event.update({"status": "error", "error": str(exc)})
+        finally:
+            event["latency_ms"] = float((time.perf_counter() - started) * 1000.0)
+            self._restore_torch_rng_state(rng_state)
+        return event
+
+    def _plan_s2_loop_strict_active(
+        self,
+        event: Optional[dict],
+        active_count: int,
+        *,
+        observations: Optional[dict] = None,
+        depth_m: Optional[np.ndarray] = None,
+    ) -> dict:
+        cfg = self._get_s2_action_loop_cfg()
+        candidate = dict((event or {}).get("candidate") or {})
+        result = {
+            "event_type": "s2_loop_strict_active",
+            "event_schema_version": "stage21c_strict_active_v1",
+            "scene_id": (event or {}).get("scene_id"),
+            "episode_id": (event or {}).get("episode_id"),
+            "episode_index": (event or {}).get("episode_index"),
+            "episode_count": (event or {}).get("episode_count"),
+            "episode_eval_seed": (event or {}).get("episode_eval_seed"),
+            "step_id": (event or {}).get("step_id"),
+            "failure_type": (event or {}).get("failure_type"),
+            "triage_tier": (event or {}).get("triage_tier"),
+            "triage_reason": (event or {}).get("triage_reason"),
+            "turn_direction": (event or {}).get("turn_direction"),
+            "candidate": candidate,
+            "enabled": bool(cfg.get("strict_active_enable")),
+            "considered": bool(event),
+            "action_applied": False,
+            "output_rewritten": False,
+            "execution_pending": False,
+            "reason": None,
+            "intervention_index": int(active_count + 1),
+            "intervention_budget": int(
+                cfg.get("strict_active_max_interventions_per_episode", 1)
+            ),
+            "geometry_preflight": {
+                "geometry_safe": bool(candidate.get("geometry_safe")),
+                "active_gate_safe": bool(candidate.get("active_gate_safe")),
+                "direction_bucket": candidate.get("direction_bucket"),
+            },
+            "trajectory_preflight": "delegated_to_existing_nextdit_occ_safety",
+            "gt_fields_used": [],
+        }
+        if not result["enabled"]:
+            result["reason"] = "disabled"
+        elif not event:
+            result["reason"] = "missing_loop_event"
+        elif str(event.get("triage_tier") or "") != "strict_intervention":
+            result["reason"] = "non_strict_hold"
+        elif active_count >= int(cfg.get("strict_active_max_interventions_per_episode", 1)):
+            result["reason"] = "budget_exhausted"
+        elif not bool(candidate.get("geometry_safe")):
+            result["reason"] = "candidate_not_geometry_safe"
+        elif bool(cfg.get("strict_active_require_active_gate_safe")) and not bool(
+            candidate.get("active_gate_safe")
+        ):
+            result["reason"] = "candidate_not_active_gate_safe"
+        elif str(candidate.get("direction_bucket") or "").lower() not in set(
+            cfg.get("strict_active_allowed_directions") or ()
+        ):
+            result["reason"] = "candidate_direction_not_allowed"
+        else:
+            plan = self._semantic_resilience_active_lite_directional_pixel_goal(
+                candidate, self._get_semantic_resilience_active_lite_cfg()
+            )
+            result["pixel_goal_plan"] = plan
+            if not plan.get("valid"):
+                result["reason"] = str(plan.get("reason") or "invalid_pixel_goal")
+            else:
+                waypoint_preflight = self.occ_memory.evaluate_waypoint(
+                    plan.get("pixel_goal"),
+                    {
+                        "gps": (observations or {}).get("gps"),
+                        "compass": (observations or {}).get("compass"),
+                    },
+                    depth_m,
+                    context={
+                        "step_id": (event or {}).get("step_id"),
+                        "scene_id": (event or {}).get("scene_id"),
+                        "episode_id": (event or {}).get("episode_id"),
+                        "image_width": int(getattr(self.model_args, "resize_w", 384)),
+                        "image_height": int(getattr(self.model_args, "resize_h", 384)),
+                        "probe_source": "s2_loop_strict_active_preflight",
+                    },
+                )
+                result["waypoint_preflight"] = {
+                    "valid": bool(waypoint_preflight.get("valid")),
+                    "reason": waypoint_preflight.get("reason"),
+                    "goal_state": waypoint_preflight.get("goal_state"),
+                    "goal_grid": waypoint_preflight.get("goal_grid"),
+                    "depth_m": waypoint_preflight.get("depth_m"),
+                    "points_to_revisited_region": waypoint_preflight.get(
+                        "points_to_revisited_region"
+                    ),
+                }
+                if not waypoint_preflight.get("valid"):
+                    result["reason"] = "waypoint_preflight_invalid"
+                elif str(waypoint_preflight.get("goal_state") or "") != "free":
+                    result["reason"] = "waypoint_preflight_not_free"
+                else:
+                    result["reason"] = "preflight_pass"
+                    result["execution_pending"] = True
+        return result
 
     def _write_s2_action_loop_event(self, event: dict) -> None:
         run_dir = self._get_vlmap_run_dir()
@@ -365,6 +804,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "s2_action_loop_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _write_s2_recovery_context_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "s2_recovery_context_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _write_s2_loop_strict_active_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "s2_loop_strict_active_events.jsonl")
         with open(log_path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
@@ -5678,6 +6137,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
 
             rgb_list = []
+            rgb_frame_records = []
             action_seq = []
             input_images = []
             output_ids = None
@@ -5693,6 +6153,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             pending_vlmap_waypoint_feedback = ""
             pending_vlmap_semantic_hint = ""
             pending_occ_memory_guidance_hint = ""
+            pending_s2_recovery_context = None
+            s2_recovery_context_set_count = 0
+            s2_recovery_context_injected_count = 0
+            s2_recovery_context_counterfactual_count = 0
+            s2_recovery_context_changed_count = 0
+            s2_recovery_context_expired_count = 0
+            s2_loop_strict_active_event_count = 0
+            s2_loop_strict_active_rewrite_count = 0
+            s2_loop_strict_active_applied_count = 0
+            s2_loop_strict_active_first_step = None
+            pending_s2_loop_strict_active_execution = None
             semantic_hint_set_count = 0
             semantic_hint_injected_count = 0
             semantic_hint_detection_step = None
@@ -5918,6 +6389,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 else:
                     image = image.resize((self.model_args.resize_w, self.model_args.resize_h))
                     rgb_list.append(image)
+                    rgb_frame_records.append(
+                        {"step_id": int(step_id), "image": image}
+                    )
 
                     down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
                     down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
@@ -5967,6 +6441,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         history_id = sorted(history_id)
                         input_images = [rgb_list[i] for i in history_id] + cur_images
                         input_img_id = 0
+
+                    recovery_context = pending_s2_recovery_context
+                    recovery_cfg = self._get_s2_action_loop_cfg()
+                    if recovery_context and not recovery_cfg.get("recovery_context_shadow_only"):
+                        sources[0]["value"] += (
+                            " "
+                            + self._recovery_context_prompt(
+                                recovery_context, "text_images"
+                            )
+                        )
+                        input_images.extend(list(recovery_context.get("images") or []))
+                        s2_recovery_context_injected_count += 1
+                        remaining = int(
+                            recovery_context.get("remaining_queries", 1) or 1
+                        ) - 1
+                        recovery_context["remaining_queries"] = remaining
+                        if remaining <= 0:
+                            pending_s2_recovery_context = None
+                            s2_recovery_context_expired_count += 1
 
                     if pending_vlmap_waypoint_feedback:
                         sources[0]["value"] += f" {pending_vlmap_waypoint_feedback}"
@@ -6048,7 +6541,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     last_s2_query_step = int(step_id)
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
-                    self._observe_s2_action_loop_shadow(
+                    s2_loop_event = self._observe_s2_action_loop_shadow(
                         state=s2_action_loop_state,
                         output=llm_outputs,
                         observations=observations,
@@ -6059,6 +6552,150 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         episode_count=episode_count,
                         episode_eval_seed=episode_eval_seed,
                     )
+
+                    if s2_loop_event and s2_loop_event.get("transition") == "start":
+                        strict_active_event = self._plan_s2_loop_strict_active(
+                            s2_loop_event,
+                            s2_loop_strict_active_rewrite_count,
+                            observations=observations,
+                            depth_m=current_depth_m,
+                        )
+                        if strict_active_event.get("enabled"):
+                            s2_loop_strict_active_event_count += 1
+                            strict_active_event["base_s2_output"] = llm_outputs
+                            if strict_active_event.get("execution_pending"):
+                                plan = dict(strict_active_event.get("pixel_goal_plan") or {})
+                                planned_goal = list(plan.get("pixel_goal") or [])
+                                try:
+                                    if len(planned_goal) != 2:
+                                        raise ValueError("invalid_pixel_goal")
+                                    goal_x, goal_y = int(planned_goal[0]), int(planned_goal[1])
+                                    replacement_text = f"{goal_y} {goal_x}"
+                                    replacement_ids = self.processor.tokenizer(
+                                        replacement_text,
+                                        add_special_tokens=False,
+                                        return_tensors="pt",
+                                    ).input_ids.to(output_ids.device)
+                                    if replacement_ids.numel() <= 0:
+                                        raise ValueError("empty_recovery_pixel_tokens")
+                                    prompt_len = int(inputs.input_ids.shape[1])
+                                    output_ids = torch.cat(
+                                        [output_ids[:, :prompt_len], replacement_ids], dim=1
+                                    )
+                                    llm_outputs = replacement_text
+                                except Exception as exc:
+                                    strict_active_event.update(
+                                        {
+                                            "reason": "output_rewrite_failed",
+                                            "execution_pending": False,
+                                            "execution_error_type": type(exc).__name__,
+                                            "execution_error": str(exc),
+                                        }
+                                    )
+                                else:
+                                    strict_active_event.update(
+                                        {
+                                            "reason": "output_rewritten_pending_trajectory",
+                                            "action_applied": False,
+                                            "output_rewritten": True,
+                                            "execution_pending": True,
+                                            "recovery_s2_output": replacement_text,
+                                            "executed_pixel_goal": [goal_x, goal_y],
+                                        }
+                                    )
+                                    s2_loop_strict_active_rewrite_count += 1
+                                    pending_s2_loop_strict_active_execution = dict(
+                                        strict_active_event
+                                    )
+                                    print(
+                                        "[S2LoopStrictActive] "
+                                        f"episode={scene_id}/{episode_id} step={step_id} "
+                                        f"base={strict_active_event.get('base_s2_output')} "
+                                        f"recovery={replacement_text}",
+                                        flush=True,
+                                    )
+                            self._write_s2_loop_strict_active_event(strict_active_event)
+
+                        recovery_context = self._build_s2_recovery_context(
+                            s2_loop_event,
+                            frame_records=rgb_frame_records,
+                            current_image=image,
+                        )
+                        if recovery_context is not None:
+                            pending_s2_recovery_context = recovery_context
+                            s2_recovery_context_set_count += 1
+                            self._write_s2_recovery_context_event(
+                                {
+                                    "event_type": "s2_recovery_context_set",
+                                    "event_schema_version": "stage21d_recovery_context_v1",
+                                    "scene_id": recovery_context.get("scene_id"),
+                                    "episode_id": recovery_context.get("episode_id"),
+                                    "episode_index": recovery_context.get("episode_index"),
+                                    "episode_count": recovery_context.get("episode_count"),
+                                    "episode_eval_seed": recovery_context.get("episode_eval_seed"),
+                                    "trigger_step": recovery_context.get("trigger_step"),
+                                    "current_query_step": recovery_context.get("current_query_step"),
+                                    "first_repeated_decision_step": recovery_context.get(
+                                        "first_repeated_decision_step"
+                                    ),
+                                    "safe_anchor_step": recovery_context.get("safe_anchor_step"),
+                                    "failure_type": recovery_context.get("failure_type"),
+                                    "triage_tier": recovery_context.get("triage_tier"),
+                                    "triage_reason": recovery_context.get("triage_reason"),
+                                    "turn_direction": recovery_context.get("turn_direction"),
+                                    "base_current_frame_present": recovery_context.get(
+                                        "base_current_frame_present"
+                                    ),
+                                    "image_roles": list(
+                                        recovery_context.get("image_roles") or []
+                                    ),
+                                    "image_steps": list(
+                                        recovery_context.get("image_steps") or []
+                                    ),
+                                    "remaining_queries": recovery_context.get(
+                                        "remaining_queries"
+                                    ),
+                                    "shadow_variants": list(
+                                        self._get_s2_action_loop_cfg().get(
+                                            "recovery_context_shadow_variants"
+                                        )
+                                        or []
+                                    ),
+                                    "action_applied": False,
+                                    "gt_fields_used": [],
+                                }
+                            )
+
+                    recovery_cfg = self._get_s2_action_loop_cfg()
+                    if (
+                        pending_s2_recovery_context
+                        and recovery_cfg.get("recovery_context_shadow_only")
+                    ):
+                        for variant in recovery_cfg.get(
+                            "recovery_context_shadow_variants"
+                        ) or ():
+                            counterfactual_event = self._run_s2_recovery_context_counterfactual(
+                                base_prompt_body=s2_prompt_body_before_final_prompt,
+                                final_prompt=prompt,
+                                input_images=input_images,
+                                messages_prefix=s2_counterfactual_messages_prefix,
+                                base_output=llm_outputs,
+                                context=pending_s2_recovery_context,
+                                image_width=int(self.model_args.resize_w),
+                                variant=variant,
+                                current_query_step=int(step_id),
+                            )
+                            self._write_s2_recovery_context_event(counterfactual_event)
+                            s2_recovery_context_counterfactual_count += 1
+                            if counterfactual_event.get("changed_pixel"):
+                                s2_recovery_context_changed_count += 1
+                        pending_s2_recovery_context["remaining_queries"] = int(
+                            pending_s2_recovery_context.get("remaining_queries", 1)
+                            or 1
+                        ) - 1
+                        if pending_s2_recovery_context["remaining_queries"] <= 0:
+                            pending_s2_recovery_context = None
+                            s2_recovery_context_expired_count += 1
 
                     s2_candidate_probe_s2_query_count += 1
                     s2_candidate_probe_cfg = self._get_s2_candidate_probe_cfg()
@@ -7455,6 +8092,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 f"reason={semantic_decision.get('stagnation_would_requery_reason')} "
                                 f"recent={semantic_decision.get('stagnation_recent_terms')}"
                             )
+                            if pending_s2_loop_strict_active_execution is not None:
+                                pending_s2_loop_strict_active_execution.update(
+                                    {
+                                        "event_type": "s2_loop_strict_active_execution",
+                                        "reason": "semantic_requery_before_trajectory",
+                                        "action_applied": False,
+                                        "execution_pending": False,
+                                    }
+                                )
+                                self._write_s2_loop_strict_active_event(
+                                    pending_s2_loop_strict_active_execution
+                                )
+                                pending_s2_loop_strict_active_execution = None
                             continue
                         guidance_cfg = self._get_occ_memory_guidance_cfg()
                         guidance_context = {
@@ -7589,6 +8239,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                         "[OccMemory][Habitat][Guidance] "
                                         "clear current goal and requery S2 with memory hint"
                                     )
+                                    if pending_s2_loop_strict_active_execution is not None:
+                                        pending_s2_loop_strict_active_execution.update(
+                                            {
+                                                "event_type": "s2_loop_strict_active_execution",
+                                                "reason": "occ_guidance_requery_before_trajectory",
+                                                "action_applied": False,
+                                                "execution_pending": False,
+                                            }
+                                        )
+                                        self._write_s2_loop_strict_active_event(
+                                            pending_s2_loop_strict_active_execution
+                                        )
+                                        pending_s2_loop_strict_active_execution = None
                                     continue
                         elif dead_zone_candidate:
                             occ_memory_guidance_blocked_count += 1
@@ -7624,6 +8287,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                     "[VLMapSafety][Habitat][Waypoint] "
                                     f"clear current goal and run VLMap recovery actions {vlmap_recovery_actions}"
                                 )
+                                if pending_s2_loop_strict_active_execution is not None:
+                                    pending_s2_loop_strict_active_execution.update(
+                                        {
+                                            "event_type": "s2_loop_strict_active_execution",
+                                            "reason": "waypoint_recovery_before_trajectory",
+                                            "action_applied": False,
+                                            "execution_pending": False,
+                                        }
+                                    )
+                                    self._write_s2_loop_strict_active_event(
+                                        pending_s2_loop_strict_active_execution
+                                    )
+                                    pending_s2_loop_strict_active_execution = None
                                 continue
 
                         if vlmap_waypoint_decision.get("requery_required"):
@@ -7648,6 +8324,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             forward_action = 0
                             draw_pixel_goal = False
                             flag = False
+                            if pending_s2_loop_strict_active_execution is not None:
+                                pending_s2_loop_strict_active_execution.update(
+                                    {
+                                        "event_type": "s2_loop_strict_active_execution",
+                                        "reason": "waypoint_safety_requery_before_trajectory",
+                                        "action_applied": False,
+                                        "execution_pending": False,
+                                    }
+                                )
+                                self._write_s2_loop_strict_active_event(
+                                    pending_s2_loop_strict_active_execution
+                                )
+                                pending_s2_loop_strict_active_execution = None
                             print("[VLMapSafety][Habitat][Waypoint] clear current goal and requery S2")
                             continue
 
@@ -7692,6 +8381,50 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_count=episode_count,
                             pixel_goal=pixel_goal,
                         )
+                        if pending_s2_loop_strict_active_execution is not None:
+                            first_action = local_actions[0] if local_actions else None
+                            strict_trajectory_pass = bool(
+                                not traj_reject_required
+                                and first_action is not None
+                                and int(first_action) != int(action_code.STOP)
+                            )
+                            pending_s2_loop_strict_active_execution.update(
+                                {
+                                    "event_type": "s2_loop_strict_active_execution",
+                                    "event_schema_version": "stage21c_strict_active_v1",
+                                    "reason": (
+                                        "applied"
+                                        if strict_trajectory_pass
+                                        else "trajectory_preflight_rejected"
+                                    ),
+                                    "action_applied": strict_trajectory_pass,
+                                    "execution_pending": False,
+                                    "trajectory_preflight": {
+                                        "valid": bool(vlmap_traj_decision.get("valid")),
+                                        "safe": bool(vlmap_traj_decision.get("safe")),
+                                        "would_reject": bool(
+                                            vlmap_traj_decision.get("would_reject")
+                                        ),
+                                        "reason": vlmap_traj_decision.get("reason"),
+                                        "reject_required": bool(traj_reject_required),
+                                        "first_action": first_action,
+                                        "local_actions": list(local_actions),
+                                    },
+                                }
+                            )
+                            self._write_s2_loop_strict_active_event(
+                                pending_s2_loop_strict_active_execution
+                            )
+                            if strict_trajectory_pass:
+                                s2_loop_strict_active_applied_count += 1
+                                if s2_loop_strict_active_first_step is None:
+                                    s2_loop_strict_active_first_step = int(step_id)
+                            else:
+                                # Never allow the evaluator's legacy STOP->LEFT
+                                # fallback to turn a rejected recovery trajectory
+                                # into an unreviewed environment action.
+                                traj_reject_required = True
+                            pending_s2_loop_strict_active_execution = None
                         nextdit_probe_cfg = self._get_nextdit_candidate_probe_cfg()
                         nextdit_query_index = (
                             nextdit_candidate_probe_event_count
@@ -8251,6 +8984,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "pending_immediate_requery",
             ):
                 occ_memory_guidance_not_injected_reason = "episode_ended"
+            if pending_s2_recovery_context is not None:
+                pending_s2_recovery_context = None
+                s2_recovery_context_expired_count += 1
+            if pending_s2_loop_strict_active_execution is not None:
+                pending_s2_loop_strict_active_execution.update(
+                    {
+                        "event_type": "s2_loop_strict_active_execution",
+                        "reason": "episode_ended_before_trajectory_preflight",
+                        "action_applied": False,
+                        "execution_pending": False,
+                    }
+                )
+                self._write_s2_loop_strict_active_event(
+                    pending_s2_loop_strict_active_execution
+                )
+                pending_s2_loop_strict_active_execution = None
             semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
             occ_memory_summary = self.occ_memory.finish_episode(metrics=metrics, steps=step_id)
             occ_memory_recovery_summary = self._summarize_occ_memory_recovery_state(
@@ -8272,6 +9021,37 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "episode_instruction": episode_instruction,
             }
             result.update(safety_summary)
+            result["s2_recovery_context_enabled"] = bool(
+                self._get_s2_action_loop_cfg().get("recovery_context_enable")
+            )
+            result["s2_recovery_context_set_count"] = int(
+                s2_recovery_context_set_count
+            )
+            result["s2_recovery_context_injected_count"] = int(
+                s2_recovery_context_injected_count
+            )
+            result["s2_recovery_context_counterfactual_count"] = int(
+                s2_recovery_context_counterfactual_count
+            )
+            result["s2_recovery_context_changed_count"] = int(
+                s2_recovery_context_changed_count
+            )
+            result["s2_recovery_context_expired_count"] = int(
+                s2_recovery_context_expired_count
+            )
+            result["s2_loop_strict_active_enabled"] = bool(
+                self._get_s2_action_loop_cfg().get("strict_active_enable")
+            )
+            result["s2_loop_strict_active_event_count"] = int(
+                s2_loop_strict_active_event_count
+            )
+            result["s2_loop_strict_active_rewrite_count"] = int(
+                s2_loop_strict_active_rewrite_count
+            )
+            result["s2_loop_strict_active_applied_count"] = int(
+                s2_loop_strict_active_applied_count
+            )
+            result["s2_loop_strict_active_first_step"] = s2_loop_strict_active_first_step
             if self._get_occ_memory_recovery_cfg().get("enable"):
                 result["occ_memory_recovery_event_count"] = occ_memory_recovery_summary.get("event_count")
                 result["occ_memory_recovery_logged_event_count"] = occ_memory_recovery_summary.get(
