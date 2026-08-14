@@ -8891,6 +8891,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "progress_ranker_shadow_resilience_unsafe_rate",
                     "progress_ranker_shadow_resilience_future_observability_mean",
                     "progress_ranker_shadow_resilience_recoverability_mean",
+                    "stage21_multitask_shadow_enabled_count",
+                    "stage21_multitask_shadow_valid_count",
+                    "stage21_multitask_shadow_error_count",
+                    "stage21_multitask_shadow_action_applied_count",
+                    "stage21_multitask_shadow_progress_change_count",
+                    "stage21_multitask_shadow_intent_change_count",
+                    "stage21_multitask_shadow_recovery_candidate_count",
+                    "stage21_multitask_shadow_progress_change_rate",
+                    "stage21_multitask_shadow_intent_change_rate",
+                    "stage21_multitask_shadow_missing_numeric_mean",
+                    "stage21_multitask_shadow_latency_mean_ms",
+                    "stage21_multitask_shadow_latency_p95_ms",
                 ):
                     result[f"occ_memory_{shadow_key}"] = occ_memory_summary.get(shadow_key)
                 dead_zone_frontier_counts = (

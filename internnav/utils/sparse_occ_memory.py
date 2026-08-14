@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from internnav.utils.progress_ranker_shadow import ProgressRankerShadowScorer
+from internnav.utils.stage21_multitask_shadow import Stage21MultiTaskShadowScorer
 
 _GOAL_PROGRESS_LANDMARK_ALIASES = {
     "appliance": "appliances",
@@ -393,6 +394,9 @@ class SparseOccMemoryConfig:
     progress_ranker_shadow_checkpoint: str = ""
     progress_ranker_shadow_device: str = "cpu"
     progress_ranker_shadow_resilience_weight: float = 0.20
+    stage21_multitask_shadow_enable: bool = False
+    stage21_multitask_shadow_checkpoint: str = ""
+    stage21_multitask_shadow_device: str = "cpu"
     candidate_probe_save_bev: bool = True
     candidate_probe_max_bev_snapshots: int = 12
     save_bev: bool = True
@@ -466,6 +470,17 @@ class SparseOccSemanticMemory:
                 device=str(self.config.progress_ranker_shadow_device or "cpu"),
                 resilience_weight=float(self.config.progress_ranker_shadow_resilience_weight),
             )
+        self.stage21_multitask_shadow_scorer: Optional[Stage21MultiTaskShadowScorer] = None
+        self.stage21_multitask_shadow_init_error: Optional[str] = None
+        if bool(self.config.stage21_multitask_shadow_enable):
+            try:
+                self.stage21_multitask_shadow_scorer = Stage21MultiTaskShadowScorer(
+                    checkpoint_path=str(self.config.stage21_multitask_shadow_checkpoint),
+                    device=str(self.config.stage21_multitask_shadow_device or "cpu"),
+                )
+            except Exception as exc:
+                # A shadow model must never make the frozen navigator fail.
+                self.stage21_multitask_shadow_init_error = str(exc)
         self.reset_episode()
 
     @property
@@ -1777,6 +1792,9 @@ class SparseOccSemanticMemory:
             }
         )
         event["progress_ranker_shadow"] = self._score_progress_ranker_shadow(candidates)
+        event["stage21_multitask_shadow"] = self._score_stage21_multitask_shadow(
+            candidates, current_policy_candidate
+        )
         self.candidate_probe_events.append(event)
         self._write_event(event)
         return event
@@ -1890,6 +1908,29 @@ class SparseOccSemanticMemory:
                 "valid": False,
                 "reason": "error",
                 "error": str(exc),
+            }
+
+    def _score_stage21_multitask_shadow(
+        self,
+        candidates: List[Dict[str, Any]],
+        current_policy_candidate: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not bool(self.config.stage21_multitask_shadow_enable):
+            return {"enabled": False, "valid": False, "reason": "disabled", "action_applied": False}
+        if self.stage21_multitask_shadow_scorer is None:
+            return {
+                "enabled": True, "valid": False, "reason": "not_initialized",
+                "error": self.stage21_multitask_shadow_init_error,
+                "action_applied": False,
+            }
+        try:
+            return self.stage21_multitask_shadow_scorer.score_candidates(
+                candidates, current_policy_candidate
+            )
+        except Exception as exc:  # shadow diagnostics must not affect navigation
+            return {
+                "enabled": True, "valid": False, "reason": "error", "error": str(exc),
+                "action_applied": False,
             }
 
     def _semantic_resilience_term_kind(self, term: Any) -> Optional[str]:
@@ -4035,6 +4076,16 @@ class SparseOccSemanticMemory:
         progress_ranker_shadow_resilience_unsafe_count = 0
         progress_ranker_shadow_resilience_future_sum = 0.0
         progress_ranker_shadow_resilience_recoverability_sum = 0.0
+        stage21_shadow_enabled_count = 0
+        stage21_shadow_valid_count = 0
+        stage21_shadow_error_count = 0
+        stage21_shadow_action_applied_count = 0
+        stage21_shadow_progress_change_count = 0
+        stage21_shadow_intent_change_count = 0
+        stage21_shadow_recovery_candidate_count = 0
+        stage21_shadow_missing_sum = 0.0
+        stage21_shadow_latency_sum = 0.0
+        stage21_shadow_latency_values: List[float] = []
         candidate_type_counts: Dict[str, int] = defaultdict(int)
         candidate_direction_counts: Dict[str, int] = defaultdict(int)
         for event in self.candidate_probe_events:
@@ -4140,6 +4191,28 @@ class SparseOccSemanticMemory:
                 progress_ranker_shadow_resilience_recoverability_sum += float(
                     selected.get("recoverability_proxy", 0.0) or 0.0
                 )
+            stage21_shadow = event.get("stage21_multitask_shadow") or {}
+            if stage21_shadow.get("enabled"):
+                stage21_shadow_enabled_count += 1
+            if stage21_shadow.get("reason") in {"error", "not_initialized"}:
+                stage21_shadow_error_count += 1
+            if stage21_shadow.get("valid"):
+                stage21_shadow_valid_count += 1
+                if stage21_shadow.get("action_applied"):
+                    stage21_shadow_action_applied_count += 1
+                if stage21_shadow.get("progress_changes_candidate_score"):
+                    stage21_shadow_progress_change_count += 1
+                if stage21_shadow.get("progress_changes_intent_alignment"):
+                    stage21_shadow_intent_change_count += 1
+                stage21_shadow_recovery_candidate_count += int(
+                    stage21_shadow.get("recovery_eligible_count", 0) or 0
+                )
+                stage21_shadow_missing_sum += float(
+                    stage21_shadow.get("missing_numeric_mean", 0.0) or 0.0
+                )
+                latency = float(stage21_shadow.get("inference_latency_ms", 0.0) or 0.0)
+                stage21_shadow_latency_sum += latency
+                stage21_shadow_latency_values.append(latency)
             for key, value in (event.get("candidate_type_counts") or {}).items():
                 candidate_type_counts[str(key)] += int(value or 0)
             for key, value in (event.get("candidate_direction_counts") or {}).items():
@@ -4450,6 +4523,33 @@ class SparseOccSemanticMemory:
             "progress_ranker_shadow_resilience_recoverability_mean": (
                 float(progress_ranker_shadow_resilience_recoverability_sum / progress_ranker_shadow_valid_count)
                 if progress_ranker_shadow_valid_count else None
+            ),
+            "stage21_multitask_shadow_enabled_count": int(stage21_shadow_enabled_count),
+            "stage21_multitask_shadow_valid_count": int(stage21_shadow_valid_count),
+            "stage21_multitask_shadow_error_count": int(stage21_shadow_error_count),
+            "stage21_multitask_shadow_action_applied_count": int(stage21_shadow_action_applied_count),
+            "stage21_multitask_shadow_progress_change_count": int(stage21_shadow_progress_change_count),
+            "stage21_multitask_shadow_intent_change_count": int(stage21_shadow_intent_change_count),
+            "stage21_multitask_shadow_recovery_candidate_count": int(stage21_shadow_recovery_candidate_count),
+            "stage21_multitask_shadow_progress_change_rate": (
+                float(stage21_shadow_progress_change_count / stage21_shadow_valid_count)
+                if stage21_shadow_valid_count else None
+            ),
+            "stage21_multitask_shadow_intent_change_rate": (
+                float(stage21_shadow_intent_change_count / stage21_shadow_valid_count)
+                if stage21_shadow_valid_count else None
+            ),
+            "stage21_multitask_shadow_missing_numeric_mean": (
+                float(stage21_shadow_missing_sum / stage21_shadow_valid_count)
+                if stage21_shadow_valid_count else None
+            ),
+            "stage21_multitask_shadow_latency_mean_ms": (
+                float(stage21_shadow_latency_sum / stage21_shadow_valid_count)
+                if stage21_shadow_valid_count else None
+            ),
+            "stage21_multitask_shadow_latency_p95_ms": (
+                float(np.percentile(stage21_shadow_latency_values, 95))
+                if stage21_shadow_latency_values else None
             ),
             "candidate_selection_event_count": int(selection_event_count),
             "candidate_selection_valid_count": int(selection_valid_count),

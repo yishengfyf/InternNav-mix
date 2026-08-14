@@ -7,6 +7,11 @@ SPEC = importlib.util.spec_from_file_location("stage21_training_common", SCRIPT_
 common = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(common)
 
+RUNTIME_FEATURE_PATH = Path(__file__).resolve().parents[2] / "internnav" / "utils" / "stage21_scorer_features.py"
+RUNTIME_SPEC = importlib.util.spec_from_file_location("stage21_scorer_features", RUNTIME_FEATURE_PATH)
+runtime_features = importlib.util.module_from_spec(RUNTIME_SPEC)
+RUNTIME_SPEC.loader.exec_module(runtime_features)
+
 
 def _row(candidate=None):
     return {
@@ -54,3 +59,9 @@ def test_recovery_target_is_explicitly_non_causal():
     score, auxiliary = common.task_target(_row(), "recovery")
     assert score == 0.7
     assert auxiliary == 1.0
+
+
+def test_runtime_feature_schema_matches_training_schema():
+    row = _row()
+    assert runtime_features.feature_names() == common.feature_names()
+    assert runtime_features.encode_row(row) == common.encode_row(row)
