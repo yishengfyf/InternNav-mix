@@ -46,8 +46,28 @@ def _ratio(value, total):
     return None if not total else float(value) / float(total)
 
 
-def analyze(run_root: Path, expected_episodes: int):
+def _seed_replay_manifest(path: Path | None):
+    if path is None:
+        return {}
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        f"{row['scene_id']}/{int(row['episode_id'])}": int(row["episode_eval_seed"])
+        for row in rows
+    }
+
+
+def analyze(
+    run_root: Path,
+    expected_episodes: int,
+    seed_manifest: Path | None = None,
+):
     progress = _progress(run_root)
+    progress_by_episode = {
+        f"{row.get('scene_id')}/{int(row.get('episode_id'))}": row
+        for row in progress
+        if row.get("episode_id") is not None
+    }
+    expected_seeds = _seed_replay_manifest(seed_manifest)
     events = _events(run_root)
     set_events = [row for row in events if row.get("event_type") == "s2_recovery_context_set"]
     cf_events = [
@@ -62,6 +82,8 @@ def analyze(run_root: Path, expected_episodes: int):
     for name, rows in sorted(variants.items()):
         ok = [row for row in rows if row.get("status") == "ok"]
         valid = [row for row in ok if bool(row.get("hinted_valid"))]
+        protocol_valid = [row for row in ok if bool(row.get("hinted_protocol_valid"))]
+        reobserve = [row for row in ok if bool(row.get("hinted_reobserve"))]
         continued = [row for row in ok if bool(row.get("continues_repeated_error_direction"))]
         latencies = sorted(float(row.get("latency_ms", 0.0) or 0.0) for row in ok)
         variant_summary[name] = {
@@ -70,6 +92,10 @@ def analyze(run_root: Path, expected_episodes: int):
             "error_count": len(rows) - len(ok),
             "hinted_valid_count": len(valid),
             "hinted_valid_rate": _ratio(len(valid), len(ok)),
+            "hinted_protocol_valid_count": len(protocol_valid),
+            "hinted_protocol_valid_rate": _ratio(len(protocol_valid), len(ok)),
+            "hinted_reobserve_count": len(reobserve),
+            "hinted_reobserve_rate": _ratio(len(reobserve), len(ok)),
             "change_type_counts": dict(Counter(str(row.get("change_type")) for row in ok)),
             "direction_changed_count": sum(
                 bool(row.get("direction_bucket_changed")) for row in ok
@@ -121,6 +147,27 @@ def analyze(run_root: Path, expected_episodes: int):
         int(row.get("extra_image_count", 0) or 0) > 0
         for row in variants.get("text_images", [])
     )
+    image_binding_violations = [
+        row
+        for row in variants.get("text_images", [])
+        if row.get("status") == "ok"
+        and not bool(row.get("prompt_image_binding_valid"))
+    ]
+    snapshot_errors = [row for row in set_events if row.get("snapshot_error")]
+    missing_snapshots = [
+        row for row in set_events if not list(row.get("snapshot_records") or [])
+    ]
+    seed_replay_mismatches = [
+        {
+            "scene_episode": key,
+            "expected_episode_eval_seed": seed,
+            "actual_episode_eval_seed": progress_by_episode.get(key, {}).get(
+                "episode_eval_seed"
+            ),
+        }
+        for key, seed in expected_seeds.items()
+        if progress_by_episode.get(key, {}).get("episode_eval_seed") != seed
+    ]
     integrity_passed = bool(
         len(progress) == expected_episodes
         and set_events
@@ -132,6 +179,11 @@ def analyze(run_root: Path, expected_episodes: int):
         and not missing_identity
         and not action_violations
         and not gt_leakage
+        and not image_binding_violations
+        and not snapshot_errors
+        and not missing_snapshots
+        and (not seed_manifest or len(expected_seeds) == expected_episodes)
+        and not seed_replay_mismatches
     )
     return {
         "task": "stage21d_recovery_context_shadow_ab",
@@ -154,6 +206,17 @@ def analyze(run_root: Path, expected_episodes: int):
         "action_applied_violation_count": len(action_violations),
         "gt_leakage_count": len(gt_leakage),
         "text_images_has_event_image_evidence": image_variant_has_evidence,
+        "image_binding_violation_count": len(image_binding_violations),
+        "snapshot_error_count": len(snapshot_errors),
+        "missing_snapshot_event_count": len(missing_snapshots),
+        "snapshot_record_count": sum(
+            len(row.get("snapshot_records") or []) for row in set_events
+        ),
+        "seed_replay_expected_count": len(expected_seeds),
+        "seed_replay_verified_count": len(expected_seeds) - len(seed_replay_mismatches),
+        "seed_replay_manifest_complete": bool(
+            not seed_manifest or len(expected_seeds) == expected_episodes
+        ),
         "integrity_passed": integrity_passed,
         "interpretation_guard": (
             "A valid or changed pixel is a steerability/data-chain signal, not causal "
@@ -161,6 +224,10 @@ def analyze(run_root: Path, expected_episodes: int):
         ),
         "error_records": error_events,
         "missing_identity_records": missing_identity,
+        "image_binding_violation_records": image_binding_violations,
+        "snapshot_error_records": snapshot_errors,
+        "missing_snapshot_event_records": missing_snapshots,
+        "seed_replay_mismatch_records": seed_replay_mismatches,
     }
 
 
@@ -168,10 +235,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--expected-episodes", type=int, required=True)
+    parser.add_argument("--seed-manifest", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
     args = parser.parse_args()
-    summary = analyze(args.run_root, args.expected_episodes)
+    summary = analyze(
+        args.run_root,
+        args.expected_episodes,
+        seed_manifest=args.seed_manifest,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -184,4 +256,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

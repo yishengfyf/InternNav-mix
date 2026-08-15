@@ -8,6 +8,7 @@ cd "${REPO_ROOT}"
 
 CHECKPOINT=${STAGE21C_SCORER_CHECKPOINT:?Set STAGE21C_SCORER_CHECKPOINT to seed_53/best.pt}
 MANIFEST=${STAGE21C_ACTIVE_MANIFEST:-scripts/eval/manifests/stage21c_strict_active_5_episode_ids.json}
+REFERENCE_ROOT=${STAGE21C_REPLAY_REFERENCE_ROOT:-results/stage_17/stage21c_multitask_scorer_shadow500_return_20260814_134102}
 RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
 PIPELINE_TAG=${STAGE21_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
 CUDA_DEVICES=${STAGE21_CUDA_VISIBLE_DEVICES:-0,1,2,3}
@@ -32,6 +33,7 @@ write_metadata() {
   git status --short > "${root}/git_status_short.txt"
   printf '%s\n' "${CHECKPOINT}" > "${root}/SOURCE_CHECKPOINT.txt"
   printf '%s\n' "${MANIFEST}" > "${root}/SOURCE_MANIFEST.txt"
+  printf '%s\n' "${REFERENCE_ROOT}" > "${root}/SOURCE_REFERENCE_ROOT.txt"
   sha256sum "${MANIFEST}" > "${root}/MANIFEST_SHA256.txt"
   cat > "${root}/EXPERIMENT_SCOPE.txt" <<'EOF'
 Paired tiny active experiment on the identical 5-episode manifest.
@@ -72,6 +74,7 @@ trap package_failure EXIT
 mkdir -p "${RETURN_ROOT}"
 test -f "${CHECKPOINT}"
 test -f "${MANIFEST}"
+test -f "${REFERENCE_ROOT}/progress.json"
 test ! -e "${WORK_DIR}"; test ! -e "${SUCCESS_DEST}"; test ! -e "${FAILURE_DEST}"
 test ! -e "${CONTROL_ROOT}"; test ! -e "${ACTIVE_ROOT}"
 mkdir -p "${WORK_DIR}"
@@ -80,6 +83,7 @@ exec > >(tee -a "${WORK_DIR}/pipeline.log") 2>&1
 FAILED_STAGE=control_evaluation
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" \
 STAGE21_EPISODE_IDS="${MANIFEST}" STAGE21_RUN_NAME="${CONTROL_NAME}" \
+STAGE21_EPISODE_SEED_REPLAY_MANIFEST="${MANIFEST}" \
 STAGE21C_SCORER_CHECKPOINT="${CHECKPOINT}" STAGE21C_SCORER_DEVICE=cpu \
 STAGE21_EVAL_PORT=${STAGE21C_CONTROL_EVAL_PORT:-2481} \
 NPROC_PER_NODE=4 MASTER_PORT=${STAGE21C_CONTROL_MASTER_PORT:-2482} \
@@ -89,6 +93,7 @@ bash scripts/eval/bash/stage21_torchrun_eval.sh \
 FAILED_STAGE=active_evaluation
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" \
 STAGE21_EPISODE_IDS="${MANIFEST}" STAGE21_RUN_NAME="${ACTIVE_NAME}" \
+STAGE21_EPISODE_SEED_REPLAY_MANIFEST="${MANIFEST}" \
 STAGE21C_SCORER_CHECKPOINT="${CHECKPOINT}" STAGE21C_SCORER_DEVICE=cpu \
 STAGE21C_ACTIVE_EVAL_PORT=${STAGE21C_ACTIVE_EVAL_PORT:-2483} \
 NPROC_PER_NODE=4 MASTER_PORT=${STAGE21C_ACTIVE_MASTER_PORT:-2484} \
@@ -99,6 +104,8 @@ FAILED_STAGE=paired_audit
 python3 scripts/eval/analyze_stage21c_strict_loop_active_paired.py \
   --control-root "${CONTROL_ROOT}" --active-root "${ACTIVE_ROOT}" \
   --expected-episodes "${EXPECTED_EPISODES}" \
+  --seed-manifest "${MANIFEST}" \
+  --reference-root "${REFERENCE_ROOT}" \
   --output "${ACTIVE_ROOT}/stage21c_strict_loop_active_paired_audit.json" \
   --require-all
 

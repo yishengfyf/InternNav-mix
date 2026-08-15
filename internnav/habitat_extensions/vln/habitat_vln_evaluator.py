@@ -383,6 +383,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "recovery_context_ttl_queries": int(
                 vlmap_safety_cfg.get("s2_recovery_context_ttl_queries", 2)
             ),
+            "recovery_context_save_images": bool(
+                vlmap_safety_cfg.get("s2_recovery_context_save_images", False)
+            ),
             "recovery_context_shadow_variants": shadow_variants,
             "strict_active_enable": bool(
                 vlmap_safety_cfg.get("s2_loop_strict_active_enable", False)
@@ -526,7 +529,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         images = images[:max_images]
         roles = roles[: len(images)]
         selected_steps = selected_steps[: len(images)]
-        return {
+        context = {
             "event_type": "s2_recovery_context",
             "event_schema_version": "stage21d_recovery_context_v1",
             "scene_id": event.get("scene_id"),
@@ -555,6 +558,38 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "action_applied": False,
             "gt_fields_used": [],
         }
+        if cfg.get("recovery_context_save_images"):
+            run_dir = self._get_vlmap_run_dir()
+            if run_dir:
+                try:
+                    snapshot_dir = os.path.join(run_dir, "s2_recovery_context_snapshots")
+                    os.makedirs(snapshot_dir, exist_ok=True)
+                    stem = (
+                        f"{context.get('scene_id')}_{int(context.get('episode_id'))}_"
+                        f"trigger{int(context.get('trigger_step'))}"
+                    )
+                    snapshot_records = []
+                    snapshot_items = [
+                        (
+                            "base current frame",
+                            context.get("current_query_step"),
+                            current_image,
+                        )
+                    ] + list(zip(roles, selected_steps, images))
+                    for index, (role, frame_step, frame_image) in enumerate(snapshot_items):
+                        path = os.path.join(snapshot_dir, f"{stem}_image{index}.jpg")
+                        frame_image.save(path, quality=90)
+                        snapshot_records.append(
+                            {
+                                "prompt_role": str(role),
+                                "step_id": frame_step,
+                                "path": path,
+                            }
+                        )
+                    context["snapshot_records"] = snapshot_records
+                except Exception as exc:
+                    context["snapshot_error"] = f"{type(exc).__name__}: {exc}"
+        return context
 
     def _recovery_context_prompt(self, context: dict, variant: str) -> str:
         if variant == "text_only":
@@ -566,12 +601,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         suffix = f" Recovery context images: {image_tokens}." if image_tokens else ""
         return f"{context.get('prompt', '')}{suffix}"
 
-    @staticmethod
-    def _s2_recovery_change_metrics(base_parse: dict, hinted_parse: dict, context: dict) -> dict:
+    def _s2_direct_action_codes(self, text: Any) -> list[int]:
+        value = str(text or "").strip()
+        if not value or re.search(r"\d", value) or "STOP" in value.upper():
+            return []
+        residue = re.sub(r"[↑←→↓\s,.;:!?，。；：！？]", "", value)
+        return [] if residue else self.parse_actions(value)
+
+    def _s2_recovery_change_metrics(self, base_parse: dict, hinted_parse: dict, context: dict) -> dict:
         base_valid = bool(base_parse.get("valid"))
         hinted_valid = bool(hinted_parse.get("valid"))
         base_stop = bool(base_parse.get("is_stop"))
         hinted_stop = bool(hinted_parse.get("is_stop"))
+        base_action_codes = self._s2_direct_action_codes(base_parse.get("text"))
+        hinted_action_codes = self._s2_direct_action_codes(hinted_parse.get("text"))
+        hinted_reobserve = bool(
+            hinted_action_codes
+            and set(hinted_action_codes) == {int(action_code.LOOKDOWN)}
+        )
         base_goal = base_parse.get("pixel_goal")
         hinted_goal = hinted_parse.get("pixel_goal")
         shift = None
@@ -584,6 +631,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
         if not base_valid and not base_stop and hinted_valid:
             transition = "invalid_or_turn_to_valid_pixel"
+        elif hinted_reobserve:
+            transition = "invalid_or_turn_to_reobserve"
         elif base_valid and hinted_stop:
             transition = "valid_to_stop"
         elif base_valid and hinted_valid:
@@ -603,6 +652,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "hinted_valid": hinted_valid,
             "base_is_stop": base_stop,
             "hinted_is_stop": hinted_stop,
+            "base_direct_action_codes": base_action_codes,
+            "hinted_direct_action_codes": hinted_action_codes,
+            "hinted_protocol_valid": bool(
+                hinted_valid or hinted_stop or hinted_action_codes
+            ),
+            "hinted_reobserve": hinted_reobserve,
             "base_pixel_goal": base_goal,
             "hinted_pixel_goal": hinted_goal,
             "base_direction_bucket": base_parse.get("direction_bucket"),
@@ -639,7 +694,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         """Shadow-only extra S2 query; the resulting action is never applied."""
         variant = str(variant).strip().lower()
         extra_images = list(context.get("images") or []) if variant == "text_images" else []
-        images = list(input_images) + extra_images
+        base_images = list(input_images)
+        # The base prompt places historical image tokens before its final
+        # current-view token. Recovery image tokens are inserted between those
+        # two regions, so the processor image list must follow that same order.
+        # Appending recovery images after the current frame silently binds every
+        # prompt role to the wrong image.
+        if extra_images and base_images:
+            images = base_images[:-1] + extra_images + base_images[-1:]
+        else:
+            images = base_images
+        prompt_image_roles = (
+            [f"base historical frame {index}" for index in range(max(0, len(base_images) - 1))]
+            + (list(context.get("image_roles") or []) if extra_images else [])
+            + (["base current frame"] if base_images else [])
+        )
         prompt = (
             f"{base_prompt_body} {self._recovery_context_prompt(context, variant)} "
             f"{final_prompt}."
@@ -669,6 +738,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "image_roles": list(context.get("image_roles") or []) if extra_images else [],
             "image_steps": list(context.get("image_steps") or []) if extra_images else [],
             "extra_image_count": len(extra_images),
+            "base_image_count": len(base_images),
+            "prompt_image_roles": prompt_image_roles,
+            "prompt_image_binding_valid": bool(len(prompt_image_roles) == len(images)),
+            "snapshot_records": list(context.get("snapshot_records") or []),
         }
         rng_state = self._capture_torch_rng_state()
         started = time.perf_counter()
@@ -6652,6 +6725,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                     "image_steps": list(
                                         recovery_context.get("image_steps") or []
                                     ),
+                                    "snapshot_records": list(
+                                        recovery_context.get("snapshot_records") or []
+                                    ),
+                                    "snapshot_error": recovery_context.get("snapshot_error"),
                                     "remaining_queries": recovery_context.get(
                                         "remaining_queries"
                                     ),
@@ -9013,6 +9090,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result = {
                 "scene_id": scene_id,
                 "episode_id": episode_id,
+                "episode_index": int(episode_index),
+                "episode_count": int(episode_count),
+                "rank": int(getattr(self, "rank", 0)),
+                "world_size": int(getattr(self, "world_size", 1)),
+                "episode_eval_seed": episode_eval_seed,
                 "success": metrics["success"],
                 "spl": metrics["spl"],
                 "os": metrics['oracle_success'],

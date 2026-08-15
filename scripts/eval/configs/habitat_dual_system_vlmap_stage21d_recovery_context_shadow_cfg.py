@@ -29,6 +29,9 @@ vlmap_cfg["s2_recovery_context_max_images"] = int(
 vlmap_cfg["s2_recovery_context_ttl_queries"] = int(
     os.environ.get("STAGE21D_RECOVERY_CONTEXT_TTL_QUERIES", "2")
 )
+vlmap_cfg["s2_recovery_context_save_images"] = (
+    os.environ.get("STAGE21D_RECOVERY_CONTEXT_SAVE_IMAGES", "1") != "0"
+)
 vlmap_cfg["s2_recovery_context_shadow_variants"] = [
     value.strip()
     for value in os.environ.get(
@@ -38,4 +41,3 @@ vlmap_cfg["s2_recovery_context_shadow_variants"] = [
 ]
 
 eval_cfg.eval_settings["port"] = os.environ.get("STAGE21D_EVAL_PORT", "2483")
-

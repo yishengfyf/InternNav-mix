@@ -40,14 +40,58 @@ def _events(run_root: Path):
     return [row for path in paths for row in _read_jsonl(Path(path))]
 
 
+def _loop_events(run_root: Path):
+    paths = glob.glob(
+        str(run_root / "vlmap_safety_debug" / "*" / "s2_action_loop_events.jsonl")
+    )
+    return [row for path in paths for row in _read_jsonl(Path(path))]
+
+
+def _loop_signatures(run_root: Path):
+    signatures = defaultdict(list)
+    for row in _loop_events(run_root):
+        if row.get("transition") != "start":
+            continue
+        signatures[_key(row)].append(
+            (
+                int(row.get("step_id", -1)),
+                int(row.get("start_step", -1)),
+                str(row.get("turn_direction")),
+                str(row.get("triage_tier")),
+            )
+        )
+    return {key: sorted(values) for key, values in signatures.items()}
+
+
+def _seed_replay_manifest(path: Path | None):
+    if path is None:
+        return {}
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    expected = {}
+    for row in rows:
+        key = f"{row['scene_id']}/{int(row['episode_id'])}"
+        expected[key] = int(row["episode_eval_seed"])
+    return expected
+
+
 def _mean(rows, field):
     values = [float(row.get(field, 0.0) or 0.0) for row in rows]
     return None if not values else sum(values) / len(values)
 
 
-def analyze(control_root: Path, active_root: Path, expected_episodes: int):
+def analyze(
+    control_root: Path,
+    active_root: Path,
+    expected_episodes: int,
+    seed_manifest: Path | None = None,
+    reference_root: Path | None = None,
+):
     control = _progress(control_root)
     active = _progress(active_root)
+    expected_seeds = _seed_replay_manifest(seed_manifest)
+    reference = _progress(reference_root) if reference_root is not None else {}
+    reference_loops = _loop_signatures(reference_root) if reference_root is not None else {}
+    control_loops = _loop_signatures(control_root)
     events = _events(active_root)
     common = sorted(set(control).intersection(active))
     applied = [row for row in events if bool(row.get("action_applied"))]
@@ -77,6 +121,38 @@ def analyze(control_root: Path, active_root: Path, expected_episodes: int):
         row for row in applied_rows
         if row["control_success"] > 0.0 and row["active_success"] <= 0.0
     ]
+    reference_metric_mismatches = []
+    reference_loop_mismatches = []
+    if reference_root is not None:
+        for key in common:
+            reference_row = reference.get(key)
+            if reference_row is None:
+                reference_metric_mismatches.append(
+                    {"scene_episode": key, "reason": "missing_reference_episode"}
+                )
+                continue
+            differing = {}
+            for field in METRICS:
+                control_value = float(control[key].get(field, 0.0) or 0.0)
+                reference_value = float(reference_row.get(field, 0.0) or 0.0)
+                if abs(control_value - reference_value) > 1e-6:
+                    differing[field] = {
+                        "control": control_value,
+                        "reference": reference_value,
+                    }
+            if differing:
+                reference_metric_mismatches.append(
+                    {"scene_episode": key, "fields": differing}
+                )
+            if control_loops.get(key, []) != reference_loops.get(key, []):
+                reference_loop_mismatches.append(
+                    {
+                        "scene_episode": key,
+                        "control_loop_signatures": control_loops.get(key, []),
+                        "reference_loop_signatures": reference_loops.get(key, []),
+                    }
+                )
+
     violations = {
         "non_strict_applied": [
             row for row in applied if row.get("triage_tier") != "strict_intervention"
@@ -94,11 +170,42 @@ def analyze(control_root: Path, active_root: Path, expected_episodes: int):
         "budget_exceeded_episodes": [key for key, rows in by_episode.items() if len(rows) > 1],
         "rewrite_failures": [row for row in events if row.get("reason") == "output_rewrite_failed"],
         "gt_leakage": [row for row in events if list(row.get("gt_fields_used") or [])],
+        "paired_seed_mismatch": [
+            {
+                "scene_episode": key,
+                "control_episode_eval_seed": control[key].get("episode_eval_seed"),
+                "active_episode_eval_seed": active[key].get("episode_eval_seed"),
+            }
+            for key in common
+            if control[key].get("episode_eval_seed")
+            != active[key].get("episode_eval_seed")
+        ],
+        "control_seed_replay_mismatch": [
+            {
+                "scene_episode": key,
+                "expected_episode_eval_seed": seed,
+                "actual_episode_eval_seed": control.get(key, {}).get("episode_eval_seed"),
+            }
+            for key, seed in expected_seeds.items()
+            if control.get(key, {}).get("episode_eval_seed") != seed
+        ],
+        "active_seed_replay_mismatch": [
+            {
+                "scene_episode": key,
+                "expected_episode_eval_seed": seed,
+                "actual_episode_eval_seed": active.get(key, {}).get("episode_eval_seed"),
+            }
+            for key, seed in expected_seeds.items()
+            if active.get(key, {}).get("episode_eval_seed") != seed
+        ],
+        "control_reference_metric_mismatch": reference_metric_mismatches,
+        "control_reference_loop_mismatch": reference_loop_mismatches,
     }
     integrity_passed = bool(
         len(control) == expected_episodes
         and len(active) == expected_episodes
         and len(common) == expected_episodes
+        and (not seed_manifest or len(expected_seeds) == expected_episodes)
         and applied
         and not any(violations.values())
     )
@@ -125,6 +232,22 @@ def analyze(control_root: Path, active_root: Path, expected_episodes: int):
         "active_episode_count": len(active),
         "common_episode_count": len(common),
         "active_event_count": len(events),
+        "seed_replay_expected_count": len(expected_seeds),
+        "seed_replay_manifest_complete": bool(
+            not seed_manifest or len(expected_seeds) == expected_episodes
+        ),
+        "seed_replay_verified_count": sum(
+            control.get(key, {}).get("episode_eval_seed") == seed
+            and active.get(key, {}).get("episode_eval_seed") == seed
+            for key, seed in expected_seeds.items()
+        ),
+        "reference_replay_required": bool(reference_root is not None),
+        "reference_metric_verified_count": (
+            0 if reference_root is None else len(common) - len(reference_metric_mismatches)
+        ),
+        "reference_loop_verified_count": (
+            0 if reference_root is None else len(common) - len(reference_loop_mismatches)
+        ),
         "event_reason_counts": dict(Counter(str(row.get("reason")) for row in events)),
         "applied_event_count": len(applied),
         "applied_episode_count": len(by_episode),
@@ -150,10 +273,18 @@ def main():
     parser.add_argument("--control-root", type=Path, required=True)
     parser.add_argument("--active-root", type=Path, required=True)
     parser.add_argument("--expected-episodes", type=int, required=True)
+    parser.add_argument("--seed-manifest", type=Path)
+    parser.add_argument("--reference-root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
     args = parser.parse_args()
-    summary = analyze(args.control_root, args.active_root, args.expected_episodes)
+    summary = analyze(
+        args.control_root,
+        args.active_root,
+        args.expected_episodes,
+        seed_manifest=args.seed_manifest,
+        reference_root=args.reference_root,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

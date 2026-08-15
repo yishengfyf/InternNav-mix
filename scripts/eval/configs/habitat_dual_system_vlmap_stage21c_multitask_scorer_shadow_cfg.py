@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -22,6 +23,34 @@ if not Path(checkpoint).is_file():
 
 eval_cfg = copy.deepcopy(_load_stage21a_cfg())
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
+
+# Optional explicit replay identity.  The normal Stage21 runs leave this unset
+# and retain the rank/local-index seed formula.  A paired replay manifest may
+# carry ``episode_eval_seed`` so control and treatment use the same random
+# stream even when 4-GPU sharding changes the local episode index.
+seed_replay_manifest = os.environ.get("STAGE21_EPISODE_SEED_REPLAY_MANIFEST", "").strip()
+if seed_replay_manifest:
+    replay_path = Path(seed_replay_manifest)
+    if not replay_path.is_file():
+        raise FileNotFoundError(
+            f"STAGE21_EPISODE_SEED_REPLAY_MANIFEST not found: {replay_path}"
+        )
+    replay_rows = json.loads(replay_path.read_text(encoding="utf-8"))
+    if not isinstance(replay_rows, list) or not replay_rows:
+        raise ValueError("STAGE21 episode seed replay manifest must be a non-empty list")
+    overrides = {}
+    for row in replay_rows:
+        if not isinstance(row, dict):
+            raise ValueError("STAGE21 episode seed replay rows must be objects")
+        scene_id = row.get("scene_id")
+        episode_id = row.get("episode_id")
+        seed = row.get("episode_eval_seed")
+        if scene_id is None or episode_id is None or seed is None:
+            raise ValueError(
+                "STAGE21 replay rows require scene_id, episode_id and episode_eval_seed"
+            )
+        overrides[f"{scene_id}/{int(episode_id)}"] = int(seed)
+    eval_cfg.agent.model_settings["eval_episode_seed_overrides"] = overrides
 
 # The old Stage17 scorer has a different schema and must remain disabled.
 vlmap_cfg["occ_memory_progress_ranker_shadow_enable"] = False
