@@ -13,7 +13,7 @@ import re
 import time
 from collections import OrderedDict
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import cv2
 import habitat
