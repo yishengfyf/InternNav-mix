@@ -101,6 +101,43 @@ def analyze(
     for key in intervention_keys:
         by_episode[key[0]].add(key)
 
+    # Keep the causal chain visible in the audit.  The first event at a
+    # trigger is the pre-reorient decision; the event carrying
+    # ``post_reobserve_step`` is the first Frozen-S2 query after the real
+    # environment turns.  This is deliberately a state-change diagnostic,
+    # not a navigation-success proxy.
+    post_reobserve_events = [
+        row for row in events if row.get("post_reobserve_step") is not None
+    ]
+    state_changed_records = []
+    grouped_events = defaultdict(list)
+    for row in events:
+        grouped_events[(
+            _key(row),
+            int(row.get("trigger_step", row.get("step_id", -1))),
+        )].append(row)
+    for group_key, rows in grouped_events.items():
+        initial = next(
+            (row for row in rows if row.get("reorient_action_applied") is not True),
+            None,
+        )
+        post = next(
+            (row for row in rows if row.get("post_reobserve_step") is not None),
+            None,
+        )
+        if initial is None or post is None:
+            continue
+        before = initial.get("base_s2_output")
+        after = post.get("base_s2_output")
+        state_changed_records.append({
+            "scene_episode": group_key[0],
+            "trigger_step": group_key[1],
+            "before": before,
+            "after": after,
+            "changed": before != after,
+            "post_reobserve_step": post.get("post_reobserve_step"),
+        })
+
     paired_rows = []
     for key in common:
         base = control[key]
@@ -272,6 +309,11 @@ def analyze(
         "applied_intervention_count": len(intervention_keys),
         "applied_episode_count": len(by_episode),
         "reorient_completed_event_count": len(reorient_events),
+        "post_reobserve_query_count": len(post_reobserve_events),
+        "post_reobserve_state_changed_count": sum(
+            bool(row["changed"]) for row in state_changed_records
+        ),
+        "post_reobserve_state_change_records": state_changed_records,
         "path_pixel_applied_event_count": len(pixel_events),
         "seed_replay_verified_count": sum(
             control.get(key, {}).get("episode_eval_seed") == seed
