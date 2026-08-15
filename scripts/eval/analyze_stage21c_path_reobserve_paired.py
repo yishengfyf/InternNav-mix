@@ -66,6 +66,16 @@ def _manifest(path: Path | None):
     }
 
 
+def _manifest_keys(path: Path | None):
+    if path is None:
+        return set()
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        f"{row['scene_id']}/{int(row['episode_id'])}"
+        for row in rows
+    }
+
+
 def _mean(rows, field):
     values = [float(row.get(field, 0.0) or 0.0) for row in rows]
     return None if not values else sum(values) / len(values)
@@ -82,6 +92,7 @@ def analyze(
     seed_manifest: Path | None,
     reference_root: Path | None,
     allow_reference_missing: bool = False,
+    reference_manifest: Path | None = None,
 ):
     control = _progress(control_root)
     active = _progress(active_root)
@@ -170,8 +181,15 @@ def analyze(
     reference_metric_mismatches = []
     reference_loop_mismatches = []
     reference_missing = []
+    reference_skipped = []
+    reference_checked_count = 0
     if reference_root:
-        for key in common:
+        reference_keys = set(common)
+        if reference_manifest is not None:
+            reference_keys &= _manifest_keys(reference_manifest)
+            reference_skipped = sorted(set(common) - reference_keys)
+        reference_checked_count = len(reference_keys)
+        for key in sorted(reference_keys):
             reference_row = reference.get(key)
             if reference_row is None:
                 reference_missing.append(key)
@@ -326,19 +344,22 @@ def analyze(
         "reference_metric_verified_count": (
             0
             if not reference_root
-            else len(common)
+            else reference_checked_count
             - len(reference_metric_mismatches)
             - len(reference_missing)
         ),
         "reference_loop_verified_count": (
             0
             if not reference_root
-            else len(common)
+            else reference_checked_count
             - len(reference_loop_mismatches)
             - len(reference_missing)
         ),
+        "reference_checked_episode_count": reference_checked_count,
         "reference_missing_count": len(reference_missing),
         "reference_missing_episodes": reference_missing,
+        "reference_skipped_count": len(reference_skipped),
+        "reference_skipped_episodes": reference_skipped,
         "violations": {name: len(rows) for name, rows in violations.items()},
         "violation_records": violations,
         "integrity_passed": integrity_passed,
@@ -368,6 +389,11 @@ def main():
         action="store_true",
         help="Allow new episodes without a prior reference root; still audit any present references.",
     )
+    parser.add_argument(
+        "--reference-manifest",
+        type=Path,
+        help="Only compare reference metrics/loops for keys listed in this manifest.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
     args = parser.parse_args()
@@ -378,6 +404,7 @@ def main():
         args.seed_manifest,
         args.reference_root,
         args.allow_reference_missing,
+        args.reference_manifest,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

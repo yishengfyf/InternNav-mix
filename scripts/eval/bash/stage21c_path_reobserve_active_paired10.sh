@@ -9,6 +9,7 @@ cd "${REPO_ROOT}"
 
 CHECKPOINT=${STAGE21C_SCORER_CHECKPOINT:?Set STAGE21C_SCORER_CHECKPOINT to seed_53/best.pt}
 MANIFEST=${STAGE21C_PATH_ACTIVE_MANIFEST:-scripts/eval/manifests/stage21c_path_reobserve_active_paired10.json}
+REFERENCE_MANIFEST=${STAGE21C_REFERENCE_MANIFEST:-scripts/eval/manifests/stage21c_strict_active_5_episode_ids.json}
 REFERENCE_ROOT=${STAGE21C_REPLAY_REFERENCE_ROOT:-results/stage_17/stage21c_multitask_scorer_shadow500_return_20260814_134102}
 RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
 PIPELINE_TAG=${STAGE21_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
@@ -75,6 +76,7 @@ trap package_failure EXIT
 mkdir -p "${RETURN_ROOT}"
 test -f "${CHECKPOINT}"
 test -f "${MANIFEST}"
+test -f "${REFERENCE_MANIFEST}"
 test -f "${REFERENCE_ROOT}/progress.json"
 test ! -e "${WORK_DIR}"; test ! -e "${SUCCESS_DEST}"; test ! -e "${FAILURE_DEST}"
 test ! -e "${CONTROL_ROOT}"; test ! -e "${ACTIVE_ROOT}"
@@ -106,6 +108,7 @@ python3 scripts/eval/analyze_stage21c_path_reobserve_paired.py \
   --control-root "${CONTROL_ROOT}" --active-root "${ACTIVE_ROOT}" \
   --expected-episodes "${EXPECTED_EPISODES}" \
   --seed-manifest "${MANIFEST}" --reference-root "${REFERENCE_ROOT}" \
+  --reference-manifest "${REFERENCE_MANIFEST}" \
   --allow-reference-missing \
   --output "${ACTIVE_ROOT}/stage21c_path_reobserve_active_paired_audit.json" \
   --require-all
