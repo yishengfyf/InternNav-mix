@@ -414,6 +414,37 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 if str(value).strip()
             ),
+            "projection_bridge_enable": bool(
+                vlmap_safety_cfg.get("s2_loop_projection_bridge_enable", False)
+            ),
+            "projection_bridge_shadow_only": bool(
+                vlmap_safety_cfg.get("s2_loop_projection_bridge_shadow_only", True)
+            ),
+            "projection_bridge_sample_x_ratios": tuple(
+                float(value)
+                for value in list(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_projection_bridge_sample_x_ratios",
+                        [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90],
+                    )
+                    or []
+                )
+            ),
+            "projection_bridge_sample_y_ratios": tuple(
+                float(value)
+                for value in list(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_projection_bridge_sample_y_ratios",
+                        [0.55, 0.65, 0.75, 0.85],
+                    )
+                    or []
+                )
+            ),
+            "projection_bridge_max_angle_error_deg": float(
+                vlmap_safety_cfg.get(
+                    "s2_loop_projection_bridge_max_angle_error_deg", 30.0
+                )
+            ),
         }
 
     def _format_s2_recovery_context(self, context: dict) -> str:
@@ -767,6 +798,100 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             self._restore_torch_rng_state(rng_state)
         return event
 
+    def _plan_s2_loop_projection_bridge_shadow(
+        self,
+        event: Optional[dict],
+        *,
+        observations: Optional[dict] = None,
+        depth_m: Optional[np.ndarray] = None,
+    ) -> dict:
+        """Audit map-candidate to visible-free-pixel bridging without acting."""
+        cfg = self._get_s2_action_loop_cfg()
+        candidate = dict((event or {}).get("candidate") or {})
+        result = {
+            "event_type": "s2_loop_projection_bridge_shadow",
+            "event_schema_version": "stage21c_projection_bridge_shadow_v1",
+            "scene_id": (event or {}).get("scene_id"),
+            "episode_id": (event or {}).get("episode_id"),
+            "episode_index": (event or {}).get("episode_index"),
+            "episode_count": (event or {}).get("episode_count"),
+            "episode_eval_seed": (event or {}).get("episode_eval_seed"),
+            "step_id": (event or {}).get("step_id"),
+            "failure_type": (event or {}).get("failure_type"),
+            "triage_tier": (event or {}).get("triage_tier"),
+            "triage_reason": (event or {}).get("triage_reason"),
+            "turn_direction": (event or {}).get("turn_direction"),
+            "candidate": candidate,
+            "enabled": bool(cfg.get("projection_bridge_enable")),
+            "shadow_only": True,
+            "considered": bool(event),
+            "proposal_valid": False,
+            "selected_pixel_goal": None,
+            "reason": None,
+            "action_applied": False,
+            "output_rewritten": False,
+            "gt_fields_used": [],
+            "bridge": None,
+        }
+        if not result["enabled"]:
+            result["reason"] = "disabled"
+            return result
+        if not cfg.get("projection_bridge_shadow_only"):
+            result["reason"] = "shadow_only_required"
+            return result
+        if not event:
+            result["reason"] = "missing_loop_event"
+            return result
+        if str(event.get("triage_tier") or "") != "strict_intervention":
+            result["reason"] = "non_strict_hold"
+            return result
+        if not bool(candidate.get("geometry_safe")):
+            result["reason"] = "candidate_not_geometry_safe"
+            return result
+        if not bool(candidate.get("active_gate_safe")):
+            result["reason"] = "candidate_not_active_gate_safe"
+            return result
+        if str(candidate.get("direction_bucket") or "").lower() not in set(
+            cfg.get("strict_active_allowed_directions") or ()
+        ):
+            result["reason"] = "candidate_direction_not_allowed"
+            return result
+        if observations is None or depth_m is None:
+            result["reason"] = "missing_observation_or_depth"
+            return result
+
+        baseline_plan = self._semantic_resilience_active_lite_directional_pixel_goal(
+            candidate, self._get_semantic_resilience_active_lite_cfg()
+        )
+        result["fixed_directional_pixel_plan"] = baseline_plan
+        bridge = self.occ_memory.plan_recovery_projection_bridge(
+            candidate,
+            {
+                "gps": observations.get("gps"),
+                "compass": observations.get("compass"),
+            },
+            depth_m,
+            context={
+                "step_id": event.get("step_id"),
+                "scene_id": event.get("scene_id"),
+                "episode_id": event.get("episode_id"),
+                "image_width": int(getattr(self.model_args, "resize_w", 384)),
+                "image_height": int(getattr(self.model_args, "resize_h", 384)),
+                "probe_source": "s2_loop_projection_bridge_shadow",
+            },
+            baseline_pixel_goal=baseline_plan.get("pixel_goal"),
+            sample_x_ratios=cfg.get("projection_bridge_sample_x_ratios") or (),
+            sample_y_ratios=cfg.get("projection_bridge_sample_y_ratios") or (),
+            max_angle_error_deg=float(
+                cfg.get("projection_bridge_max_angle_error_deg", 30.0)
+            ),
+        )
+        result["bridge"] = bridge
+        result["proposal_valid"] = bool(bridge.get("valid"))
+        result["selected_pixel_goal"] = bridge.get("selected_pixel_goal")
+        result["reason"] = str(bridge.get("reason") or "bridge_failed")
+        return result
+
     def _plan_s2_loop_strict_active(
         self,
         event: Optional[dict],
@@ -897,6 +1022,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "s2_loop_strict_active_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _write_s2_loop_projection_bridge_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(
+            log_dir, "s2_loop_projection_bridge_events.jsonl"
+        )
         with open(log_path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
@@ -6237,6 +6374,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             s2_loop_strict_active_applied_count = 0
             s2_loop_strict_active_first_step = None
             pending_s2_loop_strict_active_execution = None
+            s2_loop_projection_bridge_event_count = 0
+            s2_loop_projection_bridge_strict_count = 0
+            s2_loop_projection_bridge_valid_count = 0
             semantic_hint_set_count = 0
             semantic_hint_injected_count = 0
             semantic_hint_detection_step = None
@@ -6627,6 +6767,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
 
                     if s2_loop_event and s2_loop_event.get("transition") == "start":
+                        projection_bridge_event = (
+                            self._plan_s2_loop_projection_bridge_shadow(
+                                s2_loop_event,
+                                observations=observations,
+                                depth_m=current_depth_m,
+                            )
+                        )
+                        if projection_bridge_event.get("enabled"):
+                            projection_bridge_event["base_s2_output"] = llm_outputs
+                            s2_loop_projection_bridge_event_count += 1
+                            if (
+                                projection_bridge_event.get("triage_tier")
+                                == "strict_intervention"
+                            ):
+                                s2_loop_projection_bridge_strict_count += 1
+                            if projection_bridge_event.get("proposal_valid"):
+                                s2_loop_projection_bridge_valid_count += 1
+                            self._write_s2_loop_projection_bridge_event(
+                                projection_bridge_event
+                            )
+
                         strict_active_event = self._plan_s2_loop_strict_active(
                             s2_loop_event,
                             s2_loop_strict_active_rewrite_count,
@@ -9134,6 +9295,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 s2_loop_strict_active_applied_count
             )
             result["s2_loop_strict_active_first_step"] = s2_loop_strict_active_first_step
+            result["s2_loop_projection_bridge_enabled"] = bool(
+                self._get_s2_action_loop_cfg().get("projection_bridge_enable")
+            )
+            result["s2_loop_projection_bridge_event_count"] = int(
+                s2_loop_projection_bridge_event_count
+            )
+            result["s2_loop_projection_bridge_strict_count"] = int(
+                s2_loop_projection_bridge_strict_count
+            )
+            result["s2_loop_projection_bridge_valid_count"] = int(
+                s2_loop_projection_bridge_valid_count
+            )
             if self._get_occ_memory_recovery_cfg().get("enable"):
                 result["occ_memory_recovery_event_count"] = occ_memory_recovery_summary.get("event_count")
                 result["occ_memory_recovery_logged_event_count"] = occ_memory_recovery_summary.get(

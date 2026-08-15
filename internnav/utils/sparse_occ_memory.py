@@ -2672,6 +2672,9 @@ class SparseOccSemanticMemory:
                     "semantic_resilience_reason": "backtrack_to_recent_safe_observation",
                     "semantic_resilience_source": source_type,
                     "semantic_resilience_source_step_id": step,
+                    "semantic_resilience_source_world_z": float(
+                        node.get("z", 0.0) or 0.0
+                    ),
                     "semantic_resilience_step_gap": step_gap,
                     "semantic_resilience_backtrack_distance_m": float(distance),
                     "semantic_resilience_open_score": float(open_score),
@@ -4770,6 +4773,7 @@ class SparseOccSemanticMemory:
                 "col": int(col),
                 "x": float(xy[0]),
                 "y": float(xy[1]),
+                "z": float(rel_base_tf[2, 3]),
                 "yaw": float(yaw),
                 "semantic_top_match": self.last_semantic_decision.get("top_match"),
                 "semantic_top_score": self.last_semantic_decision.get("top_score"),
@@ -4995,6 +4999,282 @@ class SparseOccSemanticMemory:
         result["valid"] = True
         result["reason"] = "ok"
         result["pixel_goal"] = [int(projected[0]), int(projected[1])]
+        return result
+
+    def plan_recovery_projection_bridge(
+        self,
+        candidate: Dict[str, Any],
+        obs: Dict[str, Any],
+        depth: np.ndarray,
+        *,
+        context: Optional[Dict[str, Any]] = None,
+        baseline_pixel_goal: Any = None,
+        sample_x_ratios: Iterable[float] = (
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+            0.50,
+            0.60,
+            0.70,
+            0.80,
+            0.90,
+        ),
+        sample_y_ratios: Iterable[float] = (0.55, 0.65, 0.75, 0.85),
+        max_angle_error_deg: float = 30.0,
+    ) -> Dict[str, Any]:
+        """Find a visible free local pixel that preserves a map recovery intent.
+
+        This diagnostic reads the current sparse map and depth image but never
+        changes memory, navigation actions, or the S2 output. The exact map
+        anchor is projected first. A small image grid is then searched for
+        free local proxy waypoints whose map bearing is close to the original
+        candidate bearing.
+        """
+        context = dict(context or {})
+        result: Dict[str, Any] = {
+            "valid": False,
+            "reason": None,
+            "candidate_grid": None,
+            "candidate_direction_bucket": candidate.get("direction_bucket"),
+            "candidate_direction_angle_deg": candidate.get("direction_angle_deg"),
+            "candidate_distance_m": candidate.get("distance_m"),
+            "baseline_probe": None,
+            "exact_projection": None,
+            "sample_count": 0,
+            "projected_sample_count": 0,
+            "free_sample_count": 0,
+            "angle_aligned_free_sample_count": 0,
+            "eligible_probe_count": 0,
+            "sample_goal_state_counts": {},
+            "selected_pixel_goal": None,
+            "selected_probe": None,
+            "sample_records": [],
+        }
+        if not self.enabled or not self.config.waypoint_probe_enable:
+            result["reason"] = "disabled"
+            return result
+        if self.camera_intrinsic is None:
+            result["reason"] = "missing_intrinsic"
+            return result
+        pose_tf = self._pose_from_obs(obs or {})
+        if pose_tf is None:
+            result["reason"] = "missing_pose"
+            return result
+        if self.init_base_tf is None:
+            result["reason"] = "memory_not_initialized"
+            return result
+        try:
+            candidate_grid = [int(value) for value in list(candidate.get("grid"))[:2]]
+            candidate_angle = float(candidate.get("direction_angle_deg"))
+        except (TypeError, ValueError):
+            result["reason"] = "invalid_candidate_geometry"
+            return result
+        if len(candidate_grid) != 2 or not np.isfinite(candidate_angle):
+            result["reason"] = "invalid_candidate_geometry"
+            return result
+        result["candidate_grid"] = candidate_grid
+
+        depth_arr = np.asarray(depth)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        if depth_arr.ndim < 2:
+            result["reason"] = "invalid_depth"
+            return result
+        depth_h, depth_w = depth_arr.shape[:2]
+        image_w = int(
+            context.get("image_width")
+            or self.config.waypoint_source_image_width
+            or depth_w
+        )
+        image_h = int(
+            context.get("image_height")
+            or self.config.waypoint_source_image_height
+            or depth_h
+        )
+        if image_w <= 0 or image_h <= 0:
+            result["reason"] = "invalid_image_shape"
+            return result
+        result["image_width"] = image_w
+        result["image_height"] = image_h
+        max_angle_error = max(0.0, float(max_angle_error_deg))
+        candidate_distance = max(
+            0.5,
+            float(candidate.get("distance_m", 0.0) or 0.0),
+        )
+
+        def probe(pixel_goal: Any, source: str) -> Dict[str, Any]:
+            record: Dict[str, Any] = {
+                "source": source,
+                "pixel_goal": None,
+                "in_bounds": False,
+                "projection_valid": False,
+                "goal_state": None,
+                "goal_grid": None,
+                "depth_m": None,
+                "direction_bucket": None,
+                "direction_angle_deg": None,
+                "angle_error_deg": None,
+                "proxy_to_candidate_distance_m": None,
+                "nearby_visit_count": None,
+                "points_to_revisited_region": None,
+                "eligible": False,
+                "selection_score": None,
+                "reason": None,
+            }
+            try:
+                px = int(round(float(pixel_goal[0])))
+                py = int(round(float(pixel_goal[1])))
+            except (TypeError, ValueError, IndexError):
+                record["reason"] = "invalid_pixel_goal"
+                return record
+            record["pixel_goal"] = [px, py]
+            record["in_bounds"] = bool(0 <= px < image_w and 0 <= py < image_h)
+            if not record["in_bounds"]:
+                record["reason"] = "pixel_out_of_bounds"
+                return record
+            target = self._pixel_goal_to_grid([px, py], depth_arr, pose_tf, context)
+            if target is None:
+                record["reason"] = "invalid_pixel_projection"
+                return record
+            goal_grid = [int(value) for value in target["goal_grid"][:2]]
+            state = self._cell_state(goal_grid[0], goal_grid[1])
+            direction = self._direction_to_cell(
+                target["start_grid"],
+                goal_grid,
+                float(target.get("start_yaw", 0.0) or 0.0),
+            )
+            proxy_angle = direction.get("angle_deg")
+            angle_error = (
+                None
+                if proxy_angle is None
+                else self._angle_distance_degrees(candidate_angle, float(proxy_angle))
+            )
+            proxy_to_candidate_m = float(
+                np.linalg.norm(
+                    np.asarray(goal_grid, dtype=np.float32)
+                    - np.asarray(candidate_grid, dtype=np.float32)
+                )
+                * self.cs
+            )
+            revisit_count = self._nearby_visit_count(
+                goal_grid, int(self.config.waypoint_revisit_radius_cells)
+            )
+            eligible = bool(
+                state == "free"
+                and angle_error is not None
+                and angle_error <= max_angle_error
+            )
+            selection_score = None
+            if eligible:
+                selection_score = float(
+                    angle_error / max(1.0, max_angle_error)
+                    + proxy_to_candidate_m / candidate_distance
+                )
+            record.update(
+                {
+                    "projection_valid": True,
+                    "goal_state": state,
+                    "goal_grid": goal_grid,
+                    "depth_m": float(target["depth_m"]),
+                    "direction_bucket": direction.get("bucket"),
+                    "direction_angle_deg": proxy_angle,
+                    "angle_error_deg": angle_error,
+                    "proxy_to_candidate_distance_m": proxy_to_candidate_m,
+                    "nearby_visit_count": int(revisit_count),
+                    "points_to_revisited_region": bool(revisit_count > 0),
+                    "eligible": eligible,
+                    "selection_score": selection_score,
+                    "reason": "eligible" if eligible else (
+                        "goal_not_free" if state != "free" else "angle_mismatch"
+                    ),
+                }
+            )
+            return record
+
+        if baseline_pixel_goal is not None:
+            result["baseline_probe"] = probe(
+                baseline_pixel_goal, "fixed_directional_pixel"
+            )
+
+        exact = self.project_grid_to_pixel_goal(
+            candidate_grid,
+            obs,
+            depth_arr,
+            context=context,
+            goal_world_z=float(
+                candidate.get("semantic_resilience_source_world_z", 0.0) or 0.0
+            ),
+        )
+        exact_record = {"projection": exact, "probe": None}
+        if exact.get("valid"):
+            exact_record["probe"] = probe(
+                exact.get("pixel_goal"), "exact_candidate_projection"
+            )
+        result["exact_projection"] = exact_record
+
+        sample_records: List[Dict[str, Any]] = []
+        seen_pixels = set()
+        for y_ratio in sample_y_ratios:
+            for x_ratio in sample_x_ratios:
+                try:
+                    px = int(
+                        round(min(1.0, max(0.0, float(x_ratio))) * (image_w - 1))
+                    )
+                    py = int(
+                        round(min(1.0, max(0.0, float(y_ratio))) * (image_h - 1))
+                    )
+                except (TypeError, ValueError):
+                    continue
+                key = (px, py)
+                if key in seen_pixels:
+                    continue
+                seen_pixels.add(key)
+                sample_records.append(probe([px, py], "sample_grid"))
+        result["sample_records"] = sample_records
+        result["sample_count"] = len(sample_records)
+        result["projected_sample_count"] = sum(
+            bool(record.get("projection_valid")) for record in sample_records
+        )
+        state_counts: Dict[str, int] = defaultdict(int)
+        for record in sample_records:
+            state_counts[str(record.get("goal_state") or "invalid")] += 1
+        result["sample_goal_state_counts"] = dict(state_counts)
+        result["free_sample_count"] = sum(
+            record.get("goal_state") == "free" for record in sample_records
+        )
+        eligible_samples = [
+            record for record in sample_records if record.get("eligible")
+        ]
+        result["angle_aligned_free_sample_count"] = len(eligible_samples)
+        exact_probe = dict(exact_record.get("probe") or {})
+        eligible = (
+            [exact_probe] if exact_probe.get("eligible") else []
+        ) + eligible_samples
+        result["eligible_probe_count"] = len(eligible)
+        if not eligible:
+            result["reason"] = "no_visible_aligned_free_proxy"
+            return result
+        selected = min(
+            eligible,
+            key=lambda record: (
+                float(record.get("selection_score", float("inf"))),
+                float(record.get("proxy_to_candidate_distance_m", float("inf"))),
+                float(record.get("angle_error_deg", float("inf"))),
+            ),
+        )
+        result.update(
+            {
+                "valid": True,
+                "reason": (
+                    "exact_candidate_visible_free"
+                    if selected.get("source") == "exact_candidate_projection"
+                    else "visible_aligned_free_proxy"
+                ),
+                "selected_pixel_goal": list(selected["pixel_goal"]),
+                "selected_probe": selected,
+            }
+        )
         return result
 
     def _stage15_repair_shadow_info(
