@@ -445,6 +445,78 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "s2_loop_projection_bridge_max_angle_error_deg", 30.0
                 )
             ),
+            "path_reobserve_active_enable": bool(
+                vlmap_safety_cfg.get("s2_loop_path_reobserve_active_enable", False)
+            ),
+            "path_reobserve_max_interventions_per_episode": max(
+                0,
+                int(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_max_interventions_per_episode", 1
+                    )
+                ),
+            ),
+            "path_reobserve_max_turn_steps": max(
+                0,
+                int(vlmap_safety_cfg.get("s2_loop_path_reobserve_max_turn_steps", 4)),
+            ),
+            "path_reobserve_turn_deadband_deg": max(
+                0.0,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_turn_deadband_deg", 7.5
+                    )
+                ),
+            ),
+            "path_reobserve_scan_when_aligned": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_scan_when_aligned", True
+                )
+            ),
+            "path_reobserve_max_path_cells": max(
+                1,
+                int(vlmap_safety_cfg.get("s2_loop_path_reobserve_max_path_cells", 160)),
+            ),
+            "path_reobserve_path_corridor_m": max(
+                0.05,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_path_corridor_m", 0.35
+                    )
+                ),
+            ),
+            "path_reobserve_min_path_progress_m": max(
+                0.05,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_min_path_progress_m", 0.25
+                    )
+                ),
+            ),
+            "path_reobserve_max_local_subgoal_m": max(
+                0.25,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_max_local_subgoal_m", 3.0
+                    )
+                ),
+            ),
+            "path_reobserve_max_heading_error_deg": max(
+                0.0,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_max_heading_error_deg", 40.0
+                    )
+                ),
+            ),
+            "path_reobserve_lookahead_m": max(
+                0.05,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_lookahead_m", 0.75
+                    )
+                ),
+            ),
         }
 
     def _format_s2_recovery_context(self, context: dict) -> str:
@@ -995,6 +1067,264 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     result["execution_pending"] = True
         return result
 
+    def _recovery_path_bridge(
+        self,
+        event: dict,
+        *,
+        observations: Optional[dict],
+        depth_m: Optional[np.ndarray],
+        probe_source: str,
+    ) -> dict:
+        cfg = self._get_s2_action_loop_cfg()
+        if observations is None or depth_m is None:
+            return {
+                "valid": False,
+                "reason": "missing_observation_or_depth",
+                "path_reachable": False,
+            }
+        return self.occ_memory.plan_recovery_path_bridge(
+            dict(event.get("candidate") or {}),
+            {
+                "gps": observations.get("gps"),
+                "compass": observations.get("compass"),
+            },
+            depth_m,
+            context={
+                "step_id": event.get("step_id"),
+                "scene_id": event.get("scene_id"),
+                "episode_id": event.get("episode_id"),
+                "image_width": int(getattr(self.model_args, "resize_w", 384)),
+                "image_height": int(getattr(self.model_args, "resize_h", 384)),
+                "probe_source": str(probe_source),
+            },
+            sample_x_ratios=cfg.get("projection_bridge_sample_x_ratios") or (),
+            sample_y_ratios=cfg.get("projection_bridge_sample_y_ratios") or (),
+            max_path_cells=int(cfg.get("path_reobserve_max_path_cells", 160)),
+            path_corridor_m=float(
+                cfg.get("path_reobserve_path_corridor_m", 0.35)
+            ),
+            min_path_progress_m=float(
+                cfg.get("path_reobserve_min_path_progress_m", 0.25)
+            ),
+            max_local_subgoal_m=float(
+                cfg.get("path_reobserve_max_local_subgoal_m", 3.0)
+            ),
+            max_initial_heading_error_deg=float(
+                cfg.get("path_reobserve_max_heading_error_deg", 40.0)
+            ),
+            reorient_lookahead_m=float(
+                cfg.get("path_reobserve_lookahead_m", 0.75)
+            ),
+        )
+
+    def _plan_s2_loop_path_reobserve_active(
+        self,
+        event: Optional[dict],
+        active_count: int,
+        *,
+        observations: Optional[dict] = None,
+        depth_m: Optional[np.ndarray] = None,
+    ) -> dict:
+        """Plan one strict-only path bridge or bounded active reorientation."""
+        cfg = self._get_s2_action_loop_cfg()
+        candidate = dict((event or {}).get("candidate") or {})
+        result = {
+            "event_type": "s2_loop_path_reobserve_active",
+            "event_schema_version": "stage21c_path_reobserve_active_v1",
+            "scene_id": (event or {}).get("scene_id"),
+            "episode_id": (event or {}).get("episode_id"),
+            "episode_index": (event or {}).get("episode_index"),
+            "episode_count": (event or {}).get("episode_count"),
+            "episode_eval_seed": (event or {}).get("episode_eval_seed"),
+            "trigger_step": (event or {}).get("step_id"),
+            "step_id": (event or {}).get("step_id"),
+            "failure_type": (event or {}).get("failure_type"),
+            "triage_tier": (event or {}).get("triage_tier"),
+            "triage_reason": (event or {}).get("triage_reason"),
+            "turn_direction": (event or {}).get("turn_direction"),
+            "candidate": candidate,
+            "enabled": bool(cfg.get("path_reobserve_active_enable")),
+            "considered": bool(event),
+            "intervention_index": int(active_count + 1),
+            "intervention_budget": int(
+                cfg.get("path_reobserve_max_interventions_per_episode", 1)
+            ),
+            "execution_mode": None,
+            "execution_pending": False,
+            "reobserve_pending": False,
+            "reorient_actions": [],
+            "selected_pixel_goal": None,
+            "action_applied": False,
+            "output_rewritten": False,
+            "reason": None,
+            "path_bridge": None,
+            "geometry_preflight": {
+                "geometry_safe": bool(candidate.get("geometry_safe")),
+                "active_gate_safe": bool(candidate.get("active_gate_safe")),
+                "direction_bucket": candidate.get("direction_bucket"),
+            },
+            "gt_fields_used": [],
+        }
+        if not result["enabled"]:
+            result["reason"] = "disabled"
+            return result
+        if not event:
+            result["reason"] = "missing_loop_event"
+            return result
+        if str(event.get("triage_tier") or "") != "strict_intervention":
+            result["reason"] = "non_strict_hold"
+            return result
+        if active_count >= int(
+            cfg.get("path_reobserve_max_interventions_per_episode", 1)
+        ):
+            result["reason"] = "budget_exhausted"
+            return result
+        if not bool(candidate.get("geometry_safe")):
+            result["reason"] = "candidate_not_geometry_safe"
+            return result
+        if not bool(candidate.get("active_gate_safe")):
+            result["reason"] = "candidate_not_active_gate_safe"
+            return result
+        if str(candidate.get("direction_bucket") or "").lower() not in set(
+            cfg.get("strict_active_allowed_directions") or ()
+        ):
+            result["reason"] = "candidate_direction_not_allowed"
+            return result
+
+        bridge = self._recovery_path_bridge(
+            event,
+            observations=observations,
+            depth_m=depth_m,
+            probe_source="s2_loop_path_reobserve_initial",
+        )
+        result["path_bridge"] = bridge
+        if bridge.get("valid"):
+            result.update(
+                {
+                    "execution_mode": "path_pixel",
+                    "execution_pending": True,
+                    "selected_pixel_goal": bridge.get("selected_pixel_goal"),
+                    "reason": "path_pixel_preflight_pass",
+                }
+            )
+            return result
+        if not bridge.get("path_reachable"):
+            result["reason"] = str(bridge.get("reason") or "path_not_reachable")
+            return result
+
+        try:
+            path_angle = float(bridge.get("initial_direction_angle_deg"))
+        except (TypeError, ValueError):
+            result["reason"] = "missing_path_reorient_angle"
+            return result
+        while path_angle > 180.0:
+            path_angle -= 360.0
+        while path_angle <= -180.0:
+            path_angle += 360.0
+        turn_angle = max(
+            1e-6,
+            abs(float(getattr(self.config.habitat.simulator, "turn_angle", 15.0))),
+        )
+        deadband = float(cfg.get("path_reobserve_turn_deadband_deg", 7.5))
+        max_turn_steps = int(cfg.get("path_reobserve_max_turn_steps", 4))
+        if abs(path_angle) <= deadband:
+            if not cfg.get("path_reobserve_scan_when_aligned"):
+                result["reason"] = "path_aligned_but_not_visible"
+                return result
+            # A one-step scan opposite the repeated policy turn exposes new
+            # pixels while avoiding another action in the known loop direction.
+            turn_action = (
+                action_code.RIGHT
+                if str(event.get("turn_direction") or "") == "left"
+                else action_code.LEFT
+            )
+            turn_steps = 1
+            scan_reason = "opposite_loop_scan"
+        else:
+            turn_action = action_code.LEFT if path_angle > 0.0 else action_code.RIGHT
+            turn_steps = min(
+                max_turn_steps,
+                max(1, int(math.ceil(abs(path_angle) / turn_angle))),
+            )
+            scan_reason = "turn_to_path_lookahead"
+        if turn_steps <= 0:
+            result["reason"] = "empty_reorient_plan"
+            return result
+        actions = [int(turn_action)] * int(turn_steps)
+        result.update(
+            {
+                "execution_mode": "bounded_reorient_reobserve",
+                "reobserve_pending": True,
+                "reorient_actions": actions,
+                "reorient_angle_deg": float(path_angle),
+                "habitat_turn_angle_deg": float(turn_angle),
+                "scan_reason": scan_reason,
+                "reason": "reorient_queued",
+            }
+        )
+        return result
+
+    def _plan_s2_loop_path_reobserve_post_observation(
+        self,
+        pending: dict,
+        *,
+        observations: Optional[dict],
+        depth_m: Optional[np.ndarray],
+        step_id: int,
+    ) -> dict:
+        result = dict(pending or {})
+        planned_actions = [int(item) for item in pending.get("reorient_actions") or []]
+        applied_actions = [
+            int(item) for item in pending.get("reorient_actions_applied") or []
+        ]
+        reorient_complete = bool(
+            planned_actions and applied_actions == planned_actions
+        )
+        result.update(
+            {
+                "event_type": "s2_loop_path_reobserve_post_observation",
+                "event_schema_version": "stage21c_path_reobserve_active_v1",
+                "step_id": int(step_id),
+                "post_reobserve_step": int(step_id),
+                "reobserve_pending": False,
+                "execution_pending": False,
+                "selected_pixel_goal": None,
+                "output_rewritten": False,
+                # Reaching this query means the bounded turn queue was fully
+                # stepped by the environment.
+                "action_applied": bool(reorient_complete),
+                "reorient_action_applied": bool(reorient_complete),
+                "reorient_actions_applied": list(applied_actions),
+                "reason": None,
+            }
+        )
+        if not reorient_complete:
+            result["reason"] = "reorient_queue_incomplete_handoff_s2"
+            return result
+        bridge_event = dict(pending or {})
+        bridge_event["step_id"] = int(step_id)
+        bridge = self._recovery_path_bridge(
+            bridge_event,
+            observations=observations,
+            depth_m=depth_m,
+            probe_source="s2_loop_path_reobserve_post_observation",
+        )
+        result["post_path_bridge"] = bridge
+        if bridge.get("valid"):
+            result.update(
+                {
+                    "execution_mode": "post_reobserve_path_pixel",
+                    "execution_pending": True,
+                    "selected_pixel_goal": bridge.get("selected_pixel_goal"),
+                    "reason": "post_reobserve_path_pixel_preflight_pass",
+                }
+            )
+        else:
+            result["reason"] = str(
+                bridge.get("reason") or "post_reobserve_no_path_pixel_handoff_s2"
+            )
+        return result
+
     def _write_s2_action_loop_event(self, event: dict) -> None:
         run_dir = self._get_vlmap_run_dir()
         log_dir = run_dir or self.output_path
@@ -1036,6 +1366,55 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         )
         with open(log_path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _write_s2_loop_path_reobserve_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(
+            log_dir, "s2_loop_path_reobserve_active_events.jsonl"
+        )
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _save_s2_loop_path_reobserve_snapshot(
+        self, event: dict, observations: Optional[dict]
+    ) -> Optional[str]:
+        if not observations or observations.get("rgb") is None:
+            return None
+        log_dir = self._get_vlmap_run_dir() or self.output_path
+        if not log_dir:
+            return None
+        snapshot_dir = os.path.join(log_dir, "s2_loop_path_reobserve_snapshots")
+        os.makedirs(snapshot_dir, exist_ok=True)
+        name = (
+            f"{event.get('scene_id')}_{int(event.get('episode_id'))}_"
+            f"trigger{int(event.get('trigger_step', -1))}_"
+            f"post{int(event.get('post_reobserve_step', event.get('step_id', -1)))}.jpg"
+        )
+        path = os.path.join(snapshot_dir, name)
+        image = Image.fromarray(
+            np.asarray(observations.get("rgb"), dtype=np.uint8)
+        ).convert("RGB")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, image.width, 34), fill=(0, 0, 0))
+        draw.text(
+            (8, 8),
+            (
+                f"path reobserve trigger={event.get('trigger_step')} "
+                f"post={event.get('post_reobserve_step')} "
+                f"reason={event.get('reason')}"
+            ),
+            fill=(255, 255, 0),
+        )
+        pixel_goal = list(event.get("selected_pixel_goal") or [])
+        if len(pixel_goal) == 2:
+            x, y = int(pixel_goal[0]), int(pixel_goal[1])
+            draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=(255, 0, 0))
+        image.save(path, quality=92)
+        return os.path.relpath(path, log_dir)
 
     def _observe_s2_action_loop_shadow(
         self,
@@ -6377,6 +6756,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             s2_loop_projection_bridge_event_count = 0
             s2_loop_projection_bridge_strict_count = 0
             s2_loop_projection_bridge_valid_count = 0
+            s2_loop_path_reobserve_event_count = 0
+            s2_loop_path_reobserve_intervention_count = 0
+            s2_loop_path_reobserve_reorient_count = 0
+            s2_loop_path_reobserve_post_query_count = 0
+            s2_loop_path_reobserve_pixel_rewrite_count = 0
+            s2_loop_path_reobserve_applied_count = 0
+            s2_loop_path_reobserve_first_step = None
+            pending_s2_loop_path_reobserve = None
+            pending_s2_loop_path_execution = None
             semantic_hint_set_count = 0
             semantic_hint_injected_count = 0
             semantic_hint_detection_step = None
@@ -6753,10 +7141,79 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                     last_s2_query_step = int(step_id)
                     print('step_id:', step_id, 'output text:', llm_outputs)
+                    loop_observer_output = llm_outputs
+
+                    if pending_s2_loop_path_reobserve is not None:
+                        path_post_event = (
+                            self._plan_s2_loop_path_reobserve_post_observation(
+                                pending_s2_loop_path_reobserve,
+                                observations=observations,
+                                depth_m=current_depth_m,
+                                step_id=int(step_id),
+                            )
+                        )
+                        path_post_event["base_s2_output"] = llm_outputs
+                        s2_loop_path_reobserve_post_query_count += 1
+                        if path_post_event.get("action_applied"):
+                            s2_loop_path_reobserve_applied_count += 1
+                            if s2_loop_path_reobserve_first_step is None:
+                                s2_loop_path_reobserve_first_step = int(
+                                    path_post_event.get("trigger_step", step_id)
+                                )
+                        if path_post_event.get("execution_pending"):
+                            planned_goal = list(
+                                path_post_event.get("selected_pixel_goal") or []
+                            )
+                            try:
+                                if len(planned_goal) != 2:
+                                    raise ValueError("invalid_path_pixel_goal")
+                                goal_x, goal_y = int(planned_goal[0]), int(planned_goal[1])
+                                replacement_text = f"{goal_y} {goal_x}"
+                                replacement_ids = self.processor.tokenizer(
+                                    replacement_text,
+                                    add_special_tokens=False,
+                                    return_tensors="pt",
+                                ).input_ids.to(output_ids.device)
+                                if replacement_ids.numel() <= 0:
+                                    raise ValueError("empty_recovery_pixel_tokens")
+                                prompt_len = int(inputs.input_ids.shape[1])
+                                output_ids = torch.cat(
+                                    [output_ids[:, :prompt_len], replacement_ids], dim=1
+                                )
+                                llm_outputs = replacement_text
+                            except Exception as exc:
+                                path_post_event.update(
+                                    {
+                                        "reason": "post_reobserve_output_rewrite_failed",
+                                        "execution_pending": False,
+                                        "execution_error_type": type(exc).__name__,
+                                        "execution_error": str(exc),
+                                    }
+                                )
+                            else:
+                                path_post_event.update(
+                                    {
+                                        "reason": "post_reobserve_output_rewritten_pending_trajectory",
+                                        "output_rewritten": True,
+                                        "execution_pending": True,
+                                        "recovery_s2_output": replacement_text,
+                                        "executed_pixel_goal": [goal_x, goal_y],
+                                        "intervention_already_applied": True,
+                                    }
+                                )
+                                s2_loop_path_reobserve_pixel_rewrite_count += 1
+                                pending_s2_loop_path_execution = dict(path_post_event)
+                        path_post_event["rgb_file"] = (
+                            self._save_s2_loop_path_reobserve_snapshot(
+                                path_post_event, observations
+                            )
+                        )
+                        self._write_s2_loop_path_reobserve_event(path_post_event)
+                        pending_s2_loop_path_reobserve = None
 
                     s2_loop_event = self._observe_s2_action_loop_shadow(
                         state=s2_action_loop_state,
-                        output=llm_outputs,
+                        output=loop_observer_output,
                         observations=observations,
                         step_id=step_id,
                         scene_id=scene_id,
@@ -6786,6 +7243,120 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 s2_loop_projection_bridge_valid_count += 1
                             self._write_s2_loop_projection_bridge_event(
                                 projection_bridge_event
+                            )
+
+                        path_reobserve_event = (
+                            self._plan_s2_loop_path_reobserve_active(
+                                s2_loop_event,
+                                s2_loop_path_reobserve_intervention_count,
+                                observations=observations,
+                                depth_m=current_depth_m,
+                            )
+                        )
+                        if path_reobserve_event.get("enabled"):
+                            s2_loop_path_reobserve_event_count += 1
+                            path_reobserve_event["base_s2_output"] = llm_outputs
+                            if path_reobserve_event.get("reobserve_pending"):
+                                reorient_actions = [
+                                    int(item)
+                                    for item in list(
+                                        path_reobserve_event.get("reorient_actions") or []
+                                    )
+                                    if int(item) in (
+                                        int(action_code.LEFT),
+                                        int(action_code.RIGHT),
+                                    )
+                                ]
+                                if reorient_actions:
+                                    path_reobserve_event["reorient_actions"] = list(
+                                        reorient_actions
+                                    )
+                                    path_reobserve_event["reorient_actions_applied"] = []
+                                    pending_s2_loop_path_reobserve = dict(
+                                        path_reobserve_event
+                                    )
+                                    s2_loop_path_reobserve_intervention_count += 1
+                                    s2_loop_path_reobserve_reorient_count += 1
+                                    vlmap_recovery_actions = list(reorient_actions)
+                                    pixel_goal = None
+                                    output_ids = None
+                                    traj_latents = None
+                                    pix_goal_image = None
+                                    pix_goal_depth = None
+                                    messages = []
+                                    input_images = []
+                                    llm_outputs = ""
+                                    local_actions = []
+                                    action_seq = []
+                                    action = None
+                                    forward_action = 0
+                                    draw_pixel_goal = False
+                                    flag = False
+                                    self._write_s2_loop_path_reobserve_event(
+                                        path_reobserve_event
+                                    )
+                                    print(
+                                        "[S2LoopPathReobserve] "
+                                        f"episode={scene_id}/{episode_id} step={step_id} "
+                                        f"queue={reorient_actions} "
+                                        f"path_angle={path_reobserve_event.get('reorient_angle_deg')}",
+                                        flush=True,
+                                    )
+                                    continue
+                                path_reobserve_event.update(
+                                    {
+                                        "reason": "empty_reorient_queue_hold",
+                                        "reobserve_pending": False,
+                                    }
+                                )
+                            if path_reobserve_event.get("execution_pending"):
+                                planned_goal = list(
+                                    path_reobserve_event.get("selected_pixel_goal") or []
+                                )
+                                try:
+                                    if len(planned_goal) != 2:
+                                        raise ValueError("invalid_path_pixel_goal")
+                                    goal_x, goal_y = int(planned_goal[0]), int(planned_goal[1])
+                                    replacement_text = f"{goal_y} {goal_x}"
+                                    replacement_ids = self.processor.tokenizer(
+                                        replacement_text,
+                                        add_special_tokens=False,
+                                        return_tensors="pt",
+                                    ).input_ids.to(output_ids.device)
+                                    if replacement_ids.numel() <= 0:
+                                        raise ValueError("empty_recovery_pixel_tokens")
+                                    prompt_len = int(inputs.input_ids.shape[1])
+                                    output_ids = torch.cat(
+                                        [output_ids[:, :prompt_len], replacement_ids], dim=1
+                                    )
+                                    llm_outputs = replacement_text
+                                except Exception as exc:
+                                    path_reobserve_event.update(
+                                        {
+                                            "reason": "path_output_rewrite_failed",
+                                            "execution_pending": False,
+                                            "execution_error_type": type(exc).__name__,
+                                            "execution_error": str(exc),
+                                        }
+                                    )
+                                else:
+                                    path_reobserve_event.update(
+                                        {
+                                            "reason": "path_output_rewritten_pending_trajectory",
+                                            "output_rewritten": True,
+                                            "execution_pending": True,
+                                            "recovery_s2_output": replacement_text,
+                                            "executed_pixel_goal": [goal_x, goal_y],
+                                            "intervention_already_applied": False,
+                                        }
+                                    )
+                                    s2_loop_path_reobserve_intervention_count += 1
+                                    s2_loop_path_reobserve_pixel_rewrite_count += 1
+                                    pending_s2_loop_path_execution = dict(
+                                        path_reobserve_event
+                                    )
+                            self._write_s2_loop_path_reobserve_event(
+                                path_reobserve_event
                             )
 
                         strict_active_event = self._plan_s2_loop_strict_active(
@@ -8343,6 +8914,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                     pending_s2_loop_strict_active_execution
                                 )
                                 pending_s2_loop_strict_active_execution = None
+                            if pending_s2_loop_path_execution is not None:
+                                pending_s2_loop_path_execution.update(
+                                    {
+                                        "event_type": "s2_loop_path_reobserve_execution",
+                                        "reason": "semantic_requery_before_path_trajectory",
+                                        "pixel_action_applied": False,
+                                        "execution_pending": False,
+                                    }
+                                )
+                                self._write_s2_loop_path_reobserve_event(
+                                    pending_s2_loop_path_execution
+                                )
+                                pending_s2_loop_path_execution = None
                             continue
                         guidance_cfg = self._get_occ_memory_guidance_cfg()
                         guidance_context = {
@@ -8490,6 +9074,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                             pending_s2_loop_strict_active_execution
                                         )
                                         pending_s2_loop_strict_active_execution = None
+                                    if pending_s2_loop_path_execution is not None:
+                                        pending_s2_loop_path_execution.update(
+                                            {
+                                                "event_type": "s2_loop_path_reobserve_execution",
+                                                "reason": "occ_guidance_requery_before_path_trajectory",
+                                                "pixel_action_applied": False,
+                                                "execution_pending": False,
+                                            }
+                                        )
+                                        self._write_s2_loop_path_reobserve_event(
+                                            pending_s2_loop_path_execution
+                                        )
+                                        pending_s2_loop_path_execution = None
                                     continue
                         elif dead_zone_candidate:
                             occ_memory_guidance_blocked_count += 1
@@ -8538,6 +9135,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                         pending_s2_loop_strict_active_execution
                                     )
                                     pending_s2_loop_strict_active_execution = None
+                                if pending_s2_loop_path_execution is not None:
+                                    pending_s2_loop_path_execution.update(
+                                        {
+                                            "event_type": "s2_loop_path_reobserve_execution",
+                                            "reason": "waypoint_recovery_before_path_trajectory",
+                                            "pixel_action_applied": False,
+                                            "execution_pending": False,
+                                        }
+                                    )
+                                    self._write_s2_loop_path_reobserve_event(
+                                        pending_s2_loop_path_execution
+                                    )
+                                    pending_s2_loop_path_execution = None
                                 continue
 
                         if vlmap_waypoint_decision.get("requery_required"):
@@ -8575,6 +9185,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                     pending_s2_loop_strict_active_execution
                                 )
                                 pending_s2_loop_strict_active_execution = None
+                            if pending_s2_loop_path_execution is not None:
+                                pending_s2_loop_path_execution.update(
+                                    {
+                                        "event_type": "s2_loop_path_reobserve_execution",
+                                        "reason": "waypoint_safety_requery_before_path_trajectory",
+                                        "pixel_action_applied": False,
+                                        "execution_pending": False,
+                                    }
+                                )
+                                self._write_s2_loop_path_reobserve_event(
+                                    pending_s2_loop_path_execution
+                                )
+                                pending_s2_loop_path_execution = None
                             print("[VLMapSafety][Habitat][Waypoint] clear current goal and requery S2")
                             continue
 
@@ -8663,6 +9286,61 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 # into an unreviewed environment action.
                                 traj_reject_required = True
                             pending_s2_loop_strict_active_execution = None
+                        if pending_s2_loop_path_execution is not None:
+                            first_action = local_actions[0] if local_actions else None
+                            path_trajectory_pass = bool(
+                                not traj_reject_required
+                                and first_action is not None
+                                and int(first_action) != int(action_code.STOP)
+                            )
+                            reorient_already_applied = bool(
+                                pending_s2_loop_path_execution.get(
+                                    "intervention_already_applied"
+                                )
+                            )
+                            pending_s2_loop_path_execution.update(
+                                {
+                                    "event_type": "s2_loop_path_reobserve_execution",
+                                    "event_schema_version": "stage21c_path_reobserve_active_v1",
+                                    "reason": (
+                                        "path_pixel_applied"
+                                        if path_trajectory_pass
+                                        else "path_pixel_trajectory_preflight_rejected"
+                                    ),
+                                    "action_applied": bool(
+                                        reorient_already_applied or path_trajectory_pass
+                                    ),
+                                    "reorient_action_applied": bool(
+                                        reorient_already_applied
+                                    ),
+                                    "pixel_action_applied": bool(path_trajectory_pass),
+                                    "execution_pending": False,
+                                    "trajectory_preflight": {
+                                        "valid": bool(vlmap_traj_decision.get("valid")),
+                                        "safe": bool(vlmap_traj_decision.get("safe")),
+                                        "would_reject": bool(
+                                            vlmap_traj_decision.get("would_reject")
+                                        ),
+                                        "reason": vlmap_traj_decision.get("reason"),
+                                        "reject_required": bool(traj_reject_required),
+                                        "first_action": first_action,
+                                        "local_actions": list(local_actions),
+                                    },
+                                }
+                            )
+                            self._write_s2_loop_path_reobserve_event(
+                                pending_s2_loop_path_execution
+                            )
+                            if path_trajectory_pass:
+                                if not reorient_already_applied:
+                                    s2_loop_path_reobserve_applied_count += 1
+                                    if s2_loop_path_reobserve_first_step is None:
+                                        s2_loop_path_reobserve_first_step = int(step_id)
+                            else:
+                                # A rejected path pixel never falls through to
+                                # the evaluator's legacy STOP->LEFT behavior.
+                                traj_reject_required = True
+                            pending_s2_loop_path_execution = None
                         nextdit_probe_cfg = self._get_nextdit_candidate_probe_cfg()
                         nextdit_query_index = (
                             nextdit_candidate_probe_event_count
@@ -9159,6 +9837,56 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     if action in (action_code.FORWARD, action_code.LEFT, action_code.RIGHT):
                         self._vlmap_last_nav_action = int(action)
 
+                if (
+                    pending_s2_loop_path_reobserve is not None
+                    and action_source == "vlmap_recovery_queue"
+                ):
+                    planned_reorient = [
+                        int(item)
+                        for item in pending_s2_loop_path_reobserve.get(
+                            "reorient_actions"
+                        )
+                        or []
+                    ]
+                    applied_reorient = [
+                        int(item)
+                        for item in pending_s2_loop_path_reobserve.get(
+                            "reorient_actions_applied"
+                        )
+                        or []
+                    ]
+                    expected_action = (
+                        planned_reorient[len(applied_reorient)]
+                        if len(applied_reorient) < len(planned_reorient)
+                        else None
+                    )
+                    if expected_action is not None and int(action) == int(
+                        expected_action
+                    ):
+                        applied_reorient.append(int(action))
+                        pending_s2_loop_path_reobserve[
+                            "reorient_actions_applied"
+                        ] = applied_reorient
+                        pending_s2_loop_path_reobserve[
+                            "last_reorient_environment_step"
+                        ] = int(step_id)
+                    else:
+                        pending_s2_loop_path_reobserve.update(
+                            {
+                                "event_type": "s2_loop_path_reobserve_execution",
+                                "reason": "reorient_action_changed_or_overrun",
+                                "action_applied": bool(applied_reorient),
+                                "reorient_action_applied": bool(applied_reorient),
+                                "actual_action": int(action),
+                                "expected_action": expected_action,
+                                "execution_pending": False,
+                            }
+                        )
+                        self._write_s2_loop_path_reobserve_event(
+                            pending_s2_loop_path_reobserve
+                        )
+                        pending_s2_loop_path_reobserve = None
+
             # ---------- 3. End of episode -----------
             # collect the metric result of this episode and write progress to the output_path/progress.json
 
@@ -9238,6 +9966,47 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     pending_s2_loop_strict_active_execution
                 )
                 pending_s2_loop_strict_active_execution = None
+            if pending_s2_loop_path_reobserve is not None:
+                planned_reorient = list(
+                    pending_s2_loop_path_reobserve.get("reorient_actions") or []
+                )
+                applied_reorient = list(
+                    pending_s2_loop_path_reobserve.get(
+                        "reorient_actions_applied"
+                    )
+                    or []
+                )
+                pending_s2_loop_path_reobserve.update(
+                    {
+                        "event_type": "s2_loop_path_reobserve_execution",
+                        "reason": "episode_ended_before_reobserve_query",
+                        "action_applied": bool(applied_reorient),
+                        "reorient_action_applied": bool(applied_reorient),
+                        "reorient_complete": bool(
+                            planned_reorient
+                            and applied_reorient == planned_reorient
+                        ),
+                        "execution_pending": False,
+                    }
+                )
+                self._write_s2_loop_path_reobserve_event(
+                    pending_s2_loop_path_reobserve
+                )
+                pending_s2_loop_path_reobserve = None
+            if pending_s2_loop_path_execution is not None:
+                pending_s2_loop_path_execution.update(
+                    {
+                        "event_type": "s2_loop_path_reobserve_execution",
+                        "reason": "episode_ended_before_path_trajectory_preflight",
+                        "action_applied": False,
+                        "pixel_action_applied": False,
+                        "execution_pending": False,
+                    }
+                )
+                self._write_s2_loop_path_reobserve_event(
+                    pending_s2_loop_path_execution
+                )
+                pending_s2_loop_path_execution = None
             semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
             occ_memory_summary = self.occ_memory.finish_episode(metrics=metrics, steps=step_id)
             occ_memory_recovery_summary = self._summarize_occ_memory_recovery_state(
@@ -9306,6 +10075,30 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
             result["s2_loop_projection_bridge_valid_count"] = int(
                 s2_loop_projection_bridge_valid_count
+            )
+            result["s2_loop_path_reobserve_active_enabled"] = bool(
+                self._get_s2_action_loop_cfg().get("path_reobserve_active_enable")
+            )
+            result["s2_loop_path_reobserve_event_count"] = int(
+                s2_loop_path_reobserve_event_count
+            )
+            result["s2_loop_path_reobserve_intervention_count"] = int(
+                s2_loop_path_reobserve_intervention_count
+            )
+            result["s2_loop_path_reobserve_reorient_count"] = int(
+                s2_loop_path_reobserve_reorient_count
+            )
+            result["s2_loop_path_reobserve_post_query_count"] = int(
+                s2_loop_path_reobserve_post_query_count
+            )
+            result["s2_loop_path_reobserve_pixel_rewrite_count"] = int(
+                s2_loop_path_reobserve_pixel_rewrite_count
+            )
+            result["s2_loop_path_reobserve_applied_count"] = int(
+                s2_loop_path_reobserve_applied_count
+            )
+            result["s2_loop_path_reobserve_first_step"] = (
+                s2_loop_path_reobserve_first_step
             )
             if self._get_occ_memory_recovery_cfg().get("enable"):
                 result["occ_memory_recovery_event_count"] = occ_memory_recovery_summary.get("event_count")

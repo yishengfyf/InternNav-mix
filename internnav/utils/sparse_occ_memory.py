@@ -5277,6 +5277,321 @@ class SparseOccSemanticMemory:
         )
         return result
 
+    def plan_recovery_path_bridge(
+        self,
+        candidate: Dict[str, Any],
+        obs: Dict[str, Any],
+        depth: np.ndarray,
+        *,
+        context: Optional[Dict[str, Any]] = None,
+        sample_x_ratios: Iterable[float] = (
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+            0.50,
+            0.60,
+            0.70,
+            0.80,
+            0.90,
+        ),
+        sample_y_ratios: Iterable[float] = (0.55, 0.65, 0.75, 0.85),
+        max_path_cells: int = 160,
+        max_visited_cells: int = 20000,
+        path_corridor_m: float = 0.35,
+        min_path_progress_m: float = 0.25,
+        max_local_subgoal_m: float = 3.0,
+        max_initial_heading_error_deg: float = 40.0,
+        reorient_lookahead_m: float = 0.75,
+    ) -> Dict[str, Any]:
+        """Bridge a recovery anchor through a known-free map path.
+
+        Unlike :meth:`plan_recovery_projection_bridge`, a visible free pixel
+        is accepted only when its depth endpoint lies close to the shortest
+        known-free path to the selected recovery anchor and advances along
+        that path.  This preserves the identity of a ``resilience_backtrack``
+        candidate instead of replacing it with an arbitrary same-bearing
+        free point.
+
+        The method is read-only.  It is safe to call both before a bounded
+        reorientation and on the first observation after that reorientation.
+        """
+        context = dict(context or {})
+        result: Dict[str, Any] = {
+            "valid": False,
+            "reason": None,
+            "path_reachable": False,
+            "start_grid": None,
+            "anchor_grid": None,
+            "path": [],
+            "path_preview": [],
+            "path_cell_count": 0,
+            "path_edge_count": 0,
+            "path_m": None,
+            "path_visited_cell_count": 0,
+            "initial_path_grid": None,
+            "initial_direction_bucket": None,
+            "initial_direction_angle_deg": None,
+            "base_projection_bridge": None,
+            "path_eligible_probe_count": 0,
+            "selected_pixel_goal": None,
+            "selected_probe": None,
+            "probe_records": [],
+        }
+        if not self.enabled or not self.config.waypoint_probe_enable:
+            result["reason"] = "disabled"
+            return result
+        pose_state = self._current_pose_state(obs or {})
+        if pose_state is None:
+            result["reason"] = "missing_pose_or_memory"
+            return result
+        try:
+            start_values = list(pose_state.get("grid") or [])
+            anchor_values = list(candidate.get("grid") or [])
+            start = (int(start_values[0]), int(start_values[1]))
+            anchor = (int(anchor_values[0]), int(anchor_values[1]))
+        except (TypeError, ValueError, IndexError):
+            result["reason"] = "invalid_start_or_anchor"
+            return result
+        result["start_grid"] = [int(start[0]), int(start[1])]
+        result["anchor_grid"] = [int(anchor[0]), int(anchor[1])]
+        if self._cell_state(anchor[0], anchor[1]) != "free":
+            result["reason"] = "anchor_not_free"
+            return result
+
+        free_cells = set(self.free2d_counts.keys()) - set(self.occ2d_counts.keys())
+        if not free_cells:
+            result["reason"] = "no_known_free_cells"
+            return result
+        max_depth = max(1, int(max_path_cells))
+        max_visited = max(1, int(max_visited_cells))
+        queue = deque([start])
+        parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
+        path_depth: Dict[Tuple[int, int], int] = {start: 0}
+        reached = False
+        visited_count = 0
+        while queue and visited_count < max_visited:
+            cell = queue.popleft()
+            visited_count += 1
+            if cell == anchor:
+                reached = True
+                break
+            if int(path_depth[cell]) >= max_depth:
+                continue
+            for nbr_raw in self._neighbors2d(cell[0], cell[1]):
+                nbr = (int(nbr_raw[0]), int(nbr_raw[1]))
+                if nbr in parent:
+                    continue
+                if nbr != anchor and nbr not in free_cells:
+                    continue
+                if nbr in self.occ2d_counts:
+                    continue
+                # Do not cut diagonally through the corner of an occupied or
+                # unknown cell.  Cardinal moves need no additional check.
+                dr = int(nbr[0] - cell[0])
+                dc = int(nbr[1] - cell[1])
+                if dr and dc:
+                    side_a = (cell[0] + dr, cell[1])
+                    side_b = (cell[0], cell[1] + dc)
+                    if side_a not in free_cells or side_b not in free_cells:
+                        continue
+                parent[nbr] = cell
+                path_depth[nbr] = int(path_depth[cell]) + 1
+                queue.append(nbr)
+        result["path_visited_cell_count"] = int(visited_count)
+        if not reached:
+            result["reason"] = (
+                "path_search_budget_exhausted"
+                if visited_count >= max_visited
+                else "no_known_free_path_to_anchor"
+            )
+            return result
+
+        path: List[Tuple[int, int]] = []
+        cursor: Optional[Tuple[int, int]] = anchor
+        while cursor is not None:
+            path.append(cursor)
+            cursor = parent.get(cursor)
+        path.reverse()
+        path_edges = max(0, len(path) - 1)
+        path_m = float(path_edges * self.cs)
+        result.update(
+            {
+                "path_reachable": True,
+                "path": [[int(row), int(col)] for row, col in path],
+                "path_preview": [
+                    [int(row), int(col)]
+                    for row, col in (path[:12] + ([path[-1]] if len(path) > 12 else []))
+                ],
+                "path_cell_count": int(len(path)),
+                "path_edge_count": int(path_edges),
+                "path_m": float(path_m),
+            }
+        )
+
+        yaw = float(pose_state.get("yaw", 0.0) or 0.0)
+        lookahead_cells = max(
+            1, int(round(max(float(self.cs), float(reorient_lookahead_m)) / self.cs))
+        )
+        lookahead_index = min(path_edges, lookahead_cells)
+        initial_grid = path[lookahead_index]
+        initial_direction = self._direction_to_cell(start, initial_grid, yaw)
+        result.update(
+            {
+                "initial_path_grid": [int(initial_grid[0]), int(initial_grid[1])],
+                "initial_path_index": int(lookahead_index),
+                "initial_direction_bucket": initial_direction.get("bucket"),
+                "initial_direction_angle_deg": initial_direction.get("angle_deg"),
+            }
+        )
+
+        base_bridge = self.plan_recovery_projection_bridge(
+            candidate,
+            obs,
+            depth,
+            context=context,
+            baseline_pixel_goal=None,
+            sample_x_ratios=sample_x_ratios,
+            sample_y_ratios=sample_y_ratios,
+            # Bearing is retained in the audit, but route membership below is
+            # the active eligibility criterion.
+            max_angle_error_deg=180.0,
+        )
+        result["base_projection_bridge"] = base_bridge
+        raw_probes: List[Dict[str, Any]] = []
+        exact_probe = dict(
+            ((base_bridge.get("exact_projection") or {}).get("probe") or {})
+        )
+        if exact_probe:
+            raw_probes.append(exact_probe)
+        raw_probes.extend(dict(item) for item in base_bridge.get("sample_records") or [])
+
+        corridor_m = max(float(self.cs), float(path_corridor_m))
+        min_progress_m = max(float(self.cs), float(min_path_progress_m))
+        max_subgoal_m = max(min_progress_m, float(max_local_subgoal_m))
+        max_heading_error = max(0.0, float(max_initial_heading_error_deg))
+        path_arr = np.asarray(path, dtype=np.float32)
+        eligible_records: List[Dict[str, Any]] = []
+        probe_records: List[Dict[str, Any]] = []
+        for raw in raw_probes:
+            record = dict(raw)
+            record.update(
+                {
+                    "path_nearest_index": None,
+                    "path_deviation_m": None,
+                    "path_progress_m": None,
+                    "path_remaining_m": None,
+                    "proxy_from_current_m": None,
+                    "initial_heading_error_deg": None,
+                    "path_eligible": False,
+                    "path_reason": None,
+                    "path_selection_score": None,
+                }
+            )
+            goal_grid = record.get("goal_grid")
+            if not record.get("projection_valid") or record.get("goal_state") != "free":
+                record["path_reason"] = str(record.get("reason") or "probe_not_free")
+                probe_records.append(record)
+                continue
+            try:
+                goal = np.asarray(list(goal_grid)[:2], dtype=np.float32)
+            except (TypeError, ValueError):
+                record["path_reason"] = "invalid_goal_grid"
+                probe_records.append(record)
+                continue
+            distances = np.linalg.norm(path_arr - goal[None, :], axis=1)
+            nearest_index = int(np.argmin(distances))
+            path_deviation_m = float(distances[nearest_index] * self.cs)
+            progress_m = float(nearest_index * self.cs)
+            remaining_m = float(max(0, path_edges - nearest_index) * self.cs)
+            proxy_from_current_m = float(
+                np.linalg.norm(goal - np.asarray(start, dtype=np.float32)) * self.cs
+            )
+            proxy_angle = record.get("direction_angle_deg")
+            initial_angle = initial_direction.get("angle_deg")
+            heading_error = (
+                None
+                if proxy_angle is None or initial_angle is None
+                else float(
+                    self._angle_distance_degrees(
+                        float(initial_angle), float(proxy_angle)
+                    )
+                )
+            )
+            is_exact = record.get("source") == "exact_candidate_projection"
+            eligible = bool(
+                path_deviation_m <= corridor_m
+                and progress_m >= min_progress_m
+                and (is_exact or proxy_from_current_m <= max_subgoal_m)
+                and heading_error is not None
+                and heading_error <= max_heading_error
+            )
+            if path_deviation_m > corridor_m:
+                path_reason = "outside_path_corridor"
+            elif progress_m < min_progress_m:
+                path_reason = "insufficient_path_progress"
+            elif not is_exact and proxy_from_current_m > max_subgoal_m:
+                path_reason = "local_subgoal_too_far"
+            elif heading_error is None or heading_error > max_heading_error:
+                path_reason = "initial_heading_mismatch"
+            else:
+                path_reason = "eligible"
+            selection_score = None
+            if eligible:
+                selection_score = float(
+                    path_deviation_m / corridor_m
+                    + float(heading_error) / max(1.0, max_heading_error)
+                    - min(1.0, progress_m / max(float(self.cs), max_subgoal_m))
+                )
+            record.update(
+                {
+                    "path_nearest_index": int(nearest_index),
+                    "path_deviation_m": float(path_deviation_m),
+                    "path_progress_m": float(progress_m),
+                    "path_remaining_m": float(remaining_m),
+                    "proxy_from_current_m": float(proxy_from_current_m),
+                    "initial_heading_error_deg": heading_error,
+                    "path_eligible": bool(eligible),
+                    "path_reason": path_reason,
+                    "path_selection_score": selection_score,
+                }
+            )
+            probe_records.append(record)
+            if eligible:
+                eligible_records.append(record)
+        result["probe_records"] = probe_records
+        result["path_eligible_probe_count"] = int(len(eligible_records))
+        result["path_constraints"] = {
+            "path_corridor_m": float(corridor_m),
+            "min_path_progress_m": float(min_progress_m),
+            "max_local_subgoal_m": float(max_subgoal_m),
+            "max_initial_heading_error_deg": float(max_heading_error),
+        }
+        if not eligible_records:
+            result["reason"] = "no_visible_path_consistent_free_proxy"
+            return result
+        selected = min(
+            eligible_records,
+            key=lambda item: (
+                float(item.get("path_selection_score", float("inf"))),
+                float(item.get("path_deviation_m", float("inf"))),
+                -float(item.get("path_progress_m", 0.0) or 0.0),
+            ),
+        )
+        result.update(
+            {
+                "valid": True,
+                "reason": (
+                    "exact_anchor_visible_path_consistent"
+                    if selected.get("source") == "exact_candidate_projection"
+                    else "visible_path_consistent_free_proxy"
+                ),
+                "selected_pixel_goal": list(selected.get("pixel_goal") or []),
+                "selected_probe": selected,
+            }
+        )
+        return result
+
     def _stage15_repair_shadow_info(
         self,
         *,
