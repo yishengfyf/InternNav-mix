@@ -81,6 +81,7 @@ def analyze(
     expected_episodes: int,
     seed_manifest: Path | None,
     reference_root: Path | None,
+    allow_reference_missing: bool = False,
 ):
     control = _progress(control_root)
     active = _progress(active_root)
@@ -168,13 +169,12 @@ def analyze(
 
     reference_metric_mismatches = []
     reference_loop_mismatches = []
+    reference_missing = []
     if reference_root:
         for key in common:
             reference_row = reference.get(key)
             if reference_row is None:
-                reference_metric_mismatches.append(
-                    {"scene_episode": key, "reason": "missing_reference_episode"}
-                )
+                reference_missing.append(key)
                 continue
             differing = {}
             for field in METRICS:
@@ -277,6 +277,9 @@ def analyze(
         ],
         "control_reference_metric_mismatch": reference_metric_mismatches,
         "control_reference_loop_mismatch": reference_loop_mismatches,
+        "control_reference_missing": (
+            [] if allow_reference_missing else reference_missing
+        ),
     }
     integrity_passed = bool(
         len(control) == expected_episodes
@@ -321,11 +324,21 @@ def analyze(
             for key, seed in expected_seeds.items()
         ),
         "reference_metric_verified_count": (
-            0 if not reference_root else len(common) - len(reference_metric_mismatches)
+            0
+            if not reference_root
+            else len(common)
+            - len(reference_metric_mismatches)
+            - len(reference_missing)
         ),
         "reference_loop_verified_count": (
-            0 if not reference_root else len(common) - len(reference_loop_mismatches)
+            0
+            if not reference_root
+            else len(common)
+            - len(reference_loop_mismatches)
+            - len(reference_missing)
         ),
+        "reference_missing_count": len(reference_missing),
+        "reference_missing_episodes": reference_missing,
         "violations": {name: len(rows) for name, rows in violations.items()},
         "violation_records": violations,
         "integrity_passed": integrity_passed,
@@ -350,6 +363,11 @@ def main():
     parser.add_argument("--expected-episodes", type=int, required=True)
     parser.add_argument("--seed-manifest", type=Path)
     parser.add_argument("--reference-root", type=Path)
+    parser.add_argument(
+        "--allow-reference-missing",
+        action="store_true",
+        help="Allow new episodes without a prior reference root; still audit any present references.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
     args = parser.parse_args()
@@ -359,6 +377,7 @@ def main():
         args.expected_episodes,
         args.seed_manifest,
         args.reference_root,
+        args.allow_reference_missing,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
