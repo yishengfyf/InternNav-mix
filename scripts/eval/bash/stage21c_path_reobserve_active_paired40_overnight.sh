@@ -84,11 +84,39 @@ package_failure() {
 trap package_failure EXIT
 
 mkdir -p "${RETURN_ROOT}" "${MANIFEST_DIR}"
-test -f "${CHECKPOINT}"
-test -f "${REFERENCE_MANIFEST}"
-test -f "${REFERENCE_ROOT}/progress.json"
-test ! -e "${WORK_DIR}"; test ! -e "${SUCCESS_DEST}"; test ! -e "${FAILURE_DEST}"
-test ! -e "${CONTROL_ROOT}"; test ! -e "${ACTIVE_ROOT}"
+init_failed=0
+check_init_file() {
+  local label=$1
+  local path=$2
+  if [[ ! -f "${path}" ]]; then
+    echo "INIT_CHECK_FAIL ${label}=${path}" >&2
+    init_failed=1
+  else
+    echo "INIT_CHECK_OK ${label}=${path}"
+  fi
+}
+check_init_absent() {
+  local label=$1
+  local path=$2
+  if [[ -e "${path}" ]]; then
+    echo "INIT_CHECK_FAIL ${label}_already_exists=${path}" >&2
+    init_failed=1
+  else
+    echo "INIT_CHECK_OK ${label}_absent=${path}"
+  fi
+}
+check_init_file checkpoint "${CHECKPOINT}"
+check_init_file reference_manifest "${REFERENCE_MANIFEST}"
+check_init_file reference_progress "${REFERENCE_ROOT}/progress.json"
+check_init_absent work_dir "${WORK_DIR}"
+check_init_absent success_dest "${SUCCESS_DEST}"
+check_init_absent failure_dest "${FAILURE_DEST}"
+check_init_absent control_root "${CONTROL_ROOT}"
+check_init_absent active_root "${ACTIVE_ROOT}"
+if [[ "${init_failed}" -ne 0 ]]; then
+  echo "INIT_CHECK_SUMMARY=failed; use the INIT_CHECK_FAIL lines above to repair the run" >&2
+  exit 1
+fi
 
 if [[ ! -f "${BASE_MANIFEST}" ]]; then
   FAILED_STAGE=base_manifest_generation

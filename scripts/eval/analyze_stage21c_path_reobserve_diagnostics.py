@@ -81,6 +81,25 @@ def main():
 
     audit = json.loads(args.audit.read_text(encoding="utf-8"))
     paired = audit.get("paired_aggregate", {})
+    paired_by_episode = {
+        str(row.get("scene_episode")): row
+        for row in audit.get("paired_episode_records") or []
+    }
+    strict_episode_outcomes = []
+    for episode_key in strict_keys:
+        paired_row = paired_by_episode.get(episode_key, {})
+        strict_episode_outcomes.append(
+            {
+                "scene_episode": episode_key,
+                "control_success": paired_row.get("control_success"),
+                "active_success": paired_row.get("active_success"),
+                "control_steps": paired_row.get("control_steps"),
+                "active_steps": paired_row.get("active_steps"),
+                "control_collision_count": paired_row.get("control_collision_count"),
+                "active_collision_count": paired_row.get("active_collision_count"),
+                "intervention_count": paired_row.get("intervention_count", 0),
+            }
+        )
     result = {
         "task": "stage21c_path_reobserve_diagnostics",
         "active_event_count": len(rows),
@@ -89,6 +108,13 @@ def main():
         "strict_trigger_count": len(strict_rows),
         "strict_episode_count": len(strict_keys),
         "strict_episodes": strict_keys,
+        "strict_episode_outcomes": strict_episode_outcomes,
+        "strict_control_success_episode_count": sum(
+            row.get("control_success") == 1 for row in strict_episode_outcomes
+        ),
+        "strict_control_failure_episode_count": sum(
+            row.get("control_success") == 0 for row in strict_episode_outcomes
+        ),
         "strict_trigger_keys": strict_trigger_keys,
         "no_known_free_path_to_anchor_count": len(no_path_rows),
         "path_bridge_attempt_count": len(bridge_rows),
