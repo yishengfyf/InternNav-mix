@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Overnight Stage21c paired40 active audit.
+# Overnight Stage21c paired-N active audit.
 # Generates explicit per-episode seeds, runs Frozen control and strict-only
 # bounded path reobserve active, then performs an automatic integrity audit.
 
@@ -9,7 +9,8 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
 CHECKPOINT=${STAGE21C_SCORER_CHECKPOINT:?Set STAGE21C_SCORER_CHECKPOINT to seed_53/best.pt}
-BASE_MANIFEST=${STAGE21C_BASE_EPISODE_MANIFEST:-data/stage18/train_balanced_40_episode_ids.json}
+EXPECTED_EPISODES=${STAGE21C_EXPECTED_EPISODES:-40}
+BASE_MANIFEST=${STAGE21C_BASE_EPISODE_MANIFEST:-data/stage18/train_balanced_${EXPECTED_EPISODES}_episode_ids.json}
 EPISODES_FILE=${STAGE21C_TRAIN_EPISODES_FILE:-data/vln_ce/raw_data/r2r/train/train.json.gz}
 REFERENCE_MANIFEST=${STAGE21C_REFERENCE_MANIFEST:-scripts/eval/manifests/stage21c_strict_active_5_episode_ids.json}
 REFERENCE_ROOT=${STAGE21C_REPLAY_REFERENCE_ROOT:-results/stage_17/stage21c_multitask_scorer_shadow500_return_20260814_134102}
@@ -17,17 +18,17 @@ RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
 MANIFEST_DIR=${STAGE21C_MANIFEST_DIR:-data/stage21c}
 PIPELINE_TAG=${STAGE21_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
 CUDA_DEVICES=${STAGE21_CUDA_VISIBLE_DEVICES:-0,1,2,3}
-EXPECTED_EPISODES=40
+[[ "${EXPECTED_EPISODES}" =~ ^[1-9][0-9]*$ ]]
 
-MANIFEST="${MANIFEST_DIR}/stage21c_path_reobserve_active_paired40_episode_ids_${PIPELINE_TAG}.json"
-RUNNING_NAME="stage21c_path_reobserve_active_paired40_overnight_running_${PIPELINE_TAG}"
-SUCCESS_NAME="stage21c_path_reobserve_active_paired40_overnight_return_${PIPELINE_TAG}"
-FAILURE_NAME="stage21c_path_reobserve_active_paired40_overnight_failure_return_${PIPELINE_TAG}"
+MANIFEST="${MANIFEST_DIR}/stage21c_path_reobserve_active_paired${EXPECTED_EPISODES}_episode_ids_${PIPELINE_TAG}.json"
+RUNNING_NAME="stage21c_path_reobserve_active_paired${EXPECTED_EPISODES}_overnight_running_${PIPELINE_TAG}"
+SUCCESS_NAME="stage21c_path_reobserve_active_paired${EXPECTED_EPISODES}_overnight_return_${PIPELINE_TAG}"
+FAILURE_NAME="stage21c_path_reobserve_active_paired${EXPECTED_EPISODES}_overnight_failure_return_${PIPELINE_TAG}"
 WORK_DIR="${RETURN_ROOT}/${RUNNING_NAME}"
 SUCCESS_DEST="${RETURN_ROOT}/${SUCCESS_NAME}"
 FAILURE_DEST="${RETURN_ROOT}/${FAILURE_NAME}"
-CONTROL_NAME="compare_vlmap_stage21c_path_reobserve_control_paired40_${PIPELINE_TAG}"
-ACTIVE_NAME="compare_vlmap_stage21c_path_reobserve_active_paired40_${PIPELINE_TAG}"
+CONTROL_NAME="compare_vlmap_stage21c_path_reobserve_control_paired${EXPECTED_EPISODES}_${PIPELINE_TAG}"
+ACTIVE_NAME="compare_vlmap_stage21c_path_reobserve_active_paired${EXPECTED_EPISODES}_${PIPELINE_TAG}"
 CONTROL_ROOT="logs/habitat/${CONTROL_NAME}"
 ACTIVE_ROOT="logs/habitat/${ACTIVE_NAME}"
 FAILED_STAGE=initialization
@@ -44,9 +45,9 @@ write_metadata() {
   if [[ -f "${MANIFEST}" ]]; then
     sha256sum "${MANIFEST}" > "${root}/MANIFEST_SHA256.txt"
   fi
-  cat > "${root}/EXPERIMENT_SCOPE.txt" <<'EOF'
-Overnight Stage21c paired40 information-collection run. The manifest is
-derived from a balanced40 episode list and receives deterministic explicit
+  cat > "${root}/EXPERIMENT_SCOPE.txt" <<EOF
+Overnight Stage21c paired-${EXPECTED_EPISODES} information-collection run. The manifest is
+derived from a balanced-${EXPECTED_EPISODES} episode list and receives deterministic explicit
 episode_eval_seed values; the five known strict episodes retain their prior
 seeds. Control is Frozen S2/NextDiT. Active permits only one strict bounded
 known-free-path reorient/reobserve intervention per episode. No blind forward,
@@ -76,7 +77,7 @@ package_failure() {
   write_metadata "${WORK_DIR}"
   mv "${WORK_DIR}" "${FAILURE_DEST}"
   find "${FAILURE_DEST}" -type f | sort > "${FAILURE_DEST}/RETURN_MANIFEST.txt"
-  echo "STAGE21C_PATH_REOBSERVE_PAIRED40_STATUS=failed"
+  echo "STAGE21C_PATH_REOBSERVE_PAIRED${EXPECTED_EPISODES}_STATUS=failed"
   echo "FAILED_STAGE=${FAILED_STAGE}"
   echo "DEST=$(readlink -f "${FAILURE_DEST}")"
 }
@@ -104,13 +105,14 @@ python3 scripts/eval/build_stage21c_episode_seed_manifest.py \
   --input "${BASE_MANIFEST}" --output "${MANIFEST}" \
   --overrides "${REFERENCE_MANIFEST}" --include "${REFERENCE_MANIFEST}" \
   --max-episodes "${EXPECTED_EPISODES}" --base-seed 300000
-python3 - "${MANIFEST}" <<'PY'
+python3 - "${MANIFEST}" "${EXPECTED_EPISODES}" <<'PY'
 import json, sys
 rows = json.load(open(sys.argv[1]))
-assert len(rows) == 40, len(rows)
-assert len({(r['scene_id'], int(r['episode_id'])) for r in rows}) == 40
-assert len({int(r['episode_eval_seed']) for r in rows}) == 40
-print(json.dumps({'episode_count': len(rows), 'unique_seed_count': len(rows)}))
+expected = int(sys.argv[2])
+assert len(rows) == expected, len(rows)
+assert len({(r['scene_id'], int(r['episode_id'])) for r in rows}) == expected
+assert len({int(r['episode_eval_seed']) for r in rows}) == expected
+print(json.dumps({'episode_count': len(rows), 'unique_seed_count': len(rows), 'expected': expected}))
 PY
 
 mkdir -p "${WORK_DIR}"
@@ -146,21 +148,28 @@ python3 scripts/eval/analyze_stage21c_path_reobserve_paired.py \
   --output "${ACTIVE_ROOT}/stage21c_path_reobserve_active_paired_audit.json" \
   --require-all
 
+FAILED_STAGE=diagnostic_summary
+python3 scripts/eval/analyze_stage21c_path_reobserve_diagnostics.py \
+  --active-root "${ACTIVE_ROOT}" \
+  --audit "${ACTIVE_ROOT}/stage21c_path_reobserve_active_paired_audit.json" \
+  --output "${ACTIVE_ROOT}/stage21c_path_reobserve_active_diagnostics.json"
+
 FAILED_STAGE=automatic_audit_summary
-python3 - "${ACTIVE_ROOT}/stage21c_path_reobserve_active_paired_audit.json" <<'PY'
+python3 - "${ACTIVE_ROOT}/stage21c_path_reobserve_active_paired_audit.json" "${EXPECTED_EPISODES}" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
+expected = int(sys.argv[2])
 assert d['integrity_passed'] is True, d
-assert d['control_episode_count'] == 40, d
-assert d['active_episode_count'] == 40, d
-assert d['common_episode_count'] == 40, d
-assert d['seed_replay_verified_count'] == 40, d
+assert d['control_episode_count'] == expected, d
+assert d['active_episode_count'] == expected, d
+assert d['common_episode_count'] == expected, d
+assert d['seed_replay_verified_count'] == expected, d
 assert d['reference_checked_episode_count'] == 5, d
 assert d['reference_metric_verified_count'] == 5, d
 assert d['reference_loop_verified_count'] == 5, d
 assert all(v == 0 for v in d['violations'].values()), d['violations']
 print(json.dumps({
-    'episodes': 40,
+    'episodes': d['expected_episode_count'],
     'active_experiment_formed': d['active_experiment_formed'],
     'applied_intervention_count': d['applied_intervention_count'],
     'reorient_completed_event_count': d['reorient_completed_event_count'],
@@ -187,7 +196,7 @@ mv "${WORK_DIR}" "${SUCCESS_DEST}"
 find "${SUCCESS_DEST}" -type f | sort > "${SUCCESS_DEST}/RETURN_MANIFEST.txt"
 PIPELINE_COMPLETE=1
 
-echo "STAGE21C_PATH_REOBSERVE_PAIRED40_STATUS=complete"
+echo "STAGE21C_PATH_REOBSERVE_PAIRED${EXPECTED_EPISODES}_STATUS=complete"
 echo "RETURN_NAME=${SUCCESS_NAME}"
 echo "DEST=$(readlink -f "${SUCCESS_DEST}")"
 du -sh "${SUCCESS_DEST}"
