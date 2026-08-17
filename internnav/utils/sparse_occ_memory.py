@@ -5720,6 +5720,406 @@ class SparseOccSemanticMemory:
             return "free"
         return "unknown"
 
+    def _rasterize_executed_route_edge(
+        self,
+        start: Tuple[int, int],
+        end: Tuple[int, int],
+        *,
+        edge_length_m: float,
+        sample_spacing_m: float,
+    ) -> List[Tuple[int, int]]:
+        """Return ordered map cells intersected by one executed pose edge."""
+        dr = int(end[0]) - int(start[0])
+        dc = int(end[1]) - int(start[1])
+        grid_steps = max(abs(dr), abs(dc), 1)
+        metric_steps = int(
+            math.ceil(max(0.0, float(edge_length_m)) / max(1e-3, sample_spacing_m))
+        )
+        steps = max(grid_steps, metric_steps, 1)
+        cells: List[Tuple[int, int]] = []
+        for index in range(steps + 1):
+            alpha = float(index) / float(steps)
+            cell = (
+                int(round(float(start[0]) + alpha * float(dr))),
+                int(round(float(start[1]) + alpha * float(dc))),
+            )
+            if not cells or cell != cells[-1]:
+                cells.append(cell)
+        return cells
+
+    def _known_free_connectivity_audit(
+        self,
+        start: Tuple[int, int],
+        anchor: Tuple[int, int],
+        *,
+        max_path_cells: int,
+        max_visited_cells: int,
+    ) -> Dict[str, Any]:
+        """Mirror the path-reobserve ray-free BFS without projecting a pixel."""
+        result: Dict[str, Any] = {
+            "reachable": False,
+            "reason": None,
+            "visited_cell_count": 0,
+            "path_cell_count": 0,
+            "path_edge_count": 0,
+            "path_m": None,
+            "path_preview": [],
+        }
+        if self._cell_state(anchor[0], anchor[1]) != "free":
+            result["reason"] = "anchor_not_free"
+            return result
+        free_cells = set(self.free2d_counts.keys()) - set(self.occ2d_counts.keys())
+        if not free_cells:
+            result["reason"] = "no_known_free_cells"
+            return result
+
+        max_depth = max(1, int(max_path_cells))
+        max_visited = max(1, int(max_visited_cells))
+        queue = deque([start])
+        parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
+        depth: Dict[Tuple[int, int], int] = {start: 0}
+        reached = False
+        visited_count = 0
+        while queue and visited_count < max_visited:
+            cell = queue.popleft()
+            visited_count += 1
+            if cell == anchor:
+                reached = True
+                break
+            if int(depth[cell]) >= max_depth:
+                continue
+            for nbr_raw in self._neighbors2d(cell[0], cell[1]):
+                nbr = (int(nbr_raw[0]), int(nbr_raw[1]))
+                if nbr in parent:
+                    continue
+                if nbr != anchor and nbr not in free_cells:
+                    continue
+                if nbr in self.occ2d_counts:
+                    continue
+                dr = int(nbr[0] - cell[0])
+                dc = int(nbr[1] - cell[1])
+                if dr and dc:
+                    side_a = (cell[0] + dr, cell[1])
+                    side_b = (cell[0], cell[1] + dc)
+                    if side_a not in free_cells or side_b not in free_cells:
+                        continue
+                parent[nbr] = cell
+                depth[nbr] = int(depth[cell]) + 1
+                queue.append(nbr)
+        result["visited_cell_count"] = int(visited_count)
+        if not reached:
+            result["reason"] = (
+                "path_search_budget_exhausted"
+                if visited_count >= max_visited
+                else "no_known_free_path_to_anchor"
+            )
+            return result
+
+        path: List[Tuple[int, int]] = []
+        cursor: Optional[Tuple[int, int]] = anchor
+        while cursor is not None:
+            path.append(cursor)
+            cursor = parent.get(cursor)
+        path.reverse()
+        result.update(
+            {
+                "reachable": True,
+                "reason": "ok",
+                "path_cell_count": int(len(path)),
+                "path_edge_count": int(max(0, len(path) - 1)),
+                "path_m": float(max(0, len(path) - 1) * self.cs),
+                "path_preview": [
+                    [int(row), int(col)]
+                    for row, col in (
+                        path[:12] + ([path[-1]] if len(path) > 12 else [])
+                    )
+                ],
+            }
+        )
+        return result
+
+    def audit_executed_route_to_candidate(
+        self,
+        candidate: Dict[str, Any],
+        *,
+        current_step: Optional[int] = None,
+        max_edge_m: float = 0.75,
+        sample_spacing_m: float = 0.05,
+        max_path_cells: int = 160,
+        max_visited_cells: int = 20000,
+    ) -> Dict[str, Any]:
+        """Compare a real pose chain with the current ray-derived OCC map.
+
+        The pose chain remains a separate source of evidence.  This method does
+        not promote visited cells to free space and does not mutate any memory
+        state, which keeps map quality and route-history quality independently
+        auditable.
+        """
+        result: Dict[str, Any] = {
+            "event_schema_version": "stage22a_executed_route_occ_audit_v1",
+            "valid": False,
+            "reason": None,
+            "shadow_only": True,
+            "action_applied": False,
+            "output_rewritten": False,
+            "gt_fields_used": [],
+            "source_step": None,
+            "trigger_step": self._safe_int(current_step),
+            "anchor_grid": None,
+            "source_pose_grid": None,
+            "trigger_pose_grid": None,
+            "source_anchor_pose_match": False,
+            "route_raw_pose_count": 0,
+            "route_translation_node_count": 0,
+            "rotation_or_duplicate_pose_count": 0,
+            "route_movement_edge_count": 0,
+            "route_length_m": 0.0,
+            "route_max_edge_m": None,
+            "route_chain_continuous": False,
+            "route_discontinuity_edge_count": 0,
+            "route_cells": [],
+            "route_cell_count": 0,
+            "route_unique_cell_count": 0,
+            "route_cell_state_counts": {"free": 0, "unknown": 0, "occupied": 0},
+            "route_cell_state_ratios": {"free": None, "unknown": None, "occupied": None},
+            "route_conflict_edge_count": 0,
+            "route_unknown_edge_count": 0,
+            "longest_unknown_gap_cells": 0,
+            "longest_unknown_gap_m": 0.0,
+            "first_occupied_conflict": None,
+            "first_unknown_gap": None,
+            "edge_records": [],
+            "known_free_connectivity": None,
+            "continuous_but_ray_disconnected": False,
+        }
+        if not self.enabled:
+            result["reason"] = "memory_disabled"
+            return result
+        source_step = self._safe_int(
+            (candidate or {}).get("semantic_resilience_source_step_id")
+        )
+        result["source_step"] = source_step
+        try:
+            anchor_values = list((candidate or {}).get("grid") or [])
+            anchor = (int(anchor_values[0]), int(anchor_values[1]))
+        except (TypeError, ValueError, IndexError):
+            result["reason"] = "invalid_candidate_anchor"
+            return result
+        result["anchor_grid"] = [int(anchor[0]), int(anchor[1])]
+        if source_step is None:
+            result["reason"] = "missing_candidate_source_step"
+            return result
+        if not self.pose_trace:
+            result["reason"] = "missing_pose_trace"
+            return result
+
+        trigger_step = self._safe_int(current_step)
+        exact_source_indices: List[int] = []
+        for index, node in enumerate(self.pose_trace):
+            step = self._safe_int(node.get("step_id"))
+            if step == source_step:
+                exact_source_indices.append(index)
+        if not exact_source_indices:
+            result["reason"] = "source_step_not_in_pose_trace"
+            return result
+        source_index = min(
+            exact_source_indices,
+            key=lambda index: abs(int(self.pose_trace[index].get("row", -10**9)) - anchor[0])
+            + abs(int(self.pose_trace[index].get("col", -10**9)) - anchor[1]),
+        )
+
+        raw_nodes: List[Dict[str, Any]] = []
+        for node in self.pose_trace[source_index:]:
+            step = self._safe_int(node.get("step_id"))
+            if trigger_step is not None and step is not None and step > trigger_step:
+                break
+            try:
+                row = int(node["row"])
+                col = int(node["col"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            raw_nodes.append(
+                {
+                    "step_id": step,
+                    "row": row,
+                    "col": col,
+                    "x": node.get("x"),
+                    "y": node.get("y"),
+                }
+            )
+        if not raw_nodes:
+            result["reason"] = "empty_source_to_trigger_trace"
+            return result
+
+        source_grid = (int(raw_nodes[0]["row"]), int(raw_nodes[0]["col"]))
+        trigger_grid = (int(raw_nodes[-1]["row"]), int(raw_nodes[-1]["col"]))
+        result.update(
+            {
+                "source_pose_grid": [int(source_grid[0]), int(source_grid[1])],
+                "trigger_pose_grid": [int(trigger_grid[0]), int(trigger_grid[1])],
+                "source_pose_step": raw_nodes[0].get("step_id"),
+                "trigger_pose_step": raw_nodes[-1].get("step_id"),
+                "source_anchor_pose_match": bool(source_grid == anchor),
+                "source_anchor_grid_distance_cells": float(
+                    math.hypot(source_grid[0] - anchor[0], source_grid[1] - anchor[1])
+                ),
+                "route_raw_pose_count": int(len(raw_nodes)),
+            }
+        )
+
+        def node_distance(first: Dict[str, Any], second: Dict[str, Any]) -> float:
+            try:
+                first_xy = (float(first["x"]), float(first["y"]))
+                second_xy = (float(second["x"]), float(second["y"]))
+                if all(math.isfinite(value) for value in first_xy + second_xy):
+                    return float(math.hypot(second_xy[0] - first_xy[0], second_xy[1] - first_xy[1]))
+            except (KeyError, TypeError, ValueError):
+                pass
+            return float(
+                math.hypot(
+                    int(second["row"]) - int(first["row"]),
+                    int(second["col"]) - int(first["col"]),
+                )
+                * self.cs
+            )
+
+        translation_nodes = [raw_nodes[0]]
+        for node in raw_nodes[1:]:
+            if node_distance(translation_nodes[-1], node) > 1e-4:
+                translation_nodes.append(node)
+        result["route_translation_node_count"] = int(len(translation_nodes))
+        result["rotation_or_duplicate_pose_count"] = int(
+            len(raw_nodes) - len(translation_nodes)
+        )
+        result["route_nodes"] = [
+            {
+                "step_id": node.get("step_id"),
+                "grid": [int(node["row"]), int(node["col"])],
+                "xy": (
+                    [float(node["x"]), float(node["y"])]
+                    if node.get("x") is not None and node.get("y") is not None
+                    else None
+                ),
+            }
+            for node in translation_nodes
+        ]
+
+        ordered_cells: List[Tuple[int, int]] = []
+        edge_lengths: List[float] = []
+        discontinuity_count = 0
+        conflict_edge_count = 0
+        unknown_edge_count = 0
+        edge_records: List[Dict[str, Any]] = []
+        for edge_index, (first, second) in enumerate(
+            zip(translation_nodes[:-1], translation_nodes[1:])
+        ):
+            edge_length = node_distance(first, second)
+            edge_lengths.append(edge_length)
+            start = (int(first["row"]), int(first["col"]))
+            end = (int(second["row"]), int(second["col"]))
+            edge_cells = self._rasterize_executed_route_edge(
+                start,
+                end,
+                edge_length_m=edge_length,
+                sample_spacing_m=max(1e-3, float(sample_spacing_m)),
+            )
+            if ordered_cells and edge_cells and edge_cells[0] == ordered_cells[-1]:
+                ordered_cells.extend(edge_cells[1:])
+            else:
+                ordered_cells.extend(edge_cells)
+            unique_edge_cells = list(dict.fromkeys(edge_cells))
+            edge_counts = {"free": 0, "unknown": 0, "occupied": 0}
+            for row, col in unique_edge_cells:
+                edge_counts[self._cell_state(row, col)] += 1
+            continuous = bool(edge_length <= max(1e-3, float(max_edge_m)) + 1e-9)
+            discontinuity_count += int(not continuous)
+            conflict_edge_count += int(edge_counts["occupied"] > 0)
+            unknown_edge_count += int(edge_counts["unknown"] > 0)
+            edge_records.append(
+                {
+                    "edge_index": int(edge_index),
+                    "source_step": first.get("step_id"),
+                    "target_step": second.get("step_id"),
+                    "source_grid": [int(start[0]), int(start[1])],
+                    "target_grid": [int(end[0]), int(end[1])],
+                    "length_m": float(edge_length),
+                    "continuous": continuous,
+                    "cell_count": int(len(unique_edge_cells)),
+                    "cell_state_counts": edge_counts,
+                }
+            )
+        if not ordered_cells:
+            ordered_cells = [source_grid]
+
+        unique_cells = list(dict.fromkeys(ordered_cells))
+        state_counts = {"free": 0, "unknown": 0, "occupied": 0}
+        first_occupied = None
+        first_unknown = None
+        unknown_run = 0
+        longest_unknown = 0
+        for index, (row, col) in enumerate(ordered_cells):
+            state = self._cell_state(row, col)
+            if state == "unknown":
+                unknown_run += 1
+                longest_unknown = max(longest_unknown, unknown_run)
+                if first_unknown is None:
+                    first_unknown = {
+                        "route_cell_index": int(index),
+                        "grid": [int(row), int(col)],
+                    }
+            else:
+                unknown_run = 0
+            if state == "occupied" and first_occupied is None:
+                first_occupied = {
+                    "route_cell_index": int(index),
+                    "grid": [int(row), int(col)],
+                }
+        for row, col in unique_cells:
+            state_counts[self._cell_state(row, col)] += 1
+        denominator = max(1, len(unique_cells))
+        connectivity = self._known_free_connectivity_audit(
+            trigger_grid,
+            anchor,
+            max_path_cells=max_path_cells,
+            max_visited_cells=max_visited_cells,
+        )
+        chain_continuous = bool(discontinuity_count == 0)
+        result.update(
+            {
+                "valid": True,
+                "reason": "ok",
+                "route_movement_edge_count": int(len(edge_records)),
+                "route_length_m": float(sum(edge_lengths)),
+                "route_max_edge_m": (
+                    float(max(edge_lengths)) if edge_lengths else 0.0
+                ),
+                "route_chain_continuous": chain_continuous,
+                "route_discontinuity_edge_count": int(discontinuity_count),
+                "route_cells": [
+                    [int(row), int(col)] for row, col in ordered_cells
+                ],
+                "route_cell_count": int(len(ordered_cells)),
+                "route_unique_cell_count": int(len(unique_cells)),
+                "route_cell_state_counts": state_counts,
+                "route_cell_state_ratios": {
+                    name: float(count / denominator)
+                    for name, count in state_counts.items()
+                },
+                "route_conflict_edge_count": int(conflict_edge_count),
+                "route_unknown_edge_count": int(unknown_edge_count),
+                "longest_unknown_gap_cells": int(longest_unknown),
+                "longest_unknown_gap_m": float(longest_unknown * self.cs),
+                "first_occupied_conflict": first_occupied,
+                "first_unknown_gap": first_unknown,
+                "edge_records": edge_records,
+                "known_free_connectivity": connectivity,
+                "continuous_but_ray_disconnected": bool(
+                    chain_continuous and not connectivity.get("reachable")
+                ),
+            }
+        )
+        return result
+
     def _nearby_visit_count(self, cell: Iterable[int], radius: int) -> int:
         row, col = [int(v) for v in list(cell)[:2]]
         total = 0

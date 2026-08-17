@@ -371,6 +371,41 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "max_snapshots_per_episode": int(
                 vlmap_safety_cfg.get("s2_action_loop_max_snapshots_per_episode", 2)
             ),
+            "executed_route_occ_audit_enable": bool(
+                vlmap_safety_cfg.get("s2_loop_executed_route_occ_audit_enable", False)
+            ),
+            "executed_route_occ_audit_max_edge_m": max(
+                0.05,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_executed_route_occ_audit_max_edge_m", 0.75
+                    )
+                ),
+            ),
+            "executed_route_occ_audit_sample_spacing_m": max(
+                0.01,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_executed_route_occ_audit_sample_spacing_m", 0.05
+                    )
+                ),
+            ),
+            "executed_route_occ_audit_max_path_cells": max(
+                1,
+                int(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_executed_route_occ_audit_max_path_cells", 160
+                    )
+                ),
+            ),
+            "executed_route_occ_audit_max_visited_cells": max(
+                1,
+                int(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_executed_route_occ_audit_max_visited_cells", 20000
+                    )
+                ),
+            ),
             "recovery_context_enable": bool(
                 vlmap_safety_cfg.get("s2_recovery_context_enable", False)
             ),
@@ -1335,6 +1370,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(log_path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
+    def _write_s2_loop_executed_route_occ_audit_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(
+            log_dir, "s2_loop_executed_route_occ_audit_events.jsonl"
+        )
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
     def _write_s2_recovery_context_event(self, event: dict) -> None:
         run_dir = self._get_vlmap_run_dir()
         log_dir = run_dir or self.output_path
@@ -1517,6 +1564,51 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "triage_reason": triage.get("reason"),
             "gt_fields_used": [],
         }
+        if (
+            bool(cfg.get("executed_route_occ_audit_enable"))
+            and str(event.get("triage_tier") or "") == "strict_intervention"
+        ):
+            route_audit = self.occ_memory.audit_executed_route_to_candidate(
+                candidate or {},
+                current_step=int(step_id),
+                max_edge_m=float(cfg["executed_route_occ_audit_max_edge_m"]),
+                sample_spacing_m=float(
+                    cfg["executed_route_occ_audit_sample_spacing_m"]
+                ),
+                max_path_cells=int(
+                    cfg["executed_route_occ_audit_max_path_cells"]
+                ),
+                max_visited_cells=int(
+                    cfg["executed_route_occ_audit_max_visited_cells"]
+                ),
+            )
+            route_audit_event = {
+                "event_type": "s2_loop_executed_route_occ_audit",
+                "scene_id": scene_id,
+                "episode_id": int(episode_id),
+                "episode_index": int(episode_index),
+                "episode_count": int(episode_count),
+                "episode_eval_seed": episode_eval_seed,
+                "step_id": int(step_id),
+                "loop_index": transition.get("loop_index"),
+                "failure_type": failure_type,
+                "triage_tier": triage.get("tier"),
+                "triage_reason": triage.get("reason"),
+                "candidate_id": (candidate or {}).get("candidate_id"),
+                "candidate_source": (candidate or {}).get(
+                    "semantic_resilience_source"
+                ),
+                "audit": route_audit,
+                "shadow_only": True,
+                "action_applied": False,
+                "output_rewritten": False,
+                "gt_fields_used": [],
+            }
+            event["executed_route_occ_audit_valid"] = bool(
+                route_audit.get("valid")
+            )
+            event["executed_route_occ_audit_reason"] = route_audit.get("reason")
+            self._write_s2_loop_executed_route_occ_audit_event(route_audit_event)
         max_snapshots = max(0, int(cfg.get("max_snapshots_per_episode", 2)))
         snapshot_expected = bool(
             int(transition.get("loop_index", 0) or 0) <= max_snapshots
