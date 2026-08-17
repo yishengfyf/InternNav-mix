@@ -110,7 +110,13 @@ def test_stage22b_analysis_pairs_map_events_and_preserves_navigation(tmp_path):
 
     summary = analyze(run, 1, manifest, nav, stage22a)
 
-    assert summary["comparison_integrity_passed"] is True, summary
+    assert summary["comparison_integrity_passed"] is True, {
+        "integrity": summary.get("integrity_passed"),
+        "violations": summary.get("violations"),
+        "missing": (summary.get("missing_current_event_keys"), summary.get("missing_baseline_event_keys")),
+        "identity": summary.get("route_identity_mismatches"),
+        "pitch": (summary.get("non_pitch_aware_audit_count"), summary.get("valid_occ_update_count"), summary.get("pitched_occ_update_count"), summary.get("pitch_application_mismatch_count")),
+    }
     assert summary["occupied_ratio_delta_mean"] == -0.25
     assert summary["ray_reachability_gain_count"] == 1
     assert summary["pitch_application_mismatch_count"] == 0
