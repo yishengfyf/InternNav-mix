@@ -110,7 +110,7 @@ def test_stage22b_analysis_pairs_map_events_and_preserves_navigation(tmp_path):
 
     summary = analyze(run, 1, manifest, nav, stage22a)
 
-    assert summary["comparison_integrity_passed"] is True
+    assert summary["comparison_integrity_passed"] is True, summary
     assert summary["occupied_ratio_delta_mean"] == -0.25
     assert summary["ray_reachability_gain_count"] == 1
     assert summary["pitch_application_mismatch_count"] == 0
