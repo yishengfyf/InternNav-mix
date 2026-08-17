@@ -90,7 +90,7 @@ def test_stage22b_analysis_pairs_map_events_and_preserves_navigation(tmp_path):
     )
     _write_jsonl(
         run / "vlmap_safety_debug" / "rank0_run_001" / "s2_loop_executed_route_occ_audit_events.jsonl",
-        [{**wrapper, "audit": _audit(0.25, True)}],
+        [{**wrapper, "audit": _audit(0.25, True, True)}],
     )
     _write_jsonl(
         run / "vlmap_safety_debug" / "rank0_run_001" / "occ_memory" / "memory_events.jsonl",
