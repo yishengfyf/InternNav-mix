@@ -234,6 +234,26 @@ def analyze(
         ]
         for state in ("free", "unknown", "occupied")
     }
+    height_values = {
+        name: [
+            int(
+                (audit.get("route_occupied_height_diagnostics") or {}).get(
+                    name, 0
+                )
+                or 0
+            )
+            for audit in nested_audits
+        ]
+        for name in (
+            "occupied_route_cell_count",
+            "low_or_ground_conflict_cell_count",
+            "lower_obstacle_conflict_cell_count",
+            "body_obstacle_conflict_cell_count",
+            "obstacle_band_conflict_cell_count",
+            "high_conflict_cell_count",
+            "no_voxel_conflict_cell_count",
+        )
+    }
 
     event_records = []
     for row in events:
@@ -260,6 +280,15 @@ def analyze(
                 "route_chain_continuous": audit.get("route_chain_continuous"),
                 "route_cell_state_counts": audit.get("route_cell_state_counts"),
                 "route_cell_state_ratios": audit.get("route_cell_state_ratios"),
+                "route_occupied_height_diagnostics": audit.get(
+                    "route_occupied_height_diagnostics"
+                ),
+                "route_pitch_observation_count": audit.get(
+                    "route_pitch_observation_count"
+                ),
+                "route_max_camera_pitch_deg": audit.get(
+                    "route_max_camera_pitch_deg"
+                ),
                 "longest_unknown_gap_m": audit.get("longest_unknown_gap_m"),
                 "first_occupied_conflict": audit.get("first_occupied_conflict"),
                 "first_unknown_gap": audit.get("first_unknown_gap"),
@@ -297,6 +326,9 @@ def analyze(
         "route_cell_free_ratio_mean": _mean(ratio_values["free"]),
         "route_cell_unknown_ratio_mean": _mean(ratio_values["unknown"]),
         "route_cell_occupied_ratio_mean": _mean(ratio_values["occupied"]),
+        "route_occupied_height_diagnostics_sum": {
+            name: int(sum(values)) for name, values in height_values.items()
+        },
         "route_length_mean_m": _mean(
             [float(audit.get("route_length_m", 0.0)) for audit in nested_audits]
         ),

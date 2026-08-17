@@ -230,6 +230,23 @@ def _default_cam_to_base_tf(camera_height: float) -> np.ndarray:
     return tf
 
 
+def _cam_to_base_for_pitch(camera_height: float, pitch_down_deg: float) -> np.ndarray:
+    """Return the optical-camera transform for a known downward pitch."""
+    pitch = math.radians(float(pitch_down_deg))
+    c, s = math.cos(pitch), math.sin(pitch)
+    tf = np.eye(4, dtype=np.float32)
+    tf[:3, :3] = np.array(
+        [
+            [0.0, s, c],
+            [-1.0, 0.0, 0.0],
+            [0.0, -c, -s],
+        ],
+        dtype=np.float32,
+    )
+    tf[:3, 3] = np.array([0.0, 0.0, camera_height], dtype=np.float32)
+    return tf
+
+
 def _yaw_to_tf(pos: np.ndarray, yaw: float) -> np.ndarray:
     c = math.cos(float(yaw))
     s = math.sin(float(yaw))
@@ -293,6 +310,7 @@ class SparseOccMemoryConfig:
     center_on_first_pose: bool = True
     obstacle_height_min: float = 0.15
     obstacle_height_max: float = 1.2
+    camera_pitch_aware_update: bool = False
     raycast_enable: bool = True
     raycast_stride_cells: int = 2
     raycast_max_points_per_update: int = 2500
@@ -599,7 +617,16 @@ class SparseOccSemanticMemory:
             self.init_base_tf = pose_tf.copy()
             self.inv_init_base_tf = np.linalg.inv(self.init_base_tf)
         rel_base_tf = self._relative_base_tf(pose_tf)
-        cam_pose_tf = rel_base_tf @ self.cam_to_base_tf
+        requested_camera_pitch_deg = float(context.get("camera_pitch_deg", 0.0) or 0.0)
+        applied_camera_pitch_deg = (
+            requested_camera_pitch_deg
+            if bool(self.config.camera_pitch_aware_update)
+            else 0.0
+        )
+        cam_to_base_tf = _cam_to_base_for_pitch(
+            float(self.config.camera_height), applied_camera_pitch_deg
+        )
+        cam_pose_tf = rel_base_tf @ cam_to_base_tf
         pose_row, pose_col, pose_yaw = self._pose_to_grid(rel_base_tf)
         self.last_pose_grid = (int(pose_row), int(pose_col))
         self.visited2d_counts[(int(pose_row), int(pose_col))] += 1
@@ -612,6 +639,8 @@ class SparseOccSemanticMemory:
                 "y": float(rel_base_tf[1, 3]),
                 "z": float(rel_base_tf[2, 3]),
                 "yaw": float(pose_yaw),
+                "camera_pitch_deg": float(requested_camera_pitch_deg),
+                "mapping_camera_pitch_deg": float(applied_camera_pitch_deg),
             }
         )
         self._maybe_add_keyframe(context, rel_base_tf, pose_row, pose_col, pose_yaw)
@@ -686,6 +715,11 @@ class SparseOccSemanticMemory:
                 "free_cell_count": int(len(self.free2d_counts)),
                 "frontier_count": None if frontier_count is None else int(frontier_count),
                 "pose_grid": [int(pose_row), int(pose_col)],
+                "camera_pitch_aware_update": bool(
+                    self.config.camera_pitch_aware_update
+                ),
+                "requested_camera_pitch_deg": float(requested_camera_pitch_deg),
+                "applied_camera_pitch_deg": float(applied_camera_pitch_deg),
             }
         )
         self._write_event(event)
@@ -5863,6 +5897,9 @@ class SparseOccSemanticMemory:
             "action_applied": False,
             "output_rewritten": False,
             "gt_fields_used": [],
+            "mapping_camera_pitch_aware": bool(
+                self.config.camera_pitch_aware_update
+            ),
             "source_step": None,
             "trigger_step": self._safe_int(current_step),
             "anchor_grid": None,
@@ -5870,6 +5907,8 @@ class SparseOccSemanticMemory:
             "trigger_pose_grid": None,
             "source_anchor_pose_match": False,
             "route_raw_pose_count": 0,
+            "route_pitch_observation_count": 0,
+            "route_max_camera_pitch_deg": 0.0,
             "route_translation_node_count": 0,
             "rotation_or_duplicate_pose_count": 0,
             "route_movement_edge_count": 0,
@@ -5888,6 +5927,21 @@ class SparseOccSemanticMemory:
             "longest_unknown_gap_m": 0.0,
             "first_occupied_conflict": None,
             "first_unknown_gap": None,
+            "route_occupied_height_diagnostics": {
+                "occupied_route_cell_count": 0,
+                "low_or_ground_conflict_cell_count": 0,
+                "lower_obstacle_conflict_cell_count": 0,
+                "body_obstacle_conflict_cell_count": 0,
+                "obstacle_band_conflict_cell_count": 0,
+                "high_conflict_cell_count": 0,
+                "no_voxel_conflict_cell_count": 0,
+                "mean_low_or_ground_voxel_count": 0.0,
+                "mean_lower_obstacle_voxel_count": 0.0,
+                "mean_body_obstacle_voxel_count": 0.0,
+                "mean_obstacle_band_voxel_count": 0.0,
+                "mean_high_voxel_count": 0.0,
+                "cells": [],
+            },
             "edge_records": [],
             "known_free_connectivity": None,
             "continuous_but_ray_disconnected": False,
@@ -5945,6 +5999,7 @@ class SparseOccSemanticMemory:
                     "col": col,
                     "x": node.get("x"),
                     "y": node.get("y"),
+                    "camera_pitch_deg": float(node.get("camera_pitch_deg", 0.0) or 0.0),
                 }
             )
         if not raw_nodes:
@@ -5964,6 +6019,12 @@ class SparseOccSemanticMemory:
                     math.hypot(source_grid[0] - anchor[0], source_grid[1] - anchor[1])
                 ),
                 "route_raw_pose_count": int(len(raw_nodes)),
+                "route_pitch_observation_count": int(
+                    sum(abs(float(node.get("camera_pitch_deg", 0.0))) > 1e-4 for node in raw_nodes)
+                ),
+                "route_max_camera_pitch_deg": float(
+                    max((abs(float(node.get("camera_pitch_deg", 0.0))) for node in raw_nodes), default=0.0)
+                ),
             }
         )
 
@@ -6076,6 +6137,99 @@ class SparseOccSemanticMemory:
                 }
         for row, col in unique_cells:
             state_counts[self._cell_state(row, col)] += 1
+
+        # Keep the flattened 2D decision unchanged, but expose the 3D voxel
+        # heights behind each occupied route cell.  This diagnoses floor/height
+        # projection errors without changing connectivity or action selection.
+        height_cells = []
+        low_conflict = lower_conflict = body_conflict = 0
+        band_conflict = high_conflict = no_voxel = 0
+        low_counts = []
+        lower_counts = []
+        body_counts = []
+        band_counts = []
+        high_counts = []
+        route_occupied_cells = {
+            (int(row), int(col))
+            for row, col in unique_cells
+            if self._cell_state(row, col) == "occupied"
+        }
+        voxel_heights_by_cell: Dict[Tuple[int, int], List[Tuple[int, int]]] = defaultdict(list)
+        for (voxel_row, voxel_col, height), count in self.occ_counts.items():
+            cell = (int(voxel_row), int(voxel_col))
+            if cell in route_occupied_cells:
+                voxel_heights_by_cell[cell].append((int(height), int(count)))
+        for row, col in unique_cells:
+            if (int(row), int(col)) not in route_occupied_cells:
+                continue
+            per_height = voxel_heights_by_cell.get((int(row), int(col)), [])
+            low = sum(
+                count
+                for height, count in per_height
+                if float(height) * self.cs
+                <= float(self.config.obstacle_height_min)
+            )
+            lower = sum(
+                count
+                for height, count in per_height
+                if self._is_obstacle_height(height)
+                and float(height) * self.cs <= 0.35
+            )
+            body = sum(
+                count
+                for height, count in per_height
+                if self._is_obstacle_height(height)
+                and float(height) * self.cs > 0.35
+            )
+            band = lower + body
+            high = sum(
+                count
+                for height, count in per_height
+                if float(height) * self.cs
+                >= float(self.config.obstacle_height_max)
+            )
+            low_counts.append(low)
+            lower_counts.append(lower)
+            body_counts.append(body)
+            band_counts.append(band)
+            high_counts.append(high)
+            low_conflict += int(low > 0)
+            lower_conflict += int(lower > 0)
+            body_conflict += int(body > 0)
+            band_conflict += int(band > 0)
+            high_conflict += int(high > 0)
+            if not per_height:
+                no_voxel += 1
+            height_cells.append(
+                {
+                    "grid": [int(row), int(col)],
+                    "low_or_ground_voxel_count": int(low),
+                    "lower_obstacle_voxel_count": int(lower),
+                    "body_obstacle_voxel_count": int(body),
+                    "obstacle_band_voxel_count": int(band),
+                    "high_voxel_count": int(high),
+                    "voxel_heights": [
+                        {"height_index": int(height), "z_m": float(height * self.cs), "count": int(count)}
+                        for height, count in sorted(per_height)
+                    ],
+                }
+            )
+        occupied_route_cell_count = len(height_cells)
+        result_height_diagnostics = {
+            "occupied_route_cell_count": int(occupied_route_cell_count),
+            "low_or_ground_conflict_cell_count": int(low_conflict),
+            "lower_obstacle_conflict_cell_count": int(lower_conflict),
+            "body_obstacle_conflict_cell_count": int(body_conflict),
+            "obstacle_band_conflict_cell_count": int(band_conflict),
+            "high_conflict_cell_count": int(high_conflict),
+            "no_voxel_conflict_cell_count": int(no_voxel),
+            "mean_low_or_ground_voxel_count": float(sum(low_counts) / occupied_route_cell_count) if occupied_route_cell_count else 0.0,
+            "mean_lower_obstacle_voxel_count": float(sum(lower_counts) / occupied_route_cell_count) if occupied_route_cell_count else 0.0,
+            "mean_body_obstacle_voxel_count": float(sum(body_counts) / occupied_route_cell_count) if occupied_route_cell_count else 0.0,
+            "mean_obstacle_band_voxel_count": float(sum(band_counts) / occupied_route_cell_count) if occupied_route_cell_count else 0.0,
+            "mean_high_voxel_count": float(sum(high_counts) / occupied_route_cell_count) if occupied_route_cell_count else 0.0,
+            "cells": height_cells,
+        }
         denominator = max(1, len(unique_cells))
         connectivity = self._known_free_connectivity_audit(
             trigger_grid,
@@ -6111,6 +6265,7 @@ class SparseOccSemanticMemory:
                 "longest_unknown_gap_m": float(longest_unknown * self.cs),
                 "first_occupied_conflict": first_occupied,
                 "first_unknown_gap": first_unknown,
+                "route_occupied_height_diagnostics": result_height_diagnostics,
                 "edge_records": edge_records,
                 "known_free_connectivity": connectivity,
                 "continuous_but_ray_disconnected": bool(

@@ -7013,6 +7013,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         "episode_id": episode_id,
                         "episode_index": episode_index,
                         "episode_count": episode_count,
+                        # At loop entry, `action` is the previous Habitat
+                        # action. LOOKDOWN is applied twice per visual tilt,
+                        # so this observation is approximately 2*tilt below
+                        # horizon; normal observations are horizon-facing.
+                        "camera_pitch_deg": (
+                            2.0 * self._tilt_angle_deg
+                            if action == action_code.LOOKDOWN
+                            else 0.0
+                        ),
                     },
                 )
                 occ_memory_recovery_event = self._update_occ_memory_recovery_shadow(

@@ -1,6 +1,12 @@
 import copy
 
-from internnav.utils.sparse_occ_memory import SparseOccSemanticMemory
+import numpy as np
+
+from internnav.utils.sparse_occ_memory import (
+    SparseOccSemanticMemory,
+    _cam_to_base_for_pitch,
+    _default_cam_to_base_tf,
+)
 
 
 def _memory():
@@ -31,6 +37,16 @@ def _candidate(source_step=10):
         "grid": [32, 32],
         "semantic_resilience_source_step_id": source_step,
     }
+
+
+def test_pitch_transform_preserves_horizontal_projection_and_rotates_lookdown():
+    horizontal = _cam_to_base_for_pitch(1.5, 0.0)
+    assert np.allclose(horizontal, _default_cam_to_base_tf(1.5))
+
+    optical_forward = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+    pitched_point = _cam_to_base_for_pitch(1.5, 30.0) @ optical_forward
+    assert np.allclose(pitched_point[:2], [np.cos(np.deg2rad(30.0)), 0.0])
+    assert np.isclose(pitched_point[2], 1.0)
 
 
 def test_route_audit_collapses_rotation_poses_and_finds_known_free_path():
@@ -141,3 +157,23 @@ def test_route_audit_is_read_only():
     assert memory.free2d_counts == before["free2d_counts"]
     assert memory.occ2d_counts == before["occ2d_counts"]
     assert memory.visited2d_counts == before["visited2d_counts"]
+
+
+def test_route_audit_reports_3d_height_conflicts_without_changing_2d_state():
+    memory = _memory()
+    memory.pose_trace = [
+        _node(10, 32, 32, 0.0, 0.0),
+        _node(11, 32, 31, 0.0, 0.25),
+    ]
+    # The flattened route cell is occupied, but its only evidence is below
+    # the configured obstacle band. This must remain an occupied 2D audit
+    # state while being diagnosed as ground-level evidence.
+    memory.occ2d_counts[(32, 31)] = 1
+    memory.occ_counts[(32, 31, 0)] = 3
+    result = memory.audit_executed_route_to_candidate(_candidate(), current_step=11)
+    diagnostics = result["route_occupied_height_diagnostics"]
+    assert result["route_cell_state_counts"]["occupied"] == 1
+    assert diagnostics["occupied_route_cell_count"] == 1
+    assert diagnostics["low_or_ground_conflict_cell_count"] == 1
+    assert diagnostics["obstacle_band_conflict_cell_count"] == 0
+    assert diagnostics["cells"][0]["voxel_heights"][0]["z_m"] == 0.0
