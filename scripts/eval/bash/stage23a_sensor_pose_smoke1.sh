@@ -7,6 +7,7 @@ cd "${REPO_ROOT}"
 
 CHECKPOINT=${STAGE21C_SCORER_CHECKPOINT:?Set STAGE21C_SCORER_CHECKPOINT to seed_53/best.pt}
 MANIFEST=${STAGE23A_SENSOR_MANIFEST:-scripts/eval/manifests/stage23a_sensor_smoke1_episode_seed_replay.json}
+CONFIG=${STAGE23A_SENSOR_CONFIG:-scripts/eval/configs/habitat_dual_system_vlmap_stage23a_sensor_pose_occ_cfg.py}
 RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
 PIPELINE_TAG=${STAGE21_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
 CUDA_DEVICES=${STAGE21_CUDA_VISIBLE_DEVICES:-0,1,2}
@@ -53,12 +54,13 @@ STAGE21C_SCORER_CHECKPOINT="${CHECKPOINT}" STAGE21C_SCORER_DEVICE=cpu \
 STAGE23A_EVAL_PORT=${STAGE23A_EVAL_PORT:-2573} \
 NPROC_PER_NODE="${NPROC}" MASTER_PORT=${STAGE23A_MASTER_PORT:-2574} \
 bash scripts/eval/bash/stage21_torchrun_eval.sh \
-  --config scripts/eval/configs/habitat_dual_system_vlmap_stage23a_sensor_pose_occ_cfg.py
+  --config "${CONFIG}"
 
 FAILED_STAGE=sensor_pose_automatic_audit
 python3 scripts/eval/analyze_stage23a_sensor_pose_occ.py \
   --run-root "${RUN_ROOT}" --manifest "${MANIFEST}" \
-  --output "${RUN_ROOT}/stage23a_sensor_pose_occ_audit.json" --require-all
+  --output "${RUN_ROOT}/stage23a_sensor_pose_occ_audit.json" --require-all \
+  ${STAGE23A_ANALYZER_EXTRA_ARGS:-}
 
 FAILED_STAGE=return_packaging
 cp -a "${RUN_ROOT}/." "${WORK_DIR}/"

@@ -17,6 +17,7 @@ from typing import Any, Optional, Tuple
 
 import cv2
 import habitat
+import habitat_sim
 import imageio
 import numpy as np
 import quaternion
@@ -33,6 +34,7 @@ from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations.utils import images_to_video, observations_to_image
 from habitat_baselines.config.default import get_config as get_habitat_config
 from PIL import Image, ImageDraw
+from magnum import Vector3
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from internnav.configs.evaluator import EvalCfg
@@ -275,6 +277,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         )
         self._stage23a_initial_sim_position = None
         self._stage23a_initial_agent_matrix = None
+        self._stage23a_mesh_raycast_enabled = bool(
+            vlmap_safety_cfg.get("occ_memory_validation_mesh_raycast_enable", False)
+        )
+        self._stage23a_mesh_raycast_max_rays = max(
+            0,
+            int(
+                vlmap_safety_cfg.get(
+                    "occ_memory_validation_mesh_raycast_max_rays", 128
+                )
+            ),
+        )
+        self._stage23a_mesh_raycast_errors = []
+        self._stage23a_mesh_raycast_total = 0
+        self._stage23a_mesh_raycast_hits = 0
+        self._stage23a_mesh_raycast_misses = 0
+        self._stage23a_mesh_raycast_errors = []
         self.occ_memory_oracle_pose = None
         if self._stage23a_oracle_pose_enabled:
             oracle_cfg = copy.deepcopy(vlmap_safety_cfg)
@@ -1285,6 +1303,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "reason": "missing_observation_or_depth",
                 "path_reachable": False,
             }
+
         return self.occ_memory.plan_recovery_path_bridge(
             dict(event.get("candidate") or {}),
             {
@@ -1319,6 +1338,96 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 cfg.get("path_reobserve_lookahead_m", 0.75)
             ),
         )
+
+    def _stage23a_mesh_raycast_audit(
+        self, depth_m: np.ndarray, context: dict
+    ) -> None:
+        """Compare sampled GT-sensor RGB-D endpoints with Habitat mesh hits."""
+        if not self._stage23a_mesh_raycast_enabled:
+            return
+        sensor_position = context.get("stage23a_sensor_position")
+        sensor_rotation = context.get("stage23a_sensor_rotation_wxyz")
+        if sensor_position is None or sensor_rotation is None:
+            return
+        depth = np.asarray(depth_m, dtype=np.float32)
+        if depth.ndim != 2 or depth.size == 0:
+            return
+        intrinsic = np.asarray(self.occ_memory.camera_intrinsic, dtype=np.float32)
+        if intrinsic.shape != (3, 3):
+            return
+        valid = np.isfinite(depth) & (depth > 0.05) & (depth < 10.0)
+        rows, cols = np.where(valid)
+        if rows.size == 0:
+            return
+        max_rays = self._stage23a_mesh_raycast_max_rays
+        if max_rays > 0 and rows.size > max_rays:
+            ids = np.linspace(0, rows.size - 1, max_rays).astype(np.int64)
+            rows, cols = rows[ids], cols[ids]
+        try:
+            sensor_rot = quaternion.as_rotation_matrix(
+                quaternion.from_float_array(np.asarray(sensor_rotation, dtype=np.float64))
+            ).astype(np.float32)
+            sensor_pos = np.asarray(sensor_position, dtype=np.float32).reshape(3)
+            optical_to_habitat = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+            fx, fy = float(intrinsic[0, 0]), float(intrinsic[1, 1])
+            cx, cy = float(intrinsic[0, 2]), float(intrinsic[1, 2])
+            for row, col in zip(rows.tolist(), cols.tolist()):
+                z = float(depth[row, col])
+                cam_point = np.array(
+                    [
+                        (float(col) - cx) * z / fx,
+                        (float(row) - cy) * z / fy,
+                        z,
+                    ],
+                    dtype=np.float32,
+                )
+                direction = sensor_rot @ (optical_to_habitat @ cam_point)
+                norm = float(np.linalg.norm(direction))
+                if not np.isfinite(norm) or norm <= 1e-6:
+                    continue
+                ray = habitat_sim.geo.Ray(
+                    Vector3(*sensor_pos.tolist()),
+                    Vector3(*(direction / norm).tolist()),
+                )
+                self._stage23a_mesh_raycast_total += 1
+                result = self.env._env.sim.cast_ray(ray, max_distance=10.0)
+                if not bool(getattr(result, "has_hits", False)):
+                    self._stage23a_mesh_raycast_misses += 1
+                    continue
+                hits = getattr(result, "hits", None) or []
+                if not hits:
+                    self._stage23a_mesh_raycast_misses += 1
+                    continue
+                hit_pos = np.asarray(hits[0].hit_pos, dtype=np.float32).reshape(3)
+                expected = sensor_pos + sensor_rot @ (
+                    optical_to_habitat @ cam_point
+                )
+                error = float(np.linalg.norm(hit_pos - expected))
+                if np.isfinite(error):
+                    self._stage23a_mesh_raycast_errors.append(error)
+                    self._stage23a_mesh_raycast_hits += 1
+        except Exception as exc:
+            print(f"[Stage23A][mesh_raycast] disabled for frame: {type(exc).__name__}: {exc}")
+
+    def _stage23a_mesh_raycast_summary(self) -> dict:
+        values = np.asarray(self._stage23a_mesh_raycast_errors, dtype=np.float64)
+        values = values[np.isfinite(values)]
+        return {
+            "enabled": bool(self._stage23a_mesh_raycast_enabled),
+            "total_rays": int(self._stage23a_mesh_raycast_total),
+            "hit_count": int(self._stage23a_mesh_raycast_hits),
+            "miss_count": int(self._stage23a_mesh_raycast_misses),
+            "hit_rate": (
+                float(self._stage23a_mesh_raycast_hits / self._stage23a_mesh_raycast_total)
+                if self._stage23a_mesh_raycast_total
+                else None
+            ),
+            "endpoint_error_count": int(values.size),
+            "endpoint_error_mean_m": float(np.mean(values)) if values.size else None,
+            "endpoint_error_median_m": float(np.median(values)) if values.size else None,
+            "endpoint_error_p95_m": float(np.percentile(values, 95)) if values.size else None,
+            "endpoint_error_max_m": float(np.max(values)) if values.size else None,
+        }
 
     def _plan_s2_loop_path_reobserve_active(
         self,
@@ -7041,6 +7150,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
             self._stage23a_initial_sim_position = None
             self._stage23a_initial_agent_matrix = None
+            self._stage23a_mesh_raycast_errors = []
+            self._stage23a_mesh_raycast_total = 0
+            self._stage23a_mesh_raycast_hits = 0
+            self._stage23a_mesh_raycast_misses = 0
             self._stage23a_sim_pose_context(initialize=True)
             print("episode start", episode_instruction)
             self.vlmap_safety.reset()
@@ -7300,6 +7413,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     ),
                     **self._stage23a_sim_pose_context(),
                 }
+                self._stage23a_mesh_raycast_audit(
+                    current_depth_m, occ_memory_context
+                )
                 occ_memory_update_event = self.occ_memory.update_observation(
                     occ_memory_obs,
                     current_depth_m,
@@ -10538,6 +10654,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         "validation_gt_relative_height_range_m"
                     )
                 ),
+                "stage23a_mesh_raycast": self._stage23a_mesh_raycast_summary(),
             }
             result.update(safety_summary)
             result["s2_recovery_context_enabled"] = bool(

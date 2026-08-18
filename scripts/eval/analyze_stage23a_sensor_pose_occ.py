@@ -41,7 +41,14 @@ def _find_comparison(run_root, key, comparison_dir):
     return None
 
 
-def analyze(run_root, manifest, output, require_all, require_height_ablation):
+def analyze(
+    run_root,
+    manifest,
+    output,
+    require_all,
+    require_height_ablation,
+    require_mesh_raycast,
+):
     expected = _load_manifest(manifest)
     progress = _load_unique(run_root.glob("vlmap_safety_debug/*run_*/progress.json"))
     current = _load_unique(
@@ -105,6 +112,12 @@ def analyze(run_root, manifest, output, require_all, require_height_ablation):
         )
         if require_height_ablation and height_comparison is None:
             errors.append(f"missing_height_comparison:{key}")
+        mesh_raycast = p.get("stage23a_mesh_raycast") or {}
+        if require_mesh_raycast and (
+            not mesh_raycast.get("enabled")
+            or int(mesh_raycast.get("total_rays", 0) or 0) <= 0
+        ):
+            errors.append(f"missing_mesh_raycast:{key}")
         endpoint = c.get("validation_endpoint_gt_error_stats") or {}
         if not endpoint.get("count"):
             errors.append(f"missing_endpoint_gt_stats:{key}")
@@ -130,6 +143,7 @@ def analyze(run_root, manifest, output, require_all, require_height_ablation):
                 "comparison": comparison,
                 "current_to_oracle_height_comparison": height_comparison,
                 "shadow_action_violation_count": violations,
+                "mesh_raycast": mesh_raycast,
             }
         )
     report = {
@@ -145,6 +159,7 @@ def analyze(run_root, manifest, output, require_all, require_height_ablation):
             int(row["shadow_action_violation_count"]) for row in episodes
         ),
         "height_ablation_required": bool(require_height_ablation),
+        "mesh_raycast_required": bool(require_mesh_raycast),
         "episodes": episodes,
         "errors": errors,
     }
@@ -162,6 +177,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
     parser.add_argument("--require-height-ablation", action="store_true")
+    parser.add_argument("--require-mesh-raycast", action="store_true")
     args = parser.parse_args()
     analyze(
         args.run_root,
@@ -169,6 +185,7 @@ def main():
         args.output,
         args.require_all,
         args.require_height_ablation,
+        args.require_mesh_raycast,
     )
 
 
