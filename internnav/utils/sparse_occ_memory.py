@@ -237,7 +237,7 @@ def _cam_to_base_for_pitch(camera_height: float, pitch_down_deg: float) -> np.nd
     tf = np.eye(4, dtype=np.float32)
     tf[:3, :3] = np.array(
         [
-            [0.0, s, c],
+            [0.0, -s, c],
             [-1.0, 0.0, 0.0],
             [0.0, -c, -s],
         ],
@@ -4922,9 +4922,11 @@ class SparseOccSemanticMemory:
         xy_error = float(np.linalg.norm(delta[:2]))
         z_error = float(abs(delta[2]))
         yaw = float(math.atan2(float(pose_tf[1, 0]), float(pose_tf[0, 0])))
-        gt_yaw = float(
-            math.atan2(float(gt_pose_tf[1, 0]), float(gt_pose_tf[0, 0]))
-        )
+        # The Habitat agent's local forward axis is -Z, whereas the
+        # internal pose matrix uses +X as forward.  Taking the XY yaw from
+        # matrix column 0 would report a spurious fixed 90-degree offset.
+        gt_forward = -np.asarray(gt_pose_tf[:3, 2], dtype=np.float64)
+        gt_yaw = float(math.atan2(float(gt_forward[1]), float(gt_forward[0])))
         yaw_error = abs((yaw - gt_yaw + math.pi) % (2.0 * math.pi) - math.pi)
         yaw_error_deg = float(math.degrees(yaw_error))
         self.validation_pose_xy_errors.append(xy_error)
