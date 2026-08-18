@@ -117,6 +117,7 @@ def analyze(
             )
 
     raw_loop_mismatches = []
+    dynamic_failure_type_transitions = Counter()
     if set(current_loops) != set(baseline_loops):
         raw_loop_mismatches.append(
             {
@@ -130,9 +131,13 @@ def analyze(
         baseline = baseline_loops[key]
         fields = {
             name: {"stage22a": baseline.get(name), "stage22c": current.get(name)}
-            for name in ("start_step", "turn_direction", "failure_type")
+            for name in ("start_step", "turn_direction")
             if baseline.get(name) != current.get(name)
         }
+        if baseline.get("failure_type") != current.get("failure_type"):
+            dynamic_failure_type_transitions[
+                f"{baseline.get('failure_type')}->{current.get('failure_type')}"
+            ] += 1
         if fields:
             raw_loop_mismatches.append(
                 {"scene_episode": key[0], "step_id": key[1], "fields": fields}
@@ -301,6 +306,8 @@ def analyze(
                 "candidate_identity_changed": changed,
                 "stage22a_triage_tier": baseline.get("triage_tier"),
                 "stage22c_triage_tier": current.get("triage_tier"),
+                "stage22a_failure_type": baseline.get("failure_type"),
+                "stage22c_failure_type": current.get("failure_type"),
             }
         )
 
@@ -369,6 +376,9 @@ def analyze(
         ),
         "candidate_identity_changed_count": candidate_identity_changed,
         "triage_transition_counts": dict(triage_transitions),
+        "dynamic_failure_type_transition_counts": dict(
+            dynamic_failure_type_transitions
+        ),
         "integrity_passed": integrity_passed,
         "measurement_complete": integrity_passed,
         "violations": {
@@ -404,7 +414,8 @@ def analyze(
         "interpretation_guard": (
             "Only fixed-route OCC deltas measure pitch projection quality. "
             "Dynamic candidate and triage changes are reported separately and "
-            "do not fail integrity when the Frozen trajectory is unchanged."
+            "do not fail integrity when the Frozen trajectory is unchanged. "
+            "failure_type is also a dynamic OCC-derived diagnostic."
         ),
     }
 

@@ -75,6 +75,7 @@ def test_fixed_route_analysis_allows_candidate_and_triage_changes(tmp_path):
     }
     current_loop = {
         **baseline_loop,
+        "failure_type": "s2_turn_loop_semantic",
         "triage_tier": "adapter_candidate",
         "candidate": {
             "candidate_id": "B",
@@ -181,6 +182,9 @@ def test_fixed_route_analysis_allows_candidate_and_triage_changes(tmp_path):
     assert summary["occupied_ratio_delta_mean"] == -0.25
     assert summary["ray_reachability_gain_count"] == 1
     assert summary["candidate_identity_changed_count"] == 1
+    assert summary["dynamic_failure_type_transition_counts"] == {
+        "local_trap->s2_turn_loop_semantic": 1
+    }
     assert summary["triage_transition_counts"] == {
         "strict_intervention->adapter_candidate": 1
     }
