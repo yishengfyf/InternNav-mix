@@ -10425,6 +10425,36 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                 )
             occ_memory_oracle_sensor_summary = {}
+            stage23a_pose_comparison = {}
+            stage23a_pose_comparison_path = None
+            if self.occ_memory_oracle_pose is not None:
+                stage23a_pose_comparison = (
+                    self.occ_memory.validation_compare_to_reference(
+                        self.occ_memory_oracle_pose,
+                        tolerance_cells=1,
+                    )
+                )
+                comparison_root = self._get_vlmap_run_dir()
+                if comparison_root:
+                    comparison_root = os.path.join(
+                        comparison_root, "stage23a_pose_occ_comparison"
+                    )
+                    os.makedirs(comparison_root, exist_ok=True)
+                    stage23a_pose_comparison_path = os.path.join(
+                        comparison_root,
+                        f"{scene_id}_{episode_id}_comparison.json",
+                    )
+                    with open(
+                        stage23a_pose_comparison_path,
+                        "w",
+                        encoding="utf-8",
+                    ) as comparison_file:
+                        json.dump(
+                            stage23a_pose_comparison,
+                            comparison_file,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
             stage23a_sensor_comparison = {}
             stage23a_sensor_comparison_path = None
             if self.occ_memory_oracle_sensor_pose is not None:
@@ -10499,6 +10529,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     stage23a_sensor_comparison_path
                 ),
                 "stage23a_sensor_occ_comparison": stage23a_sensor_comparison,
+                "stage23a_pose_occ_comparison_path": (
+                    stage23a_pose_comparison_path
+                ),
+                "stage23a_pose_occ_comparison": stage23a_pose_comparison,
                 "stage23a_gt_relative_height_range_m": (
                     occ_memory_oracle_pose_summary.get(
                         "validation_gt_relative_height_range_m"

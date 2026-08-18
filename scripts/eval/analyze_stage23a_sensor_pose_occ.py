@@ -32,16 +32,16 @@ def _load_manifest(path):
     return {_key(row): row for row in json.loads(path.read_text(encoding="utf-8"))}
 
 
-def _find_comparison(run_root, key):
+def _find_comparison(run_root, key, comparison_dir):
     for path in run_root.glob(
-        "vlmap_safety_debug/*run_*/stage23a_sensor_occ_comparison/*.json"
+        f"vlmap_safety_debug/*run_*/{comparison_dir}/*.json"
     ):
         if path.stem == f"{key[0]}_{key[1]}_comparison":
             return json.loads(path.read_text(encoding="utf-8"))
     return None
 
 
-def analyze(run_root, manifest, output, require_all):
+def analyze(run_root, manifest, output, require_all, require_height_ablation):
     expected = _load_manifest(manifest)
     progress = _load_unique(run_root.glob("vlmap_safety_debug/*run_*/progress.json"))
     current = _load_unique(
@@ -51,6 +51,12 @@ def analyze(run_root, manifest, output, require_all):
     oracle = _load_unique(
         run_root.glob(
             "vlmap_safety_debug/*run_*/stage23a_oracle_sensor_pose/occ_memory/memory_episode_summary.jsonl"
+        ),
+        "occ_memory_episode_summary",
+    )
+    oracle_height = _load_unique(
+        run_root.glob(
+            "vlmap_safety_debug/*run_*/stage23a_oracle_pose/occ_memory/memory_episode_summary.jsonl"
         ),
         "occ_memory_episode_summary",
     )
@@ -70,10 +76,18 @@ def analyze(run_root, manifest, output, require_all):
         if p is None or c is None or o is None:
             errors.append(f"missing_rows:{key}")
             continue
+        h = oracle_height.get(key)
+        if require_height_ablation and h is None:
+            errors.append(f"missing_oracle_height_row:{key}")
+            continue
         if int(p.get("episode_eval_seed", -1)) != int(manifest_row["episode_eval_seed"]):
             errors.append(f"seed_mismatch:{key}")
         if int(c.get("update_count", -1)) != int(o.get("update_count", -2)):
             errors.append(f"branch_update_mismatch:{key}")
+        if require_height_ablation and int(c.get("update_count", -1)) != int(
+            h.get("update_count", -2)
+        ):
+            errors.append(f"height_branch_update_mismatch:{key}")
         if not p.get("stage23a_oracle_sensor_pose_audit_enabled"):
             errors.append(f"sensor_branch_disabled:{key}")
         if p.get("stage23a_gt_fields_used_for_navigation"):
@@ -81,9 +95,16 @@ def analyze(run_root, manifest, output, require_all):
         violations = sum(int(p.get(name, 0) or 0) for name in action_fields)
         if violations:
             errors.append(f"shadow_action_violation:{key}:{violations}")
-        comparison = _find_comparison(run_root, key)
+        comparison = _find_comparison(
+            run_root, key, "stage23a_sensor_occ_comparison"
+        )
         if comparison is None:
             errors.append(f"missing_sensor_comparison:{key}")
+        height_comparison = _find_comparison(
+            run_root, key, "stage23a_pose_occ_comparison"
+        )
+        if require_height_ablation and height_comparison is None:
+            errors.append(f"missing_height_comparison:{key}")
         endpoint = c.get("validation_endpoint_gt_error_stats") or {}
         if not endpoint.get("count"):
             errors.append(f"missing_endpoint_gt_stats:{key}")
@@ -97,6 +118,9 @@ def analyze(run_root, manifest, output, require_all):
                 "success": p.get("success"),
                 "current_update_count": c.get("update_count"),
                 "oracle_sensor_update_count": o.get("update_count"),
+                "oracle_height_update_count": (
+                    h.get("update_count") if h is not None else None
+                ),
                 "pose_xy_error_stats": c.get("validation_pose_gt_xy_error_stats"),
                 "pose_z_error_stats": c.get("validation_pose_gt_z_error_stats"),
                 "pose_yaw_error_stats": c.get("validation_pose_gt_yaw_error_deg_stats"),
@@ -104,6 +128,7 @@ def analyze(run_root, manifest, output, require_all):
                 "endpoint_error_groups": c.get("validation_endpoint_gt_error_groups"),
                 "endpoint_mapped_ratio": c.get("validation_endpoint_mapped_ratio"),
                 "comparison": comparison,
+                "current_to_oracle_height_comparison": height_comparison,
                 "shadow_action_violation_count": violations,
             }
         )
@@ -119,6 +144,7 @@ def analyze(run_root, manifest, output, require_all):
         "shadow_action_violation_count": sum(
             int(row["shadow_action_violation_count"]) for row in episodes
         ),
+        "height_ablation_required": bool(require_height_ablation),
         "episodes": episodes,
         "errors": errors,
     }
@@ -135,8 +161,15 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
+    parser.add_argument("--require-height-ablation", action="store_true")
     args = parser.parse_args()
-    analyze(args.run_root, args.manifest, args.output, args.require_all)
+    analyze(
+        args.run_root,
+        args.manifest,
+        args.output,
+        args.require_all,
+        args.require_height_ablation,
+    )
 
 
 if __name__ == "__main__":
