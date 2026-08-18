@@ -268,7 +268,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._stage23a_oracle_pose_enabled = bool(
             vlmap_safety_cfg.get("occ_memory_validation_oracle_pose_enable", False)
         )
+        self._stage23a_oracle_sensor_pose_enabled = bool(
+            vlmap_safety_cfg.get(
+                "occ_memory_validation_oracle_sensor_pose_enable", False
+            )
+        )
         self._stage23a_initial_sim_position = None
+        self._stage23a_initial_agent_matrix = None
         self.occ_memory_oracle_pose = None
         if self._stage23a_oracle_pose_enabled:
             oracle_cfg = copy.deepcopy(vlmap_safety_cfg)
@@ -288,6 +294,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     oracle_debug_dir, "stage23a_oracle_pose"
                 )
             self.occ_memory_oracle_pose.set_debug_dir(oracle_debug_dir)
+        self.occ_memory_oracle_sensor_pose = None
+        if self._stage23a_oracle_sensor_pose_enabled:
+            oracle_cfg = copy.deepcopy(vlmap_safety_cfg)
+            oracle_cfg["occ_memory_validation_camera_pose_from_context"] = True
+            oracle_cfg["occ_memory_validation_pose_from_context"] = True
+            oracle_cfg["occ_memory_stage21_multitask_shadow_enable"] = False
+            oracle_cfg["occ_memory_progress_ranker_shadow_enable"] = False
+            oracle_cfg["occ_memory_candidate_probe_enable"] = False
+            oracle_cfg["occ_memory_save_bev"] = False
+            oracle_cfg["occ_memory_candidate_probe_save_bev"] = False
+            self.occ_memory_oracle_sensor_pose = SparseOccSemanticMemory(
+                oracle_cfg,
+                get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
+            )
+            oracle_debug_dir = self._get_vlmap_run_dir()
+            if oracle_debug_dir:
+                oracle_debug_dir = os.path.join(
+                    oracle_debug_dir, "stage23a_oracle_sensor_pose"
+                )
+            self.occ_memory_oracle_sensor_pose.set_debug_dir(oracle_debug_dir)
 
     def eval_action(self):
         """
@@ -346,19 +372,84 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         try:
             state = self.env._env.sim.get_agent_state()
             position = np.asarray(state.position, dtype=np.float32).reshape(3)
+            agent_rotation = quaternion.as_rotation_matrix(state.rotation).astype(
+                np.float32
+            )
+            agent_matrix = np.eye(4, dtype=np.float32)
+            agent_matrix[:3, :3] = agent_rotation
+            agent_matrix[:3, 3] = position
             if initialize or self._stage23a_initial_sim_position is None:
                 self._stage23a_initial_sim_position = position.copy()
+            if initialize or self._stage23a_initial_agent_matrix is None:
+                self._stage23a_initial_agent_matrix = agent_matrix.copy()
             initial = np.asarray(
                 self._stage23a_initial_sim_position, dtype=np.float32
             ).reshape(3)
             rotation = quaternion.as_float_array(state.rotation).astype(np.float32)
-            return {
+            context = {
                 "stage23a_gt_relative_height_m": float(position[1] - initial[1]),
                 "stage23a_sim_position": position.tolist(),
                 "stage23a_initial_sim_position": initial.tolist(),
                 "stage23a_sim_rotation_wxyz": rotation.tolist(),
                 "stage23a_gt_only": True,
             }
+            if self._stage23a_oracle_sensor_pose_enabled:
+                sensor_states = getattr(state, "sensor_states", {}) or {}
+                sensor_key = None
+                for candidate in ("depth", "depth_sensor", "rgb", "rgb_sensor"):
+                    if candidate in sensor_states:
+                        sensor_key = candidate
+                        break
+                if sensor_key is None and sensor_states:
+                    sensor_key = next(iter(sensor_states))
+                sensor_state = sensor_states.get(sensor_key) if sensor_key else None
+                if sensor_state is None:
+                    raise RuntimeError("Habitat agent state has no sensor state")
+                sensor_position = np.asarray(
+                    sensor_state.position, dtype=np.float32
+                ).reshape(3)
+                sensor_rotation = quaternion.as_rotation_matrix(
+                    sensor_state.rotation
+                ).astype(np.float32)
+                sensor_matrix = np.eye(4, dtype=np.float32)
+                sensor_matrix[:3, :3] = sensor_rotation
+                sensor_matrix[:3, 3] = sensor_position
+                initial_agent_inverse = np.linalg.inv(
+                    np.asarray(self._stage23a_initial_agent_matrix, dtype=np.float32)
+                )
+                # Habitat local axes: +X right, +Y up, -Z forward.
+                # Internal map axes: +X forward, +Y left, +Z up.
+                habitat_to_map = np.array(
+                    [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    dtype=np.float32,
+                )
+                optical_to_habitat_sensor = np.diag(
+                    [1.0, -1.0, -1.0, 1.0]
+                ).astype(np.float32)
+                habitat_to_map_tf = np.eye(4, dtype=np.float32)
+                habitat_to_map_tf[:3, :3] = habitat_to_map
+                context.update(
+                    {
+                        "stage23_gt_base_pose_map": (
+                            habitat_to_map_tf
+                            @ initial_agent_inverse
+                            @ agent_matrix
+                        ).tolist(),
+                        "stage23_gt_camera_pose_map": (
+                            habitat_to_map_tf
+                            @ initial_agent_inverse
+                            @ sensor_matrix
+                            @ optical_to_habitat_sensor
+                        ).tolist(),
+                        "stage23a_sensor_state_key": sensor_key,
+                        "stage23a_sensor_position": sensor_position.tolist(),
+                        "stage23a_sensor_rotation_wxyz": quaternion.as_float_array(
+                            sensor_state.rotation
+                        ).astype(np.float32).tolist(),
+                        "stage23a_gt_sensor_pose_only": True,
+                    }
+                )
+            return context
         except Exception as exc:
             return {
                 "stage23a_gt_pose_error": f"{type(exc).__name__}: {exc}",
@@ -6946,6 +7037,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 episode_index, episode_id, scene_id
             )
             self._stage23a_initial_sim_position = None
+            self._stage23a_initial_agent_matrix = None
             self._stage23a_sim_pose_context(initialize=True)
             print("episode start", episode_instruction)
             self.vlmap_safety.reset()
@@ -6966,6 +7058,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
             if self.occ_memory_oracle_pose is not None:
                 self.occ_memory_oracle_pose.reset_episode(
+                    instruction=episode_instruction,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    episode_index=episode_index,
+                    episode_count=episode_count,
+                )
+            if self.occ_memory_oracle_sensor_pose is not None:
+                self.occ_memory_oracle_sensor_pose.reset_episode(
                     instruction=episode_instruction,
                     scene_id=scene_id,
                     episode_id=episode_id,
@@ -7212,6 +7312,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             **occ_memory_context,
                             "stage23a_map_branch": "oracle_relative_height",
                             "gt_fields_used": ["habitat_sim_agent_position_y"],
+                        },
+                    )
+                if self.occ_memory_oracle_sensor_pose is not None:
+                    self.occ_memory_oracle_sensor_pose.update_observation(
+                        occ_memory_obs,
+                        current_depth_m,
+                        rgb=rgb,
+                        context={
+                            **occ_memory_context,
+                            "stage23a_map_branch": "oracle_sensor_pose",
+                            "gt_fields_used": [
+                                "habitat_sensor_state_position",
+                                "habitat_sensor_state_rotation",
+                            ],
                         },
                     )
                 occ_memory_recovery_event = self._update_occ_memory_recovery_shadow(
@@ -10307,6 +10421,42 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         metrics=metrics, steps=step_id
                     )
                 )
+            occ_memory_oracle_sensor_summary = {}
+            stage23a_sensor_comparison = {}
+            stage23a_sensor_comparison_path = None
+            if self.occ_memory_oracle_sensor_pose is not None:
+                occ_memory_oracle_sensor_summary = (
+                    self.occ_memory_oracle_sensor_pose.finish_episode(
+                        metrics=metrics, steps=step_id
+                    )
+                )
+                stage23a_sensor_comparison = (
+                    self.occ_memory.validation_compare_to_reference(
+                        self.occ_memory_oracle_sensor_pose,
+                        tolerance_cells=1,
+                    )
+                )
+                comparison_root = self._get_vlmap_run_dir()
+                if comparison_root:
+                    comparison_root = os.path.join(
+                        comparison_root, "stage23a_sensor_occ_comparison"
+                    )
+                    os.makedirs(comparison_root, exist_ok=True)
+                    stage23a_sensor_comparison_path = os.path.join(
+                        comparison_root,
+                        f"{scene_id}_{episode_id}_comparison.json",
+                    )
+                    with open(
+                        stage23a_sensor_comparison_path,
+                        "w",
+                        encoding="utf-8",
+                    ) as comparison_file:
+                        json.dump(
+                            stage23a_sensor_comparison,
+                            comparison_file,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
             occ_memory_recovery_summary = self._summarize_occ_memory_recovery_state(
                 occ_memory_recovery_state
             )
@@ -10336,6 +10486,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "stage23a_oracle_pose_update_count": int(
                     occ_memory_oracle_pose_summary.get("update_count", 0) or 0
                 ),
+                "stage23a_oracle_sensor_pose_audit_enabled": bool(
+                    self.occ_memory_oracle_sensor_pose is not None
+                ),
+                "stage23a_oracle_sensor_pose_update_count": int(
+                    occ_memory_oracle_sensor_summary.get("update_count", 0) or 0
+                ),
+                "stage23a_sensor_occ_comparison_path": (
+                    stage23a_sensor_comparison_path
+                ),
+                "stage23a_sensor_occ_comparison": stage23a_sensor_comparison,
                 "stage23a_gt_relative_height_range_m": (
                     occ_memory_oracle_pose_summary.get(
                         "validation_gt_relative_height_range_m"

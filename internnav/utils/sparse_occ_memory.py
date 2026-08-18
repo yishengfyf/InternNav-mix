@@ -439,6 +439,7 @@ class SparseOccMemoryConfig:
     validation_max_accumulated_surface_points: int = 200000
     validation_projection_size: int = 768
     validation_pose_from_context: bool = False
+    validation_camera_pose_from_context: bool = False
     verbose: bool = False
 
 
@@ -585,6 +586,14 @@ class SparseOccSemanticMemory:
         self.validation_endpoint_outside_xy_count = 0
         self.validation_endpoint_negative_z_count = 0
         self.validation_endpoint_negative_z_mapped_count = 0
+        self.validation_pose_xy_errors: List[float] = []
+        self.validation_pose_z_errors: List[float] = []
+        self.validation_pose_yaw_errors_deg: List[float] = []
+        self.validation_endpoint_gt_errors: List[float] = []
+        self.validation_endpoint_gt_abs_x_errors: List[float] = []
+        self.validation_endpoint_gt_abs_y_errors: List[float] = []
+        self.validation_endpoint_gt_abs_z_errors: List[float] = []
+        self.validation_endpoint_gt_error_groups: Dict[str, List[float]] = defaultdict(list)
         self.last_semantic_decision: Dict[str, Any] = {}
         self.last_stagnation_step: Optional[int] = None
         event = {
@@ -619,31 +628,53 @@ class SparseOccSemanticMemory:
             event["reason"] = "missing_intrinsic"
             self._write_event(event)
             return event
-        pose_tf = self._pose_from_obs(obs, context=context)
-        if pose_tf is None:
-            event["reason"] = "missing_pose"
-            self._write_event(event)
-            return event
+        direct_base_tf = self._validation_context_matrix(
+            context, "stage23_gt_base_pose_map"
+        )
+        direct_cam_tf = self._validation_context_matrix(
+            context, "stage23_gt_camera_pose_map"
+        )
+        if bool(self.config.validation_camera_pose_from_context):
+            if direct_base_tf is None or direct_cam_tf is None:
+                event["reason"] = "missing_gt_camera_pose"
+                self._write_event(event)
+                return event
+            pose_tf = direct_base_tf
+        else:
+            pose_tf = self._pose_from_obs(obs, context=context)
+            if pose_tf is None:
+                event["reason"] = "missing_pose"
+                self._write_event(event)
+                return event
         self.observation_count += 1
         if self.observation_count % max(1, int(self.config.update_every_steps)) != 0:
             event["reason"] = "update_stride"
             self._write_event(event)
             return event
 
-        if self.init_base_tf is None:
+        if self.init_base_tf is None and not bool(
+            self.config.validation_camera_pose_from_context
+        ):
             self.init_base_tf = pose_tf.copy()
             self.inv_init_base_tf = np.linalg.inv(self.init_base_tf)
-        rel_base_tf = self._relative_base_tf(pose_tf)
+        rel_base_tf = (
+            pose_tf.copy()
+            if bool(self.config.validation_camera_pose_from_context)
+            else self._relative_base_tf(pose_tf)
+        )
         requested_camera_pitch_deg = float(context.get("camera_pitch_deg", 0.0) or 0.0)
         applied_camera_pitch_deg = (
             requested_camera_pitch_deg
             if bool(self.config.camera_pitch_aware_update)
             else 0.0
         )
-        cam_to_base_tf = _cam_to_base_for_pitch(
-            float(self.config.camera_height), applied_camera_pitch_deg
-        )
-        cam_pose_tf = rel_base_tf @ cam_to_base_tf
+        if bool(self.config.validation_camera_pose_from_context):
+            cam_pose_tf = direct_cam_tf
+        else:
+            cam_to_base_tf = _cam_to_base_for_pitch(
+                float(self.config.camera_height), applied_camera_pitch_deg
+            )
+            cam_pose_tf = rel_base_tf @ cam_to_base_tf
         pose_row, pose_col, pose_yaw = self._pose_to_grid(rel_base_tf)
         self.last_pose_grid = (int(pose_row), int(pose_col))
         self.visited2d_counts[(int(pose_row), int(pose_col))] += 1
@@ -674,6 +705,9 @@ class SparseOccSemanticMemory:
             self.validation_pose_height_values.append(pose_height)
             self.validation_gt_height_values.append(gt_height)
             self.validation_height_abs_errors.append(abs(pose_height - gt_height))
+        pose_gt_event = self._record_validation_pose_gt_error(
+            rel_base_tf, direct_base_tf
+        )
         self._maybe_add_keyframe(context, rel_base_tf, pose_row, pose_col, pose_yaw)
 
         cam_points, point_ids = _depth_to_points(
@@ -705,6 +739,13 @@ class SparseOccSemanticMemory:
             axis=1,
         )
         world_points = (cam_pose_tf @ cam_points_h.T).T[:, :3]
+        endpoint_gt_event = self._record_validation_endpoint_gt_error(
+            world_points,
+            cam_points,
+            cam_points_h,
+            direct_cam_tf,
+            requested_camera_pitch_deg,
+        )
         if self.config.validation_enable and self.config.validation_accumulate_rgb_surface:
             surface_colors = self._rgb_colors_for_point_ids(
                 rgb, point_ids, self._depth_shape(depth)
@@ -800,6 +841,8 @@ class SparseOccSemanticMemory:
                 "validation_endpoint_rejection_counts": dict(
                     validation_endpoint_rejection_counts
                 ),
+                **pose_gt_event,
+                **endpoint_gt_event,
             }
         )
         self._write_event(event)
@@ -4757,9 +4800,13 @@ class SparseOccSemanticMemory:
             "validation_snapshot_count": int(self.saved_validation_count),
             "validation_final_snapshot_count": int(self.saved_validation_final_count),
             "validation_pose_source": (
-                "context_oracle_height"
-                if bool(self.config.validation_pose_from_context)
-                else "gps_compass_2d"
+                "context_oracle_sensor_6dof"
+                if bool(self.config.validation_camera_pose_from_context)
+                else (
+                    "context_oracle_height"
+                    if bool(self.config.validation_pose_from_context)
+                    else "gps_compass_2d"
+                )
             ),
             "validation_accumulated_rgb_surface_point_count": int(
                 self.validation_surface_point_count
@@ -4829,6 +4876,107 @@ class SparseOccSemanticMemory:
         pos = np.array([float(gps[0]), -float(gps[1]), height], dtype=np.float32)
         return _yaw_to_tf(pos, yaw)
 
+    @staticmethod
+    def _validation_context_matrix(
+        context: Dict[str, Any], key: str
+    ) -> Optional[np.ndarray]:
+        value = context.get(key)
+        if value is None:
+            return None
+        try:
+            matrix = np.asarray(value, dtype=np.float32).reshape(4, 4)
+        except (TypeError, ValueError):
+            return None
+        if not np.all(np.isfinite(matrix)):
+            return None
+        return matrix
+
+    @staticmethod
+    def _distribution_stats(values: Iterable[Any]) -> Dict[str, Any]:
+        cleaned = np.asarray(list(values), dtype=np.float64).reshape(-1)
+        cleaned = cleaned[np.isfinite(cleaned)]
+        if cleaned.size == 0:
+            return {
+                "count": 0,
+                "mean": None,
+                "median": None,
+                "p95": None,
+                "max": None,
+            }
+        return {
+            "count": int(cleaned.size),
+            "mean": float(np.mean(cleaned)),
+            "median": float(np.median(cleaned)),
+            "p95": float(np.percentile(cleaned, 95)),
+            "max": float(np.max(cleaned)),
+        }
+
+    def _record_validation_pose_gt_error(
+        self,
+        pose_tf: np.ndarray,
+        gt_pose_tf: Optional[np.ndarray],
+    ) -> Dict[str, Any]:
+        if not self.config.validation_enable or gt_pose_tf is None:
+            return {}
+        delta = np.asarray(pose_tf[:3, 3] - gt_pose_tf[:3, 3], dtype=np.float64)
+        xy_error = float(np.linalg.norm(delta[:2]))
+        z_error = float(abs(delta[2]))
+        yaw = float(math.atan2(float(pose_tf[1, 0]), float(pose_tf[0, 0])))
+        gt_yaw = float(
+            math.atan2(float(gt_pose_tf[1, 0]), float(gt_pose_tf[0, 0]))
+        )
+        yaw_error = abs((yaw - gt_yaw + math.pi) % (2.0 * math.pi) - math.pi)
+        yaw_error_deg = float(math.degrees(yaw_error))
+        self.validation_pose_xy_errors.append(xy_error)
+        self.validation_pose_z_errors.append(z_error)
+        self.validation_pose_yaw_errors_deg.append(yaw_error_deg)
+        return {
+            "validation_pose_gt_xy_error_m": xy_error,
+            "validation_pose_gt_z_error_m": z_error,
+            "validation_pose_gt_yaw_error_deg": yaw_error_deg,
+        }
+
+    def _record_validation_endpoint_gt_error(
+        self,
+        world_points: np.ndarray,
+        cam_points: np.ndarray,
+        cam_points_h: np.ndarray,
+        gt_cam_pose_tf: Optional[np.ndarray],
+        camera_pitch_deg: float,
+    ) -> Dict[str, Any]:
+        if not self.config.validation_enable or gt_cam_pose_tf is None:
+            return {}
+        gt_points = (gt_cam_pose_tf @ cam_points_h.T).T[:, :3]
+        if gt_points.shape != world_points.shape or gt_points.shape[0] == 0:
+            return {"validation_endpoint_gt_error": "shape_mismatch"}
+        delta = np.asarray(world_points - gt_points, dtype=np.float64)
+        errors = np.linalg.norm(delta, axis=1)
+        abs_delta = np.abs(delta)
+        self.validation_endpoint_gt_errors.extend(errors.tolist())
+        self.validation_endpoint_gt_abs_x_errors.extend(abs_delta[:, 0].tolist())
+        self.validation_endpoint_gt_abs_y_errors.extend(abs_delta[:, 1].tolist())
+        self.validation_endpoint_gt_abs_z_errors.extend(abs_delta[:, 2].tolist())
+        pitch_key = "lookdown" if abs(float(camera_pitch_deg)) > 1e-4 else "horizon"
+        self.validation_endpoint_gt_error_groups[pitch_key].extend(errors.tolist())
+        distances = np.linalg.norm(np.asarray(cam_points, dtype=np.float64), axis=1)
+        for name, lower, upper in (
+            ("range_0_1m", 0.0, 1.0),
+            ("range_1_3m", 1.0, 3.0),
+            ("range_3_5m", 3.0, 5.0),
+        ):
+            mask = (distances >= lower) & (distances < upper)
+            if np.any(mask):
+                self.validation_endpoint_gt_error_groups[name].extend(
+                    errors[mask].tolist()
+                )
+        stats = self._distribution_stats(errors)
+        return {
+            "validation_endpoint_gt_error_count": stats["count"],
+            "validation_endpoint_gt_error_mean_m": stats["mean"],
+            "validation_endpoint_gt_error_p95_m": stats["p95"],
+            "validation_endpoint_gt_error_max_m": stats["max"],
+        }
+
     def _validation_pose_audit_summary(self) -> Dict[str, Any]:
         gt = self.validation_gt_height_values
         pose = self.validation_pose_height_values
@@ -4854,6 +5002,33 @@ class SparseOccSemanticMemory:
             "validation_height_abs_error_max_m": (
                 float(max(errors)) if errors else None
             ),
+            "validation_pose_gt_xy_error_stats": self._distribution_stats(
+                self.validation_pose_xy_errors
+            ),
+            "validation_pose_gt_z_error_stats": self._distribution_stats(
+                self.validation_pose_z_errors
+            ),
+            "validation_pose_gt_yaw_error_deg_stats": self._distribution_stats(
+                self.validation_pose_yaw_errors_deg
+            ),
+            "validation_endpoint_gt_error_stats": self._distribution_stats(
+                self.validation_endpoint_gt_errors
+            ),
+            "validation_endpoint_gt_abs_x_error_stats": self._distribution_stats(
+                self.validation_endpoint_gt_abs_x_errors
+            ),
+            "validation_endpoint_gt_abs_y_error_stats": self._distribution_stats(
+                self.validation_endpoint_gt_abs_y_errors
+            ),
+            "validation_endpoint_gt_abs_z_error_stats": self._distribution_stats(
+                self.validation_endpoint_gt_abs_z_errors
+            ),
+            "validation_endpoint_gt_error_groups": {
+                key: self._distribution_stats(values)
+                for key, values in sorted(
+                    self.validation_endpoint_gt_error_groups.items()
+                )
+            },
         }
 
     def _validation_endpoint_rejection_reason(self, xyz: np.ndarray) -> str:
@@ -4905,6 +5080,128 @@ class SparseOccSemanticMemory:
             "validation_endpoint_unclassified_rejection_count": int(
                 max(0, total - mapped - below - above - outside_xy)
             ),
+        }
+
+    def validation_compare_to_reference(
+        self, reference: "SparseOccSemanticMemory", *, tolerance_cells: int = 1
+    ) -> Dict[str, Any]:
+        """Compare observed OCC labels with an independent reference branch.
+
+        The reference branch is expected to be built from the same RGB-D frames
+        using a complete simulator sensor pose. Cells outside the reference's
+        observed volume remain unknown and are reported separately instead of
+        being treated as free.
+        """
+        pred_occ = set(self.occ_counts.keys())
+        pred_free = set(self.free_counts.keys()) - pred_occ
+        ref_occ = set(reference.occ_counts.keys())
+        ref_free = set(reference.free_counts.keys()) - ref_occ
+        observed = ref_occ | ref_free
+        pred_observed_occ = pred_occ & observed
+        pred_observed_free = pred_free & observed
+
+        def _binary_metrics(pred: set, positive: set) -> Dict[str, Any]:
+            tp = len(pred & positive)
+            fp = len(pred - positive)
+            fn = len(positive - pred)
+            precision = tp / float(tp + fp) if tp + fp else None
+            recall = tp / float(tp + fn) if tp + fn else None
+            f1 = (
+                2.0 * precision * recall / (precision + recall)
+                if precision is not None and recall is not None and precision + recall
+                else None
+            )
+            iou = tp / float(tp + fp + fn) if tp + fp + fn else None
+            return {
+                "tp": int(tp),
+                "fp": int(fp),
+                "fn": int(fn),
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "iou": iou,
+            }
+
+        ref_occ_by_xy: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        for row, col, height in ref_occ:
+            ref_occ_by_xy[(int(row), int(col))].append(int(height))
+        tolerance = max(0, int(tolerance_cells))
+        ref_occ_tolerant = set()
+        for row, col, height in ref_occ:
+            for dr in range(-tolerance, tolerance + 1):
+                for dc in range(-tolerance, tolerance + 1):
+                    for dh in range(-tolerance, tolerance + 1):
+                        ref_occ_tolerant.add((row + dr, col + dc, height + dh))
+        tol_pred_occ = pred_observed_occ & ref_occ_tolerant
+        tol_ref_occ = ref_occ
+        tol_fp = len(pred_observed_occ - ref_occ_tolerant)
+        tol_fn = len(ref_occ - pred_observed_occ)
+        tol_tp = len(tol_pred_occ)
+        tol_precision = (
+            tol_tp / float(tol_tp + tol_fp) if tol_tp + tol_fp else None
+        )
+        tol_recall = tol_tp / float(tol_tp + tol_fn) if tol_tp + tol_fn else None
+
+        height_errors = []
+        for row, col, height in pred_observed_occ:
+            candidates = ref_occ_by_xy.get((int(row), int(col)))
+            if candidates:
+                height_errors.append(
+                    min(abs(int(height) - candidate) for candidate in candidates)
+                    * float(self.cs)
+                )
+
+        return {
+            "reference_source": "independent_sparse_occ_branch",
+            "reference_observed_cell_count": int(len(observed)),
+            "reference_occupied_cell_count": int(len(ref_occ)),
+            "reference_free_cell_count": int(len(ref_free)),
+            "prediction_occupied_cell_count": int(len(pred_occ)),
+            "prediction_free_cell_count": int(len(pred_free)),
+            "prediction_outside_reference_observed_occupied_count": int(
+                len(pred_occ - observed)
+            ),
+            "prediction_outside_reference_observed_free_count": int(
+                len(pred_free - observed)
+            ),
+            "occupied_exact": _binary_metrics(pred_observed_occ, ref_occ),
+            "free_exact": _binary_metrics(pred_observed_free, ref_free),
+            "occupied_tolerance": {
+                "tolerance_cells": tolerance,
+                "tolerance_m": float(tolerance * self.cs),
+                "tp": int(tol_tp),
+                "fp": int(tol_fp),
+                "fn": int(tol_fn),
+                "precision": tol_precision,
+                "recall": tol_recall,
+                "f1": (
+                    2.0 * tol_precision * tol_recall
+                    / (tol_precision + tol_recall)
+                    if tol_precision is not None
+                    and tol_recall is not None
+                    and tol_precision + tol_recall
+                    else None
+                ),
+            },
+            "unknown_coverage": (
+                float(
+                    len(observed - pred_observed_occ - pred_observed_free)
+                    / len(observed)
+                )
+                if observed
+                else None
+            ),
+            "false_free_rate": (
+                float(len(pred_observed_free & ref_occ) / len(pred_observed_free))
+                if pred_observed_free
+                else None
+            ),
+            "false_occupied_rate": (
+                float(len(pred_observed_occ & ref_free) / len(pred_observed_occ))
+                if pred_observed_occ
+                else None
+            ),
+            "occupied_height_bin_error_m": self._distribution_stats(height_errors),
         }
 
     def _relative_base_tf(self, base_pose_tf: np.ndarray) -> np.ndarray:
