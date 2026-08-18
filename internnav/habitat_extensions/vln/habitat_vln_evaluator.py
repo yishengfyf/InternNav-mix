@@ -164,6 +164,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "collisions": CollisionsMeasurementConfig(),
                 }
             )
+            mesh_audit_requested = bool(
+                (cfg.agent.model_settings.get("vlmap_safety", {}) or {}).get(
+                    "occ_memory_validation_mesh_raycast_enable", False
+                )
+            )
+            if mesh_audit_requested:
+                self.config.habitat.simulator.habitat_sim_v0.enable_physics = True
         cfg.env.env_settings['habitat_config'] = self.config
         cfg.env.env_settings['output_path'] = self.output_path
 
@@ -292,7 +299,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._stage23a_mesh_raycast_total = 0
         self._stage23a_mesh_raycast_hits = 0
         self._stage23a_mesh_raycast_misses = 0
-        self._stage23a_mesh_raycast_errors = []
         self.occ_memory_oracle_pose = None
         if self._stage23a_oracle_pose_enabled:
             oracle_cfg = copy.deepcopy(vlmap_safety_cfg)

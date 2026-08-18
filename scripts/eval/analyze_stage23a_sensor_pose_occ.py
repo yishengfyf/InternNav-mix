@@ -116,6 +116,8 @@ def analyze(
         if require_mesh_raycast and (
             not mesh_raycast.get("enabled")
             or int(mesh_raycast.get("total_rays", 0) or 0) <= 0
+            or int(mesh_raycast.get("hit_count", 0) or 0) <= 0
+            or int(mesh_raycast.get("endpoint_error_count", 0) or 0) <= 0
         ):
             errors.append(f"missing_mesh_raycast:{key}")
         endpoint = c.get("validation_endpoint_gt_error_stats") or {}
