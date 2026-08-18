@@ -578,6 +578,13 @@ class SparseOccSemanticMemory:
         self.validation_pose_height_values: List[float] = []
         self.validation_gt_height_values: List[float] = []
         self.validation_height_abs_errors: List[float] = []
+        self.validation_endpoint_total_count = 0
+        self.validation_endpoint_mapped_count = 0
+        self.validation_endpoint_below_volume_count = 0
+        self.validation_endpoint_above_volume_count = 0
+        self.validation_endpoint_outside_xy_count = 0
+        self.validation_endpoint_negative_z_count = 0
+        self.validation_endpoint_negative_z_mapped_count = 0
         self.last_semantic_decision: Dict[str, Any] = {}
         self.last_stagnation_step: Optional[int] = None
         event = {
@@ -706,10 +713,25 @@ class SparseOccSemanticMemory:
         cam_origin = cam_pose_tf[:3, 3]
         occupied_added = 0
         free_added = 0
+        validation_endpoint_mapped = 0
+        validation_endpoint_negative_z = 0
+        validation_endpoint_negative_z_mapped = 0
+        validation_endpoint_rejection_counts: Dict[str, int] = defaultdict(int)
+        if self.config.validation_enable:
+            self.validation_endpoint_total_count += int(world_points.shape[0])
         for point in world_points:
+            if self.config.validation_enable and float(point[2]) < 0.0:
+                validation_endpoint_negative_z += 1
             endpoint = self._xyz_to_grid(point)
             if endpoint is None:
+                if self.config.validation_enable:
+                    reason = self._validation_endpoint_rejection_reason(point)
+                    validation_endpoint_rejection_counts[reason] += 1
                 continue
+            if self.config.validation_enable:
+                validation_endpoint_mapped += 1
+                if float(point[2]) < 0.0:
+                    validation_endpoint_negative_z_mapped += 1
             row, col, height = endpoint
             key3 = (row, col, height)
             before = self.occ_counts.get(key3, 0)
@@ -720,6 +742,24 @@ class SparseOccSemanticMemory:
                 self.occ2d_counts[(row, col)] += 1
             if self.config.raycast_enable:
                 free_added += self._raycast_free(cam_origin, point, endpoint)
+
+        if self.config.validation_enable:
+            self.validation_endpoint_mapped_count += int(validation_endpoint_mapped)
+            self.validation_endpoint_below_volume_count += int(
+                validation_endpoint_rejection_counts.get("below_volume", 0)
+            )
+            self.validation_endpoint_above_volume_count += int(
+                validation_endpoint_rejection_counts.get("above_volume", 0)
+            )
+            self.validation_endpoint_outside_xy_count += int(
+                validation_endpoint_rejection_counts.get("outside_xy", 0)
+            )
+            self.validation_endpoint_negative_z_count += int(
+                validation_endpoint_negative_z
+            )
+            self.validation_endpoint_negative_z_mapped_count += int(
+                validation_endpoint_negative_z_mapped
+            )
 
         self.update_count += 1
         self.occupied_update_count += occupied_added
@@ -749,6 +789,17 @@ class SparseOccSemanticMemory:
                 ),
                 "requested_camera_pitch_deg": float(requested_camera_pitch_deg),
                 "applied_camera_pitch_deg": float(applied_camera_pitch_deg),
+                "validation_endpoint_total_count": int(world_points.shape[0]),
+                "validation_endpoint_mapped_count": int(validation_endpoint_mapped),
+                "validation_endpoint_negative_z_count": int(
+                    validation_endpoint_negative_z
+                ),
+                "validation_endpoint_negative_z_mapped_count": int(
+                    validation_endpoint_negative_z_mapped
+                ),
+                "validation_endpoint_rejection_counts": dict(
+                    validation_endpoint_rejection_counts
+                ),
             }
         )
         self._write_event(event)
@@ -4714,6 +4765,7 @@ class SparseOccSemanticMemory:
                 self.validation_surface_point_count
             ),
             **self._validation_pose_audit_summary(),
+            **self._validation_endpoint_volume_summary(),
         }
         self._write_event(summary)
         self._write_summary(summary)
@@ -4801,6 +4853,57 @@ class SparseOccSemanticMemory:
             ),
             "validation_height_abs_error_max_m": (
                 float(max(errors)) if errors else None
+            ),
+        }
+
+    def _validation_endpoint_rejection_reason(self, xyz: np.ndarray) -> str:
+        x, y, z = [float(value) for value in np.asarray(xyz).reshape(-1)[:3]]
+        row, col = self._xy_to_grid_cell(x, y)
+        if row < 0 or row >= self.gs or col < 0 or col >= self.gs:
+            return "outside_xy"
+        height = int(z / self.cs)
+        if height < 0:
+            return "below_volume"
+        if height >= self.vh:
+            return "above_volume"
+        return "other"
+
+    def _validation_endpoint_volume_summary(self) -> Dict[str, Any]:
+        total = int(self.validation_endpoint_total_count)
+        mapped = int(self.validation_endpoint_mapped_count)
+        below = int(self.validation_endpoint_below_volume_count)
+        above = int(self.validation_endpoint_above_volume_count)
+        outside_xy = int(self.validation_endpoint_outside_xy_count)
+        negative_z = int(self.validation_endpoint_negative_z_count)
+        negative_z_mapped = int(self.validation_endpoint_negative_z_mapped_count)
+        return {
+            "validation_endpoint_total_count": total,
+            "validation_endpoint_mapped_count": mapped,
+            "validation_endpoint_mapped_ratio": (
+                float(mapped / total) if total else None
+            ),
+            "validation_endpoint_below_volume_count": below,
+            "validation_endpoint_below_volume_ratio": (
+                float(below / total) if total else None
+            ),
+            "validation_endpoint_above_volume_count": above,
+            "validation_endpoint_above_volume_ratio": (
+                float(above / total) if total else None
+            ),
+            "validation_endpoint_outside_xy_count": outside_xy,
+            "validation_endpoint_outside_xy_ratio": (
+                float(outside_xy / total) if total else None
+            ),
+            "validation_endpoint_negative_z_count": negative_z,
+            "validation_endpoint_negative_z_ratio": (
+                float(negative_z / total) if total else None
+            ),
+            "validation_endpoint_negative_z_mapped_count": negative_z_mapped,
+            "validation_endpoint_negative_z_mapped_ratio": (
+                float(negative_z_mapped / total) if total else None
+            ),
+            "validation_endpoint_unclassified_rejection_count": int(
+                max(0, total - mapped - below - above - outside_xy)
             ),
         }
 
@@ -7394,6 +7497,7 @@ class SparseOccSemanticMemory:
             "free_only_point_count": int(free_points.shape[0]),
             "trajectory_point_count": int(trajectory_points.shape[0]),
             **self._validation_pose_audit_summary(),
+            **self._validation_endpoint_volume_summary(),
             **memory_stats,
         }
         self.saved_validation_final_count += 1
@@ -7562,6 +7666,14 @@ class SparseOccSemanticMemory:
             path = os.path.join(out_dir, f"{suffix}_{name}.png")
             if self._write_projection_png(path, layers, axes=axes, size=size):
                 paths[f"{name}_png"] = path
+            surface_path = os.path.join(out_dir, f"{suffix}_surface_{name}.png")
+            if self._write_projection_png(
+                surface_path,
+                [(surface_points, surface_colors)],
+                axes=axes,
+                size=size,
+            ):
+                paths[f"surface_{name}_png"] = surface_path
         return paths
 
     def _write_projection_png(

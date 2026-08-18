@@ -1,0 +1,23 @@
+[
+  {
+    "scene_id": "5q7pvUzZiYa",
+    "episode_id": 9640,
+    "episode_eval_seed": 300011,
+    "audit_role": "reference_flat_0m",
+    "reference_path_height_range_m": 0.0
+  },
+  {
+    "scene_id": "17DRP5sb8fy",
+    "episode_id": 3717,
+    "episode_eval_seed": 300486,
+    "audit_role": "reference_flat_0m",
+    "reference_path_height_range_m": 0.0
+  },
+  {
+    "scene_id": "29hnd4uzFmX",
+    "episode_id": 467,
+    "episode_eval_seed": 300190,
+    "audit_role": "reference_flat_0m",
+    "reference_path_height_range_m": 0.0
+  }
+]

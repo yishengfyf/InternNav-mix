@@ -61,7 +61,14 @@ def _combine_views(run_root, keys):
             continue
         current_dir = owner / "occ_memory" / "validation"
         oracle_dir = owner / "stage23a_oracle_pose" / "occ_memory" / "validation"
-        for view in ("bev_xy", "side_xz", "side_yz"):
+        for view in (
+            "bev_xy",
+            "side_xz",
+            "side_yz",
+            "surface_bev_xy",
+            "surface_side_xz",
+            "surface_side_yz",
+        ):
             current = list(current_dir.glob(f"ep{episode_id}_step*_final_{view}.png"))
             oracle = list(oracle_dir.glob(f"ep{episode_id}_step*_final_{view}.png"))
             if len(current) != 1 or len(oracle) != 1:
@@ -83,7 +90,15 @@ def _combine_views(run_root, keys):
     return outputs, errors
 
 
-def analyze(run_root, manifest_path, reference_root, output, require_all):
+def analyze(
+    run_root,
+    manifest_path,
+    reference_root,
+    output,
+    require_all,
+    min_flat_episodes=1,
+    min_height_change_episodes=1,
+):
     expected = _load_manifest(manifest_path)
     progress = _load_unique(run_root.glob("vlmap_safety_debug/rank*_run_*/progress.json"))
     current = _load_unique(
@@ -117,6 +132,9 @@ def analyze(run_root, manifest_path, reference_root, output, require_all):
         "_bev_xy.png",
         "_side_xz.png",
         "_side_yz.png",
+        "_surface_bev_xy.png",
+        "_surface_side_xz.png",
+        "_surface_side_yz.png",
         "_pose_height_audit.json",
     )
     for key, manifest_row in expected.items():
@@ -180,6 +198,9 @@ def analyze(run_root, manifest_path, reference_root, output, require_all):
                 "scene_id": key[0],
                 "episode_id": key[1],
                 "audit_role": manifest_row.get("audit_role"),
+                "reference_path_height_range_m": manifest_row.get(
+                    "reference_path_height_range_m"
+                ),
                 "episode_eval_seed": p.get("episode_eval_seed"),
                 "steps": p.get("steps"),
                 "success": p.get("success"),
@@ -191,6 +212,36 @@ def analyze(run_root, manifest_path, reference_root, output, require_all):
                 "oracle_pose_height_range_m": oracle_height_range,
                 "current_height_error_p95_m": c.get("validation_height_abs_error_p95_m"),
                 "oracle_height_error_p95_m": o.get("validation_height_abs_error_p95_m"),
+                "current_endpoint_mapped_ratio": c.get(
+                    "validation_endpoint_mapped_ratio"
+                ),
+                "oracle_endpoint_mapped_ratio": o.get(
+                    "validation_endpoint_mapped_ratio"
+                ),
+                "current_endpoint_below_volume_ratio": c.get(
+                    "validation_endpoint_below_volume_ratio"
+                ),
+                "oracle_endpoint_below_volume_ratio": o.get(
+                    "validation_endpoint_below_volume_ratio"
+                ),
+                "current_endpoint_above_volume_ratio": c.get(
+                    "validation_endpoint_above_volume_ratio"
+                ),
+                "oracle_endpoint_above_volume_ratio": o.get(
+                    "validation_endpoint_above_volume_ratio"
+                ),
+                "current_endpoint_negative_z_ratio": c.get(
+                    "validation_endpoint_negative_z_ratio"
+                ),
+                "oracle_endpoint_negative_z_ratio": o.get(
+                    "validation_endpoint_negative_z_ratio"
+                ),
+                "current_endpoint_negative_z_mapped_ratio": c.get(
+                    "validation_endpoint_negative_z_mapped_ratio"
+                ),
+                "oracle_endpoint_negative_z_mapped_ratio": o.get(
+                    "validation_endpoint_negative_z_mapped_ratio"
+                ),
                 "visual_bundle_complete": files_ok,
                 "shadow_action_violation_count": action_violation_count,
             }
@@ -199,9 +250,9 @@ def analyze(run_root, manifest_path, reference_root, output, require_all):
     ranges = [row["gt_relative_height_range_m"] for row in episode_rows]
     flat_count = sum(value <= 0.20 for value in ranges)
     height_change_count = sum(value >= 0.40 for value in ranges)
-    if flat_count < 1:
+    if flat_count < int(min_flat_episodes):
         errors.append("missing_measured_flat_episode")
-    if height_change_count < 1:
+    if height_change_count < int(min_height_change_episodes):
         errors.append("missing_measured_height_change_episode")
     comparison_paths, comparison_errors = _combine_views(run_root, expected.keys())
     errors.extend(comparison_errors)
@@ -237,8 +288,18 @@ def main():
     parser.add_argument("--reference-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
+    parser.add_argument("--min-flat-episodes", type=int, default=1)
+    parser.add_argument("--min-height-change-episodes", type=int, default=1)
     args = parser.parse_args()
-    analyze(args.run_root, args.manifest, args.reference_root, args.output, args.require_all)
+    analyze(
+        args.run_root,
+        args.manifest,
+        args.reference_root,
+        args.output,
+        args.require_all,
+        min_flat_episodes=args.min_flat_episodes,
+        min_height_change_episodes=args.min_height_change_episodes,
+    )
 
 
 if __name__ == "__main__":
