@@ -10,6 +10,7 @@ MANIFEST=${STAGE23A_SENSOR_MANIFEST:-scripts/eval/manifests/stage23a_sensor_smok
 RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
 PIPELINE_TAG=${STAGE21_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
 CUDA_DEVICES=${STAGE21_CUDA_VISIBLE_DEVICES:-0,1,2}
+NPROC=${STAGE23A_NPROC_PER_NODE:-3}
 RUN_NAME="compare_vlmap_stage23a_sensor_pose_smoke1_${PIPELINE_TAG}"
 RUN_ROOT="logs/habitat/${RUN_NAME}"
 WORK_DIR="${RETURN_ROOT}/stage23a_sensor_pose_smoke1_running_${PIPELINE_TAG}"
@@ -50,7 +51,7 @@ STAGE21_EPISODE_IDS="${MANIFEST}" STAGE21_RUN_NAME="${RUN_NAME}" \
 STAGE21_EPISODE_SEED_REPLAY_MANIFEST="${MANIFEST}" \
 STAGE21C_SCORER_CHECKPOINT="${CHECKPOINT}" STAGE21C_SCORER_DEVICE=cpu \
 STAGE23A_EVAL_PORT=${STAGE23A_EVAL_PORT:-2573} \
-NPROC_PER_NODE=3 MASTER_PORT=${STAGE23A_MASTER_PORT:-2574} \
+NPROC_PER_NODE="${NPROC}" MASTER_PORT=${STAGE23A_MASTER_PORT:-2574} \
 bash scripts/eval/bash/stage21_torchrun_eval.sh \
   --config scripts/eval/configs/habitat_dual_system_vlmap_stage23a_sensor_pose_occ_cfg.py
 
