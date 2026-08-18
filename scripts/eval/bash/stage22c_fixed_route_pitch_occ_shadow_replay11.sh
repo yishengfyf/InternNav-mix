@@ -73,6 +73,7 @@ python3 scripts/eval/analyze_stage22c_fixed_route_pitch_occ.py \
   --fixed-route-manifest "${FIXED_ROUTE_MANIFEST}" \
   --output "${RUN_ROOT}/${FIXED_ROUTE_AUDIT_NAME}" \
   ${STAGE22_REQUIRE_EVIDENCE:+--require-evidence} \
+  ${STAGE22_REQUIRE_HEIGHT_EVIDENCE:+--require-height-evidence} \
   --require-all
 
 FAILED_STAGE=return_packaging
@@ -91,6 +92,7 @@ ${FIXED_ROUTE_LABEL} replays the same 11 Frozen episodes and audits the exact
 12 Stage22A trigger/anchor/source routes on pitch-aware OCC. Dynamic candidate
 and triage changes are logged separately. No route cell, output, or action is
 modified. Evidence audit: ${STAGE22_REQUIRE_EVIDENCE:-disabled}.
+Height-aligned evidence audit: ${STAGE22_REQUIRE_HEIGHT_EVIDENCE:-disabled}.
 EOF
 find "${WORK_DIR}" -type f | sort > "${WORK_DIR}/RETURN_MANIFEST.txt"
 mv "${WORK_DIR}" "${SUCCESS_DEST}"

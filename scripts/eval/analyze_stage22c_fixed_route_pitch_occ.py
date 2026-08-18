@@ -73,6 +73,7 @@ def analyze(
     fixed_route_manifest: Path,
     expected_fixed_routes: int = 12,
     require_evidence: bool = False,
+    require_height_evidence: bool = False,
 ):
     progress = _progress(run_root)
     reference_progress = _progress(navigation_reference_root)
@@ -153,6 +154,8 @@ def analyze(
     invalid_audits = []
     reference_mismatches = []
     evidence_missing = []
+    height_evidence_missing = []
+    height_evidence_cells = []
     action_or_output_violations = []
     gt_leakage = []
     non_pitch_aware = []
@@ -171,7 +174,7 @@ def analyze(
         current = dict(current_row.get("audit") or {})
         baseline = dict(baseline_row.get("audit") or {})
         evidence = current.get("route_cell_evidence")
-        if require_evidence and (
+        if (require_evidence or require_height_evidence) and (
             not isinstance(evidence, dict)
             or int(evidence.get("cell_count", -1))
             != int(current.get("route_unique_cell_count", -2))
@@ -179,6 +182,59 @@ def analyze(
         ):
             evidence_missing.append(
                 {"scene_episode": key[0], "step_id": key[1], "evidence": evidence}
+            )
+        if isinstance(evidence, dict):
+            cells = list(evidence.get("cells") or [])
+            if require_height_evidence and (
+                evidence.get("schema_version")
+                != "stage22e_height_aligned_route_cell_evidence_v1"
+                or not evidence.get("height_aligned")
+                or int(evidence.get("height_aligned_cell_count", -1))
+                != int(evidence.get("cell_count", -2))
+                or len(cells) != int(evidence.get("cell_count", -1))
+                or any(
+                    not isinstance(cell, dict)
+                    or any(
+                        field not in cell
+                        for field in (
+                            "occupied_band_hits",
+                            "free_band_hits",
+                            "band_evidence_hits",
+                            "occupied_band_ratio",
+                            "occupied_band_margin",
+                            "occupied_band_height_indices",
+                            "free_band_height_indices",
+                            "shared_band_height_indices",
+                            "shared_band_occupied_hits",
+                            "shared_band_free_hits",
+                        )
+                    )
+                    for cell in cells
+                )
+            ):
+                height_evidence_missing.append(
+                    {
+                        "scene_episode": key[0],
+                        "step_id": key[1],
+                        "schema_version": evidence.get("schema_version"),
+                        "height_aligned": evidence.get("height_aligned"),
+                        "cell_count": evidence.get("cell_count"),
+                        "height_aligned_cell_count": evidence.get(
+                            "height_aligned_cell_count"
+                        ),
+                    }
+                )
+            if evidence.get("height_aligned"):
+                height_evidence_cells.extend(
+                    cell for cell in cells if isinstance(cell, dict)
+                )
+        elif require_height_evidence:
+            height_evidence_missing.append(
+                {
+                    "scene_episode": key[0],
+                    "step_id": key[1],
+                    "reason": "missing_route_cell_evidence",
+                }
             )
         reference = dict(current_row.get("fixed_reference") or {})
         expected = fixed_entries[key]
@@ -325,6 +381,36 @@ def analyze(
 
     occupied_deltas = [row["occupied_ratio_delta"] for row in comparison_records]
     free_deltas = [row["free_ratio_delta"] for row in comparison_records]
+    occupied_height_evidence_cells = [
+        cell for cell in height_evidence_cells if cell.get("state") == "occupied"
+    ]
+    occupied_with_band_free = [
+        cell
+        for cell in occupied_height_evidence_cells
+        if int(cell.get("free_band_hits", 0) or 0) > 0
+    ]
+    occupied_band_free_dominant = [
+        cell
+        for cell in occupied_height_evidence_cells
+        if int(cell.get("free_band_hits", 0) or 0)
+        > int(cell.get("occupied_band_hits", 0) or 0)
+    ]
+    occupied_shared_band = [
+        cell
+        for cell in occupied_height_evidence_cells
+        if cell.get("shared_band_height_indices")
+    ]
+    occupied_shared_band_free_dominant = [
+        cell
+        for cell in occupied_shared_band
+        if int(cell.get("shared_band_free_hits", 0) or 0)
+        > int(cell.get("shared_band_occupied_hits", 0) or 0)
+    ]
+    visited_band_free_dominant = [
+        cell
+        for cell in occupied_band_free_dominant
+        if int(cell.get("visited_hits", 0) or 0) > 0
+    ]
     integrity_passed = bool(
         len(progress) == expected_episodes
         and len(expected_seeds) == expected_episodes
@@ -339,7 +425,12 @@ def analyze(
         and not invalid_audits
         and not reference_mismatches
         and not route_identity_mismatches
-        and (not evidence_missing if require_evidence else True)
+        and (
+            not evidence_missing
+            if require_evidence or require_height_evidence
+            else True
+        )
+        and (not height_evidence_missing if require_height_evidence else True)
         and not action_or_output_violations
         and not gt_leakage
         and not non_pitch_aware
@@ -354,6 +445,7 @@ def analyze(
         "fixed_route_expected_count": expected_fixed_routes,
         "fixed_route_manifest_count": len(fixed_entries),
         "evidence_required": bool(require_evidence),
+        "height_evidence_required": bool(require_height_evidence),
         "fixed_route_audit_count": len(current_events),
         "seed_replay_verified_count": len(expected_seeds) - len(seed_mismatches),
         "reference_metric_verified_count": expected_episodes
@@ -363,8 +455,38 @@ def analyze(
         - len(route_identity_mismatches),
         "route_evidence_verified_count": (
             len(comparison_records) - len(evidence_missing)
-            if require_evidence
+            if require_evidence or require_height_evidence
             else None
+        ),
+        "route_height_evidence_verified_count": (
+            len(comparison_records) - len(height_evidence_missing)
+            if require_height_evidence
+            else None
+        ),
+        "route_height_evidence_cell_count": len(height_evidence_cells),
+        "occupied_route_height_evidence_cell_count": len(
+            occupied_height_evidence_cells
+        ),
+        "occupied_cells_with_band_free_evidence_count": len(
+            occupied_with_band_free
+        ),
+        "occupied_cells_band_free_dominant_count": len(
+            occupied_band_free_dominant
+        ),
+        "occupied_cells_shared_band_height_count": len(occupied_shared_band),
+        "occupied_cells_shared_band_free_dominant_count": len(
+            occupied_shared_band_free_dominant
+        ),
+        "occupied_visited_band_free_dominant_count": len(
+            visited_band_free_dominant
+        ),
+        "occupied_band_hit_total": sum(
+            int(cell.get("occupied_band_hits", 0) or 0)
+            for cell in occupied_height_evidence_cells
+        ),
+        "occupied_cell_band_free_hit_total": sum(
+            int(cell.get("free_band_hits", 0) or 0)
+            for cell in occupied_height_evidence_cells
         ),
         "valid_occ_update_count": len(memory_updates),
         "pitched_occ_update_count": len(pitched_updates),
@@ -412,6 +534,7 @@ def analyze(
             "fixed_reference_mismatch": len(reference_mismatches),
             "route_identity_mismatch": len(route_identity_mismatches),
             "missing_route_evidence": len(evidence_missing),
+            "missing_height_route_evidence": len(height_evidence_missing),
             "action_or_output_applied": len(action_or_output_violations),
             "gt_leakage": len(gt_leakage),
             "non_pitch_aware_audit": len(non_pitch_aware),
@@ -429,6 +552,7 @@ def analyze(
             "fixed_reference_mismatch": reference_mismatches,
             "route_identity_mismatch": route_identity_mismatches,
             "missing_route_evidence": evidence_missing,
+            "missing_height_route_evidence": height_evidence_missing,
         },
         "comparison_records": comparison_records,
         "loop_comparison_records": loop_comparison_records,
@@ -451,6 +575,7 @@ def main():
     parser.add_argument("--fixed-route-manifest", type=Path, required=True)
     parser.add_argument("--expected-fixed-routes", type=int, default=12)
     parser.add_argument("--require-evidence", action="store_true")
+    parser.add_argument("--require-height-evidence", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
     args = parser.parse_args()
@@ -463,6 +588,7 @@ def main():
         args.fixed_route_manifest,
         args.expected_fixed_routes,
         args.require_evidence,
+        args.require_height_evidence,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

@@ -5755,7 +5755,10 @@ class SparseOccSemanticMemory:
         return "unknown"
 
     def audit_route_cell_evidence(
-        self, route_audit: Dict[str, Any]
+        self,
+        route_audit: Dict[str, Any],
+        *,
+        include_height_aligned: bool = False,
     ) -> Dict[str, Any]:
         """Expose per-cell evidence without changing the OCC decision rule."""
         ordered_cells = list(route_audit.get("route_cells") or [])
@@ -5769,34 +5772,117 @@ class SparseOccSemanticMemory:
             if cell not in seen:
                 seen.add(cell)
                 unique_cells.append(cell)
+        route_cell_set = set(unique_cells)
+        occupied_band_by_cell: Dict[Tuple[int, int], Dict[int, int]] = defaultdict(dict)
+        free_band_by_cell: Dict[Tuple[int, int], Dict[int, int]] = defaultdict(dict)
+        if include_height_aligned:
+            for (row, col, height), count in self.occ_counts.items():
+                cell = (int(row), int(col))
+                if (
+                    cell in route_cell_set
+                    and self._is_obstacle_height(int(height))
+                    and int(count) > 0
+                ):
+                    occupied_band_by_cell[cell][int(height)] = int(count)
+            for (row, col, height), count in self.free_counts.items():
+                cell = (int(row), int(col))
+                if (
+                    cell in route_cell_set
+                    and self._is_obstacle_height(int(height))
+                    and int(count) > 0
+                ):
+                    free_band_by_cell[cell][int(height)] = int(count)
+
         cells = []
         for row, col in unique_cells:
             occupied_hits = int(self.occ2d_counts.get((row, col), 0))
             free_hits = int(self.free2d_counts.get((row, col), 0))
             visited_hits = int(self.visited2d_counts.get((row, col), 0))
             total_hits = occupied_hits + free_hits
-            cells.append(
-                {
-                    "grid": [int(row), int(col)],
-                    "state": self._cell_state(row, col),
-                    "occupied_hits": occupied_hits,
-                    "free_hits": free_hits,
-                    "visited_hits": visited_hits,
-                    "evidence_hits": total_hits,
-                    "occupied_free_ratio": (
-                        float(occupied_hits / total_hits)
-                        if total_hits
-                        else None
-                    ),
-                    "occupied_free_margin": (
-                        float((occupied_hits - free_hits) / total_hits)
-                        if total_hits
-                        else None
-                    ),
-                }
-            )
+            cell_record = {
+                "grid": [int(row), int(col)],
+                "state": self._cell_state(row, col),
+                "occupied_hits": occupied_hits,
+                "free_hits": free_hits,
+                "visited_hits": visited_hits,
+                "evidence_hits": total_hits,
+                "occupied_free_ratio": (
+                    float(occupied_hits / total_hits) if total_hits else None
+                ),
+                "occupied_free_margin": (
+                    float((occupied_hits - free_hits) / total_hits)
+                    if total_hits
+                    else None
+                ),
+            }
+            if include_height_aligned:
+                # Keep this audit tied to the same 3D voxel height band used
+                # for obstacle reasoning. The existing flattened 2D counts
+                # remain untouched and continue to drive all decisions.
+                occupied_by_height = occupied_band_by_cell[(row, col)]
+                free_by_height = free_band_by_cell[(row, col)]
+                occupied_band_hits = int(sum(occupied_by_height.values()))
+                free_band_hits = int(sum(free_by_height.values()))
+                band_total_hits = occupied_band_hits + free_band_hits
+                occupied_heights = sorted(occupied_by_height)
+                free_heights = sorted(free_by_height)
+                shared_heights = sorted(
+                    set(occupied_heights).intersection(free_heights)
+                )
+                shared_occupied_hits = int(
+                    sum(occupied_by_height[height] for height in shared_heights)
+                )
+                shared_free_hits = int(
+                    sum(free_by_height[height] for height in shared_heights)
+                )
+                cell_record.update(
+                    {
+                        "obstacle_height_min_m": float(self.config.obstacle_height_min),
+                        "obstacle_height_max_m": float(self.config.obstacle_height_max),
+                        "occupied_band_hits": occupied_band_hits,
+                        "free_band_hits": free_band_hits,
+                        "band_evidence_hits": int(band_total_hits),
+                        "occupied_band_ratio": (
+                            float(occupied_band_hits / band_total_hits)
+                            if band_total_hits
+                            else None
+                        ),
+                        "occupied_band_margin": (
+                            float((occupied_band_hits - free_band_hits) / band_total_hits)
+                            if band_total_hits
+                            else None
+                        ),
+                        "occupied_band_height_indices": occupied_heights,
+                        "free_band_height_indices": free_heights,
+                        "shared_band_height_indices": shared_heights,
+                        "shared_band_occupied_hits": shared_occupied_hits,
+                        "shared_band_free_hits": shared_free_hits,
+                        "shared_band_evidence_hits": int(
+                            shared_occupied_hits + shared_free_hits
+                        ),
+                    }
+                )
+            cells.append(cell_record)
+        height_aligned_cells = [
+            item for item in cells if "occupied_band_hits" in item
+        ]
+        occupied_band_cells = [
+            item for item in height_aligned_cells if item["occupied_band_hits"] > 0
+        ]
+        band_free_dominant_cells = [
+            item
+            for item in occupied_band_cells
+            if item["free_band_hits"] > item["occupied_band_hits"]
+        ]
+        shared_band_cells = [
+            item for item in occupied_band_cells if item["shared_band_height_indices"]
+        ]
         return {
-            "schema_version": "stage22d_route_cell_evidence_v1",
+            "schema_version": (
+                "stage22e_height_aligned_route_cell_evidence_v1"
+                if include_height_aligned
+                else "stage22d_route_cell_evidence_v1"
+            ),
             "cell_count": int(len(cells)),
             "occupied_cell_count": int(
                 sum(item["state"] == "occupied" for item in cells)
@@ -5809,6 +5895,21 @@ class SparseOccSemanticMemory:
             ),
             "cells": cells,
             "decision_rule": "occupied_key_precedes_free_key",
+            "height_aligned": bool(include_height_aligned),
+            "height_aligned_cell_count": int(len(height_aligned_cells)),
+            "occupied_band_cell_count": int(len(occupied_band_cells)),
+            "band_free_dominant_cell_count": int(len(band_free_dominant_cells)),
+            "shared_band_height_cell_count": int(len(shared_band_cells)),
+            "occupied_band_height_min_m": (
+                float(self.config.obstacle_height_min)
+                if include_height_aligned
+                else None
+            ),
+            "occupied_band_height_max_m": (
+                float(self.config.obstacle_height_max)
+                if include_height_aligned
+                else None
+            ),
             "mutated_memory": False,
         }
 

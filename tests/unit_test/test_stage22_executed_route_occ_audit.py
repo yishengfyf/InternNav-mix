@@ -202,3 +202,50 @@ def test_route_cell_evidence_reports_occupied_free_and_visit_support_read_only()
     assert cell["occupied_free_ratio"] == 0.75
     assert evidence["mutated_memory"] is False
     assert (memory.occ2d_counts, memory.free2d_counts, memory.visited2d_counts) == before
+
+
+def test_route_cell_evidence_aligns_free_and_occupied_obstacle_heights_read_only():
+    memory = _memory()
+    memory.occ2d_counts[(32, 31)] = 3
+    memory.free2d_counts[(32, 31)] = 109
+    memory.visited2d_counts[(32, 31)] = 2
+    memory.occ_counts[(32, 31, 2)] = 3
+    memory.free_counts[(32, 31, 2)] = 10
+    memory.free_counts[(32, 31, 0)] = 99
+    before = copy.deepcopy(
+        (
+            memory.occ_counts,
+            memory.free_counts,
+            memory.occ2d_counts,
+            memory.free2d_counts,
+            memory.visited2d_counts,
+        )
+    )
+
+    evidence = memory.audit_route_cell_evidence(
+        {"route_cells": [[32, 31]]}, include_height_aligned=True
+    )
+
+    assert evidence["schema_version"] == "stage22e_height_aligned_route_cell_evidence_v1"
+    assert evidence["height_aligned"] is True
+    assert evidence["height_aligned_cell_count"] == 1
+    assert evidence["band_free_dominant_cell_count"] == 1
+    assert evidence["shared_band_height_cell_count"] == 1
+    cell = evidence["cells"][0]
+    assert cell["occupied_hits"] == 3
+    assert cell["free_hits"] == 109
+    assert cell["occupied_band_hits"] == 3
+    assert cell["free_band_hits"] == 10
+    assert cell["band_evidence_hits"] == 13
+    assert cell["shared_band_height_indices"] == [2]
+    assert cell["shared_band_occupied_hits"] == 3
+    assert cell["shared_band_free_hits"] == 10
+    assert cell["free_band_height_indices"] == [2]
+    assert evidence["mutated_memory"] is False
+    assert (
+        memory.occ_counts,
+        memory.free_counts,
+        memory.occ2d_counts,
+        memory.free2d_counts,
+        memory.visited2d_counts,
+    ) == before

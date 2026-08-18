@@ -25,6 +25,7 @@ def _audit(occupied_ratio, reachable, pitch_aware):
         "trigger_pose_grid": [8, 10],
         "source_anchor_pose_match": True,
         "route_cells": [[8, 8], [8, 9], [8, 10]],
+        "route_unique_cell_count": 3,
         "route_chain_continuous": True,
         "route_cell_state_ratios": {
             "free": 1.0 - occupied_ratio,
@@ -113,6 +114,51 @@ def test_fixed_route_analysis_allows_candidate_and_triage_changes(tmp_path):
         "anchor_grid": [8, 8],
         "candidate_id": "A",
     }
+    height_cells = [
+        {
+            "grid": [8, col],
+            "state": state,
+            "visited_hits": visited,
+            "occupied_band_hits": occupied_hits,
+            "free_band_hits": free_hits,
+            "band_evidence_hits": occupied_hits + free_hits,
+            "occupied_band_ratio": (
+                occupied_hits / (occupied_hits + free_hits)
+                if occupied_hits + free_hits
+                else None
+            ),
+            "occupied_band_margin": (
+                (occupied_hits - free_hits) / (occupied_hits + free_hits)
+                if occupied_hits + free_hits
+                else None
+            ),
+            "occupied_band_height_indices": [2] if occupied_hits else [],
+            "free_band_height_indices": [2] if free_hits else [],
+            "shared_band_height_indices": [2]
+            if occupied_hits and free_hits
+            else [],
+            "shared_band_occupied_hits": occupied_hits
+            if occupied_hits and free_hits
+            else 0,
+            "shared_band_free_hits": free_hits
+            if occupied_hits and free_hits
+            else 0,
+        }
+        for col, state, visited, occupied_hits, free_hits in (
+            (8, "free", 1, 0, 4),
+            (9, "occupied", 2, 2, 8),
+            (10, "occupied", 0, 5, 1),
+        )
+    ]
+    current_audit = _audit(0.25, True, True)
+    current_audit["route_cell_evidence"] = {
+        "schema_version": "stage22e_height_aligned_route_cell_evidence_v1",
+        "height_aligned": True,
+        "height_aligned_cell_count": 3,
+        "cell_count": 3,
+        "mutated_memory": False,
+        "cells": height_cells,
+    }
     current_wrapper = {
         "scene_id": "scene",
         "episode_id": 1,
@@ -128,7 +174,7 @@ def test_fixed_route_analysis_allows_candidate_and_triage_changes(tmp_path):
         "action_applied": False,
         "output_rewritten": False,
         "gt_fields_used": [],
-        "audit": _audit(0.25, True, True),
+        "audit": current_audit,
     }
     _write_jsonl(
         stage22a
@@ -175,6 +221,7 @@ def test_fixed_route_analysis_allows_candidate_and_triage_changes(tmp_path):
         stage22a,
         fixed_manifest,
         expected_fixed_routes=1,
+        require_height_evidence=True,
     )
 
     assert summary["integrity_passed"] is True, summary["violations"]
@@ -188,3 +235,11 @@ def test_fixed_route_analysis_allows_candidate_and_triage_changes(tmp_path):
     assert summary["triage_transition_counts"] == {
         "strict_intervention->adapter_candidate": 1
     }
+    assert summary["route_height_evidence_verified_count"] == 1
+    assert summary["route_height_evidence_cell_count"] == 3
+    assert summary["occupied_route_height_evidence_cell_count"] == 2
+    assert summary["occupied_cells_with_band_free_evidence_count"] == 2
+    assert summary["occupied_cells_band_free_dominant_count"] == 1
+    assert summary["occupied_cells_shared_band_height_count"] == 2
+    assert summary["occupied_cells_shared_band_free_dominant_count"] == 1
+    assert summary["occupied_visited_band_free_dominant_count"] == 1
