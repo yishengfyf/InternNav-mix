@@ -6243,6 +6243,50 @@ class SparseOccSemanticMemory:
             return "free"
         return "unknown"
 
+    def validation_floor_aligned_cell_evidence(
+        self, row: int, col: int, floor_z_m: float
+    ) -> Dict[str, Any]:
+        """Read local-height OCC evidence without mutating navigation state."""
+        min_height = int(
+            math.floor(
+                (float(floor_z_m) + float(self.config.obstacle_height_min))
+                / self.cs
+            )
+        )
+        max_height = int(
+            math.ceil(
+                (float(floor_z_m) + float(self.config.obstacle_height_max))
+                / self.cs
+            )
+        )
+        occupied_hits = 0
+        free_hits = 0
+        occupied_voxels = 0
+        free_voxels = 0
+        for height in range(min_height, max_height + 1):
+            key = (int(row), int(col), int(height))
+            occ = int(self.occ_counts.get(key, 0) or 0)
+            free = int(self.free_counts.get(key, 0) or 0)
+            occupied_hits += occ
+            free_hits += free
+            occupied_voxels += int(occ > 0)
+            free_voxels += int(free > 0)
+        state = "unknown"
+        if occupied_hits > 0:
+            state = "blocked"
+        elif free_hits > 0:
+            state = "free"
+        return {
+            "state": state,
+            "floor_z_m": float(floor_z_m),
+            "height_index_min": int(min_height),
+            "height_index_max": int(max_height),
+            "occupied_hits": int(occupied_hits),
+            "free_hits": int(free_hits),
+            "occupied_voxel_count": int(occupied_voxels),
+            "free_voxel_count": int(free_voxels),
+        }
+
     def audit_route_cell_evidence(
         self,
         route_audit: Dict[str, Any],

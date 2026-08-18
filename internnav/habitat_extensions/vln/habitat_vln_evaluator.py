@@ -11,7 +11,7 @@ import math
 import random
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime
 from typing import Any, Optional, Tuple
 
@@ -300,6 +300,35 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._stage23a_mesh_raycast_total = 0
         self._stage23a_mesh_raycast_hits = 0
         self._stage23a_mesh_raycast_misses = 0
+        self._stage23b_navmesh_audit_enabled = bool(
+            vlmap_safety_cfg.get(
+                "occ_memory_validation_navmesh_traversability_enable", False
+            )
+        )
+        self._stage23b_navmesh_max_cells = max(
+            32,
+            int(
+                vlmap_safety_cfg.get(
+                    "occ_memory_validation_navmesh_max_cells", 1200
+                )
+            ),
+        )
+        self._stage23b_navmesh_max_pairs = max(
+            0,
+            int(
+                vlmap_safety_cfg.get(
+                    "occ_memory_validation_navmesh_max_pairs", 12
+                )
+            ),
+        )
+        self._stage23b_agent_radius_m = max(
+            0.0,
+            float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_validation_navmesh_agent_radius_m", 0.18
+                )
+            ),
+        )
         self.occ_memory_oracle_pose = None
         if self._stage23a_oracle_pose_enabled:
             oracle_cfg = copy.deepcopy(vlmap_safety_cfg)
@@ -1482,6 +1511,498 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 else None
             ),
         }
+
+    @staticmethod
+    def _stage23b_binary_metrics(predicted: set, positive: set) -> dict:
+        tp = len(predicted & positive)
+        fp = len(predicted - positive)
+        fn = len(positive - predicted)
+        precision = tp / float(tp + fp) if tp + fp else None
+        recall = tp / float(tp + fn) if tp + fn else None
+        return {
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "precision": precision,
+            "recall": recall,
+            "f1": (
+                2.0 * precision * recall / (precision + recall)
+                if precision is not None
+                and recall is not None
+                and precision + recall
+                else None
+            ),
+            "iou": (
+                tp / float(tp + fp + fn) if tp + fp + fn else None
+            ),
+        }
+
+    def _stage23b_navmesh_traversability_audit(
+        self,
+        memory: SparseOccSemanticMemory,
+        reference: SparseOccSemanticMemory,
+        *,
+        branch_name: str,
+        scene_id: str,
+        episode_id: int,
+    ) -> dict:
+        """Compare a floor-aligned SparseOcc readout with Habitat navmesh."""
+        result = {
+            "enabled": bool(self._stage23b_navmesh_audit_enabled),
+            "branch": str(branch_name),
+            "valid": False,
+            "reason": None,
+            "shadow_only": True,
+            "action_applied": False,
+            "gt_fields_used_for_navigation": [],
+            "gt_reference": "Habitat pathfinder navmesh",
+            "evaluation_domain": "oracle_sensor_observed_xy_cells",
+            "unknown_is_free": False,
+            "local_floor_source": "nearest oracle sensor pose trace",
+            "agent_radius_m": float(self._stage23b_agent_radius_m),
+        }
+        if not self._stage23b_navmesh_audit_enabled:
+            result["reason"] = "disabled"
+            return result
+        if self._stage23a_initial_agent_matrix is None:
+            result["reason"] = "missing_initial_agent_matrix"
+            return result
+        pathfinder = getattr(self.env._env.sim, "pathfinder", None)
+        if pathfinder is None or not bool(getattr(pathfinder, "is_loaded", True)):
+            result["reason"] = "pathfinder_unavailable"
+            return result
+        trace = []
+        for node in reference.pose_trace:
+            sim_position = node.get("sim_position")
+            try:
+                trace.append(
+                    {
+                        "row": int(node["row"]),
+                        "col": int(node["col"]),
+                        "x": float(node["x"]),
+                        "y": float(node["y"]),
+                        "z": float(node["z"]),
+                        "sim_position": np.asarray(
+                            sim_position, dtype=np.float32
+                        ).reshape(3),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not trace:
+            result["reason"] = "missing_oracle_pose_trace"
+            return result
+        trace_xy = np.asarray([[p["x"], p["y"]] for p in trace], dtype=np.float32)
+        habitat_to_map = np.array(
+            [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        )
+        map_to_habitat_tf = np.eye(4, dtype=np.float32)
+        map_to_habitat_tf[:3, :3] = habitat_to_map.T
+        map_to_world = (
+            np.asarray(self._stage23a_initial_agent_matrix, dtype=np.float32)
+            @ map_to_habitat_tf
+        )
+
+        floor_cache = {}
+        world_cache = {}
+        nav_cache = {}
+        evidence_cache = {}
+
+        def cell_xy(cell):
+            return memory._grid_to_xy(cell)
+
+        def nearest_trace(cell):
+            cell = (int(cell[0]), int(cell[1]))
+            if cell not in floor_cache:
+                xy = cell_xy(cell)
+                index = int(np.argmin(np.sum((trace_xy - xy[None, :]) ** 2, axis=1)))
+                floor_cache[cell] = (float(trace[index]["z"]), index)
+            return floor_cache[cell]
+
+        def cell_world(cell):
+            cell = (int(cell[0]), int(cell[1]))
+            if cell not in world_cache:
+                floor_z, _ = nearest_trace(cell)
+                xy = cell_xy(cell)
+                point_map = np.array(
+                    [float(xy[0]), float(xy[1]), floor_z, 1.0],
+                    dtype=np.float32,
+                )
+                world_cache[cell] = (map_to_world @ point_map)[:3]
+            return world_cache[cell]
+
+        def navmesh_label(cell):
+            cell = (int(cell[0]), int(cell[1]))
+            if cell not in nav_cache:
+                point = cell_world(cell)
+                try:
+                    navigable = bool(pathfinder.is_navigable(point, 0.5))
+                except TypeError:
+                    navigable = bool(pathfinder.is_navigable(point))
+                snapped = np.asarray(pathfinder.snap_point(point), dtype=np.float32)
+                snap_distance = (
+                    float(np.linalg.norm(snapped - point))
+                    if snapped.shape == (3,) and np.all(np.isfinite(snapped))
+                    else None
+                )
+                nav_cache[cell] = (navigable, snap_distance)
+            return nav_cache[cell]
+
+        radius_cells = int(
+            math.ceil(float(self._stage23b_agent_radius_m) / memory.cs)
+        )
+
+        def predicted_state(cell):
+            cell = (int(cell[0]), int(cell[1]))
+            if cell in evidence_cache:
+                return evidence_cache[cell]
+            floor_z, _ = nearest_trace(cell)
+            center = memory.validation_floor_aligned_cell_evidence(
+                cell[0], cell[1], floor_z
+            )
+            blocked = False
+            if radius_cells > 0:
+                for dr in range(-radius_cells, radius_cells + 1):
+                    for dc in range(-radius_cells, radius_cells + 1):
+                        if math.hypot(dr, dc) * memory.cs > float(
+                            self._stage23b_agent_radius_m
+                        ):
+                            continue
+                        neighbor = memory.validation_floor_aligned_cell_evidence(
+                            cell[0] + dr, cell[1] + dc, floor_z
+                        )
+                        if neighbor["state"] == "blocked":
+                            blocked = True
+                            break
+                    if blocked:
+                        break
+            state = "blocked" if blocked else center["state"]
+            evidence_cache[cell] = state
+            return state
+
+        def evenly_sample(cells, limit):
+            ordered = sorted((int(r), int(c)) for r, c in cells)
+            if len(ordered) <= limit:
+                return ordered
+            ids = np.linspace(0, len(ordered) - 1, limit).astype(np.int64)
+            return [ordered[int(index)] for index in ids]
+
+        ref_occ = {(int(r), int(c)) for r, c, _ in reference.occ_counts}
+        ref_free = {(int(r), int(c)) for r, c, _ in reference.free_counts}
+        route_cells = list(
+            dict.fromkeys((int(node["row"]), int(node["col"])) for node in trace)
+        )
+        sample_budget = int(self._stage23b_navmesh_max_cells)
+        half = max(1, (sample_budget - len(route_cells)) // 2)
+        sampled = list(
+            dict.fromkeys(
+                route_cells
+                + evenly_sample(ref_occ, half)
+                + evenly_sample(ref_free, half)
+            )
+        )
+        if len(sampled) > sample_budget:
+            keep_route = list(dict.fromkeys(route_cells))
+            remaining = [cell for cell in sampled if cell not in set(keep_route)]
+            sampled = keep_route + evenly_sample(
+                remaining, max(0, sample_budget - len(keep_route))
+            )
+
+        gt_free = set()
+        gt_blocked = set()
+        pred_free = set()
+        pred_blocked = set()
+        pred_unknown = set()
+        snap_distances = []
+        for cell in sampled:
+            navigable, snap_distance = navmesh_label(cell)
+            (gt_free if navigable else gt_blocked).add(cell)
+            if snap_distance is not None:
+                snap_distances.append(snap_distance)
+            state = predicted_state(cell)
+            if state == "free":
+                pred_free.add(cell)
+            elif state == "blocked":
+                pred_blocked.add(cell)
+            else:
+                pred_unknown.add(cell)
+
+        route_state_counts = {"free": 0, "blocked": 0, "unknown": 0}
+        route_navmesh_free = 0
+        for cell in route_cells:
+            route_state_counts[predicted_state(cell)] += 1
+            route_navmesh_free += int(navmesh_label(cell)[0])
+
+        movement_nodes = [trace[0]]
+        for node in trace[1:]:
+            if math.hypot(
+                node["x"] - movement_nodes[-1]["x"],
+                node["y"] - movement_nodes[-1]["y"],
+            ) > 1e-4:
+                movement_nodes.append(node)
+        edge_records = []
+        strict_edge_count = 0
+        nonblocked_edge_count = 0
+        for first, second in zip(movement_nodes[:-1], movement_nodes[1:]):
+            start = (first["row"], first["col"])
+            end = (second["row"], second["col"])
+            distance = math.hypot(second["x"] - first["x"], second["y"] - first["y"])
+            cells = memory._rasterize_executed_route_edge(
+                start, end, edge_length_m=distance, sample_spacing_m=memory.cs
+            )
+            counts = {"free": 0, "blocked": 0, "unknown": 0}
+            for cell in dict.fromkeys(cells):
+                counts[predicted_state(cell)] += 1
+            strict = counts["free"] > 0 and counts["blocked"] == 0 and counts["unknown"] == 0
+            nonblocked = counts["blocked"] == 0
+            strict_edge_count += int(strict)
+            nonblocked_edge_count += int(nonblocked)
+            edge_records.append(
+                {
+                    "source_grid": [int(start[0]), int(start[1])],
+                    "target_grid": [int(end[0]), int(end[1])],
+                    "length_m": float(distance),
+                    "cell_state_counts": counts,
+                    "strict_free": bool(strict),
+                    "no_false_block": bool(nonblocked),
+                }
+            )
+
+        state_cache = evidence_cache
+
+        def predicted_path(start, goal, max_visited=20000):
+            start = (int(start[0]), int(start[1]))
+            goal = (int(goal[0]), int(goal[1]))
+            if predicted_state(start) != "free" or predicted_state(goal) != "free":
+                return False, None
+            queue = deque([start])
+            distance = {start: 0.0}
+            visited = 0
+            while queue and visited < max_visited:
+                cell = queue.popleft()
+                visited += 1
+                if cell == goal:
+                    return True, float(distance[cell])
+                for dr, dc, scale in (
+                    (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+                    (-1, -1, math.sqrt(2.0)), (-1, 1, math.sqrt(2.0)),
+                    (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
+                ):
+                    neighbor = (cell[0] + dr, cell[1] + dc)
+                    if neighbor in distance or predicted_state(neighbor) != "free":
+                        continue
+                    if dr and dc and (
+                        predicted_state((cell[0] + dr, cell[1])) != "free"
+                        or predicted_state((cell[0], cell[1] + dc)) != "free"
+                    ):
+                        continue
+                    if math.hypot(neighbor[0] - start[0], neighbor[1] - start[1]) * memory.cs > 6.0:
+                        continue
+                    distance[neighbor] = distance[cell] + scale * memory.cs
+                    queue.append(neighbor)
+            return False, None
+
+        def gt_path(start, goal):
+            shortest = habitat_sim.ShortestPath()
+            shortest.requested_start = cell_world(start)
+            shortest.requested_end = cell_world(goal)
+            found = bool(pathfinder.find_path(shortest))
+            return found, float(shortest.geodesic_distance) if found else None
+
+        pairs = []
+        anchors = route_cells[:-1]
+        if anchors:
+            anchor_ids = np.linspace(
+                0, len(anchors) - 1, min(6, len(anchors))
+            ).astype(np.int64)
+            current = route_cells[-1]
+            for index in anchor_ids:
+                anchor = anchors[int(index)]
+                if anchor != current:
+                    pairs.append(("current_to_history", current, anchor))
+        nav_cells = [cell for cell in sampled if navmesh_label(cell)[0]]
+        pair_budget = max(0, self._stage23b_navmesh_max_pairs - len(pairs))
+        for index in range(min(pair_budget, max(0, len(nav_cells) - 1))):
+            first = nav_cells[index]
+            second = nav_cells[-(index + 1)]
+            if first != second and np.linalg.norm(cell_xy(first) - cell_xy(second)) <= 4.0:
+                pairs.append(("local_observed_pair", first, second))
+
+        pair_records = []
+        reachability_matches = 0
+        geodesic_errors = []
+        current_anchor_gt = current_anchor_pred = 0
+        for role, start, goal in pairs[: self._stage23b_navmesh_max_pairs]:
+            gt_reachable, gt_distance = gt_path(start, goal)
+            pred_reachable, pred_distance = predicted_path(start, goal)
+            reachability_matches += int(gt_reachable == pred_reachable)
+            if role == "current_to_history" and gt_reachable:
+                current_anchor_gt += 1
+                current_anchor_pred += int(pred_reachable)
+            if (
+                gt_reachable
+                and pred_reachable
+                and gt_distance is not None
+                and pred_distance is not None
+            ):
+                geodesic_errors.append(abs(pred_distance - gt_distance))
+            pair_records.append(
+                {
+                    "role": role,
+                    "start_grid": [int(start[0]), int(start[1])],
+                    "goal_grid": [int(goal[0]), int(goal[1])],
+                    "gt_reachable": bool(gt_reachable),
+                    "predicted_reachable": bool(pred_reachable),
+                    "gt_geodesic_m": gt_distance,
+                    "predicted_path_m": pred_distance,
+                }
+            )
+
+        floor_levels = []
+        for node in trace:
+            height = float(node["z"])
+            if not any(abs(height - existing) < 0.50 for existing in floor_levels):
+                floor_levels.append(height)
+        multi_floor_evidence_count = 0
+        if len(floor_levels) > 1:
+            for cell in sampled:
+                evidence_levels = [
+                    level
+                    for level in floor_levels
+                    if memory.validation_floor_aligned_cell_evidence(
+                        cell[0], cell[1], level
+                    )["state"]
+                    != "unknown"
+                ]
+                if evidence_levels and (
+                    max(evidence_levels) - min(evidence_levels) >= 0.75
+                ):
+                    multi_floor_evidence_count += 1
+
+        result.update(
+            {
+                "valid": True,
+                "reason": "ok",
+                "sampled_cell_count": int(len(sampled)),
+                "gt_free_cell_count": int(len(gt_free)),
+                "gt_blocked_cell_count": int(len(gt_blocked)),
+                "predicted_free_cell_count": int(len(pred_free)),
+                "predicted_blocked_cell_count": int(len(pred_blocked)),
+                "predicted_unknown_cell_count": int(len(pred_unknown)),
+                "unknown_coverage": (
+                    float(len(pred_unknown) / len(sampled)) if sampled else None
+                ),
+                "free_metrics_observed_domain": self._stage23b_binary_metrics(
+                    pred_free, gt_free
+                ),
+                "blocked_metrics_observed_domain": self._stage23b_binary_metrics(
+                    pred_blocked, gt_blocked
+                ),
+                "false_free_rate": (
+                    float(len(pred_free & gt_blocked) / len(pred_free))
+                    if pred_free else None
+                ),
+                "false_blocked_rate": (
+                    float(len(pred_blocked & gt_free) / len(pred_blocked))
+                    if pred_blocked else None
+                ),
+                "navmesh_snap_distance_m": {
+                    "mean": float(np.mean(snap_distances)) if snap_distances else None,
+                    "p95": float(np.percentile(snap_distances, 95)) if snap_distances else None,
+                },
+                "executed_route_cell_count": int(len(route_cells)),
+                "executed_route_navmesh_free_recall": (
+                    float(route_navmesh_free / len(route_cells)) if route_cells else None
+                ),
+                "executed_route_predicted_free_recall": (
+                    float(route_state_counts["free"] / len(route_cells)) if route_cells else None
+                ),
+                "executed_route_state_counts": route_state_counts,
+                "historical_edge_count": int(len(edge_records)),
+                "historical_edge_strict_free_recall": (
+                    float(strict_edge_count / len(edge_records)) if edge_records else None
+                ),
+                "historical_edge_no_false_block_recall": (
+                    float(nonblocked_edge_count / len(edge_records)) if edge_records else None
+                ),
+                "edge_records": edge_records,
+                "pair_count": int(len(pair_records)),
+                "reachability_agreement": (
+                    float(reachability_matches / len(pair_records)) if pair_records else None
+                ),
+                "current_to_history_anchor_gt_reachable_count": int(current_anchor_gt),
+                "current_to_history_anchor_predicted_reachable_count": int(current_anchor_pred),
+                "current_to_history_anchor_connectivity_recall": (
+                    float(current_anchor_pred / current_anchor_gt) if current_anchor_gt else None
+                ),
+                "geodesic_abs_error_m": {
+                    "count": int(len(geodesic_errors)),
+                    "mean": float(np.mean(geodesic_errors)) if geodesic_errors else None,
+                    "p95": float(np.percentile(geodesic_errors, 95)) if geodesic_errors else None,
+                },
+                "trace_floor_level_count": int(len(floor_levels)),
+                "trace_floor_levels_m": [float(value) for value in floor_levels],
+                "cross_floor_mixed_evidence_cell_count": int(
+                    multi_floor_evidence_count
+                ),
+                "cross_floor_mixed_evidence_rate": (
+                    float(multi_floor_evidence_count / len(sampled))
+                    if sampled else None
+                ),
+                "pair_records": pair_records,
+                "cached_cell_state_count": int(len(state_cache)),
+            }
+        )
+
+        output_root = self._get_vlmap_run_dir()
+        if output_root:
+            output_root = os.path.join(output_root, "stage23b_navmesh_traversability")
+            os.makedirs(output_root, exist_ok=True)
+            json_path = os.path.join(
+                output_root,
+                f"{scene_id}_{episode_id}_{branch_name}.json",
+            )
+            with open(json_path, "w", encoding="utf-8") as stream:
+                json.dump(result, stream, ensure_ascii=False, indent=2)
+            result["json_path"] = json_path
+
+            canvas = np.full((768, 768, 3), 245, dtype=np.uint8)
+            all_rows = [cell[0] for cell in sampled + route_cells]
+            all_cols = [cell[1] for cell in sampled + route_cells]
+            if all_rows and all_cols:
+                row_min, row_max = min(all_rows), max(all_rows)
+                col_min, col_max = min(all_cols), max(all_cols)
+                span = max(row_max - row_min + 1, col_max - col_min + 1, 1)
+                scale = 720.0 / float(span)
+                def pixel(cell):
+                    return (
+                        int(24 + (cell[1] - col_min) * scale),
+                        int(24 + (cell[0] - row_min) * scale),
+                    )
+                for cell in sampled:
+                    gt = navmesh_label(cell)[0]
+                    state = predicted_state(cell)
+                    color = (190, 190, 190)
+                    if state == "free" and gt:
+                        color = (70, 170, 70)
+                    elif state == "blocked" and not gt:
+                        color = (60, 60, 210)
+                    elif state == "free" and not gt:
+                        color = (210, 70, 210)
+                    elif state == "blocked" and gt:
+                        color = (30, 150, 235)
+                    cv2.circle(canvas, pixel(cell), 2, color, -1)
+                route_pixels = [pixel(cell) for cell in route_cells]
+                for first, second in zip(route_pixels[:-1], route_pixels[1:]):
+                    cv2.line(canvas, first, second, (10, 10, 10), 2)
+            image_path = os.path.join(
+                output_root,
+                f"{scene_id}_{episode_id}_{branch_name}.png",
+            )
+            cv2.imwrite(image_path, canvas)
+            result["visualization_path"] = image_path
+        return result
 
     def _plan_s2_loop_path_reobserve_active(
         self,
@@ -10626,6 +11147,30 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             ensure_ascii=False,
                             indent=2,
                         )
+            stage23b_navmesh_current = {}
+            stage23b_navmesh_oracle_sensor = {}
+            if (
+                self._stage23b_navmesh_audit_enabled
+                and self.occ_memory_oracle_sensor_pose is not None
+            ):
+                stage23b_navmesh_current = (
+                    self._stage23b_navmesh_traversability_audit(
+                        self.occ_memory,
+                        self.occ_memory_oracle_sensor_pose,
+                        branch_name="current",
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                    )
+                )
+                stage23b_navmesh_oracle_sensor = (
+                    self._stage23b_navmesh_traversability_audit(
+                        self.occ_memory_oracle_sensor_pose,
+                        self.occ_memory_oracle_sensor_pose,
+                        branch_name="oracle_sensor",
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                    )
+                )
             stage23a_sensor_comparison = {}
             stage23a_sensor_comparison_path = None
             if self.occ_memory_oracle_sensor_pose is not None:
@@ -10710,6 +11255,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                 ),
                 "stage23a_mesh_raycast": self._stage23a_mesh_raycast_summary(),
+                "stage23b_navmesh_traversability_current": (
+                    stage23b_navmesh_current
+                ),
+                "stage23b_navmesh_traversability_oracle_sensor": (
+                    stage23b_navmesh_oracle_sensor
+                ),
             }
             result.update(safety_summary)
             result["s2_recovery_context_enabled"] = bool(

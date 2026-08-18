@@ -49,6 +49,7 @@ def analyze(
     require_height_ablation,
     require_mesh_raycast,
     require_signed_mesh,
+    require_navmesh_traversability,
 ):
     expected = _load_manifest(manifest)
     progress = _load_unique(run_root.glob("vlmap_safety_debug/*run_*/progress.json"))
@@ -128,6 +129,25 @@ def analyze(
             or mesh_raycast.get("potential_false_occupied_lt_neg_0_05m_rate") is None
         ):
             errors.append(f"missing_signed_mesh_raycast:{key}")
+        navmesh_current = p.get("stage23b_navmesh_traversability_current") or {}
+        navmesh_oracle = (
+            p.get("stage23b_navmesh_traversability_oracle_sensor") or {}
+        )
+        if require_navmesh_traversability:
+            for branch, navmesh in (
+                ("current", navmesh_current),
+                ("oracle_sensor", navmesh_oracle),
+            ):
+                if (
+                    not navmesh.get("enabled")
+                    or not navmesh.get("valid")
+                    or int(navmesh.get("sampled_cell_count", 0) or 0) <= 0
+                    or int(navmesh.get("executed_route_cell_count", 0) or 0) <= 0
+                    or navmesh.get("executed_route_navmesh_free_recall") is None
+                    or int(navmesh.get("pair_count", 0) or 0) <= 0
+                    or navmesh.get("reachability_agreement") is None
+                ):
+                    errors.append(f"missing_navmesh_traversability:{branch}:{key}")
         endpoint = c.get("validation_endpoint_gt_error_stats") or {}
         if not endpoint.get("count"):
             errors.append(f"missing_endpoint_gt_stats:{key}")
@@ -154,6 +174,8 @@ def analyze(
                 "current_to_oracle_height_comparison": height_comparison,
                 "shadow_action_violation_count": violations,
                 "mesh_raycast": mesh_raycast,
+                "navmesh_traversability_current": navmesh_current,
+                "navmesh_traversability_oracle_sensor": navmesh_oracle,
             }
         )
     report = {
@@ -171,6 +193,7 @@ def analyze(
         "height_ablation_required": bool(require_height_ablation),
         "mesh_raycast_required": bool(require_mesh_raycast),
         "signed_mesh_raycast_required": bool(require_signed_mesh),
+        "navmesh_traversability_required": bool(require_navmesh_traversability),
         "episodes": episodes,
         "errors": errors,
     }
@@ -190,6 +213,7 @@ def main():
     parser.add_argument("--require-height-ablation", action="store_true")
     parser.add_argument("--require-mesh-raycast", action="store_true")
     parser.add_argument("--require-signed-mesh", action="store_true")
+    parser.add_argument("--require-navmesh-traversability", action="store_true")
     args = parser.parse_args()
     analyze(
         args.run_root,
@@ -199,6 +223,7 @@ def main():
         args.require_height_ablation,
         args.require_mesh_raycast,
         args.require_signed_mesh,
+        args.require_navmesh_traversability,
     )
 
 
