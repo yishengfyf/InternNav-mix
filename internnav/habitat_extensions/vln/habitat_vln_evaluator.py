@@ -374,6 +374,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "executed_route_occ_audit_enable": bool(
                 vlmap_safety_cfg.get("s2_loop_executed_route_occ_audit_enable", False)
             ),
+            "fixed_route_occ_audit_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_fixed_route_occ_audit_enable", False
+                )
+            ),
+            "fixed_route_occ_audit_entries": tuple(
+                dict(entry)
+                for entry in (
+                    vlmap_safety_cfg.get(
+                        "s2_loop_fixed_route_occ_audit_entries", []
+                    )
+                    or []
+                )
+                if isinstance(entry, dict)
+            ),
             "executed_route_occ_audit_max_edge_m": max(
                 0.05,
                 float(
@@ -1382,6 +1397,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(log_path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
+    def _write_s2_loop_fixed_route_occ_audit_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(
+            log_dir, "s2_loop_fixed_route_occ_audit_events.jsonl"
+        )
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
     def _write_s2_recovery_context_event(self, event: dict) -> None:
         run_dir = self._get_vlmap_run_dir()
         log_dir = run_dir or self.output_path
@@ -1609,6 +1636,77 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
             event["executed_route_occ_audit_reason"] = route_audit.get("reason")
             self._write_s2_loop_executed_route_occ_audit_event(route_audit_event)
+
+        fixed_route_reference = next(
+            (
+                entry
+                for entry in cfg.get("fixed_route_occ_audit_entries", ())
+                if str(entry.get("scene_id")) == str(scene_id)
+                and int(entry.get("episode_id", -1)) == int(episode_id)
+                and int(entry.get("step_id", -1)) == int(step_id)
+            ),
+            None,
+        )
+        if bool(cfg.get("fixed_route_occ_audit_enable")) and fixed_route_reference:
+            fixed_candidate = {
+                "candidate_id": fixed_route_reference.get("candidate_id"),
+                "grid": list(fixed_route_reference.get("anchor_grid") or []),
+                "semantic_resilience_source_step_id": fixed_route_reference.get(
+                    "source_step"
+                ),
+                "semantic_resilience_source": "stage22a_fixed_reference",
+            }
+            fixed_route_audit = self.occ_memory.audit_executed_route_to_candidate(
+                fixed_candidate,
+                current_step=int(step_id),
+                max_edge_m=float(cfg["executed_route_occ_audit_max_edge_m"]),
+                sample_spacing_m=float(
+                    cfg["executed_route_occ_audit_sample_spacing_m"]
+                ),
+                max_path_cells=int(
+                    cfg["executed_route_occ_audit_max_path_cells"]
+                ),
+                max_visited_cells=int(
+                    cfg["executed_route_occ_audit_max_visited_cells"]
+                ),
+            )
+            selected_candidate = candidate or {}
+            fixed_route_event = {
+                "event_type": "s2_loop_fixed_route_occ_audit",
+                "event_schema_version": "stage22c_fixed_route_occ_audit_v1",
+                "scene_id": scene_id,
+                "episode_id": int(episode_id),
+                "episode_index": int(episode_index),
+                "episode_count": int(episode_count),
+                "episode_eval_seed": episode_eval_seed,
+                "step_id": int(step_id),
+                "loop_index": transition.get("loop_index"),
+                "fixed_reference": dict(fixed_route_reference),
+                "current_selected_candidate": {
+                    "candidate_id": selected_candidate.get("candidate_id"),
+                    "grid": selected_candidate.get("grid"),
+                    "source_step": selected_candidate.get(
+                        "semantic_resilience_source_step_id"
+                    ),
+                    "source": selected_candidate.get(
+                        "semantic_resilience_source"
+                    ),
+                },
+                "current_triage_tier": triage.get("tier"),
+                "current_triage_reason": triage.get("reason"),
+                "audit": fixed_route_audit,
+                "shadow_only": True,
+                "action_applied": False,
+                "output_rewritten": False,
+                "gt_fields_used": [],
+            }
+            event["fixed_route_occ_audit_valid"] = bool(
+                fixed_route_audit.get("valid")
+            )
+            event["fixed_route_occ_audit_reason"] = fixed_route_audit.get(
+                "reason"
+            )
+            self._write_s2_loop_fixed_route_occ_audit_event(fixed_route_event)
         max_snapshots = max(0, int(cfg.get("max_snapshots_per_episode", 2)))
         snapshot_expected = bool(
             int(transition.get("loop_index", 0) or 0) <= max_snapshots

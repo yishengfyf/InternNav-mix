@@ -1,0 +1,14 @@
+[
+  {"scene_id": "1LXtFkjw3qL", "episode_id": 7080, "step_id": 72, "source_step": 39, "anchor_grid": [611, 519], "candidate_id": "D"},
+  {"scene_id": "1pXnuDYAj8r", "episode_id": 2625, "step_id": 89, "source_step": 61, "anchor_grid": [487, 477], "candidate_id": "A"},
+  {"scene_id": "1pXnuDYAj8r", "episode_id": 4147, "step_id": 82, "source_step": 40, "anchor_grid": [571, 620], "candidate_id": "A"},
+  {"scene_id": "5q7pvUzZiYa", "episode_id": 9357, "step_id": 107, "source_step": 20, "anchor_grid": [500, 500], "candidate_id": "D"},
+  {"scene_id": "5q7pvUzZiYa", "episode_id": 9357, "step_id": 324, "source_step": 227, "anchor_grid": [489, 489], "candidate_id": "B"},
+  {"scene_id": "V2XKFyX4ASd", "episode_id": 5709, "step_id": 63, "source_step": 37, "anchor_grid": [471, 568], "candidate_id": "B"},
+  {"scene_id": "VFuaQ6m2Qom", "episode_id": 9903, "step_id": 70, "source_step": 52, "anchor_grid": [596, 587], "candidate_id": "A"},
+  {"scene_id": "XcA2TqTSSAj", "episode_id": 1765, "step_id": 55, "source_step": 22, "anchor_grid": [429, 520], "candidate_id": "D"},
+  {"scene_id": "XcA2TqTSSAj", "episode_id": 9450, "step_id": 101, "source_step": 72, "anchor_grid": [508, 653], "candidate_id": "D"},
+  {"scene_id": "XcA2TqTSSAj", "episode_id": 10530, "step_id": 49, "source_step": 10, "anchor_grid": [492, 483], "candidate_id": "D"},
+  {"scene_id": "jh4fc5c5qoQ", "episode_id": 2278, "step_id": 63, "source_step": 39, "anchor_grid": [534, 607], "candidate_id": "D"},
+  {"scene_id": "kEZ7cmS4wCh", "episode_id": 7172, "step_id": 142, "source_step": 114, "anchor_grid": [421, 365], "candidate_id": "D"}
+]
