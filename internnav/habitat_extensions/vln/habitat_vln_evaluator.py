@@ -265,6 +265,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
         )
         self.occ_memory.set_debug_dir(self._get_vlmap_run_dir())
+        self._stage23a_oracle_pose_enabled = bool(
+            vlmap_safety_cfg.get("occ_memory_validation_oracle_pose_enable", False)
+        )
+        self._stage23a_initial_sim_position = None
+        self.occ_memory_oracle_pose = None
+        if self._stage23a_oracle_pose_enabled:
+            oracle_cfg = copy.deepcopy(vlmap_safety_cfg)
+            oracle_cfg["occ_memory_validation_pose_from_context"] = True
+            oracle_cfg["occ_memory_stage21_multitask_shadow_enable"] = False
+            oracle_cfg["occ_memory_progress_ranker_shadow_enable"] = False
+            oracle_cfg["occ_memory_candidate_probe_enable"] = False
+            oracle_cfg["occ_memory_save_bev"] = False
+            oracle_cfg["occ_memory_candidate_probe_save_bev"] = False
+            self.occ_memory_oracle_pose = SparseOccSemanticMemory(
+                oracle_cfg,
+                get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
+            )
+            oracle_debug_dir = self._get_vlmap_run_dir()
+            if oracle_debug_dir:
+                oracle_debug_dir = os.path.join(
+                    oracle_debug_dir, "stage23a_oracle_pose"
+                )
+            self.occ_memory_oracle_pose.set_debug_dir(oracle_debug_dir)
 
     def eval_action(self):
         """
@@ -315,6 +338,32 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return None
         self._vlmap_run_dir = get_debug_dir()
         return self._vlmap_run_dir
+
+    def _stage23a_sim_pose_context(self, *, initialize: bool = False) -> dict:
+        """Return GT-only simulator pose fields for the Stage23A shadow audit."""
+        if not self._stage23a_oracle_pose_enabled:
+            return {}
+        try:
+            state = self.env._env.sim.get_agent_state()
+            position = np.asarray(state.position, dtype=np.float32).reshape(3)
+            if initialize or self._stage23a_initial_sim_position is None:
+                self._stage23a_initial_sim_position = position.copy()
+            initial = np.asarray(
+                self._stage23a_initial_sim_position, dtype=np.float32
+            ).reshape(3)
+            rotation = quaternion.as_float_array(state.rotation).astype(np.float32)
+            return {
+                "stage23a_gt_relative_height_m": float(position[1] - initial[1]),
+                "stage23a_sim_position": position.tolist(),
+                "stage23a_initial_sim_position": initial.tolist(),
+                "stage23a_sim_rotation_wxyz": rotation.tolist(),
+                "stage23a_gt_only": True,
+            }
+        except Exception as exc:
+            return {
+                "stage23a_gt_pose_error": f"{type(exc).__name__}: {exc}",
+                "stage23a_gt_only": True,
+            }
 
     def _setup_vlmap_run_logging(self) -> None:
         run_dir = self._get_vlmap_run_dir()
@@ -6896,6 +6945,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             episode_eval_seed = self._seed_eval_rng_for_episode(
                 episode_index, episode_id, scene_id
             )
+            self._stage23a_initial_sim_position = None
+            self._stage23a_sim_pose_context(initialize=True)
             print("episode start", episode_instruction)
             self.vlmap_safety.reset()
             self._vlmap_last_nav_action = None
@@ -6913,6 +6964,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 episode_index=episode_index,
                 episode_count=episode_count,
             )
+            if self.occ_memory_oracle_pose is not None:
+                self.occ_memory_oracle_pose.reset_episode(
+                    instruction=episode_instruction,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    episode_index=episode_index,
+                    episode_count=episode_count,
+                )
 
             # save first frame per rank to validate sim quality
             os.makedirs(os.path.join(self.output_path, f'check_sim_{self.epoch}'), exist_ok=True)
@@ -7115,32 +7174,46 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 depth = depth * (self._max_depth - self._min_depth) + self._min_depth
                 current_depth_m = depth.copy()
                 depth = current_depth_m * 1000
+                occ_memory_obs = {
+                    "rgb": rgb,
+                    "depth": current_depth_m,
+                    "gps": observations.get("gps"),
+                    "compass": observations.get("compass"),
+                }
+                occ_memory_context = {
+                    "step_id": step_id,
+                    "scene_id": scene_id,
+                    "episode_id": episode_id,
+                    "episode_index": episode_index,
+                    "episode_count": episode_count,
+                    # At loop entry, `action` is the previous Habitat
+                    # action. LOOKDOWN is applied twice per visual tilt,
+                    # so this observation is approximately 2*tilt below
+                    # horizon; normal observations are horizon-facing.
+                    "camera_pitch_deg": (
+                        2.0 * self._tilt_angle_deg
+                        if action == action_code.LOOKDOWN
+                        else 0.0
+                    ),
+                    **self._stage23a_sim_pose_context(),
+                }
                 occ_memory_update_event = self.occ_memory.update_observation(
-                    {
-                        "rgb": rgb,
-                        "depth": current_depth_m,
-                        "gps": observations.get("gps"),
-                        "compass": observations.get("compass"),
-                    },
+                    occ_memory_obs,
                     current_depth_m,
                     rgb=rgb,
-                    context={
-                        "step_id": step_id,
-                        "scene_id": scene_id,
-                        "episode_id": episode_id,
-                        "episode_index": episode_index,
-                        "episode_count": episode_count,
-                        # At loop entry, `action` is the previous Habitat
-                        # action. LOOKDOWN is applied twice per visual tilt,
-                        # so this observation is approximately 2*tilt below
-                        # horizon; normal observations are horizon-facing.
-                        "camera_pitch_deg": (
-                            2.0 * self._tilt_angle_deg
-                            if action == action_code.LOOKDOWN
-                            else 0.0
-                        ),
-                    },
+                    context=occ_memory_context,
                 )
+                if self.occ_memory_oracle_pose is not None:
+                    self.occ_memory_oracle_pose.update_observation(
+                        occ_memory_obs,
+                        current_depth_m,
+                        rgb=rgb,
+                        context={
+                            **occ_memory_context,
+                            "stage23a_map_branch": "oracle_relative_height",
+                            "gt_fields_used": ["habitat_sim_agent_position_y"],
+                        },
+                    )
                 occ_memory_recovery_event = self._update_occ_memory_recovery_shadow(
                     occ_memory_recovery_state,
                     update_event=occ_memory_update_event,
@@ -10227,6 +10300,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 pending_s2_loop_path_execution = None
             semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
             occ_memory_summary = self.occ_memory.finish_episode(metrics=metrics, steps=step_id)
+            occ_memory_oracle_pose_summary = {}
+            if self.occ_memory_oracle_pose is not None:
+                occ_memory_oracle_pose_summary = (
+                    self.occ_memory_oracle_pose.finish_episode(
+                        metrics=metrics, steps=step_id
+                    )
+                )
             occ_memory_recovery_summary = self._summarize_occ_memory_recovery_state(
                 occ_memory_recovery_state
             )
@@ -10249,6 +10329,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "ne": metrics["distance_to_goal"],
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
+                "stage23a_oracle_pose_audit_enabled": bool(
+                    self.occ_memory_oracle_pose is not None
+                ),
+                "stage23a_gt_fields_used_for_navigation": [],
+                "stage23a_oracle_pose_update_count": int(
+                    occ_memory_oracle_pose_summary.get("update_count", 0) or 0
+                ),
+                "stage23a_gt_relative_height_range_m": (
+                    occ_memory_oracle_pose_summary.get(
+                        "validation_gt_relative_height_range_m"
+                    )
+                ),
             }
             result.update(safety_summary)
             result["s2_recovery_context_enabled"] = bool(

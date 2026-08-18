@@ -1,0 +1,14 @@
+[
+  {
+    "scene_id": "1pXnuDYAj8r",
+    "episode_id": 4147,
+    "episode_eval_seed": 300068,
+    "audit_role": "stairs_success"
+  },
+  {
+    "scene_id": "jh4fc5c5qoQ",
+    "episode_id": 2278,
+    "episode_eval_seed": 300112,
+    "audit_role": "flat_candidate_success"
+  }
+]

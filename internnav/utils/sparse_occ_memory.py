@@ -435,6 +435,10 @@ class SparseOccMemoryConfig:
     validation_save_current_rgb_ply: bool = True
     validation_save_memory_ply: bool = True
     validation_save_final_memory_ply: bool = True
+    validation_accumulate_rgb_surface: bool = True
+    validation_max_accumulated_surface_points: int = 200000
+    validation_projection_size: int = 768
+    validation_pose_from_context: bool = False
     verbose: bool = False
 
 
@@ -568,6 +572,12 @@ class SparseOccSemanticMemory:
         self.saved_candidate_bev_count = 0
         self.saved_validation_count = 0
         self.saved_validation_final_count = 0
+        self.validation_surface_points: List[np.ndarray] = []
+        self.validation_surface_colors: List[np.ndarray] = []
+        self.validation_surface_point_count = 0
+        self.validation_pose_height_values: List[float] = []
+        self.validation_gt_height_values: List[float] = []
+        self.validation_height_abs_errors: List[float] = []
         self.last_semantic_decision: Dict[str, Any] = {}
         self.last_stagnation_step: Optional[int] = None
         event = {
@@ -602,7 +612,7 @@ class SparseOccSemanticMemory:
             event["reason"] = "missing_intrinsic"
             self._write_event(event)
             return event
-        pose_tf = self._pose_from_obs(obs)
+        pose_tf = self._pose_from_obs(obs, context=context)
         if pose_tf is None:
             event["reason"] = "missing_pose"
             self._write_event(event)
@@ -641,8 +651,22 @@ class SparseOccSemanticMemory:
                 "yaw": float(pose_yaw),
                 "camera_pitch_deg": float(requested_camera_pitch_deg),
                 "mapping_camera_pitch_deg": float(applied_camera_pitch_deg),
+                "pose_height_source": (
+                    "context_oracle_height"
+                    if bool(self.config.validation_pose_from_context)
+                    else "gps_compass_2d"
+                ),
+                "gt_relative_height_m": context.get("stage23a_gt_relative_height_m"),
+                "sim_position": context.get("stage23a_sim_position"),
             }
         )
+        pose_height = float(rel_base_tf[2, 3])
+        gt_height = context.get("stage23a_gt_relative_height_m")
+        if gt_height is not None:
+            gt_height = float(gt_height)
+            self.validation_pose_height_values.append(pose_height)
+            self.validation_gt_height_values.append(gt_height)
+            self.validation_height_abs_errors.append(abs(pose_height - gt_height))
         self._maybe_add_keyframe(context, rel_base_tf, pose_row, pose_col, pose_yaw)
 
         cam_points, point_ids = _depth_to_points(
@@ -674,6 +698,11 @@ class SparseOccSemanticMemory:
             axis=1,
         )
         world_points = (cam_pose_tf @ cam_points_h.T).T[:, :3]
+        if self.config.validation_enable and self.config.validation_accumulate_rgb_surface:
+            surface_colors = self._rgb_colors_for_point_ids(
+                rgb, point_ids, self._depth_shape(depth)
+            )
+            self._append_validation_surface(world_points, surface_colors)
         cam_origin = cam_pose_tf[:3, 3]
         occupied_added = 0
         free_added = 0
@@ -4676,6 +4705,15 @@ class SparseOccSemanticMemory:
             "candidate_bev_snapshot_count": int(self.saved_candidate_bev_count),
             "validation_snapshot_count": int(self.saved_validation_count),
             "validation_final_snapshot_count": int(self.saved_validation_final_count),
+            "validation_pose_source": (
+                "context_oracle_height"
+                if bool(self.config.validation_pose_from_context)
+                else "gps_compass_2d"
+            ),
+            "validation_accumulated_rgb_surface_point_count": int(
+                self.validation_surface_point_count
+            ),
+            **self._validation_pose_audit_summary(),
         }
         self._write_event(summary)
         self._write_summary(summary)
@@ -4716,15 +4754,55 @@ class SparseOccSemanticMemory:
             self.frontier_set_cache_update = self.update_count
         return self.frontier_set_cache
 
-    def _pose_from_obs(self, obs: Dict[str, Any]) -> Optional[np.ndarray]:
+    def _pose_from_obs(
+        self, obs: Dict[str, Any], *, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[np.ndarray]:
         if obs.get("gps") is None or obs.get("compass") is None:
             return None
         gps = np.asarray(obs["gps"], dtype=np.float32).reshape(-1)
         if gps.shape[0] < 2:
             return None
         yaw = float(np.asarray(obs["compass"], dtype=np.float32).reshape(-1)[0])
-        pos = np.array([float(gps[0]), -float(gps[1]), 0.0], dtype=np.float32)
+        context = context or {}
+        if bool(self.config.validation_pose_from_context):
+            height = context.get("stage23a_gt_relative_height_m")
+            if height is None:
+                height = obs.get("stage23a_gt_relative_height_m", 0.0)
+            try:
+                height = float(height)
+            except (TypeError, ValueError):
+                height = 0.0
+        else:
+            height = 0.0
+        pos = np.array([float(gps[0]), -float(gps[1]), height], dtype=np.float32)
         return _yaw_to_tf(pos, yaw)
+
+    def _validation_pose_audit_summary(self) -> Dict[str, Any]:
+        gt = self.validation_gt_height_values
+        pose = self.validation_pose_height_values
+        errors = self.validation_height_abs_errors
+        return {
+            "validation_pose_audit_sample_count": int(len(gt)),
+            "validation_gt_relative_height_min_m": float(min(gt)) if gt else None,
+            "validation_gt_relative_height_max_m": float(max(gt)) if gt else None,
+            "validation_gt_relative_height_range_m": (
+                float(max(gt) - min(gt)) if gt else None
+            ),
+            "validation_pose_height_min_m": float(min(pose)) if pose else None,
+            "validation_pose_height_max_m": float(max(pose)) if pose else None,
+            "validation_pose_height_range_m": (
+                float(max(pose) - min(pose)) if pose else None
+            ),
+            "validation_height_abs_error_mean_m": (
+                float(np.mean(errors)) if errors else None
+            ),
+            "validation_height_abs_error_p95_m": (
+                float(np.percentile(errors, 95)) if errors else None
+            ),
+            "validation_height_abs_error_max_m": (
+                float(max(errors)) if errors else None
+            ),
+        }
 
     def _relative_base_tf(self, base_pose_tf: np.ndarray) -> np.ndarray:
         base_pose_tf = np.asarray(base_pose_tf, dtype=np.float32)
@@ -7221,13 +7299,101 @@ class SparseOccSemanticMemory:
         suffix = self._validation_suffix(context, self.saved_validation_final_count, final=True)
         memory_ply_path = os.path.join(out_dir, f"{suffix}_memory_cloud.ply")
         memory_stats = self._write_memory_ply_snapshot(memory_ply_path)
+        paths: Dict[str, str] = {"memory_cloud_ply": memory_ply_path}
+
+        surface_points, surface_colors = self._validation_surface_cloud()
+        surface_path = os.path.join(out_dir, f"{suffix}_accumulated_rgb_surface.ply")
+        self._write_point_cloud_ply(surface_path, surface_points, surface_colors)
+        paths["accumulated_rgb_surface_ply"] = surface_path
+
+        occ_keys = self._sample_items(
+            list(self.occ_counts.keys()), int(self.config.validation_max_occupied_points)
+        )
+        free_keys = self._sample_items(
+            list(self.free_counts.keys()), int(self.config.validation_max_free_points)
+        )
+        occ_points = self._grid_keys_to_points(occ_keys)
+        free_points = self._grid_keys_to_points(free_keys)
+        occ_path = os.path.join(out_dir, f"{suffix}_occupied_only.ply")
+        free_path = os.path.join(out_dir, f"{suffix}_free_only.ply")
+        self._write_point_cloud_ply(
+            occ_path,
+            occ_points,
+            np.tile(np.array([[225, 70, 60]], dtype=np.uint8), (occ_points.shape[0], 1)),
+        )
+        self._write_point_cloud_ply(
+            free_path,
+            free_points,
+            np.tile(np.array([[70, 155, 235]], dtype=np.uint8), (free_points.shape[0], 1)),
+        )
+        paths["occupied_only_ply"] = occ_path
+        paths["free_only_ply"] = free_path
+
+        trajectory_points = self._pose_trace_points()
+        trajectory_path = os.path.join(out_dir, f"{suffix}_trajectory.ply")
+        self._write_point_cloud_ply(
+            trajectory_path,
+            trajectory_points,
+            np.tile(
+                np.array([[255, 220, 65]], dtype=np.uint8),
+                (trajectory_points.shape[0], 1),
+            ),
+        )
+        paths["trajectory_ply"] = trajectory_path
+        paths.update(
+            self._write_validation_projection_views(
+                out_dir,
+                suffix,
+                surface_points=surface_points,
+                surface_colors=surface_colors,
+                occupied_points=occ_points,
+                free_points=free_points,
+                trajectory_points=trajectory_points,
+            )
+        )
+
+        pose_audit_path = os.path.join(out_dir, f"{suffix}_pose_height_audit.json")
+        with open(pose_audit_path, "w", encoding="utf-8") as f:
+            json.dump(
+                self._jsonable(
+                    {
+                        **self.episode_meta,
+                        "pose_source": (
+                            "context_oracle_height"
+                            if bool(self.config.validation_pose_from_context)
+                            else "gps_compass_2d"
+                        ),
+                        "gt_fields_used": (
+                            ["habitat_sim_agent_position_y"]
+                            if bool(self.config.validation_pose_from_context)
+                            else []
+                        ),
+                        **self._validation_pose_audit_summary(),
+                        "pose_trace": self.pose_trace,
+                    }
+                ),
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        paths["pose_height_audit_json"] = pose_audit_path
         event = {
             "event_type": "occ_memory_validation_final_snapshot",
             **self.episode_meta,
             **context,
             "snapshot_index": int(self.saved_validation_final_count),
             "update_count": int(self.update_count),
-            "paths": {"memory_cloud_ply": memory_ply_path},
+            "paths": paths,
+            "gt_fields_used": (
+                ["habitat_sim_agent_position_y"]
+                if bool(self.config.validation_pose_from_context)
+                else []
+            ),
+            "accumulated_rgb_surface_point_count": int(surface_points.shape[0]),
+            "occupied_only_point_count": int(occ_points.shape[0]),
+            "free_only_point_count": int(free_points.shape[0]),
+            "trajectory_point_count": int(trajectory_points.shape[0]),
+            **self._validation_pose_audit_summary(),
             **memory_stats,
         }
         self.saved_validation_final_count += 1
@@ -7331,6 +7497,124 @@ class SparseOccSemanticMemory:
         if colors is not None and colors.shape[0] != points.shape[0]:
             colors = None
         return points, colors
+
+    def _append_validation_surface(
+        self, points: np.ndarray, colors: Optional[np.ndarray]
+    ) -> None:
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
+            return
+        if colors is None:
+            colors = np.full((points.shape[0], 3), 210, dtype=np.uint8)
+        else:
+            colors = np.asarray(colors)
+            if colors.ndim != 2 or colors.shape[0] != points.shape[0] or colors.shape[1] < 3:
+                colors = np.full((points.shape[0], 3), 210, dtype=np.uint8)
+            else:
+                colors = np.clip(colors[:, :3], 0, 255).astype(np.uint8)
+        self.validation_surface_points.append(points.astype(np.float32, copy=True))
+        self.validation_surface_colors.append(colors.astype(np.uint8, copy=True))
+        self.validation_surface_point_count += int(points.shape[0])
+
+    def _validation_surface_cloud(self) -> Tuple[np.ndarray, np.ndarray]:
+        if not self.validation_surface_points:
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.uint8),
+            )
+        points = np.concatenate(self.validation_surface_points, axis=0)
+        colors = np.concatenate(self.validation_surface_colors, axis=0)
+        max_points = int(self.config.validation_max_accumulated_surface_points)
+        if max_points > 0 and points.shape[0] > max_points:
+            ids = np.linspace(0, points.shape[0] - 1, max_points).astype(np.int64)
+            points = points[ids]
+            colors = colors[ids]
+        return (
+            points.astype(np.float32, copy=False),
+            colors.astype(np.uint8, copy=False),
+        )
+
+    def _write_validation_projection_views(
+        self,
+        out_dir: str,
+        suffix: str,
+        *,
+        surface_points: np.ndarray,
+        surface_colors: np.ndarray,
+        occupied_points: np.ndarray,
+        free_points: np.ndarray,
+        trajectory_points: np.ndarray,
+    ) -> Dict[str, str]:
+        size = max(256, int(self.config.validation_projection_size))
+        layers = [
+            (free_points, np.array([55, 105, 150], dtype=np.uint8)),
+            (surface_points, surface_colors),
+            (occupied_points, np.array([240, 70, 55], dtype=np.uint8)),
+            (trajectory_points, np.array([255, 230, 55], dtype=np.uint8)),
+        ]
+        specs = {
+            "bev_xy": (0, 1),
+            "side_xz": (0, 2),
+            "side_yz": (1, 2),
+        }
+        paths: Dict[str, str] = {}
+        for name, axes in specs.items():
+            path = os.path.join(out_dir, f"{suffix}_{name}.png")
+            if self._write_projection_png(path, layers, axes=axes, size=size):
+                paths[f"{name}_png"] = path
+        return paths
+
+    def _write_projection_png(
+        self,
+        path: str,
+        layers: List[Tuple[np.ndarray, np.ndarray]],
+        *,
+        axes: Tuple[int, int],
+        size: int,
+    ) -> bool:
+        try:
+            from PIL import Image
+        except Exception:
+            return False
+        valid_parts = []
+        for points, _ in layers:
+            arr = np.asarray(points, dtype=np.float32)
+            if arr.ndim == 2 and arr.shape[1] == 3 and arr.shape[0] > 0:
+                mask = np.isfinite(arr[:, axes[0]]) & np.isfinite(arr[:, axes[1]])
+                if np.any(mask):
+                    valid_parts.append(arr[mask][:, [axes[0], axes[1]]])
+        if not valid_parts:
+            return False
+        all_xy = np.concatenate(valid_parts, axis=0)
+        lo = np.percentile(all_xy, 0.5, axis=0)
+        hi = np.percentile(all_xy, 99.5, axis=0)
+        span = np.maximum(hi - lo, 0.5)
+        margin = span * 0.05
+        lo -= margin
+        hi += margin
+        span = np.maximum(hi - lo, 1e-6)
+        canvas = np.full((size, size, 3), 22, dtype=np.uint8)
+        for points, colors in layers:
+            arr = np.asarray(points, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] == 0:
+                continue
+            xy = arr[:, [axes[0], axes[1]]]
+            valid = np.isfinite(xy).all(axis=1)
+            xy = xy[valid]
+            if xy.shape[0] == 0:
+                continue
+            uv = np.rint((xy - lo) / span * float(size - 1)).astype(np.int64)
+            uv[:, 0] = np.clip(uv[:, 0], 0, size - 1)
+            uv[:, 1] = np.clip(size - 1 - uv[:, 1], 0, size - 1)
+            color_arr = np.asarray(colors)
+            if color_arr.ndim == 1:
+                color_arr = np.tile(color_arr[:3], (uv.shape[0], 1))
+            else:
+                color_arr = color_arr[valid, :3]
+            canvas[uv[:, 1], uv[:, 0]] = np.clip(color_arr, 0, 255).astype(np.uint8)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Image.fromarray(canvas, mode="RGB").save(path)
+        return True
 
     def _write_memory_ply_snapshot(self, path: str) -> Dict[str, Any]:
         points, colors, stats = self._memory_point_cloud()
@@ -7442,13 +7726,19 @@ class SparseOccSemanticMemory:
     def _pose_trace_points(self) -> np.ndarray:
         if not self.pose_trace:
             return np.zeros((0, 3), dtype=np.float32)
-        points = [[item["x"], item["y"], 0.08] for item in self.pose_trace]
+        points = [
+            [item["x"], item["y"], float(item.get("z", 0.0)) + 0.08]
+            for item in self.pose_trace
+        ]
         return np.asarray(points, dtype=np.float32)
 
     def _keyframe_points(self) -> np.ndarray:
         if not self.keyframes:
             return np.zeros((0, 3), dtype=np.float32)
-        points = [[item["x"], item["y"], 0.14] for item in self.keyframes]
+        points = [
+            [item["x"], item["y"], float(item.get("z", 0.0)) + 0.14]
+            for item in self.keyframes
+        ]
         return np.asarray(points, dtype=np.float32)
 
     def _semantic_anchor_points(self) -> Tuple[np.ndarray, np.ndarray]:
