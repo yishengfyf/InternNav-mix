@@ -72,6 +72,7 @@ def analyze(
     stage22a_root: Path,
     fixed_route_manifest: Path,
     expected_fixed_routes: int = 12,
+    require_evidence: bool = False,
 ):
     progress = _progress(run_root)
     reference_progress = _progress(navigation_reference_root)
@@ -151,6 +152,7 @@ def analyze(
     route_identity_mismatches = []
     invalid_audits = []
     reference_mismatches = []
+    evidence_missing = []
     action_or_output_violations = []
     gt_leakage = []
     non_pitch_aware = []
@@ -168,6 +170,16 @@ def analyze(
         baseline_row = baseline_events[key]
         current = dict(current_row.get("audit") or {})
         baseline = dict(baseline_row.get("audit") or {})
+        evidence = current.get("route_cell_evidence")
+        if require_evidence and (
+            not isinstance(evidence, dict)
+            or int(evidence.get("cell_count", -1))
+            != int(current.get("route_unique_cell_count", -2))
+            or bool(evidence.get("mutated_memory"))
+        ):
+            evidence_missing.append(
+                {"scene_episode": key[0], "step_id": key[1], "evidence": evidence}
+            )
         reference = dict(current_row.get("fixed_reference") or {})
         expected = fixed_entries[key]
         if not current.get("valid") or not current.get("source_anchor_pose_match"):
@@ -327,6 +339,7 @@ def analyze(
         and not invalid_audits
         and not reference_mismatches
         and not route_identity_mismatches
+        and (not evidence_missing if require_evidence else True)
         and not action_or_output_violations
         and not gt_leakage
         and not non_pitch_aware
@@ -340,6 +353,7 @@ def analyze(
         "completed_episode_count": len(progress),
         "fixed_route_expected_count": expected_fixed_routes,
         "fixed_route_manifest_count": len(fixed_entries),
+        "evidence_required": bool(require_evidence),
         "fixed_route_audit_count": len(current_events),
         "seed_replay_verified_count": len(expected_seeds) - len(seed_mismatches),
         "reference_metric_verified_count": expected_episodes
@@ -347,6 +361,11 @@ def analyze(
         "raw_loop_identity_verified": not raw_loop_mismatches,
         "route_identity_verified_count": len(comparison_records)
         - len(route_identity_mismatches),
+        "route_evidence_verified_count": (
+            len(comparison_records) - len(evidence_missing)
+            if require_evidence
+            else None
+        ),
         "valid_occ_update_count": len(memory_updates),
         "pitched_occ_update_count": len(pitched_updates),
         "pitch_application_mismatch_count": len(pitch_mismatches),
@@ -392,6 +411,7 @@ def analyze(
             "invalid_audit": len(invalid_audits),
             "fixed_reference_mismatch": len(reference_mismatches),
             "route_identity_mismatch": len(route_identity_mismatches),
+            "missing_route_evidence": len(evidence_missing),
             "action_or_output_applied": len(action_or_output_violations),
             "gt_leakage": len(gt_leakage),
             "non_pitch_aware_audit": len(non_pitch_aware),
@@ -408,6 +428,7 @@ def analyze(
             "invalid_audit": invalid_audits,
             "fixed_reference_mismatch": reference_mismatches,
             "route_identity_mismatch": route_identity_mismatches,
+            "missing_route_evidence": evidence_missing,
         },
         "comparison_records": comparison_records,
         "loop_comparison_records": loop_comparison_records,
@@ -429,6 +450,7 @@ def main():
     parser.add_argument("--stage22a-root", type=Path, required=True)
     parser.add_argument("--fixed-route-manifest", type=Path, required=True)
     parser.add_argument("--expected-fixed-routes", type=int, default=12)
+    parser.add_argument("--require-evidence", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
     args = parser.parse_args()
@@ -440,6 +462,7 @@ def main():
         args.stage22a_root,
         args.fixed_route_manifest,
         args.expected_fixed_routes,
+        args.require_evidence,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

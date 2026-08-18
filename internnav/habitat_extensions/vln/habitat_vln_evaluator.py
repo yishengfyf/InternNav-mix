@@ -379,6 +379,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "s2_loop_fixed_route_occ_audit_enable", False
                 )
             ),
+            "fixed_route_occ_evidence_audit_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_fixed_route_occ_evidence_audit_enable", False
+                )
+            ),
             "fixed_route_occ_audit_entries": tuple(
                 dict(entry)
                 for entry in (
@@ -1670,6 +1675,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     cfg["executed_route_occ_audit_max_visited_cells"]
                 ),
             )
+            if bool(cfg.get("fixed_route_occ_evidence_audit_enable")):
+                fixed_route_audit["route_cell_evidence"] = (
+                    self.occ_memory.audit_route_cell_evidence(fixed_route_audit)
+                )
             selected_candidate = candidate or {}
             fixed_route_event = {
                 "event_type": "s2_loop_fixed_route_occ_audit",

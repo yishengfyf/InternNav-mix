@@ -14,11 +14,14 @@ RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
 PIPELINE_TAG=${STAGE21_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
 CUDA_DEVICES=${STAGE21_CUDA_VISIBLE_DEVICES:-0,1,2,3}
 EXPECTED_EPISODES=11
-RUN_NAME="compare_vlmap_stage22c_fixed_route_pitch_occ_shadow11_${PIPELINE_TAG}"
+FIXED_ROUTE_LABEL=${STAGE22_FIXED_ROUTE_LABEL:-stage22c_fixed_route_pitch_occ_shadow11}
+FIXED_ROUTE_CONFIG=${STAGE22_FIXED_ROUTE_CONFIG:-scripts/eval/configs/habitat_dual_system_vlmap_stage22c_fixed_route_pitch_occ_shadow_cfg.py}
+FIXED_ROUTE_AUDIT_NAME=${STAGE22_FIXED_ROUTE_AUDIT_NAME:-stage22c_fixed_route_pitch_occ_shadow_audit.json}
+RUN_NAME="compare_vlmap_${FIXED_ROUTE_LABEL}_${PIPELINE_TAG}"
 RUN_ROOT="logs/habitat/${RUN_NAME}"
-WORK_DIR="${RETURN_ROOT}/stage22c_fixed_route_pitch_occ_shadow11_running_${PIPELINE_TAG}"
-SUCCESS_DEST="${RETURN_ROOT}/stage22c_fixed_route_pitch_occ_shadow11_return_${PIPELINE_TAG}"
-FAILURE_DEST="${RETURN_ROOT}/stage22c_fixed_route_pitch_occ_shadow11_failure_return_${PIPELINE_TAG}"
+WORK_DIR="${RETURN_ROOT}/${FIXED_ROUTE_LABEL}_running_${PIPELINE_TAG}"
+SUCCESS_DEST="${RETURN_ROOT}/${FIXED_ROUTE_LABEL}_return_${PIPELINE_TAG}"
+FAILURE_DEST="${RETURN_ROOT}/${FIXED_ROUTE_LABEL}_failure_return_${PIPELINE_TAG}"
 FAILED_STAGE=initialization
 PIPELINE_COMPLETE=0
 
@@ -59,7 +62,7 @@ STAGE21C_SCORER_CHECKPOINT="${CHECKPOINT}" STAGE21C_SCORER_DEVICE=cpu \
 STAGE22_FIXED_ROUTE_EVAL_PORT=${STAGE22_FIXED_ROUTE_EVAL_PORT:-2565} \
 NPROC_PER_NODE=4 MASTER_PORT=${STAGE22_FIXED_ROUTE_MASTER_PORT:-2566} \
 bash scripts/eval/bash/stage21_torchrun_eval.sh \
-  --config scripts/eval/configs/habitat_dual_system_vlmap_stage22c_fixed_route_pitch_occ_shadow_cfg.py
+  --config "${FIXED_ROUTE_CONFIG}"
 
 FAILED_STAGE=fixed_route_pitch_occ_automatic_audit
 python3 scripts/eval/analyze_stage22c_fixed_route_pitch_occ.py \
@@ -68,7 +71,8 @@ python3 scripts/eval/analyze_stage22c_fixed_route_pitch_occ.py \
   --navigation-reference-root "${NAV_REFERENCE_ROOT}" \
   --stage22a-root "${STAGE22A_ROOT}" \
   --fixed-route-manifest "${FIXED_ROUTE_MANIFEST}" \
-  --output "${RUN_ROOT}/stage22c_fixed_route_pitch_occ_shadow_audit.json" \
+  --output "${RUN_ROOT}/${FIXED_ROUTE_AUDIT_NAME}" \
+  ${STAGE22_REQUIRE_EVIDENCE:+--require-evidence} \
   --require-all
 
 FAILED_STAGE=return_packaging
@@ -82,10 +86,11 @@ printf '%s\n' "${STAGE22A_ROOT}" > "${WORK_DIR}/SOURCE_STAGE22A_ROOT.txt"
 sha256sum "${EPISODE_MANIFEST}" "${FIXED_ROUTE_MANIFEST}" > "${WORK_DIR}/MANIFEST_SHA256.txt"
 git rev-parse HEAD > "${WORK_DIR}/git_commit.txt"
 git status --short > "${WORK_DIR}/git_status_short.txt"
-cat > "${WORK_DIR}/EXPERIMENT_SCOPE.txt" <<'EOF'
-Stage22C replays the same 11 Frozen episodes and audits the exact 12 Stage22A
-trigger/anchor/source routes on pitch-aware OCC. Dynamic candidate and triage
-changes are logged separately. No route cell, output, or action is modified.
+cat > "${WORK_DIR}/EXPERIMENT_SCOPE.txt" <<EOF
+${FIXED_ROUTE_LABEL} replays the same 11 Frozen episodes and audits the exact
+12 Stage22A trigger/anchor/source routes on pitch-aware OCC. Dynamic candidate
+and triage changes are logged separately. No route cell, output, or action is
+modified. Evidence audit: ${STAGE22_REQUIRE_EVIDENCE:-disabled}.
 EOF
 find "${WORK_DIR}" -type f | sort > "${WORK_DIR}/RETURN_MANIFEST.txt"
 mv "${WORK_DIR}" "${SUCCESS_DEST}"

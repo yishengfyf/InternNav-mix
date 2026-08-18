@@ -5754,6 +5754,64 @@ class SparseOccSemanticMemory:
             return "free"
         return "unknown"
 
+    def audit_route_cell_evidence(
+        self, route_audit: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Expose per-cell evidence without changing the OCC decision rule."""
+        ordered_cells = list(route_audit.get("route_cells") or [])
+        unique_cells = []
+        seen = set()
+        for values in ordered_cells:
+            try:
+                cell = (int(values[0]), int(values[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            if cell not in seen:
+                seen.add(cell)
+                unique_cells.append(cell)
+        cells = []
+        for row, col in unique_cells:
+            occupied_hits = int(self.occ2d_counts.get((row, col), 0))
+            free_hits = int(self.free2d_counts.get((row, col), 0))
+            visited_hits = int(self.visited2d_counts.get((row, col), 0))
+            total_hits = occupied_hits + free_hits
+            cells.append(
+                {
+                    "grid": [int(row), int(col)],
+                    "state": self._cell_state(row, col),
+                    "occupied_hits": occupied_hits,
+                    "free_hits": free_hits,
+                    "visited_hits": visited_hits,
+                    "evidence_hits": total_hits,
+                    "occupied_free_ratio": (
+                        float(occupied_hits / total_hits)
+                        if total_hits
+                        else None
+                    ),
+                    "occupied_free_margin": (
+                        float((occupied_hits - free_hits) / total_hits)
+                        if total_hits
+                        else None
+                    ),
+                }
+            )
+        return {
+            "schema_version": "stage22d_route_cell_evidence_v1",
+            "cell_count": int(len(cells)),
+            "occupied_cell_count": int(
+                sum(item["state"] == "occupied" for item in cells)
+            ),
+            "free_cell_count": int(
+                sum(item["state"] == "free" for item in cells)
+            ),
+            "unknown_cell_count": int(
+                sum(item["state"] == "unknown" for item in cells)
+            ),
+            "cells": cells,
+            "decision_rule": "occupied_key_precedes_free_key",
+            "mutated_memory": False,
+        }
+
     def _rasterize_executed_route_edge(
         self,
         start: Tuple[int, int],

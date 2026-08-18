@@ -177,3 +177,28 @@ def test_route_audit_reports_3d_height_conflicts_without_changing_2d_state():
     assert diagnostics["low_or_ground_conflict_cell_count"] == 1
     assert diagnostics["obstacle_band_conflict_cell_count"] == 0
     assert diagnostics["cells"][0]["voxel_heights"][0]["z_m"] == 0.0
+
+
+def test_route_cell_evidence_reports_occupied_free_and_visit_support_read_only():
+    memory = _memory()
+    memory.occ2d_counts[(32, 31)] = 3
+    memory.free2d_counts[(32, 31)] = 1
+    memory.visited2d_counts[(32, 31)] = 2
+    before = copy.deepcopy(
+        (memory.occ2d_counts, memory.free2d_counts, memory.visited2d_counts)
+    )
+
+    evidence = memory.audit_route_cell_evidence(
+        {"route_cells": [[32, 32], [32, 31], [32, 31]]}
+    )
+
+    assert evidence["schema_version"] == "stage22d_route_cell_evidence_v1"
+    assert evidence["cell_count"] == 2
+    assert evidence["occupied_cell_count"] == 1
+    cell = next(item for item in evidence["cells"] if item["grid"] == [32, 31])
+    assert cell["occupied_hits"] == 3
+    assert cell["free_hits"] == 1
+    assert cell["visited_hits"] == 2
+    assert cell["occupied_free_ratio"] == 0.75
+    assert evidence["mutated_memory"] is False
+    assert (memory.occ2d_counts, memory.free2d_counts, memory.visited2d_counts) == before
