@@ -296,6 +296,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ),
         )
         self._stage23a_mesh_raycast_errors = []
+        self._stage23a_mesh_raycast_signed_errors = []
         self._stage23a_mesh_raycast_total = 0
         self._stage23a_mesh_raycast_hits = 0
         self._stage23a_mesh_raycast_misses = 0
@@ -1418,6 +1419,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 error = float(np.linalg.norm(hit_pos - expected))
                 if np.isfinite(error):
                     self._stage23a_mesh_raycast_errors.append(error)
+                    hit_distance = float(np.linalg.norm(hit_pos - sensor_pos))
+                    signed_error = float(norm - hit_distance)
+                    if np.isfinite(signed_error):
+                        self._stage23a_mesh_raycast_signed_errors.append(
+                            signed_error
+                        )
                     self._stage23a_mesh_raycast_hits += 1
         except Exception as exc:
             print(f"[Stage23A][mesh_raycast] disabled for frame: {type(exc).__name__}: {exc}")
@@ -1425,6 +1432,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
     def _stage23a_mesh_raycast_summary(self) -> dict:
         values = np.asarray(self._stage23a_mesh_raycast_errors, dtype=np.float64)
         values = values[np.isfinite(values)]
+        signed = np.asarray(
+            self._stage23a_mesh_raycast_signed_errors, dtype=np.float64
+        )
+        signed = signed[np.isfinite(signed)]
         return {
             "enabled": bool(self._stage23a_mesh_raycast_enabled),
             "total_rays": int(self._stage23a_mesh_raycast_total),
@@ -1449,6 +1460,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ),
             "endpoint_error_gt_1m_rate": (
                 float(np.mean(values > 1.0)) if values.size else None
+            ),
+            "signed_error_definition": "depth_endpoint_range_minus_mesh_hit_distance",
+            "signed_error_count": int(signed.size),
+            "signed_error_mean_m": float(np.mean(signed)) if signed.size else None,
+            "signed_error_median_m": (
+                float(np.median(signed)) if signed.size else None
+            ),
+            "surface_match_abs_le_0_05m_rate": (
+                float(np.mean(np.abs(signed) <= 0.05)) if signed.size else None
+            ),
+            "potential_false_free_gt_0_05m_rate": (
+                float(np.mean(signed > 0.05)) if signed.size else None
+            ),
+            "potential_false_occupied_lt_neg_0_05m_rate": (
+                float(np.mean(signed < -0.05)) if signed.size else None
+            ),
+            "collision_mesh_miss_rate": (
+                float(self._stage23a_mesh_raycast_misses / self._stage23a_mesh_raycast_total)
+                if self._stage23a_mesh_raycast_total
+                else None
             ),
         }
 
@@ -7174,6 +7205,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             self._stage23a_initial_sim_position = None
             self._stage23a_initial_agent_matrix = None
             self._stage23a_mesh_raycast_errors = []
+            self._stage23a_mesh_raycast_signed_errors = []
             self._stage23a_mesh_raycast_total = 0
             self._stage23a_mesh_raycast_hits = 0
             self._stage23a_mesh_raycast_misses = 0

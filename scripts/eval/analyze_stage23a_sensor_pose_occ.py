@@ -48,6 +48,7 @@ def analyze(
     require_all,
     require_height_ablation,
     require_mesh_raycast,
+    require_signed_mesh,
 ):
     expected = _load_manifest(manifest)
     progress = _load_unique(run_root.glob("vlmap_safety_debug/*run_*/progress.json"))
@@ -120,6 +121,13 @@ def analyze(
             or int(mesh_raycast.get("endpoint_error_count", 0) or 0) <= 0
         ):
             errors.append(f"missing_mesh_raycast:{key}")
+        if require_signed_mesh and (
+            int(mesh_raycast.get("signed_error_count", 0) or 0) <= 0
+            or mesh_raycast.get("surface_match_abs_le_0_05m_rate") is None
+            or mesh_raycast.get("potential_false_free_gt_0_05m_rate") is None
+            or mesh_raycast.get("potential_false_occupied_lt_neg_0_05m_rate") is None
+        ):
+            errors.append(f"missing_signed_mesh_raycast:{key}")
         endpoint = c.get("validation_endpoint_gt_error_stats") or {}
         if not endpoint.get("count"):
             errors.append(f"missing_endpoint_gt_stats:{key}")
@@ -162,6 +170,7 @@ def analyze(
         ),
         "height_ablation_required": bool(require_height_ablation),
         "mesh_raycast_required": bool(require_mesh_raycast),
+        "signed_mesh_raycast_required": bool(require_signed_mesh),
         "episodes": episodes,
         "errors": errors,
     }
@@ -180,6 +189,7 @@ def main():
     parser.add_argument("--require-all", action="store_true")
     parser.add_argument("--require-height-ablation", action="store_true")
     parser.add_argument("--require-mesh-raycast", action="store_true")
+    parser.add_argument("--require-signed-mesh", action="store_true")
     args = parser.parse_args()
     analyze(
         args.run_root,
@@ -188,6 +198,7 @@ def main():
         args.require_all,
         args.require_height_ablation,
         args.require_mesh_raycast,
+        args.require_signed_mesh,
     )
 
 
