@@ -329,6 +329,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
             ),
         )
+        self._stage23b_clearance_ablation_enabled = bool(
+            vlmap_safety_cfg.get(
+                "occ_memory_validation_navmesh_clearance_ablation_enable",
+                False,
+            )
+        )
+        self._stage23b_clearance_height_max_m = max(
+            float(vlmap_safety_cfg.get("obstacle_height_max", 1.2)),
+            float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_validation_navmesh_clearance_height_max_m",
+                    self._camera_height,
+                )
+            ),
+        )
         self.occ_memory_oracle_pose = None
         if self._stage23a_oracle_pose_enabled:
             oracle_cfg = copy.deepcopy(vlmap_safety_cfg)
@@ -1545,6 +1560,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         branch_name: str,
         scene_id: str,
         episode_id: int,
+        readout_height_max_m: Optional[float] = None,
     ) -> dict:
         """Compare a floor-aligned SparseOcc readout with Habitat navmesh."""
         result = {
@@ -1560,6 +1576,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "unknown_is_free": False,
             "local_floor_source": "nearest oracle sensor pose trace",
             "agent_radius_m": float(self._stage23b_agent_radius_m),
+            "readout_height_min_m": float(
+                memory.config.obstacle_height_min
+            ),
+            "readout_height_max_m": float(
+                memory.config.obstacle_height_max
+                if readout_height_max_m is None
+                else readout_height_max_m
+            ),
         }
         if not self._stage23b_navmesh_audit_enabled:
             result["reason"] = "disabled"
@@ -1659,7 +1683,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 return evidence_cache[cell]
             floor_z, _ = nearest_trace(cell)
             center = memory.validation_floor_aligned_cell_evidence(
-                cell[0], cell[1], floor_z
+                cell[0],
+                cell[1],
+                floor_z,
+                height_max_m=readout_height_max_m,
             )
             blocked = False
             if radius_cells > 0:
@@ -1670,7 +1697,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         ):
                             continue
                         neighbor = memory.validation_floor_aligned_cell_evidence(
-                            cell[0] + dr, cell[1] + dc, floor_z
+                            cell[0] + dr,
+                            cell[1] + dc,
+                            floor_z,
+                            height_max_m=readout_height_max_m,
                         )
                         if neighbor["state"] == "blocked":
                             blocked = True
@@ -1860,25 +1890,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
 
         floor_levels = []
+        route_heights_by_cell = {}
         for node in trace:
             height = float(node["z"])
             if not any(abs(height - existing) < 0.50 for existing in floor_levels):
                 floor_levels.append(height)
-        multi_floor_evidence_count = 0
-        if len(floor_levels) > 1:
-            for cell in sampled:
-                evidence_levels = [
-                    level
-                    for level in floor_levels
-                    if memory.validation_floor_aligned_cell_evidence(
-                        cell[0], cell[1], level
-                    )["state"]
-                    != "unknown"
-                ]
-                if evidence_levels and (
-                    max(evidence_levels) - min(evidence_levels) >= 0.75
-                ):
-                    multi_floor_evidence_count += 1
+            cell = (int(node["row"]), int(node["col"]))
+            route_heights_by_cell.setdefault(cell, []).append(height)
+        cross_floor_route_cell_count = sum(
+            max(heights) - min(heights) >= 0.75
+            for heights in route_heights_by_cell.values()
+        )
 
         result.update(
             {
@@ -1943,12 +1965,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 },
                 "trace_floor_level_count": int(len(floor_levels)),
                 "trace_floor_levels_m": [float(value) for value in floor_levels],
-                "cross_floor_mixed_evidence_cell_count": int(
-                    multi_floor_evidence_count
+                "cross_floor_route_cell_count": int(
+                    cross_floor_route_cell_count
                 ),
-                "cross_floor_mixed_evidence_rate": (
-                    float(multi_floor_evidence_count / len(sampled))
-                    if sampled else None
+                "cross_floor_route_cell_rate": (
+                    float(
+                        cross_floor_route_cell_count
+                        / len(route_heights_by_cell)
+                    )
+                    if route_heights_by_cell else None
                 ),
                 "pair_records": pair_records,
                 "cached_cell_state_count": int(len(state_cache)),
@@ -11149,6 +11174,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         )
             stage23b_navmesh_current = {}
             stage23b_navmesh_oracle_sensor = {}
+            stage23b_navmesh_current_clearance = {}
+            stage23b_navmesh_oracle_sensor_clearance = {}
             if (
                 self._stage23b_navmesh_audit_enabled
                 and self.occ_memory_oracle_sensor_pose is not None
@@ -11171,6 +11198,31 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         episode_id=episode_id,
                     )
                 )
+                if self._stage23b_clearance_ablation_enabled:
+                    stage23b_navmesh_current_clearance = (
+                        self._stage23b_navmesh_traversability_audit(
+                            self.occ_memory,
+                            self.occ_memory_oracle_sensor_pose,
+                            branch_name="current_clearance",
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            readout_height_max_m=(
+                                self._stage23b_clearance_height_max_m
+                            ),
+                        )
+                    )
+                    stage23b_navmesh_oracle_sensor_clearance = (
+                        self._stage23b_navmesh_traversability_audit(
+                            self.occ_memory_oracle_sensor_pose,
+                            self.occ_memory_oracle_sensor_pose,
+                            branch_name="oracle_sensor_clearance",
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            readout_height_max_m=(
+                                self._stage23b_clearance_height_max_m
+                            ),
+                        )
+                    )
             stage23a_sensor_comparison = {}
             stage23a_sensor_comparison_path = None
             if self.occ_memory_oracle_sensor_pose is not None:
@@ -11260,6 +11312,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 ),
                 "stage23b_navmesh_traversability_oracle_sensor": (
                     stage23b_navmesh_oracle_sensor
+                ),
+                "stage23b_navmesh_traversability_current_clearance": (
+                    stage23b_navmesh_current_clearance
+                ),
+                "stage23b_navmesh_traversability_oracle_sensor_clearance": (
+                    stage23b_navmesh_oracle_sensor_clearance
                 ),
             }
             result.update(safety_summary)

@@ -50,6 +50,7 @@ def analyze(
     require_mesh_raycast,
     require_signed_mesh,
     require_navmesh_traversability,
+    require_navmesh_clearance_ablation,
 ):
     expected = _load_manifest(manifest)
     progress = _load_unique(run_root.glob("vlmap_safety_debug/*run_*/progress.json"))
@@ -133,6 +134,13 @@ def analyze(
         navmesh_oracle = (
             p.get("stage23b_navmesh_traversability_oracle_sensor") or {}
         )
+        navmesh_current_clearance = (
+            p.get("stage23b_navmesh_traversability_current_clearance") or {}
+        )
+        navmesh_oracle_clearance = (
+            p.get("stage23b_navmesh_traversability_oracle_sensor_clearance")
+            or {}
+        )
         if require_navmesh_traversability:
             for branch, navmesh in (
                 ("current", navmesh_current),
@@ -148,6 +156,19 @@ def analyze(
                     or navmesh.get("reachability_agreement") is None
                 ):
                     errors.append(f"missing_navmesh_traversability:{branch}:{key}")
+        if require_navmesh_clearance_ablation:
+            for branch, navmesh in (
+                ("current_clearance", navmesh_current_clearance),
+                ("oracle_sensor_clearance", navmesh_oracle_clearance),
+            ):
+                if (
+                    not navmesh.get("valid")
+                    or int(navmesh.get("sampled_cell_count", 0) or 0) <= 0
+                    or float(navmesh.get("readout_height_max_m", 0.0) or 0.0)
+                    <= 1.2
+                    or navmesh.get("executed_route_predicted_free_recall") is None
+                ):
+                    errors.append(f"missing_navmesh_clearance:{branch}:{key}")
         endpoint = c.get("validation_endpoint_gt_error_stats") or {}
         if not endpoint.get("count"):
             errors.append(f"missing_endpoint_gt_stats:{key}")
@@ -176,6 +197,12 @@ def analyze(
                 "mesh_raycast": mesh_raycast,
                 "navmesh_traversability_current": navmesh_current,
                 "navmesh_traversability_oracle_sensor": navmesh_oracle,
+                "navmesh_traversability_current_clearance": (
+                    navmesh_current_clearance
+                ),
+                "navmesh_traversability_oracle_sensor_clearance": (
+                    navmesh_oracle_clearance
+                ),
             }
         )
     report = {
@@ -194,6 +221,9 @@ def analyze(
         "mesh_raycast_required": bool(require_mesh_raycast),
         "signed_mesh_raycast_required": bool(require_signed_mesh),
         "navmesh_traversability_required": bool(require_navmesh_traversability),
+        "navmesh_clearance_ablation_required": bool(
+            require_navmesh_clearance_ablation
+        ),
         "episodes": episodes,
         "errors": errors,
     }
@@ -214,6 +244,7 @@ def main():
     parser.add_argument("--require-mesh-raycast", action="store_true")
     parser.add_argument("--require-signed-mesh", action="store_true")
     parser.add_argument("--require-navmesh-traversability", action="store_true")
+    parser.add_argument("--require-navmesh-clearance-ablation", action="store_true")
     args = parser.parse_args()
     analyze(
         args.run_root,
@@ -224,6 +255,7 @@ def main():
         args.require_mesh_raycast,
         args.require_signed_mesh,
         args.require_navmesh_traversability,
+        args.require_navmesh_clearance_ablation,
     )
 
 

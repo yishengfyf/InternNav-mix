@@ -18,3 +18,5 @@ vlmap_cfg["occ_memory_validation_navmesh_traversability_enable"] = True
 vlmap_cfg["occ_memory_validation_navmesh_max_cells"] = 1200
 vlmap_cfg["occ_memory_validation_navmesh_max_pairs"] = 12
 vlmap_cfg["occ_memory_validation_navmesh_agent_radius_m"] = 0.18
+vlmap_cfg["occ_memory_validation_navmesh_clearance_ablation_enable"] = True
+vlmap_cfg["occ_memory_validation_navmesh_clearance_height_max_m"] = 1.50

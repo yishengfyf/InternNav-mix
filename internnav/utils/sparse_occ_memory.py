@@ -6244,7 +6244,12 @@ class SparseOccSemanticMemory:
         return "unknown"
 
     def validation_floor_aligned_cell_evidence(
-        self, row: int, col: int, floor_z_m: float
+        self,
+        row: int,
+        col: int,
+        floor_z_m: float,
+        *,
+        height_max_m: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Read local-height OCC evidence without mutating navigation state."""
         min_height = int(
@@ -6255,7 +6260,14 @@ class SparseOccSemanticMemory:
         )
         max_height = int(
             math.ceil(
-                (float(floor_z_m) + float(self.config.obstacle_height_max))
+                (
+                    float(floor_z_m)
+                    + float(
+                        self.config.obstacle_height_max
+                        if height_max_m is None
+                        else height_max_m
+                    )
+                )
                 / self.cs
             )
         )
@@ -6281,6 +6293,11 @@ class SparseOccSemanticMemory:
             "floor_z_m": float(floor_z_m),
             "height_index_min": int(min_height),
             "height_index_max": int(max_height),
+            "height_max_m": float(
+                self.config.obstacle_height_max
+                if height_max_m is None
+                else height_max_m
+            ),
             "occupied_hits": int(occupied_hits),
             "free_hits": int(free_hits),
             "occupied_voxel_count": int(occupied_voxels),
