@@ -1439,7 +1439,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "endpoint_error_mean_m": float(np.mean(values)) if values.size else None,
             "endpoint_error_median_m": float(np.median(values)) if values.size else None,
             "endpoint_error_p95_m": float(np.percentile(values, 95)) if values.size else None,
+            "endpoint_error_p99_m": float(np.percentile(values, 99)) if values.size else None,
             "endpoint_error_max_m": float(np.max(values)) if values.size else None,
+            "endpoint_error_le_0_01m_rate": (
+                float(np.mean(values <= 0.01)) if values.size else None
+            ),
+            "endpoint_error_gt_0_10m_rate": (
+                float(np.mean(values > 0.10)) if values.size else None
+            ),
+            "endpoint_error_gt_1m_rate": (
+                float(np.mean(values > 1.0)) if values.size else None
+            ),
         }
 
     def _plan_s2_loop_path_reobserve_active(
