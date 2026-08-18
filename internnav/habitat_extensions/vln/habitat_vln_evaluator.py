@@ -367,7 +367,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
     def _stage23a_sim_pose_context(self, *, initialize: bool = False) -> dict:
         """Return GT-only simulator pose fields for the Stage23A shadow audit."""
-        if not self._stage23a_oracle_pose_enabled:
+        if not (
+            self._stage23a_oracle_pose_enabled
+            or self._stage23a_oracle_sensor_pose_enabled
+        ):
             return {}
         try:
             state = self.env._env.sim.get_agent_state()

@@ -34,7 +34,7 @@ def _load_manifest(path):
 
 def _find_comparison(run_root, key):
     for path in run_root.glob(
-        "vlmap_safety_debug/rank*_run_*/stage23a_sensor_occ_comparison/*.json"
+        "vlmap_safety_debug/*run_*/stage23a_sensor_occ_comparison/*.json"
     ):
         if path.stem == f"{key[0]}_{key[1]}_comparison":
             return json.loads(path.read_text(encoding="utf-8"))
@@ -43,14 +43,14 @@ def _find_comparison(run_root, key):
 
 def analyze(run_root, manifest, output, require_all):
     expected = _load_manifest(manifest)
-    progress = _load_unique(run_root.glob("vlmap_safety_debug/rank*_run_*/progress.json"))
+    progress = _load_unique(run_root.glob("vlmap_safety_debug/*run_*/progress.json"))
     current = _load_unique(
-        run_root.glob("vlmap_safety_debug/rank*_run_*/occ_memory/memory_episode_summary.jsonl"),
+        run_root.glob("vlmap_safety_debug/*run_*/occ_memory/memory_episode_summary.jsonl"),
         "occ_memory_episode_summary",
     )
     oracle = _load_unique(
         run_root.glob(
-            "vlmap_safety_debug/rank*_run_*/stage23a_oracle_sensor_pose/occ_memory/memory_episode_summary.jsonl"
+            "vlmap_safety_debug/*run_*/stage23a_oracle_sensor_pose/occ_memory/memory_episode_summary.jsonl"
         ),
         "occ_memory_episode_summary",
     )

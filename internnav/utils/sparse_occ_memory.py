@@ -5126,21 +5126,29 @@ class SparseOccSemanticMemory:
         for row, col, height in ref_occ:
             ref_occ_by_xy[(int(row), int(col))].append(int(height))
         tolerance = max(0, int(tolerance_cells))
-        ref_occ_tolerant = set()
-        for row, col, height in ref_occ:
-            for dr in range(-tolerance, tolerance + 1):
-                for dc in range(-tolerance, tolerance + 1):
-                    for dh in range(-tolerance, tolerance + 1):
-                        ref_occ_tolerant.add((row + dr, col + dc, height + dh))
-        tol_pred_occ = pred_observed_occ & ref_occ_tolerant
-        tol_ref_occ = ref_occ
-        tol_fp = len(pred_observed_occ - ref_occ_tolerant)
-        tol_fn = len(ref_occ - pred_observed_occ)
-        tol_tp = len(tol_pred_occ)
+        def _dilate_voxels(voxels: set) -> set:
+            dilated = set()
+            for row, col, height in voxels:
+                for dr in range(-tolerance, tolerance + 1):
+                    for dc in range(-tolerance, tolerance + 1):
+                        for dh in range(-tolerance, tolerance + 1):
+                            dilated.add((row + dr, col + dc, height + dh))
+            return dilated
+
+        ref_occ_tolerant = _dilate_voxels(ref_occ)
+        pred_occ_tolerant = _dilate_voxels(pred_observed_occ)
+        tol_precision_tp = len(pred_observed_occ & ref_occ_tolerant)
+        tol_recall_tp = len(ref_occ & pred_occ_tolerant)
+        tol_fp = len(pred_observed_occ) - tol_precision_tp
+        tol_fn = len(ref_occ) - tol_recall_tp
         tol_precision = (
-            tol_tp / float(tol_tp + tol_fp) if tol_tp + tol_fp else None
+            tol_precision_tp / float(len(pred_observed_occ))
+            if pred_observed_occ
+            else None
         )
-        tol_recall = tol_tp / float(tol_tp + tol_fn) if tol_tp + tol_fn else None
+        tol_recall = (
+            tol_recall_tp / float(len(ref_occ)) if ref_occ else None
+        )
 
         height_errors = []
         for row, col, height in pred_observed_occ:
@@ -5169,7 +5177,8 @@ class SparseOccSemanticMemory:
             "occupied_tolerance": {
                 "tolerance_cells": tolerance,
                 "tolerance_m": float(tolerance * self.cs),
-                "tp": int(tol_tp),
+                "precision_tp": int(tol_precision_tp),
+                "recall_tp": int(tol_recall_tp),
                 "fp": int(tol_fp),
                 "fn": int(tol_fn),
                 "precision": tol_precision,
