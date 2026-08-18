@@ -1404,7 +1404,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 if not hits:
                     self._stage23a_mesh_raycast_misses += 1
                     continue
-                hit_pos = np.asarray(hits[0].hit_pos, dtype=np.float32).reshape(3)
+                hit_record = hits[0]
+                hit_value = getattr(hit_record, "point", None)
+                if hit_value is None:
+                    hit_value = getattr(hit_record, "hit_pos", None)
+                if hit_value is None:
+                    self._stage23a_mesh_raycast_misses += 1
+                    continue
+                hit_pos = np.asarray(hit_value, dtype=np.float32).reshape(3)
                 expected = sensor_pos + sensor_rot @ (
                     optical_to_habitat @ cam_point
                 )
