@@ -1,0 +1,7 @@
+[
+  {"scene_id": "5q7pvUzZiYa", "episode_id": 9640, "episode_eval_seed": 300011, "audit_role": "flat_reference"},
+  {"scene_id": "2n8kARJN3HM", "episode_id": 764, "episode_eval_seed": 300101, "audit_role": "semantic_dense"},
+  {"scene_id": "E9uDoFAP3SH", "episode_id": 2856, "episode_eval_seed": 300102, "audit_role": "stairs_semantic"},
+  {"scene_id": "8WUmhLawc2A", "episode_id": 1734, "episode_eval_seed": 300103, "audit_role": "mixed_height_semantic"},
+  {"scene_id": "VLzqgDo317F", "episode_id": 2135, "episode_eval_seed": 300104, "audit_role": "failure_semantic"}
+]
