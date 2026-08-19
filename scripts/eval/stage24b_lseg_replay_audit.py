@@ -121,12 +121,28 @@ def _surface_stats(
     if camera_pose_map is not None:
         world_points = (np.asarray(camera_pose_map, dtype=np.float32) @ camera_points.T).T[:, :3]
 
+    aliases = {
+        "shelving": {"shelving", "shelf", "cabinet"},
+        "closet": {"closet", "wardrobe"},
+        "floor": {"floor", "floors"},
+        "wall": {"wall", "walls"},
+        "door": {"door", "doorway", "entrance"},
+        "painting": {"painting", "picture", "artwork"},
+        "cabinet": {"cabinet", "chest", "chest_of_drawers", "drawer"},
+        "stairs": {"stairs", "stair", "staircase"},
+    }
+
     def nearest_gt(points, label):
         if world_points is None or not gt_entries or len(points) == 0:
             return {"available": False, "count": 0}
-        label_tokens = _tokens(label)
+        label_tokens = set(aliases.get(label, {label}))
+        compatible = [
+            item for item in gt_entries
+            if label_tokens.intersection(_tokens(item.get("category", "")))
+        ]
         distances = []
         agreements = []
+        conditioned_distances = []
         for point in points:
             nearest = min(
                 gt_entries,
@@ -137,7 +153,17 @@ def _surface_stats(
             delta = np.maximum(np.maximum(lower - point, 0.0), point - upper)
             distances.append(float(np.linalg.norm(delta)))
             agreements.append(bool(label_tokens.intersection(_tokens(nearest.get("category", "")))))
+            if compatible:
+                compatible_nearest = min(
+                    compatible,
+                    key=lambda item: float(np.linalg.norm(np.asarray(item["center"]) - point)),
+                )
+                lower = np.asarray(compatible_nearest.get("lower", compatible_nearest["center"]), dtype=np.float32)
+                upper = np.asarray(compatible_nearest.get("upper", compatible_nearest["center"]), dtype=np.float32)
+                delta = np.maximum(np.maximum(lower - point, 0.0), point - upper)
+                conditioned_distances.append(float(np.linalg.norm(delta)))
         values = np.asarray(distances, dtype=np.float32)
+        conditioned = np.asarray(conditioned_distances, dtype=np.float32)
         return {
             "available": True,
             "count": int(values.size),
@@ -147,6 +173,13 @@ def _surface_stats(
             "surface_distance_m_p95": float(np.percentile(values, 95)) if values.size else None,
             "surface_distance_le_025m_rate": float(np.mean(values <= 0.25)) if values.size else None,
             "surface_distance_le_050m_rate": float(np.mean(values <= 0.50)) if values.size else None,
+            "compatible_gt_count": int(len(compatible)),
+            "category_conditioned_surface_distance_m_median": (
+                float(np.median(conditioned)) if conditioned.size else None
+            ),
+            "category_conditioned_surface_distance_le_050m_rate": (
+                float(np.mean(conditioned <= 0.50)) if conditioned.size else None
+            ),
         }
     for idx, label in enumerate(labels):
         keep = (cls == idx) & (conf >= 0.35)
@@ -167,7 +200,20 @@ def _surface_stats(
             ),
             "gt_aabb_audit": gt,
         }
-    return result, sampled_count, int(len(d)), world_points is not None
+    return (
+        result,
+        sampled_count,
+        int(len(d)),
+        world_points is not None,
+        {
+            "map_xyz": world_points,
+            "class_id": cls.astype(np.int16),
+            "confidence": conf.astype(np.float32),
+            "depth_m": d.astype(np.float32),
+            "pixel_y": ys.astype(np.int16),
+            "pixel_x": xs.astype(np.int16),
+        },
+    )
 
 
 def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, device: str, max_frames: int):
@@ -203,7 +249,7 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
         probs = torch.softmax(torch.from_numpy(logits), dim=0).numpy()
         pred = np.argmax(probs, axis=0).astype(np.int32)
         confidence = np.max(probs, axis=0).astype(np.float32)
-        stats, sampled, valid, projected = _surface_stats(
+        stats, sampled, valid, projected, surface_samples = _surface_stats(
             pred, confidence, depth, labels, sample_stride=8,
             intrinsic=intrinsic, camera_pose_map=camera_pose_map,
             gt_entries=gt_entries,
@@ -211,6 +257,8 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
         overlay = _overlay(rgb, pred, confidence, labels)
         frame_id = int(row.get("observation_index", len(records)))
         Image.fromarray(overlay).save(output_dir / f"obs_{frame_id:05d}_lseg_overlay.jpg", quality=90)
+        surface_path = output_dir / f"obs_{frame_id:05d}_lseg_surface.npz"
+        np.savez_compressed(surface_path, **surface_samples)
         records.append({
             "observation_index": frame_id,
             "step_id": row.get("step_id"),
@@ -221,6 +269,7 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
             "sampled_valid_count": valid,
             "map_projection_available": bool(projected),
             "semantic_gt_available": bool(gt_entries),
+            "surface_samples_path": surface_path.name,
             "mean_pixel_confidence": float(np.mean(confidence)),
             "high_confidence_pixel_fraction": float(np.mean(confidence >= 0.35)),
             "class_surface_stats": stats,
@@ -239,8 +288,9 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
         "mean_inference_seconds": float(total_seconds / max(1, len(records))),
         "peak_cuda_allocated_mb": peak,
         "records": records,
-        "gt_status": "not_available_in_replay_ledger; use Habitat semantic_scene/pixel audit separately",
+        "gt_status": "habitat_semantic_scene_aabb_surface_audit",
         "camera_model": camera_model,
+        "semantic_gt_entries": gt_entries,
         "semantic_gt_status": "aabb_surface_nearest_audit" if gt_entries else "unavailable",
     }
     (output_dir / "stage24b_lseg_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
