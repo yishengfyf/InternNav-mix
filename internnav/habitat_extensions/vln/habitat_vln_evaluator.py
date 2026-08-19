@@ -1432,6 +1432,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "category_agreement_count": 0,
             "category_agreement_rate": None,
             "nearest_distance_m": {"count": 0, "median": None, "p95": None, "max": None},
+            "nearest_surface_distance_m": {"count": 0, "median": None, "p95": None, "max": None},
             "anchors": [],
         }
         if not result["enabled"]:
@@ -1469,6 +1470,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 return None
             return value if np.all(np.isfinite(value)) else None
 
+        def _bounds(item, center):
+            box = getattr(item, "aabb", None) or getattr(item, "obb", None)
+            sizes = getattr(box, "sizes", None) if box is not None else None
+            try:
+                sizes = np.asarray(sizes, dtype=np.float32).reshape(3)
+            except Exception:
+                return center.copy(), center.copy()
+            if not np.all(np.isfinite(sizes)) or np.any(sizes < 0):
+                return center.copy(), center.copy()
+            return center - sizes / 2.0, center + sizes / 2.0
+
         objects = list(getattr(scene, "objects", None) or [])
         regions = list(getattr(scene, "regions", None) or [])
         limit = self._stage23c_semantic_scene_audit_max_objects
@@ -1484,12 +1496,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 category = _name(getattr(item, "category", None))
                 if not category and kind == "region":
                     category = _name(getattr(item, "region", None))
+                lower, upper = _bounds(item, center)
                 entries.append(
                     {
                         "kind": kind,
                         "id": str(getattr(item, "id", "")),
                         "category": category,
                         "center": center,
+                        "lower": lower,
+                        "upper": upper,
                     }
                 )
         result["object_count"] = int(len(objects))
@@ -1527,6 +1542,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 continue
             nearest = min(entries, key=lambda item: float(np.linalg.norm(item["center"] - world)))
             distance = float(np.linalg.norm(nearest["center"] - world))
+            surface_delta = np.maximum(
+                np.maximum(nearest["lower"] - world, 0.0),
+                world - nearest["upper"],
+            )
+            surface_distance = float(np.linalg.norm(surface_delta))
             term = str(anchor.get("semantic_top_match") or "").strip().lower()
             category = str(nearest.get("category") or "").strip().lower()
             term_tokens = {token for token in re.split(r"[^a-z0-9]+", term) if len(token) > 2}
@@ -1548,6 +1568,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "nearest_category": nearest["category"],
                     "nearest_center_xyz": [float(value) for value in nearest["center"]],
                     "nearest_distance_m": distance,
+                    "nearest_surface_distance_m": surface_distance,
                     "category_agreement": agreement,
                 }
             )
@@ -1562,6 +1583,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result["category_agreement_rate"] = float(
                 result["category_agreement_count"] / len(distances)
             )
+            surface_values = np.asarray(
+                [item["nearest_surface_distance_m"] for item in result["anchors"]],
+                dtype=np.float64,
+            )
+            result["nearest_surface_distance_m"] = {
+                "count": int(surface_values.size),
+                "median": float(np.median(surface_values)),
+                "p95": float(np.percentile(surface_values, 95)),
+                "max": float(np.max(surface_values)),
+            }
+            for threshold in (0.10, 0.25, 0.50, 1.00):
+                result[f"surface_distance_le_{str(threshold).replace('.', '_')}m_rate"] = float(
+                    np.mean(surface_values <= threshold)
+                )
         result["valid"] = True
         result["reason"] = "ok"
         output_root = self._get_vlmap_run_dir()
