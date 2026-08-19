@@ -125,7 +125,7 @@ def _merge_nodes(labels: List[str], frames: Iterable[dict], radius_m: float):
     return nodes
 
 
-def _finalize_nodes(nodes: List[dict], gt_entries: List[dict], radius_m: float):
+def _finalize_nodes(nodes: List[dict], gt_entries: List[dict], radius_m: float, map_to_gt: np.ndarray):
     for node in nodes:
         node["centroid"] = [float(value) for value in node["centroid"]]
         node["min_xyz"] = [float(value) for value in node["min_xyz"]]
@@ -136,7 +136,8 @@ def _finalize_nodes(nodes: List[dict], gt_entries: List[dict], radius_m: float):
         compatible = [item for item in gt_entries if _compatible(node["label"], item.get("category", ""))]
         node["gt_compatible_count"] = int(len(compatible))
         if compatible:
-            point = np.asarray(node["centroid"], dtype=np.float32)
+            point_map = np.asarray(node["centroid"], dtype=np.float32)
+            point = (map_to_gt @ np.array([*point_map, 1.0], dtype=np.float32))[:3]
             nearest = min(compatible, key=lambda item: float(np.linalg.norm(np.asarray(item["center"]) - point)))
             lower = np.asarray(nearest.get("lower", nearest["center"]), dtype=np.float32)
             upper = np.asarray(nearest.get("upper", nearest["center"]), dtype=np.float32)
@@ -173,7 +174,11 @@ def audit(report_path: Path, output_path: Path, radius_m: float, confidence_thre
     labels, frames, total, kept = _load_samples(report, report_path.parent, confidence_threshold)
     nodes = _merge_nodes(labels, frames, radius_m)
     gt_entries = list(report.get("semantic_gt_entries") or [])
-    conflicts = _finalize_nodes(nodes, gt_entries, radius_m)
+    transforms = report.get("coordinate_transforms") or {}
+    map_to_gt = np.asarray(transforms.get("map_to_habitat_world"), dtype=np.float32)
+    if map_to_gt.shape != (4, 4):
+        raise ValueError("Stage24B report is missing map_to_habitat_world transform")
+    conflicts = _finalize_nodes(nodes, gt_entries, radius_m, map_to_gt)
     support_counts = Counter(len(node["source_observations"]) for node in nodes)
     by_label = Counter(node["label"] for node in nodes)
     multi_view = [node for node in nodes if len(node["source_observations"]) >= 2]
@@ -181,6 +186,7 @@ def audit(report_path: Path, output_path: Path, radius_m: float, confidence_thre
     result = {
         "audit_name": "stage24c_semantic_node",
         "source_report": str(report_path),
+        "coordinate_transforms": transforms,
         "radius_m": float(radius_m),
         "confidence_threshold": float(confidence_threshold),
         "labels": labels,
