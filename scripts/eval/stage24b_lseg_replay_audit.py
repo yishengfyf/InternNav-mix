@@ -102,6 +102,7 @@ def _surface_stats(
     intrinsic,
     camera_pose_map: Optional[np.ndarray],
     gt_entries: List[Dict],
+    map_to_gt: np.ndarray,
 ):
     h, w = depth.shape[:2]
     ys, xs = np.mgrid[0:h:sample_stride, 0:w:sample_stride]
@@ -144,23 +145,24 @@ def _surface_stats(
         agreements = []
         conditioned_distances = []
         for point in points:
+            gt_point = (map_to_gt @ np.array([*point, 1.0], dtype=np.float32))[:3]
             nearest = min(
                 gt_entries,
-                key=lambda item: float(np.linalg.norm(np.asarray(item["center"]) - point)),
+                key=lambda item: float(np.linalg.norm(np.asarray(item["center"]) - gt_point)),
             )
             lower = np.asarray(nearest.get("lower", nearest["center"]), dtype=np.float32)
             upper = np.asarray(nearest.get("upper", nearest["center"]), dtype=np.float32)
-            delta = np.maximum(np.maximum(lower - point, 0.0), point - upper)
+            delta = np.maximum(np.maximum(lower - gt_point, 0.0), gt_point - upper)
             distances.append(float(np.linalg.norm(delta)))
             agreements.append(bool(label_tokens.intersection(_tokens(nearest.get("category", "")))))
             if compatible:
                 compatible_nearest = min(
                     compatible,
-                    key=lambda item: float(np.linalg.norm(np.asarray(item["center"]) - point)),
+                    key=lambda item: float(np.linalg.norm(np.asarray(item["center"]) - gt_point)),
                 )
                 lower = np.asarray(compatible_nearest.get("lower", compatible_nearest["center"]), dtype=np.float32)
                 upper = np.asarray(compatible_nearest.get("upper", compatible_nearest["center"]), dtype=np.float32)
-                delta = np.maximum(np.maximum(lower - point, 0.0), point - upper)
+                delta = np.maximum(np.maximum(lower - gt_point, 0.0), gt_point - upper)
                 conditioned_distances.append(float(np.linalg.norm(delta)))
         values = np.asarray(distances, dtype=np.float32)
         conditioned = np.asarray(conditioned_distances, dtype=np.float32)
@@ -225,6 +227,10 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
         raise ValueError("Replay Ledger is missing a 3x3 camera intrinsic")
     semantic_gt = metadata.get("semantic_scene_gt") or {}
     gt_entries = list(semantic_gt.get("objects") or []) + list(semantic_gt.get("regions") or [])
+    transforms = metadata.get("coordinate_transforms") or {}
+    map_to_gt = np.asarray(transforms.get("map_to_habitat_world"), dtype=np.float32)
+    if map_to_gt.shape != (4, 4):
+        raise ValueError("Replay Ledger is missing map_to_habitat_world transform")
     rows = [json.loads(line) for line in (ledger_dir / "observations.jsonl").read_text().splitlines() if line.strip()]
     if max_frames > 0:
         ids = np.linspace(0, len(rows) - 1, min(max_frames, len(rows)), dtype=int).tolist()
@@ -252,7 +258,7 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
         stats, sampled, valid, projected, surface_samples = _surface_stats(
             pred, confidence, depth, labels, sample_stride=8,
             intrinsic=intrinsic, camera_pose_map=camera_pose_map,
-            gt_entries=gt_entries,
+            gt_entries=gt_entries, map_to_gt=map_to_gt,
         )
         overlay = _overlay(rgb, pred, confidence, labels)
         frame_id = int(row.get("observation_index", len(records)))
@@ -290,6 +296,7 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
         "records": records,
         "gt_status": "habitat_semantic_scene_aabb_surface_audit",
         "camera_model": camera_model,
+        "coordinate_transforms": transforms,
         "semantic_gt_entries": gt_entries,
         "semantic_gt_status": "aabb_surface_nearest_audit" if gt_entries else "unavailable",
     }

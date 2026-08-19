@@ -8300,6 +8300,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "optical_axes": "+x_right,+y_down,+z_forward",
                 },
                 semantic_scene_gt=self._stage24a_semantic_scene_snapshot(),
+                coordinate_transforms={
+                    "map_to_habitat_world": (
+                        (
+                            np.asarray(self._stage23a_initial_agent_matrix, dtype=np.float32)
+                            @ np.asarray(
+                                [
+                                    [0.0, 0.0, -1.0, 0.0],
+                                    [-1.0, 0.0, 0.0, 0.0],
+                                    [0.0, 1.0, 0.0, 0.0],
+                                    [0.0, 0.0, 0.0, 1.0],
+                                ], dtype=np.float32
+                            ).T
+                        ).tolist()
+                        if self._stage23a_initial_agent_matrix is not None else None
+                    ),
+                    "map_frame": "sparse_occ_map",
+                    "gt_frame": "habitat_world",
+                },
             )
             if self.occ_memory_oracle_pose is not None:
                 self.occ_memory_oracle_pose.reset_episode(

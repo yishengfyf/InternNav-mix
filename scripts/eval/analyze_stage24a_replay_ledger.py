@@ -57,6 +57,14 @@ def analyze(run_root: Path, output: Path):
             semantic_gt = metadata.get("semantic_scene_gt") or {}
             if not semantic_gt.get("available"):
                 errors.append(f"semantic_scene_gt_missing:{scene_id}/{episode_id}")
+            transforms = metadata.get("coordinate_transforms") or {}
+            map_to_gt = transforms.get("map_to_habitat_world")
+            if not (
+                isinstance(map_to_gt, list)
+                and len(map_to_gt) == 4
+                and all(isinstance(row, list) and len(row) == 4 for row in map_to_gt)
+            ):
+                errors.append(f"map_to_gt_transform_missing:{scene_id}/{episode_id}")
             for item in observations:
                 pose = item.get("pose") or {}
                 if pose.get("stage23a_sensor_position") is None:
