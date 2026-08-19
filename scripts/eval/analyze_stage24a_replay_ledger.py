@@ -30,10 +30,12 @@ def analyze(run_root: Path, output: Path):
             summary_path = candidates[-1]
             episode_dir = summary_path.parent
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            metadata = json.loads((episode_dir / "episode_meta.json").read_text(encoding="utf-8"))
             observations = _jsonl(episode_dir / "observations.jsonl")
             queries = _jsonl(episode_dir / "queries.jsonl")
             actions = _jsonl(episode_dir / "actions.jsonl")
             keys = [item.get("observation_key") for item in observations]
+            key_set = set(keys)
             if len(keys) != len(set(keys)):
                 errors.append(f"duplicate_observation_key:{scene_id}/{episode_id}")
             if len(observations) != int(summary.get("observation_count", -1)):
@@ -44,6 +46,41 @@ def analyze(run_root: Path, output: Path):
                 errors.append(f"action_count_mismatch:{scene_id}/{episode_id}")
             if any("action_applied" not in item for item in actions):
                 errors.append(f"action_applied_missing:{scene_id}/{episode_id}")
+            camera_model = metadata.get("camera_model") or {}
+            intrinsic = camera_model.get("intrinsic")
+            if not (
+                isinstance(intrinsic, list)
+                and len(intrinsic) == 3
+                and all(isinstance(row, list) and len(row) == 3 for row in intrinsic)
+            ):
+                errors.append(f"camera_intrinsic_missing:{scene_id}/{episode_id}")
+            semantic_gt = metadata.get("semantic_scene_gt") or {}
+            if not semantic_gt.get("available"):
+                errors.append(f"semantic_scene_gt_missing:{scene_id}/{episode_id}")
+            for item in observations:
+                pose = item.get("pose") or {}
+                if pose.get("stage23a_sensor_position") is None:
+                    errors.append(f"sensor_position_missing:{scene_id}/{episode_id}:{item.get('observation_key')}")
+                if pose.get("stage23a_sensor_rotation_wxyz") is None:
+                    errors.append(f"sensor_rotation_missing:{scene_id}/{episode_id}:{item.get('observation_key')}")
+                camera_pose = pose.get("stage23_gt_camera_pose_map")
+                if not (
+                    isinstance(camera_pose, list)
+                    and len(camera_pose) == 4
+                    and all(isinstance(row, list) and len(row) == 4 for row in camera_pose)
+                ):
+                    errors.append(f"camera_pose_map_missing:{scene_id}/{episode_id}:{item.get('observation_key')}")
+                for path_key in ("rgb_path", "depth_path"):
+                    relative = item.get(path_key)
+                    if not relative or not (episode_dir / relative).is_file():
+                        errors.append(f"{path_key}_missing:{scene_id}/{episode_id}:{item.get('observation_key')}")
+            for kind, items in (("query", queries), ("action", actions)):
+                for item in items:
+                    if item.get("observation_key") not in key_set:
+                        errors.append(
+                            f"{kind}_observation_reference_invalid:{scene_id}/{episode_id}:"
+                            f"{item.get('observation_key')}"
+                        )
             if int(row.get("s2_loop_strict_active_applied_count", 0) or 0):
                 errors.append(f"strict_active_action_violation:{scene_id}/{episode_id}")
             if int(row.get("s2_loop_path_reobserve_applied_count", 0) or 0):
@@ -61,6 +98,8 @@ def analyze(run_root: Path, output: Path):
                 "action_count": len(actions),
                 "applied_action_count": sum(bool(item.get("action_applied")) for item in actions),
                 "discarded_action_count": sum(not bool(item.get("action_applied")) for item in actions),
+                "semantic_gt_object_count": len(semantic_gt.get("objects") or []),
+                "semantic_gt_region_count": len(semantic_gt.get("regions") or []),
                 "ledger_dir": str(episode_dir),
             }
     episodes = [episodes_by_key[key] for key in sorted(episodes_by_key)]

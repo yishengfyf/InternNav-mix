@@ -1615,6 +1615,69 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result["json_path"] = path
         return result
 
+    def _stage24a_semantic_scene_snapshot(self) -> dict:
+        """Serialize audit-only Habitat semantic bounds for offline replay."""
+        result = {
+            "available": False,
+            "coordinate_frame": "habitat_world",
+            "objects": [],
+            "regions": [],
+            "reason": None,
+        }
+        if not self.replay_ledger.enabled:
+            result["reason"] = "replay_ledger_disabled"
+            return result
+        try:
+            scene = getattr(self.env._env.sim, "semantic_scene", None)
+        except Exception as exc:
+            result["reason"] = f"semantic_scene_access_error:{type(exc).__name__}"
+            return result
+        if scene is None:
+            result["reason"] = "semantic_scene_unavailable"
+            return result
+
+        def _category_name(item) -> str:
+            category = getattr(item, "category", None)
+            if category is None:
+                return ""
+            try:
+                return str(category.name() or "").strip()
+            except Exception:
+                return str(getattr(category, "name", "") or "").strip()
+
+        def _entry(item, kind: str):
+            box = getattr(item, "aabb", None) or getattr(item, "obb", None)
+            center = getattr(box, "center", None) if box is not None else None
+            sizes = getattr(box, "sizes", None) if box is not None else None
+            try:
+                center = np.asarray(center, dtype=np.float32).reshape(3)
+                sizes = np.asarray(sizes, dtype=np.float32).reshape(3)
+            except Exception:
+                return None
+            if not np.all(np.isfinite(center)) or not np.all(np.isfinite(sizes)):
+                return None
+            if np.any(sizes < 0):
+                return None
+            return {
+                "kind": kind,
+                "id": str(getattr(item, "id", "")),
+                "category": _category_name(item),
+                "center": center.tolist(),
+                "sizes": sizes.tolist(),
+                "lower": (center - sizes / 2.0).tolist(),
+                "upper": (center + sizes / 2.0).tolist(),
+            }
+
+        for key in ("objects", "regions"):
+            kind = key[:-1]
+            for item in list(getattr(scene, key, None) or []):
+                entry = _entry(item, kind)
+                if entry is not None:
+                    result[key].append(entry)
+        result["available"] = bool(result["objects"] or result["regions"])
+        result["reason"] = "ok" if result["available"] else "no_usable_bounds"
+        return result
+
     def _stage23a_mesh_raycast_audit(
         self, depth_m: np.ndarray, context: dict
     ) -> None:
@@ -8224,6 +8287,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 episode_count=episode_count,
                 rank=getattr(self, "rank", 0),
                 world_size=getattr(self, "world_size", 1),
+                camera_model={
+                    "intrinsic": np.asarray(
+                        self.occ_memory.camera_intrinsic, dtype=np.float32
+                    ).tolist(),
+                    "width": int(self.sim_sensors_config.depth_sensor.width),
+                    "height": int(self.sim_sensors_config.depth_sensor.height),
+                    "hfov_deg": float(self.sim_sensors_config.depth_sensor.hfov),
+                    "depth_min_m": float(self._min_depth),
+                    "depth_max_m": float(self._max_depth),
+                    "depth_convention": "metric_z_depth_optical_camera",
+                    "optical_axes": "+x_right,+y_down,+z_forward",
+                },
+                semantic_scene_gt=self._stage24a_semantic_scene_snapshot(),
             )
             if self.occ_memory_oracle_pose is not None:
                 self.occ_memory_oracle_pose.reset_episode(
@@ -8494,6 +8570,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     ),
                     "stage23a_gt_relative_height_m": occ_memory_context.get(
                         "stage23a_gt_relative_height_m"
+                    ),
+                    "stage23a_sensor_position": occ_memory_context.get(
+                        "stage23a_sensor_position"
+                    ),
+                    "stage23a_sensor_rotation_wxyz": occ_memory_context.get(
+                        "stage23a_sensor_rotation_wxyz"
+                    ),
+                    "stage23_gt_camera_pose_map": occ_memory_context.get(
+                        "stage23_gt_camera_pose_map"
+                    ),
+                    "stage23_gt_base_pose_map": occ_memory_context.get(
+                        "stage23_gt_base_pose_map"
                     ),
                 }
                 replay_occ_summary = {

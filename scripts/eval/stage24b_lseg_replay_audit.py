@@ -12,7 +12,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -89,7 +89,20 @@ def _overlay(image: np.ndarray, pred: np.ndarray, confidence: np.ndarray, labels
     return blend
 
 
-def _surface_stats(pred, confidence, depth, labels, sample_stride, fx, fy):
+def _tokens(value: str):
+    return {token for token in str(value or "").lower().replace("-", "_").split("_") if len(token) > 2}
+
+
+def _surface_stats(
+    pred,
+    confidence,
+    depth,
+    labels,
+    sample_stride,
+    intrinsic,
+    camera_pose_map: Optional[np.ndarray],
+    gt_entries: List[Dict],
+):
     h, w = depth.shape[:2]
     ys, xs = np.mgrid[0:h:sample_stride, 0:w:sample_stride]
     sampled_count = int(ys.size)
@@ -99,13 +112,47 @@ def _surface_stats(pred, confidence, depth, labels, sample_stride, fx, fy):
     cls = pred[ys, xs]
     conf = confidence[ys, xs]
     result: Dict[str, Dict[str, float]] = {}
-    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    fx, fy = float(intrinsic[0, 0]), float(intrinsic[1, 1])
+    cx, cy = float(intrinsic[0, 2]), float(intrinsic[1, 2])
     x = (xs.astype(np.float32) - cx) * d / fx
     y = (ys.astype(np.float32) - cy) * d / fy
+    camera_points = np.stack([x, y, d, np.ones_like(d)], axis=1)
+    world_points = None
+    if camera_pose_map is not None:
+        world_points = (np.asarray(camera_pose_map, dtype=np.float32) @ camera_points.T).T[:, :3]
+
+    def nearest_gt(points, label):
+        if world_points is None or not gt_entries or len(points) == 0:
+            return {"available": False, "count": 0}
+        label_tokens = _tokens(label)
+        distances = []
+        agreements = []
+        for point in points:
+            nearest = min(
+                gt_entries,
+                key=lambda item: float(np.linalg.norm(np.asarray(item["center"]) - point)),
+            )
+            lower = np.asarray(nearest.get("lower", nearest["center"]), dtype=np.float32)
+            upper = np.asarray(nearest.get("upper", nearest["center"]), dtype=np.float32)
+            delta = np.maximum(np.maximum(lower - point, 0.0), point - upper)
+            distances.append(float(np.linalg.norm(delta)))
+            agreements.append(bool(label_tokens.intersection(_tokens(nearest.get("category", "")))))
+        values = np.asarray(distances, dtype=np.float32)
+        return {
+            "available": True,
+            "count": int(values.size),
+            "category_agreement_rate": float(np.mean(agreements)) if agreements else None,
+            "surface_distance_m_mean": float(np.mean(values)) if values.size else None,
+            "surface_distance_m_median": float(np.median(values)) if values.size else None,
+            "surface_distance_m_p95": float(np.percentile(values, 95)) if values.size else None,
+            "surface_distance_le_025m_rate": float(np.mean(values <= 0.25)) if values.size else None,
+            "surface_distance_le_050m_rate": float(np.mean(values <= 0.50)) if values.size else None,
+        }
     for idx, label in enumerate(labels):
         keep = (cls == idx) & (conf >= 0.35)
         if not np.any(keep):
             continue
+        gt = nearest_gt(world_points[keep] if world_points is not None else [], label)
         result[label] = {
             "pixel_count": int(np.count_nonzero(keep)),
             "mean_confidence": float(np.mean(conf[keep])),
@@ -113,12 +160,25 @@ def _surface_stats(pred, confidence, depth, labels, sample_stride, fx, fy):
             "surface_centroid_camera_xyz": [
                 float(np.mean(x[keep])), float(np.mean(y[keep])), float(np.mean(d[keep]))
             ],
+            "surface_centroid_map_xyz": (
+                [float(value) for value in np.mean(world_points[keep], axis=0)]
+                if world_points is not None
+                else None
+            ),
+            "gt_aabb_audit": gt,
         }
-    return result, sampled_count, int(len(d))
+    return result, sampled_count, int(len(d)), world_points is not None
 
 
 def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, device: str, max_frames: int):
     output_dir.mkdir(parents=True, exist_ok=True)
+    metadata = json.loads((ledger_dir / "episode_meta.json").read_text(encoding="utf-8"))
+    camera_model = metadata.get("camera_model") or {}
+    intrinsic = np.asarray(camera_model.get("intrinsic"), dtype=np.float32)
+    if intrinsic.shape != (3, 3):
+        raise ValueError("Replay Ledger is missing a 3x3 camera intrinsic")
+    semantic_gt = metadata.get("semantic_scene_gt") or {}
+    gt_entries = list(semantic_gt.get("objects") or []) + list(semantic_gt.get("regions") or [])
     rows = [json.loads(line) for line in (ledger_dir / "observations.jsonl").read_text().splitlines() if line.strip()]
     if max_frames > 0:
         ids = np.linspace(0, len(rows) - 1, min(max_frames, len(rows)), dtype=int).tolist()
@@ -132,6 +192,10 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
     for row in rows:
         rgb = np.asarray(Image.open(ledger_dir / row["rgb_path"]).convert("RGB"))
         depth = np.load(ledger_dir / row["depth_path"])["depth_m"]
+        pose = row.get("pose") or {}
+        camera_pose_map = np.asarray(pose.get("stage23_gt_camera_pose_map"), dtype=np.float32)
+        if camera_pose_map.shape != (4, 4):
+            raise ValueError(f"Missing 4x4 camera_pose_map at observation {row.get('observation_index')}")
         start = time.perf_counter()
         logits = _infer_logits(model, transform, rgb, labels, crop_size)
         elapsed = time.perf_counter() - start
@@ -139,10 +203,10 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
         probs = torch.softmax(torch.from_numpy(logits), dim=0).numpy()
         pred = np.argmax(probs, axis=0).astype(np.int32)
         confidence = np.max(probs, axis=0).astype(np.float32)
-        stats, sampled, valid = _surface_stats(
+        stats, sampled, valid, projected = _surface_stats(
             pred, confidence, depth, labels, sample_stride=8,
-            fx=640.0 / (2.0 * np.tan(np.deg2rad(79.0) / 2.0)),
-            fy=640.0 / (2.0 * np.tan(np.deg2rad(79.0) / 2.0)),
+            intrinsic=intrinsic, camera_pose_map=camera_pose_map,
+            gt_entries=gt_entries,
         )
         overlay = _overlay(rgb, pred, confidence, labels)
         frame_id = int(row.get("observation_index", len(records)))
@@ -155,6 +219,8 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
             "depth_valid_count": int(np.isfinite(depth).sum()),
             "sampled_depth_count": sampled,
             "sampled_valid_count": valid,
+            "map_projection_available": bool(projected),
+            "semantic_gt_available": bool(gt_entries),
             "mean_pixel_confidence": float(np.mean(confidence)),
             "high_confidence_pixel_fraction": float(np.mean(confidence >= 0.35)),
             "class_surface_stats": stats,
@@ -174,6 +240,8 @@ def audit(ledger_dir: Path, output_dir: Path, repo: Path, checkpoint: Path, devi
         "peak_cuda_allocated_mb": peak,
         "records": records,
         "gt_status": "not_available_in_replay_ledger; use Habitat semantic_scene/pixel audit separately",
+        "camera_model": camera_model,
+        "semantic_gt_status": "aabb_surface_nearest_audit" if gt_entries else "unavailable",
     }
     (output_dir / "stage24b_lseg_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
     print(json.dumps(report, ensure_ascii=False, indent=2))
