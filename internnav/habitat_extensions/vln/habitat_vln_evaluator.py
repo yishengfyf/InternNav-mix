@@ -2063,6 +2063,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         sample_spacing_m=memory.cs,
                     )
                 )
+            # A collision-free executed centerline certifies a narrow swept
+            # corridor, not only a one-cell digital line.  One-cell dilation
+            # also keeps diagonal steps connected under corner-cut checks.
+            route_support_cells = {
+                (row + dr, col + dc)
+                for row, col in route_support_cells
+                for dr in (-1, 0, 1)
+                for dc in (-1, 0, 1)
+            }
 
         def route_support_state(cell):
             return "free" if cell in route_support_cells else "unknown"
@@ -2119,6 +2128,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 pred_blocked.add(cell)
             else:
                 pred_unknown.add(cell)
+
+        route_pred_free = {
+            cell for cell in sampled if route_support_state(cell) == "free"
+        }
+        combined_pred_free = {
+            cell for cell in sampled if combined_state(cell) == "free"
+        }
 
         route_state_counts = {"free": 0, "blocked": 0, "unknown": 0}
         route_navmesh_free = 0
@@ -2343,6 +2359,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     self._stage23b_route_support_audit_enabled
                 ),
                 "route_support_cell_count": int(len(route_support_cells)),
+                "route_support_free_metrics_observed_domain": (
+                    self._stage23b_binary_metrics(route_pred_free, gt_free)
+                ),
+                "route_support_false_free_rate": (
+                    float(len(route_pred_free & gt_blocked) / len(route_pred_free))
+                    if route_pred_free else None
+                ),
+                "combined_free_metrics_observed_domain": (
+                    self._stage23b_binary_metrics(combined_pred_free, gt_free)
+                ),
+                "combined_false_free_rate": (
+                    float(len(combined_pred_free & gt_blocked) / len(combined_pred_free))
+                    if combined_pred_free else None
+                ),
                 "route_support_reachability_agreement": (
                     float(route_reachability_matches / len(pair_records))
                     if pair_records else None
