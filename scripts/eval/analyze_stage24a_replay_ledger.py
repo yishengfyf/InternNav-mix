@@ -11,7 +11,7 @@ def _jsonl(path: Path):
 
 def analyze(run_root: Path, output: Path):
     errors = []
-    episodes = []
+    episodes_by_key = {}
     progress_paths = list(run_root.glob("**/progress.json"))
     for progress_path in progress_paths:
         for row in _jsonl(progress_path):
@@ -48,9 +48,12 @@ def analyze(run_root: Path, output: Path):
                 errors.append(f"strict_active_action_violation:{scene_id}/{episode_id}")
             if int(row.get("s2_loop_path_reobserve_applied_count", 0) or 0):
                 errors.append(f"path_reobserve_action_violation:{scene_id}/{episode_id}")
-            episodes.append({
+            rank = int(summary.get("rank", row.get("rank", 0)) or 0)
+            key = (scene_id, episode_id, rank)
+            episodes_by_key[key] = {
                 "scene_id": scene_id,
                 "episode_id": episode_id,
+                "rank": rank,
                 "success": row.get("success"),
                 "steps": row.get("steps"),
                 "observation_count": len(observations),
@@ -59,7 +62,8 @@ def analyze(run_root: Path, output: Path):
                 "applied_action_count": sum(bool(item.get("action_applied")) for item in actions),
                 "discarded_action_count": sum(not bool(item.get("action_applied")) for item in actions),
                 "ledger_dir": str(episode_dir),
-            })
+            }
+    episodes = [episodes_by_key[key] for key in sorted(episodes_by_key)]
     report = {
         "audit_name": "stage24a_replay_ledger",
         "integrity_passed": not errors,
