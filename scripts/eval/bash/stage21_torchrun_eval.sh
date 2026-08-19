@@ -41,7 +41,8 @@ TORCHRUN_BIN=(torchrun)
 if ! command -v torchrun >/dev/null 2>&1; then
   # Some evaluation environments ship torch.distributed.run but omit the
   # torchrun console entrypoint. Preserve identical arguments in that case.
-  TORCHRUN_BIN=(python -m torch.distributed.run)
+  PYTHON_BIN=${PYTHON_BIN:-python}
+  TORCHRUN_BIN=("${PYTHON_BIN}" -m torch.distributed.run)
 fi
 
 "${TORCHRUN_BIN[@]}" \
