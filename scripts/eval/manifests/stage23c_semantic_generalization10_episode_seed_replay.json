@@ -1,0 +1,12 @@
+[
+  {"scene_id": "5q7pvUzZiYa", "episode_id": 9640, "episode_eval_seed": 300011, "audit_role": "flat_reference"},
+  {"scene_id": "2n8kARJN3HM", "episode_id": 764, "episode_eval_seed": 300101, "audit_role": "semantic_dense"},
+  {"scene_id": "E9uDoFAP3SH", "episode_id": 2856, "episode_eval_seed": 300102, "audit_role": "stairs_semantic"},
+  {"scene_id": "8WUmhLawc2A", "episode_id": 1734, "episode_eval_seed": 300103, "audit_role": "mixed_height_semantic"},
+  {"scene_id": "VLzqgDo317F", "episode_id": 2135, "episode_eval_seed": 300104, "audit_role": "failure_semantic"},
+  {"scene_id": "1pXnuDYAj8r", "episode_id": 4147, "episode_eval_seed": 300105, "audit_role": "stairs_geometry"},
+  {"scene_id": "17DRP5sb8fy", "episode_id": 3717, "episode_eval_seed": 300106, "audit_role": "flat_geometry"},
+  {"scene_id": "29hnd4uzFmX", "episode_id": 467, "episode_eval_seed": 300107, "audit_role": "near_flat_geometry"},
+  {"scene_id": "jh4fc5c5qoQ", "episode_id": 2278, "episode_eval_seed": 300108, "audit_role": "mixed_height_geometry"},
+  {"scene_id": "S9hNv5qa7GM", "episode_id": 9980, "episode_eval_seed": 300109, "audit_role": "semantic_stairs"}
+]
