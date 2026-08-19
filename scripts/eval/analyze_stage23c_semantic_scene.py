@@ -50,6 +50,10 @@ def analyze(run_root: Path, manifest: Path, output: Path, require_annotations: b
             valid_count += 1
         if require_annotations and not audit.get("annotation_available"):
             errors.append(f"annotations_unavailable:{key}")
+        if int(row.get("s2_loop_strict_active_applied_count", 0) or 0):
+            errors.append(f"strict_active_action_violation:{key}")
+        if int(row.get("s2_loop_path_reobserve_applied_count", 0) or 0):
+            errors.append(f"path_reobserve_action_violation:{key}")
         episodes.append(
             {
                 "scene_id": key[0],
