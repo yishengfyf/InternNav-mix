@@ -37,7 +37,14 @@ if [[ -z "${STAGE21_RUN_NAME:-}" ]]; then
   exit 1
 fi
 
-torchrun \
+TORCHRUN_BIN=(torchrun)
+if ! command -v torchrun >/dev/null 2>&1; then
+  # Some evaluation environments ship torch.distributed.run but omit the
+  # torchrun console entrypoint. Preserve identical arguments in that case.
+  TORCHRUN_BIN=(python -m torch.distributed.run)
+fi
+
+"${TORCHRUN_BIN[@]}" \
   --standalone \
   --nproc_per_node="${NPROC_PER_NODE}" \
   --master_port="${MASTER_PORT}" \
