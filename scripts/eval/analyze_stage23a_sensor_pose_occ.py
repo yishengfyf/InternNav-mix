@@ -48,9 +48,11 @@ def analyze(
     require_all,
     require_height_ablation,
     require_mesh_raycast,
+    require_mesh_voxel_gt,
     require_signed_mesh,
     require_navmesh_traversability,
     require_navmesh_clearance_ablation,
+    require_route_support_audit,
 ):
     expected = _load_manifest(manifest)
     progress = _load_unique(run_root.glob("vlmap_safety_debug/*run_*/progress.json"))
@@ -130,6 +132,15 @@ def analyze(
             or mesh_raycast.get("potential_false_occupied_lt_neg_0_05m_rate") is None
         ):
             errors.append(f"missing_signed_mesh_raycast:{key}")
+        mesh_voxel_gt = p.get("stage23a_mesh_voxel_gt") or {}
+        if require_mesh_voxel_gt and (
+            not mesh_voxel_gt.get("valid")
+            or int(mesh_voxel_gt.get("gt_occupied_voxel_count", 0) or 0) <= 0
+            or int(mesh_voxel_gt.get("gt_free_voxel_count", 0) or 0) <= 0
+            or mesh_voxel_gt.get("occupied_exact") is None
+            or mesh_voxel_gt.get("free_exact") is None
+        ):
+            errors.append(f"missing_mesh_voxel_gt:{key}")
         navmesh_current = p.get("stage23b_navmesh_traversability_current") or {}
         navmesh_oracle = (
             p.get("stage23b_navmesh_traversability_oracle_sensor") or {}
@@ -169,6 +180,15 @@ def analyze(
                     or navmesh.get("executed_route_predicted_free_recall") is None
                 ):
                     errors.append(f"missing_navmesh_clearance:{branch}:{key}")
+        if require_route_support_audit:
+            route_audit = navmesh_current_clearance or navmesh_current
+            if (
+                not route_audit.get("route_support_audit_enabled")
+                or int(route_audit.get("route_support_cell_count", 0) or 0) <= 0
+                or route_audit.get("route_support_reachability_agreement") is None
+                or route_audit.get("combined_reachability_agreement") is None
+            ):
+                errors.append(f"missing_route_support_audit:{key}")
         endpoint = c.get("validation_endpoint_gt_error_stats") or {}
         if not endpoint.get("count"):
             errors.append(f"missing_endpoint_gt_stats:{key}")
@@ -195,6 +215,7 @@ def analyze(
                 "current_to_oracle_height_comparison": height_comparison,
                 "shadow_action_violation_count": violations,
                 "mesh_raycast": mesh_raycast,
+                "mesh_voxel_gt": mesh_voxel_gt,
                 "navmesh_traversability_current": navmesh_current,
                 "navmesh_traversability_oracle_sensor": navmesh_oracle,
                 "navmesh_traversability_current_clearance": (
@@ -219,11 +240,13 @@ def analyze(
         ),
         "height_ablation_required": bool(require_height_ablation),
         "mesh_raycast_required": bool(require_mesh_raycast),
+        "mesh_voxel_gt_required": bool(require_mesh_voxel_gt),
         "signed_mesh_raycast_required": bool(require_signed_mesh),
         "navmesh_traversability_required": bool(require_navmesh_traversability),
         "navmesh_clearance_ablation_required": bool(
             require_navmesh_clearance_ablation
         ),
+        "route_support_audit_required": bool(require_route_support_audit),
         "episodes": episodes,
         "errors": errors,
     }
@@ -242,9 +265,11 @@ def main():
     parser.add_argument("--require-all", action="store_true")
     parser.add_argument("--require-height-ablation", action="store_true")
     parser.add_argument("--require-mesh-raycast", action="store_true")
+    parser.add_argument("--require-mesh-voxel-gt", action="store_true")
     parser.add_argument("--require-signed-mesh", action="store_true")
     parser.add_argument("--require-navmesh-traversability", action="store_true")
     parser.add_argument("--require-navmesh-clearance-ablation", action="store_true")
+    parser.add_argument("--require-route-support-audit", action="store_true")
     args = parser.parse_args()
     analyze(
         args.run_root,
@@ -253,9 +278,11 @@ def main():
         args.require_all,
         args.require_height_ablation,
         args.require_mesh_raycast,
+        args.require_mesh_voxel_gt,
         args.require_signed_mesh,
         args.require_navmesh_traversability,
         args.require_navmesh_clearance_ablation,
+        args.require_route_support_audit,
     )
 
 

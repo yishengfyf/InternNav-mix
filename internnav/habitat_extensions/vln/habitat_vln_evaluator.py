@@ -300,6 +300,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._stage23a_mesh_raycast_total = 0
         self._stage23a_mesh_raycast_hits = 0
         self._stage23a_mesh_raycast_misses = 0
+        self._stage23a_mesh_gt_occ_voxels = set()
+        self._stage23a_mesh_gt_free_voxels = set()
         self._stage23b_navmesh_audit_enabled = bool(
             vlmap_safety_cfg.get(
                 "occ_memory_validation_navmesh_traversability_enable", False
@@ -341,6 +343,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 vlmap_safety_cfg.get(
                     "occ_memory_validation_navmesh_clearance_height_max_m",
                     self._camera_height,
+                )
+            ),
+        )
+        self._stage23b_route_support_audit_enabled = bool(
+            vlmap_safety_cfg.get(
+                "occ_memory_validation_route_support_audit_enable", False
+            )
+        )
+        self._stage23c_semantic_scene_audit_enabled = bool(
+            vlmap_safety_cfg.get(
+                "occ_memory_validation_semantic_scene_audit_enable", False
+            )
+        )
+        self._stage23c_semantic_scene_audit_max_objects = max(
+            0,
+            int(
+                vlmap_safety_cfg.get(
+                    "occ_memory_validation_semantic_scene_audit_max_objects",
+                    4000,
                 )
             ),
         )
@@ -1390,6 +1411,172 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ),
         )
 
+    def _stage23c_semantic_scene_audit(self, memory) -> dict:
+        """Audit semantic anchors against Habitat scene annotations.
+
+        This is deliberately episode-end and read-only.  Anchor coordinates
+        live in the memory frame, while Habitat objects live in world space;
+        the initial base transform is used only for this comparison.  The
+        result is an availability/nearest-object audit, not voxel GT.
+        """
+        result = {
+            "enabled": bool(self._stage23c_semantic_scene_audit_enabled),
+            "valid": False,
+            "gt_reference": "Habitat semantic_scene objects/regions",
+            "annotation_available": False,
+            "reason": None,
+            "object_count": 0,
+            "region_count": 0,
+            "anchor_count": int(len(getattr(memory, "semantic_anchors", []) or [])),
+            "matched_anchor_count": 0,
+            "category_agreement_count": 0,
+            "category_agreement_rate": None,
+            "nearest_distance_m": {"count": 0, "median": None, "p95": None, "max": None},
+            "anchors": [],
+        }
+        if not result["enabled"]:
+            result["reason"] = "disabled"
+            return result
+        try:
+            sim = self.env._env.sim
+            scene = getattr(sim, "semantic_scene", None)
+        except Exception as exc:
+            result["reason"] = f"semantic_scene_access_error:{type(exc).__name__}"
+            return result
+        if scene is None:
+            result["reason"] = "semantic_scene_unavailable"
+            return result
+
+        def _name(category):
+            if category is None:
+                return ""
+            try:
+                value = category.name()
+            except Exception:
+                value = getattr(category, "name", "")
+            return str(value or "").strip()
+
+        def _center(item):
+            box = getattr(item, "aabb", None) or getattr(item, "obb", None)
+            center = getattr(box, "center", None) if box is not None else None
+            if center is None:
+                center = getattr(item, "center", None)
+            if center is None:
+                return None
+            try:
+                value = np.asarray(center, dtype=np.float32).reshape(3)
+            except Exception:
+                return None
+            return value if np.all(np.isfinite(value)) else None
+
+        objects = list(getattr(scene, "objects", None) or [])
+        regions = list(getattr(scene, "regions", None) or [])
+        limit = self._stage23c_semantic_scene_audit_max_objects
+        if limit > 0:
+            objects = objects[:limit]
+            regions = regions[:limit]
+        entries = []
+        for kind, items in (("object", objects), ("region", regions)):
+            for item in items:
+                center = _center(item)
+                if center is None:
+                    continue
+                category = _name(getattr(item, "category", None))
+                if not category and kind == "region":
+                    category = _name(getattr(item, "region", None))
+                entries.append(
+                    {
+                        "kind": kind,
+                        "id": str(getattr(item, "id", "")),
+                        "category": category,
+                        "center": center,
+                    }
+                )
+        result["object_count"] = int(len(objects))
+        result["region_count"] = int(len(regions))
+        result["annotation_available"] = bool(entries)
+        if not entries:
+            result["reason"] = "semantic_scene_has_no_usable_centers"
+            return result
+
+        if self._stage23a_initial_agent_matrix is None:
+            result["reason"] = "missing_initial_agent_matrix"
+            return result
+        habitat_to_map = np.array(
+            [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        )
+        map_to_habitat_tf = np.eye(4, dtype=np.float32)
+        map_to_habitat_tf[:3, :3] = habitat_to_map.T
+        map_to_world_tf = (
+            np.asarray(self._stage23a_initial_agent_matrix, dtype=np.float32)
+            @ map_to_habitat_tf
+        )
+        distances = []
+        anchors = list(getattr(memory, "semantic_anchors", []) or [])
+        for anchor in anchors:
+            xy = anchor.get("xy")
+            if not xy or len(xy) < 2:
+                continue
+            local_z = float(anchor.get("world_z") or 0.0)
+            local = np.array(
+                [float(xy[0]), float(xy[1]), local_z, 1.0], dtype=np.float32
+            )
+            world = (map_to_world_tf @ local)[:3]
+            if not np.all(np.isfinite(world)):
+                continue
+            nearest = min(entries, key=lambda item: float(np.linalg.norm(item["center"] - world)))
+            distance = float(np.linalg.norm(nearest["center"] - world))
+            term = str(anchor.get("semantic_top_match") or "").strip().lower()
+            category = str(nearest.get("category") or "").strip().lower()
+            term_tokens = {token for token in re.split(r"[^a-z0-9]+", term) if len(token) > 2}
+            category_tokens = {token for token in re.split(r"[^a-z0-9]+", category) if len(token) > 2}
+            agreement = bool(term and category and (term in category or category in term or term_tokens.intersection(category_tokens)))
+            distances.append(distance)
+            result["matched_anchor_count"] += 1
+            result["category_agreement_count"] += int(agreement)
+            result["anchors"].append(
+                {
+                    "anchor_id": anchor.get("anchor_id"),
+                    "semantic_top_match": anchor.get("semantic_top_match"),
+                    "semantic_kind": anchor.get("semantic_kind"),
+                    "grid": anchor.get("grid"),
+                    "memory_xy": [float(xy[0]), float(xy[1])],
+                    "world_xyz": [float(value) for value in world],
+                    "nearest_kind": nearest["kind"],
+                    "nearest_id": nearest["id"],
+                    "nearest_category": nearest["category"],
+                    "nearest_center_xyz": [float(value) for value in nearest["center"]],
+                    "nearest_distance_m": distance,
+                    "category_agreement": agreement,
+                }
+            )
+        if distances:
+            values = np.asarray(distances, dtype=np.float64)
+            result["nearest_distance_m"] = {
+                "count": int(values.size),
+                "median": float(np.median(values)),
+                "p95": float(np.percentile(values, 95)),
+                "max": float(np.max(values)),
+            }
+            result["category_agreement_rate"] = float(
+                result["category_agreement_count"] / len(distances)
+            )
+        result["valid"] = True
+        result["reason"] = "ok"
+        output_root = self._get_vlmap_run_dir()
+        if output_root:
+            output_root = os.path.join(output_root, "stage23c_semantic_scene_audit")
+            os.makedirs(output_root, exist_ok=True)
+            path = os.path.join(
+                output_root,
+                f"{memory.episode_meta.get('scene_id')}_{memory.episode_meta.get('episode_id')}.json",
+            )
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(result, stream, ensure_ascii=False, indent=2)
+            result["json_path"] = path
+        return result
+
     def _stage23a_mesh_raycast_audit(
         self, depth_m: np.ndarray, context: dict
     ) -> None:
@@ -1470,6 +1657,51 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             signed_error
                         )
                     self._stage23a_mesh_raycast_hits += 1
+                    if self._stage23a_initial_agent_matrix is not None:
+                        habitat_to_map = np.eye(4, dtype=np.float32)
+                        habitat_to_map[:3, :3] = np.array(
+                            [
+                                [0.0, 0.0, -1.0],
+                                [-1.0, 0.0, 0.0],
+                                [0.0, 1.0, 0.0],
+                            ],
+                            dtype=np.float32,
+                        )
+                        world_to_map = habitat_to_map @ np.linalg.inv(
+                            np.asarray(
+                                self._stage23a_initial_agent_matrix,
+                                dtype=np.float32,
+                            )
+                        )
+                        origin_map = (
+                            world_to_map
+                            @ np.array(
+                                [sensor_pos[0], sensor_pos[1], sensor_pos[2], 1.0],
+                                dtype=np.float32,
+                            )
+                        )[:3]
+                        hit_map = (
+                            world_to_map
+                            @ np.array(
+                                [hit_pos[0], hit_pos[1], hit_pos[2], 1.0],
+                                dtype=np.float32,
+                            )
+                        )[:3]
+                        endpoint_voxel = self.occ_memory._xyz_to_grid(hit_map)
+                        if endpoint_voxel is not None:
+                            self._stage23a_mesh_gt_occ_voxels.add(endpoint_voxel)
+                        ray_delta = hit_map - origin_map
+                        ray_length = float(np.linalg.norm(ray_delta))
+                        if ray_length > self.occ_memory.cs:
+                            direction_map = ray_delta / ray_length
+                            sample_count = int(ray_length / self.occ_memory.cs)
+                            for sample_index in range(1, sample_count):
+                                point = origin_map + direction_map * (
+                                    sample_index * self.occ_memory.cs
+                                )
+                                voxel = self.occ_memory._xyz_to_grid(point)
+                                if voxel is not None and voxel != endpoint_voxel:
+                                    self._stage23a_mesh_gt_free_voxels.add(voxel)
         except Exception as exc:
             print(f"[Stage23A][mesh_raycast] disabled for frame: {type(exc).__name__}: {exc}")
 
@@ -1524,6 +1756,70 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 float(self._stage23a_mesh_raycast_misses / self._stage23a_mesh_raycast_total)
                 if self._stage23a_mesh_raycast_total
                 else None
+            ),
+        }
+
+    def _stage23a_mesh_voxel_gt_summary(self, memory) -> dict:
+        """Compare SparseOcc labels with collision-mesh ray voxel labels."""
+        gt_occ = set(self._stage23a_mesh_gt_occ_voxels)
+        gt_free = set(self._stage23a_mesh_gt_free_voxels) - gt_occ
+        observed = gt_occ | gt_free
+        pred_occ = set(memory.occ_counts.keys()) & observed
+        pred_free = (set(memory.free_counts.keys()) - set(memory.occ_counts.keys())) & observed
+
+        def metrics(predicted, positive):
+            tp = len(predicted & positive)
+            fp = len(predicted - positive)
+            fn = len(positive - predicted)
+            precision = tp / float(tp + fp) if tp + fp else None
+            recall = tp / float(tp + fn) if tp + fn else None
+            return {
+                "tp": int(tp),
+                "fp": int(fp),
+                "fn": int(fn),
+                "precision": precision,
+                "recall": recall,
+                "f1": (
+                    2.0 * precision * recall / (precision + recall)
+                    if precision is not None and recall is not None and precision + recall
+                    else None
+                ),
+                "iou": tp / float(tp + fp + fn) if tp + fp + fn else None,
+            }
+
+        tolerance = set()
+        for row, col, height in gt_occ:
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    for dh in (-1, 0, 1):
+                        tolerance.add((row + dr, col + dc, height + dh))
+        tolerant_tp = len(pred_occ & tolerance)
+        return {
+            "enabled": bool(self._stage23a_mesh_raycast_enabled),
+            "valid": bool(observed and gt_occ and gt_free),
+            "gt_reference": "Habitat collision mesh first-hit rays",
+            "evaluation_domain": "sampled_collision_mesh_observed_rays",
+            "unknown_outside_sampled_rays": True,
+            "gt_occupied_voxel_count": int(len(gt_occ)),
+            "gt_free_voxel_count": int(len(gt_free)),
+            "predicted_unknown_voxel_count": int(len(observed - pred_occ - pred_free)),
+            "unknown_coverage": (
+                float(len(observed - pred_occ - pred_free) / len(observed))
+                if observed else None
+            ),
+            "occupied_exact": metrics(pred_occ, gt_occ),
+            "free_exact": metrics(pred_free, gt_free),
+            "occupied_tolerance_1voxel": {
+                "tp": int(tolerant_tp),
+                "prediction_count": int(len(pred_occ)),
+                "precision": float(tolerant_tp / len(pred_occ)) if pred_occ else None,
+                "tolerance_m": float(memory.cs),
+            },
+            "false_free_rate": (
+                float(len(pred_free & gt_occ) / len(pred_free)) if pred_free else None
+            ),
+            "false_occupied_rate": (
+                float(len(pred_occ & gt_free) / len(pred_occ)) if pred_occ else None
             ),
         }
 
@@ -1711,6 +2007,37 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             evidence_cache[cell] = state
             return state
 
+        route_support_cells = set()
+        if self._stage23b_route_support_audit_enabled:
+            movement_support = [trace[0]] if trace else []
+            for node in trace[1:]:
+                if math.hypot(
+                    node["x"] - movement_support[-1]["x"],
+                    node["y"] - movement_support[-1]["y"],
+                ) > 1e-4:
+                    movement_support.append(node)
+            for first, second in zip(movement_support[:-1], movement_support[1:]):
+                distance = math.hypot(
+                    second["x"] - first["x"], second["y"] - first["y"]
+                )
+                route_support_cells.update(
+                    memory._rasterize_executed_route_edge(
+                        (first["row"], first["col"]),
+                        (second["row"], second["col"]),
+                        edge_length_m=distance,
+                        sample_spacing_m=memory.cs,
+                    )
+                )
+
+        def route_support_state(cell):
+            return "free" if cell in route_support_cells else "unknown"
+
+        def combined_state(cell):
+            state = predicted_state(cell)
+            if state == "unknown" and cell in route_support_cells:
+                return "free"
+            return state
+
         def evenly_sample(cells, limit):
             ordered = sorted((int(r), int(c)) for r, c in cells)
             if len(ordered) <= limit:
@@ -1801,10 +2128,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         state_cache = evidence_cache
 
-        def predicted_path(start, goal, max_visited=20000):
+        def path_with_state(start, goal, state_fn, max_visited=20000):
             start = (int(start[0]), int(start[1]))
             goal = (int(goal[0]), int(goal[1]))
-            if predicted_state(start) != "free" or predicted_state(goal) != "free":
+            if state_fn(start) != "free" or state_fn(goal) != "free":
                 return False, None
             queue = deque([start])
             distance = {start: 0.0}
@@ -1820,11 +2147,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
                 ):
                     neighbor = (cell[0] + dr, cell[1] + dc)
-                    if neighbor in distance or predicted_state(neighbor) != "free":
+                    if neighbor in distance or state_fn(neighbor) != "free":
                         continue
                     if dr and dc and (
-                        predicted_state((cell[0] + dr, cell[1])) != "free"
-                        or predicted_state((cell[0], cell[1] + dc)) != "free"
+                        state_fn((cell[0] + dr, cell[1])) != "free"
+                        or state_fn((cell[0], cell[1] + dc)) != "free"
                     ):
                         continue
                     if math.hypot(neighbor[0] - start[0], neighbor[1] - start[1]) * memory.cs > 6.0:
@@ -1832,6 +2159,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     distance[neighbor] = distance[cell] + scale * memory.cs
                     queue.append(neighbor)
             return False, None
+
+        def predicted_path(start, goal, max_visited=20000):
+            return path_with_state(start, goal, predicted_state, max_visited)
 
         def gt_path(start, goal):
             shortest = habitat_sim.ShortestPath()
@@ -1863,13 +2193,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         reachability_matches = 0
         geodesic_errors = []
         current_anchor_gt = current_anchor_pred = 0
+        current_anchor_route = current_anchor_combined = 0
+        route_reachability_matches = combined_reachability_matches = 0
         for role, start, goal in pairs[: self._stage23b_navmesh_max_pairs]:
             gt_reachable, gt_distance = gt_path(start, goal)
             pred_reachable, pred_distance = predicted_path(start, goal)
+            route_reachable, route_distance = path_with_state(
+                start, goal, route_support_state
+            )
+            combined_reachable, combined_distance = path_with_state(
+                start, goal, combined_state
+            )
             reachability_matches += int(gt_reachable == pred_reachable)
+            route_reachability_matches += int(gt_reachable == route_reachable)
+            combined_reachability_matches += int(gt_reachable == combined_reachable)
             if role == "current_to_history" and gt_reachable:
                 current_anchor_gt += 1
                 current_anchor_pred += int(pred_reachable)
+                current_anchor_route += int(route_reachable)
+                current_anchor_combined += int(combined_reachable)
             if (
                 gt_reachable
                 and pred_reachable
@@ -1884,8 +2226,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "goal_grid": [int(goal[0]), int(goal[1])],
                     "gt_reachable": bool(gt_reachable),
                     "predicted_reachable": bool(pred_reachable),
+                    "route_support_reachable": bool(route_reachable),
+                    "combined_reachable": bool(combined_reachable),
                     "gt_geodesic_m": gt_distance,
                     "predicted_path_m": pred_distance,
+                    "route_support_path_m": route_distance,
+                    "combined_path_m": combined_distance,
                 }
             )
 
@@ -1957,6 +2303,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "current_to_history_anchor_predicted_reachable_count": int(current_anchor_pred),
                 "current_to_history_anchor_connectivity_recall": (
                     float(current_anchor_pred / current_anchor_gt) if current_anchor_gt else None
+                ),
+                "route_support_audit_enabled": bool(
+                    self._stage23b_route_support_audit_enabled
+                ),
+                "route_support_cell_count": int(len(route_support_cells)),
+                "route_support_reachability_agreement": (
+                    float(route_reachability_matches / len(pair_records))
+                    if pair_records else None
+                ),
+                "combined_reachability_agreement": (
+                    float(combined_reachability_matches / len(pair_records))
+                    if pair_records else None
+                ),
+                "current_to_history_anchor_route_support_connectivity_recall": (
+                    float(current_anchor_route / current_anchor_gt)
+                    if current_anchor_gt else None
+                ),
+                "current_to_history_anchor_combined_connectivity_recall": (
+                    float(current_anchor_combined / current_anchor_gt)
+                    if current_anchor_gt else None
                 ),
                 "geodesic_abs_error_m": {
                     "count": int(len(geodesic_errors)),
@@ -7755,6 +8121,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             self._stage23a_mesh_raycast_total = 0
             self._stage23a_mesh_raycast_hits = 0
             self._stage23a_mesh_raycast_misses = 0
+            self._stage23a_mesh_gt_occ_voxels = set()
+            self._stage23a_mesh_gt_free_voxels = set()
             self._stage23a_sim_pose_context(initialize=True)
             print("episode start", episode_instruction)
             self.vlmap_safety.reset()
@@ -11258,6 +11626,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             ensure_ascii=False,
                             indent=2,
                         )
+            stage23c_semantic_scene_audit = self._stage23c_semantic_scene_audit(
+                self.occ_memory
+            )
+            stage23a_mesh_voxel_gt = self._stage23a_mesh_voxel_gt_summary(
+                self.occ_memory_oracle_sensor_pose or self.occ_memory
+            )
             occ_memory_recovery_summary = self._summarize_occ_memory_recovery_state(
                 occ_memory_recovery_state
             )
@@ -11307,6 +11681,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                 ),
                 "stage23a_mesh_raycast": self._stage23a_mesh_raycast_summary(),
+                "stage23a_mesh_voxel_gt": stage23a_mesh_voxel_gt,
                 "stage23b_navmesh_traversability_current": (
                     stage23b_navmesh_current
                 ),
@@ -11319,6 +11694,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "stage23b_navmesh_traversability_oracle_sensor_clearance": (
                     stage23b_navmesh_oracle_sensor_clearance
                 ),
+                "stage23c_semantic_scene_audit": stage23c_semantic_scene_audit,
             }
             result.update(safety_summary)
             result["s2_recovery_context_enabled"] = bool(

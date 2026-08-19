@@ -440,6 +440,10 @@ class SparseOccMemoryConfig:
     validation_projection_size: int = 768
     validation_pose_from_context: bool = False
     validation_camera_pose_from_context: bool = False
+    # Independent audit-only semantic scene comparison.  These fields never
+    # affect online OCC state or navigation decisions.
+    validation_semantic_scene_audit_enable: bool = False
+    validation_semantic_scene_audit_max_objects: int = 4000
     verbose: bool = False
 
 
