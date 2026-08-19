@@ -55,6 +55,7 @@ from internnav.s2_action_loop import (
     observe_s2_action_query,
 )
 from internnav.utils.sparse_occ_memory import SparseOccSemanticMemory
+from internnav.utils.replay_ledger import ReplayLedger
 from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
 
@@ -274,6 +275,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
         )
         self.occ_memory.set_debug_dir(self._get_vlmap_run_dir())
+        self.replay_ledger = ReplayLedger(vlmap_safety_cfg)
+        self.replay_ledger.set_root(self._get_vlmap_run_dir() or self.output_path)
         self._stage23a_oracle_pose_enabled = bool(
             vlmap_safety_cfg.get("occ_memory_validation_oracle_pose_enable", False)
         )
@@ -8213,6 +8216,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 episode_index=episode_index,
                 episode_count=episode_count,
             )
+            self.replay_ledger.reset_episode(
+                instruction=episode_instruction,
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_index=episode_index,
+                episode_count=episode_count,
+                rank=getattr(self, "rank", 0),
+                world_size=getattr(self, "world_size", 1),
+            )
             if self.occ_memory_oracle_pose is not None:
                 self.occ_memory_oracle_pose.reset_episode(
                     instruction=episode_instruction,
@@ -8260,6 +8272,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             action = None
             action_source = "not_selected"
             pre_safety_action = None
+            last_action_applied = False
+            replay_observation_index = 0
+            replay_query_index = 0
+            history_id = []
             vlmap_safety_decision = {}
             messages = []
             local_actions = []
@@ -8463,6 +8479,68 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     rgb=rgb,
                     context=occ_memory_context,
                 )
+                # Stage24A is audit-only.  Keep the raw RGB-D in the ledger while
+                # indexing only compact map/pose state in JSONL; no ledger field is
+                # read by the action-selection path.
+                replay_pose = {
+                    "gps": observations.get("gps"),
+                    "compass": observations.get("compass"),
+                    "camera_pitch_deg": occ_memory_context.get("camera_pitch_deg"),
+                    "stage23a_sim_position": occ_memory_context.get(
+                        "stage23a_sim_position"
+                    ),
+                    "stage23a_sim_rotation_wxyz": occ_memory_context.get(
+                        "stage23a_sim_rotation_wxyz"
+                    ),
+                    "stage23a_gt_relative_height_m": occ_memory_context.get(
+                        "stage23a_gt_relative_height_m"
+                    ),
+                }
+                replay_occ_summary = {
+                    key: occ_memory_update_event.get(key)
+                    for key in (
+                        "event_type",
+                        "valid",
+                        "reason",
+                        "update_count",
+                        "sampled_point_count",
+                        "occupied_added",
+                        "free_added",
+                        "occupied_voxel_count",
+                        "free_voxel_count",
+                        "occupied_cell_count",
+                        "free_cell_count",
+                        "frontier_count",
+                        "pose_grid",
+                        "requested_camera_pitch_deg",
+                        "applied_camera_pitch_deg",
+                        "validation_endpoint_total_count",
+                        "validation_endpoint_mapped_count",
+                    )
+                    if key in occ_memory_update_event
+                }
+                replay_route_node = {
+                    "pose_grid": occ_memory_update_event.get("pose_grid"),
+                    "step_id": int(step_id),
+                    "gps": observations.get("gps"),
+                    "compass": observations.get("compass"),
+                }
+                self.replay_ledger.record_observation(
+                    step_id=step_id,
+                    observation_index=replay_observation_index,
+                    rgb=rgb,
+                    depth=current_depth_m,
+                    pose=replay_pose,
+                    camera_pitch_deg=occ_memory_context.get("camera_pitch_deg"),
+                    previous_action=action,
+                    previous_action_source=action_source,
+                    previous_pre_safety_action=pre_safety_action,
+                    previous_action_applied=last_action_applied,
+                    route_node=replay_route_node,
+                    occ_summary=replay_occ_summary,
+                    semantic_state=dict(self.occ_memory.last_semantic_decision or {}),
+                )
+                replay_observation_index += 1
                 if self.occ_memory_oracle_pose is not None:
                     self.occ_memory_oracle_pose.update_observation(
                         occ_memory_obs,
@@ -8705,6 +8783,35 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
                     last_s2_query_step = int(step_id)
+                    query_pixel_goal = None
+                    query_coordinates = [
+                        int(value) for value in re.findall(r"\d+", llm_outputs)
+                    ]
+                    if len(query_coordinates) >= 2:
+                        query_pixel_goal = [
+                            int(query_coordinates[1]),
+                            int(query_coordinates[0]),
+                        ]
+                    self.replay_ledger.record_query(
+                        step_id=step_id,
+                        query_id=replay_query_index,
+                        output=llm_outputs,
+                        pixel_goal=query_pixel_goal,
+                        input_steps={
+                            "history_rgb_indices": [
+                                int(item) for item in (history_id or [])
+                            ],
+                            "history_steps": [
+                                int(rgb_frame_records[item].get("step_id"))
+                                for item in (history_id or [])
+                                if 0 <= int(item) < len(rgb_frame_records)
+                            ],
+                            "current_step": int(step_id),
+                            "observation_index": int(replay_observation_index - 1),
+                        },
+                        semantic_state=dict(self.occ_memory.last_semantic_decision or {}),
+                    )
+                    replay_query_index += 1
                     print('step_id:', step_id, 'output text:', llm_outputs)
                     loop_observer_output = llm_outputs
 
@@ -11043,6 +11150,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             )
                             observations, _, done, _ = self.env.step(action)
                             step_id += 1
+                            self.replay_ledger.record_action(
+                                step_id=step_id - 1,
+                                action=action,
+                                action_source="nextdit_stop_fallback_left",
+                                pre_safety_action=pre_safety_action,
+                                action_applied=True,
+                                safety_decision={},
+                                next_observation_step_id=step_id,
+                            )
+                            last_action_applied = True
                             messages = []
                             continue
                         print('predicted goal', pixel_goal, flush=True)
@@ -11296,6 +11413,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_eval_seed=episode_eval_seed,
                             environment_step_applied=False,
                         )
+                        self.replay_ledger.record_action(
+                            step_id=step_id,
+                            action=action,
+                            action_source="nextdit_local_stop_discarded",
+                            pre_safety_action=action,
+                            action_applied=False,
+                            safety_decision={},
+                            next_observation_step_id=None,
+                        )
+                        last_action_applied = False
                         pixel_goal = None
                         output_ids = None
                         messages = []
@@ -11394,13 +11521,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     self.env.step(action)
                     observations, _, done, _ = self.env.step(action)
                     flag = True
+                    next_observation_step_id = int(step_id)
                 else:
                     observations, _, done, _ = self.env.step(action)
                     step_id += 1
+                    next_observation_step_id = int(step_id)
                     messages = []
                     flag = False
                     if action in (action_code.FORWARD, action_code.LEFT, action_code.RIGHT):
                         self._vlmap_last_nav_action = int(action)
+
+                self.replay_ledger.record_action(
+                    step_id=step_id if action == action_code.LOOKDOWN else step_id - 1,
+                    action=action,
+                    action_source=action_source,
+                    pre_safety_action=pre_safety_action,
+                    action_applied=True,
+                    safety_decision=vlmap_safety_decision,
+                    next_observation_step_id=next_observation_step_id,
+                )
+                last_action_applied = True
 
                 if (
                     pending_s2_loop_path_reobserve is not None
@@ -11574,6 +11714,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 pending_s2_loop_path_execution = None
             semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
             occ_memory_summary = self.occ_memory.finish_episode(metrics=metrics, steps=step_id)
+            replay_summary = self.replay_ledger.finish_episode(
+                success=metrics.get("success"),
+                steps=step_id,
+                semantic_summary=semantic_summary,
+                occ_summary=occ_memory_summary,
+            )
             occ_memory_oracle_pose_summary = {}
             if self.occ_memory_oracle_pose is not None:
                 occ_memory_oracle_pose_summary = (
@@ -11767,6 +11913,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     stage23b_navmesh_oracle_sensor_clearance
                 ),
                 "stage23c_semantic_scene_audit": stage23c_semantic_scene_audit,
+                "replay_ledger_enabled": bool(self.replay_ledger.enabled),
+                "replay_ledger_observation_count": int(
+                    replay_summary.get("observation_count", 0) or 0
+                ),
+                "replay_ledger_query_count": int(
+                    replay_summary.get("query_count", 0) or 0
+                ),
+                "replay_ledger_action_count": int(
+                    replay_summary.get("action_count", 0) or 0
+                ),
+                "replay_ledger_dir": (
+                    str(self.replay_ledger.root / "replay_ledger")
+                    if self.replay_ledger.enabled and self.replay_ledger.root is not None
+                    else None
+                ),
             }
             result.update(safety_summary)
             result["s2_recovery_context_enabled"] = bool(

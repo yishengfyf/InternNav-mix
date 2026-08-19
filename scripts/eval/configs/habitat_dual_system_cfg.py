@@ -133,6 +133,13 @@ eval_cfg = EvalCfg(
                 "occ_memory_raycast_max_points_per_update": 2500,
                 "occ_memory_keyframe_every_steps": 10,
                 "occ_memory_keyframe_min_distance": 0.50,
+                # Stage24A audit-only replay ledger. It never participates in actions.
+                "replay_ledger_enable": False,
+                "replay_ledger_save_rgb": True,
+                "replay_ledger_save_depth": True,
+                "replay_ledger_max_observations": 0,
+                "replay_ledger_max_queries": 0,
+                "replay_ledger_max_actions": 0,
                 "occ_memory_frontier_enable": True,
                 "occ_memory_waypoint_probe_enable": True,
                 "occ_memory_recovery_enable": False,
