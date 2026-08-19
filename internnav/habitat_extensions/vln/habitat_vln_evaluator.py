@@ -2077,9 +2077,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return "free" if cell in route_support_cells else "unknown"
 
         def combined_state(cell):
-            state = predicted_state(cell)
-            if state == "unknown" and cell in route_support_cells:
+            if cell in route_support_cells:
                 return "free"
+            state = predicted_state(cell)
             return state
 
         def evenly_sample(cells, limit):
@@ -2135,6 +2135,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         combined_pred_free = {
             cell for cell in sampled if combined_state(cell) == "free"
         }
+        route_support_blocked_override_count = sum(
+            predicted_state(cell) == "blocked" for cell in route_support_cells
+        )
 
         route_state_counts = {"free": 0, "blocked": 0, "unknown": 0}
         route_navmesh_free = 0
@@ -2359,6 +2362,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     self._stage23b_route_support_audit_enabled
                 ),
                 "route_support_cell_count": int(len(route_support_cells)),
+                "route_support_blocked_override_count": int(
+                    route_support_blocked_override_count
+                ),
+                "combined_route_support_precedence": "executed_swept_corridor_overrides_occ_blocked",
                 "route_support_free_metrics_observed_domain": (
                     self._stage23b_binary_metrics(route_pred_free, gt_free)
                 ),
