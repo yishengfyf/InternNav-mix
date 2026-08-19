@@ -5,6 +5,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 CHECKPOINT=${STAGE21C_SCORER_CHECKPOINT:?Set STAGE21C_SCORER_CHECKPOINT to seed_53/best.pt}
 MANIFEST=${STAGE23C_SEMANTIC_MANIFEST:-scripts/eval/manifests/stage23a_sensor_smoke1_episode_seed_replay.json}
+CONFIG=${STAGE23C_SEMANTIC_CONFIG:-scripts/eval/configs/habitat_dual_system_vlmap_stage23c_semantic_scene_audit_cfg.py}
 RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
 PIPELINE_TAG=${STAGE21_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
 CUDA_DEVICES=${STAGE21_CUDA_VISIBLE_DEVICES:-0,1,2,3}
@@ -51,7 +52,7 @@ STAGE21C_SCORER_CHECKPOINT="${CHECKPOINT}" STAGE21C_SCORER_DEVICE=cpu \
 STAGE23A_EVAL_PORT=${STAGE23C_EVAL_PORT:-2673} \
 NPROC_PER_NODE="${NPROC}" MASTER_PORT=${STAGE23C_MASTER_PORT:-2674} \
 bash scripts/eval/bash/stage21_torchrun_eval.sh \
-  --config scripts/eval/configs/habitat_dual_system_vlmap_stage23c_semantic_scene_audit_cfg.py
+  --config "${CONFIG}"
 
 FAILED_STAGE=semantic_scene_automatic_audit
 python3 scripts/eval/analyze_stage23c_semantic_scene.py \
