@@ -2,7 +2,7 @@ import numpy as np
 
 from scripts.eval.analyze_stage25_gt_detector import (
     compact_observation, cumulative_path_length, mine_events, route_revisit,
-    semantic_cells,
+    semantic_cells, merge_geometry_intervals,
 )
 
 
@@ -145,3 +145,28 @@ def test_cumulative_route_length_preserves_revisit_result():
         cumulative_path_m=cumulative_path_length(rows),
     )
     assert optimized == original
+
+
+def test_continuous_geometry_evidence_becomes_one_interval():
+    rows = [observation(index, 0.0, collision=index, collision_delta=1) for index in range(18)]
+    result = mine_events(rows, [], [])
+    geometry = [event for event in result["D1"] if event["event_family"] == "G1_geometry_execution"]
+    assert len(geometry) == 1
+    assert geometry[0]["step_id"] == 1
+    assert geometry[0]["end_step"] == 17
+    assert geometry[0]["support_count"] == 17
+
+
+def test_geometry_intervals_split_after_gap_or_departure():
+    base = {
+        "event_family": "G1_geometry_execution", "evidence": ["collision"],
+        "semantic_confirmation": {"supports_existing_suspicion": False},
+        "recoverability_proxy": "persistent_episode",
+    }
+    events = [
+        {**base, "step_id": 2, "position": [0.0, 0.0]},
+        {**base, "step_id": 3, "position": [0.0, 0.0]},
+        {**base, "step_id": 9, "position": [0.0, 0.0]},
+        {**base, "step_id": 10, "position": [1.0, 0.0]},
+    ]
+    assert len(merge_geometry_intervals(events)) == 3

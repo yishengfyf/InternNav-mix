@@ -392,6 +392,49 @@ def _event(
     }
 
 
+def merge_geometry_intervals(
+    events: Sequence[Mapping[str, Any]], *, max_gap_steps: int = 4,
+    max_region_distance_m: float = 0.50,
+) -> List[Dict[str, Any]]:
+    """Merge continuous G1 evidence into causal event intervals."""
+    merged: List[Dict[str, Any]] = []
+    for source in sorted(events, key=lambda item: int(item["step_id"])):
+        event = dict(source)
+        event["end_step"] = int(event["step_id"])
+        event["support_count"] = 1
+        event["semantic_confirmation_step"] = (
+            int(event["step_id"])
+            if event["semantic_confirmation"].get("supports_existing_suspicion")
+            else None
+        )
+        if not merged:
+            merged.append(event)
+            continue
+        current = merged[-1]
+        gap = int(event["step_id"]) - int(current["end_step"])
+        same_region = distance(event.get("position"), current.get("position")) <= float(
+            max_region_distance_m
+        )
+        if gap > int(max_gap_steps) or not same_region:
+            merged.append(event)
+            continue
+        current["end_step"] = int(event["step_id"])
+        current["support_count"] = int(current["support_count"]) + 1
+        current["evidence"] = sorted(set(current["evidence"]) | set(event["evidence"]))
+        if (
+            current.get("semantic_confirmation_step") is None
+            and event["semantic_confirmation"].get("supports_existing_suspicion")
+        ):
+            current["semantic_confirmation_step"] = int(event["step_id"])
+            current["semantic_confirmation"] = event["semantic_confirmation"]
+    for event in merged:
+        event["duration_steps"] = int(event["end_step"]) - int(event["step_id"]) + 1
+        event["semantic_confirmation"]["supports_existing_suspicion"] = bool(
+            event.get("semantic_confirmation_step") is not None
+        )
+    return merged
+
+
 def mine_events(
     observations: Sequence[Mapping[str, Any]],
     loops: Sequence[Mapping[str, Any]],
@@ -401,12 +444,12 @@ def mine_events(
     route_max_displacement_m: float = 0.25, route_max_unique_occ_growth: int = 512,
 ) -> Dict[str, List[Dict[str, Any]]]:
     rows = canonical_observations(observations)
-    immediate: List[Dict[str, Any]] = []
+    policy_loops: List[Dict[str, Any]] = []
+    geometry_samples: List[Dict[str, Any]] = []
     raw_revisits: List[Dict[str, Any]] = []
     confirmed_revisits: List[Dict[str, Any]] = []
     loop_steps = {int(row.get("step_id", -1)): row for row in loops}
     cumulative_path_m = cumulative_path_length(rows)
-    last_event_step: Dict[str, int] = {}
     last_raw_revisit_step = -1000
     pending_revisit: Optional[Dict[str, Any]] = None
     active_revisit_region: Optional[Sequence[float]] = None
@@ -428,17 +471,21 @@ def mine_events(
             int(item.get("occupied_added") or 0) + int(item.get("free_added") or 0)
             for item in recent12
         )
-        evidence: List[str] = []
-        family = None
+        geometry_evidence: List[str] = []
         if step in loop_steps:
-            family = "G2_policy_loop"
-            evidence.append("strict_s2_turn_loop")
+            policy_loops.append(_event(
+                rows, index, family="G2_policy_loop",
+                evidence=["strict_s2_turn_loop"], semantic=semantic,
+            ))
         if collision_burst >= 2 and displacement <= 0.25:
-            family = family or "G1_geometry_execution"
-            evidence.append("collision_burst_low_displacement")
+            geometry_evidence.append("collision_burst_low_displacement")
         if forward_count >= 3 and displacement <= 0.15:
-            family = family or "G1_geometry_execution"
-            evidence.append("commanded_forward_not_realized")
+            geometry_evidence.append("commanded_forward_not_realized")
+        if geometry_evidence:
+            geometry_samples.append(_event(
+                rows, index, family="G1_geometry_execution",
+                evidence=geometry_evidence, semantic=semantic,
+            ))
         revisit = route_revisit(
             rows, index, radius_m=route_radius_m, min_path_m=route_min_path_m,
             cumulative_path_m=cumulative_path_m,
@@ -453,13 +500,6 @@ def mine_events(
                 last_raw_revisit_step = step
             if pending_revisit is None and active_revisit_region is None:
                 pending_revisit = {"index": index, "step": step, "revisit": revisit}
-
-        if family is not None and step - last_event_step.get(family, -1000) >= 8:
-            last_event_step[family] = step
-            immediate.append(_event(
-                rows, index, family=family, evidence=evidence, semantic=semantic,
-                extra_window=revisit or {},
-            ))
 
         if pending_revisit is not None:
             onset_index = int(pending_revisit["index"])
@@ -497,8 +537,9 @@ def mine_events(
             elif left_region:
                 pending_revisit = None
 
-    d0 = [event for event in immediate if "strict_s2_turn_loop" in event["evidence"]]
-    d1 = [event for event in immediate if event["event_family"] in {"G1_geometry_execution", "G2_policy_loop"}]
+    geometry_intervals = merge_geometry_intervals(geometry_samples)
+    d0 = policy_loops
+    d1 = policy_loops + geometry_intervals
     d2 = d1 + confirmed_revisits
     return {
         "D0": d0,
@@ -570,6 +611,7 @@ def audit_episode(episode_dir: Path, loops: Sequence[Mapping[str, Any]]) -> Tupl
     return {
         "scene_id": meta.get("scene_id"),
         "episode_id": meta.get("episode_id"),
+        "episode_eval_seed": meta.get("episode_eval_seed"),
         "observation_count": len(observations),
         "query_count": len(queries),
         "action_count": len(actions),
@@ -582,6 +624,7 @@ def audit_episode(episode_dir: Path, loops: Sequence[Mapping[str, Any]]) -> Tupl
 def analyze(
     run_root: Path, output: Path, require_all: bool,
     *, detector_options: Optional[Mapping[str, Any]] = None,
+    episode_manifest: Optional[Path] = None,
 ) -> Dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     evidence_dir = output / "event_evidence"
@@ -592,10 +635,24 @@ def analyze(
     episode_reports = []
     all_events: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     annotation = []
+    expected_manifest: Dict[str, Dict[str, Any]] = {}
+    if episode_manifest is not None:
+        for row in json.loads(episode_manifest.read_text(encoding="utf-8")):
+            expected_manifest[episode_key(row)] = row
+    observed_keys = set()
     for episode_dir in discover_episodes(run_root):
         meta = json.loads((episode_dir / "episode_meta.json").read_text(encoding="utf-8"))
         key = episode_key(meta)
+        observed_keys.add(key)
         report, errors = audit_episode(episode_dir, loops.get(key, []))
+        expected = expected_manifest.get(key)
+        if expected_manifest and expected is None:
+            errors.append("episode_not_in_manifest")
+        if expected is not None and int(meta.get("episode_eval_seed", -1)) != int(
+            expected["episode_eval_seed"]
+        ):
+            errors.append("episode_eval_seed_mismatch")
+        report["audit_role"] = None if expected is None else expected.get("audit_role")
         episode_reports.append(report)
         contract_errors.extend(f"{key}:{error}" for error in errors)
         observations = jsonl(episode_dir / "observations.jsonl")
@@ -651,6 +708,8 @@ def analyze(
                 episode_dir, observations, semantic, negative,
                 evidence_dir / evidence_name, status="hard_negative_no_D2",
             )
+    missing_manifest = sorted(set(expected_manifest) - observed_keys)
+    contract_errors.extend(f"{key}:manifest_episode_missing" for key in missing_manifest)
     detector_summary = {}
     for variant in ("D0", "D1", "D2_raw_revisit", "D2", "D3Q_confirmed"):
         events = all_events.get(variant, [])
@@ -671,6 +730,9 @@ def analyze(
         "future_used_by_detector": False,
         "future_used_for_recoverability_label_only": True,
         "detector_options": options,
+        "episode_manifest": None if episode_manifest is None else str(episode_manifest),
+        "manifest_expected_count": len(expected_manifest),
+        "manifest_verified_count": len(expected_manifest) - len(missing_manifest),
         "episode_count": len(episode_reports),
         "episodes": episode_reports,
         "detectors": detector_summary,
@@ -690,6 +752,7 @@ def main() -> None:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
+    parser.add_argument("--episode-manifest", type=Path)
     parser.add_argument("--route-radius-m", type=float, default=0.35)
     parser.add_argument("--route-min-path-m", type=float, default=0.75)
     parser.add_argument("--route-confirm-min-steps", type=int, default=8)
@@ -698,7 +761,8 @@ def main() -> None:
     parser.add_argument("--route-max-unique-occ-growth", type=int, default=512)
     args = parser.parse_args()
     analyze(
-        args.run_root, args.output, args.require_all, detector_options={
+        args.run_root, args.output, args.require_all, episode_manifest=args.episode_manifest,
+        detector_options={
             "route_radius_m": args.route_radius_m,
             "route_min_path_m": args.route_min_path_m,
             "route_confirm_min_steps": args.route_confirm_min_steps,

@@ -68,7 +68,8 @@ python3 scripts/eval/analyze_stage24a_replay_ledger.py \
   --output "${RUN_ROOT}/stage25_replay_ledger_integrity.json"
 python3 scripts/eval/analyze_stage25_gt_detector.py \
   --run-root "${RUN_ROOT}" \
-  --output "${RUN_ROOT}/stage25_detector_audit" --require-all
+  --output "${RUN_ROOT}/stage25_detector_audit" \
+  --episode-manifest "${MANIFEST}" --require-all
 
 FAILED_STAGE=return_packaging
 cp -a "${RUN_ROOT}/." "${WORK_DIR}/"
