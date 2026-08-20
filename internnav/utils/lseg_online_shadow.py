@@ -309,6 +309,70 @@ class OnlineLSegSemanticShadow:
         )
         return logits[0].float().cpu().numpy()
 
+    def infer_logits_and_sampled_embeddings(
+        self, image: np.ndarray, pixel_y: np.ndarray, pixel_x: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return dense logits and only the requested 512-D LSeg features.
+
+        Stage24F uses this offline-only entry point to avoid materializing a
+        source-resolution H x W x 512 tensor. The online shadow remains on the
+        existing logits-only path.
+        """
+        from vlmaps.lseg.additional_utils.models import crop_image, pad_image, resize_image
+
+        source_h, source_w = image.shape[:2]
+        tensor = self.transform(image).unsqueeze(0).to(self.device)
+        _, _, height, width = tensor.shape
+        if height > width:
+            resized_h = self.crop_size
+            resized_w = int(width * self.crop_size / height + 0.5)
+        else:
+            resized_w = self.crop_size
+            resized_h = int(height * self.crop_size / width + 0.5)
+        resized = resize_image(
+            tensor, resized_h, resized_w, mode="bilinear", align_corners=True
+        )
+        padded = pad_image(resized, [0.5] * 3, [0.5] * 3, self.crop_size)
+        with torch.inference_mode():
+            embeddings, logits = self.model(padded, self.labels)
+        embeddings = crop_image(embeddings, 0, resized_h, 0, resized_w)
+        logits = crop_image(logits, 0, resized_h, 0, resized_w)
+        logits = torch.nn.functional.interpolate(
+            logits, size=(source_h, source_w), mode="bilinear", align_corners=True
+        )
+
+        sample_y = torch.as_tensor(pixel_y, device=self.device, dtype=torch.float32)
+        sample_x = torch.as_tensor(pixel_x, device=self.device, dtype=torch.float32)
+        if source_h > 1:
+            sample_y = sample_y * float(embeddings.shape[2] - 1) / float(source_h - 1)
+        else:
+            sample_y.zero_()
+        if source_w > 1:
+            sample_x = sample_x * float(embeddings.shape[3] - 1) / float(source_w - 1)
+        else:
+            sample_x.zero_()
+        grid_x = 2.0 * sample_x / max(1, embeddings.shape[3] - 1) - 1.0
+        grid_y = 2.0 * sample_y / max(1, embeddings.shape[2] - 1) - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1).reshape(1, 1, -1, 2)
+        sampled = torch.nn.functional.grid_sample(
+            embeddings, grid, mode="bilinear", padding_mode="zeros",
+            align_corners=True,
+        )[0, :, 0, :].T
+        return (
+            logits[0].float().cpu().numpy(),
+            sampled.float().cpu().numpy(),
+        )
+
+    def lseg_text_features(self) -> np.ndarray:
+        """Return normalized CLIP text features for the configured labels."""
+        import clip
+
+        tokens = clip.tokenize(self.labels).to(self.device)
+        with torch.inference_mode():
+            features = self.model.clip_pretrained.encode_text(tokens).float()
+            features = features / features.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        return features.cpu().numpy()
+
     def _project(
         self, pred: np.ndarray, confidence: np.ndarray, depth: np.ndarray,
         camera_pose_map: np.ndarray, occ_memory: Any,
