@@ -37,6 +37,7 @@ vlmap_cfg["lseg_online_shadow_max_surface_samples"] = int(
 vlmap_cfg["lseg_online_shadow_save_overlay"] = True
 vlmap_cfg["lseg_online_shadow_save_surface"] = True
 vlmap_cfg["lseg_online_shadow_save_visualizations"] = True
+vlmap_cfg["replay_ledger_rgb_format"] = "png"
 
 # Defense in depth: Stage24D is observation-only.
 vlmap_cfg["occ_memory_shadow_only"] = True

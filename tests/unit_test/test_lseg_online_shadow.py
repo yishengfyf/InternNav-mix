@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 
 import numpy as np
 
@@ -77,6 +78,28 @@ def test_projection_keeps_unknown_distinct_from_free(tmp_path):
 
     assert samples["map_xyz"].shape == (16, 3)
     assert np.all(samples["occ_state"] == 2)
+
+
+def test_query_event_hashes_exact_inputs(tmp_path):
+    shadow = _shadow(tmp_path)
+    shadow._load_model = lambda: None
+    shadow._infer_logits = lambda image: np.stack([
+        np.ones(image.shape[:2], dtype=np.float32),
+        np.zeros(image.shape[:2], dtype=np.float32),
+    ] + [np.full(image.shape[:2], -10.0, dtype=np.float32)] * 12)
+    rgb = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
+    depth = np.ones((4, 4), dtype=np.float32)
+    pose = np.eye(4, dtype=np.float32)
+
+    event = shadow.process_query_frame(
+        rgb=rgb, depth_m=depth, camera_pose_map=pose, step_id=0, query_id=0,
+        observation_index=0, occ_memory=_OccMemory(),
+    )
+
+    assert event["valid"]
+    assert event["rgb_sha256"] == hashlib.sha256(rgb.tobytes()).hexdigest()
+    assert event["depth_sha256"] == hashlib.sha256(depth.tobytes()).hexdigest()
+    assert event["camera_pose_sha256"] == hashlib.sha256(pose.tobytes()).hexdigest()
 
 
 def test_node_merge_and_visualizations_are_audit_only(tmp_path):

@@ -7,6 +7,7 @@ the JSONL index remains inspectable and query/action events stay aligned by step
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,9 @@ class ReplayLedger:
         cfg = dict(config or {})
         self.enabled = bool(cfg.get("replay_ledger_enable", False))
         self.save_rgb = bool(cfg.get("replay_ledger_save_rgb", True))
+        self.rgb_format = str(cfg.get("replay_ledger_rgb_format", "jpg")).lower()
+        if self.rgb_format not in {"jpg", "jpeg", "png"}:
+            raise ValueError(f"Unsupported replay RGB format: {self.rgb_format}")
         self.save_depth = bool(cfg.get("replay_ledger_save_depth", True))
         self.max_observations = max(
             0, int(cfg.get("replay_ledger_max_observations", 0) or 0)
@@ -142,15 +146,25 @@ class ReplayLedger:
             "semantic_state": semantic_state or {},
         }
         if rgb is not None:
-            rgb_arr = np.asarray(rgb)
+            rgb_arr = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
             record["rgb_shape"] = list(rgb_arr.shape)
+            record["rgb_dtype"] = str(rgb_arr.dtype)
+            record["rgb_sha256"] = hashlib.sha256(rgb_arr.tobytes()).hexdigest()
+            record["rgb_storage_format"] = self.rgb_format
             if self.save_rgb:
-                rgb_path = self.episode_dir / "rgb" / f"{prefix}.jpg"
-                Image.fromarray(rgb_arr.astype(np.uint8)).save(rgb_path, quality=90)
+                suffix = "png" if self.rgb_format == "png" else "jpg"
+                rgb_path = self.episode_dir / "rgb" / f"{prefix}.{suffix}"
+                if self.rgb_format == "png":
+                    Image.fromarray(rgb_arr).save(
+                        rgb_path, format="PNG", compress_level=3
+                    )
+                else:
+                    Image.fromarray(rgb_arr).save(rgb_path, quality=90)
                 record["rgb_path"] = str(rgb_path.relative_to(self.episode_dir))
         if depth is not None:
-            depth_arr = np.asarray(depth, dtype=np.float32)
+            depth_arr = np.ascontiguousarray(np.asarray(depth, dtype=np.float32))
             record["depth_shape"] = list(depth_arr.shape)
+            record["depth_sha256"] = hashlib.sha256(depth_arr.tobytes()).hexdigest()
             finite = depth_arr[np.isfinite(depth_arr)]
             record["depth_valid_count"] = int(finite.size)
             if finite.size:

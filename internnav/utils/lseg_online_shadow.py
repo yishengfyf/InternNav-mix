@@ -6,6 +6,7 @@ its outputs are exposed to prompts, safety checks, candidates, or actions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import sys
@@ -327,8 +328,13 @@ class OnlineLSegSemanticShadow:
         try:
             self._load_model()
             image = np.asarray(rgb, dtype=np.uint8)
-            depth = np.asarray(depth_m, dtype=np.float32).reshape(image.shape[:2])
-            pose = np.asarray(camera_pose_map, dtype=np.float32).reshape(4, 4)
+            image = np.ascontiguousarray(image)
+            depth = np.ascontiguousarray(
+                np.asarray(depth_m, dtype=np.float32).reshape(image.shape[:2])
+            )
+            pose = np.ascontiguousarray(
+                np.asarray(camera_pose_map, dtype=np.float32).reshape(4, 4)
+            )
             before_cuda = self._cuda_stats()
             if before_cuda.get("available"):
                 torch.cuda.reset_peak_memory_stats(torch.device(self.device))
@@ -368,6 +374,9 @@ class OnlineLSegSemanticShadow:
             self.inference_seconds.append(elapsed)
             event.update({
                 "valid": True, "reason": "ok", "inference_seconds": elapsed,
+                "rgb_sha256": hashlib.sha256(image.tobytes()).hexdigest(),
+                "depth_sha256": hashlib.sha256(depth.tobytes()).hexdigest(),
+                "camera_pose_sha256": hashlib.sha256(pose.tobytes()).hexdigest(),
                 "high_confidence_pixel_fraction": float(
                     np.mean(confidence >= self.confidence_threshold)
                 ),

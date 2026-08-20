@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -96,10 +97,28 @@ def replay_episode(ledger: Path, output: Path, args: argparse.Namespace) -> Dict
     descriptors: Dict[int, np.ndarray] = {}
     for observation in observations:
         index = int(observation["record_index"])
-        rgb = np.asarray(Image.open(ledger / observation["rgb_path"]).convert("RGB"))
+        rgb = np.ascontiguousarray(
+            np.asarray(Image.open(ledger / observation["rgb_path"]).convert("RGB")).copy()
+        )
+        loaded_hash = hashlib.sha256(rgb.tobytes()).hexdigest()
+        expected_hash = observation.get("rgb_sha256")
+        if observation.get("rgb_storage_format") != "png":
+            raise RuntimeError(
+                f"Stage24E requires lossless PNG replay RGB: {ledger}"
+            )
+        if not expected_hash or loaded_hash != expected_hash:
+            raise RuntimeError(
+                f"Lossless RGB hash mismatch for {ledger}/{observation['rgb_path']}: "
+                f"{loaded_hash} != {expected_hash}"
+            )
         descriptors[index] = _descriptor(rgb)
         with np.load(ledger / observation["depth_path"]) as payload:
-            depth = payload["depth_m"]
+            depth = np.ascontiguousarray(payload["depth_m"], dtype=np.float32)
+        loaded_depth_hash = hashlib.sha256(depth.tobytes()).hexdigest()
+        if loaded_depth_hash != observation.get("depth_sha256"):
+            raise RuntimeError(
+                f"Depth hash mismatch for {ledger}/{observation['depth_path']}"
+            )
         source.process_query_frame(
             rgb=rgb, depth_m=depth,
             camera_pose_map=(observation.get("pose") or {})["stage23_gt_camera_pose_map"],
@@ -190,6 +209,58 @@ def replay_episode(ledger: Path, output: Path, args: argparse.Namespace) -> Dict
             "max_gap": args.max_gap,
         },
         "decision_status": "audit_only_not_navigation_ready",
+    }
+    online_dirs = [
+        path.parent for path in args.ledger_root.glob("**/online_lseg_shadow/*/episode_meta.json")
+        if (lambda value: str(value.get("scene_id")) == str(meta["scene_id"])
+            and str(value.get("episode_id")) == str(meta["episode_id"]))
+        (json.loads(path.read_text(encoding="utf-8")))
+    ]
+    consistency_errors = []
+    if len(online_dirs) != 1:
+        consistency_errors.append(f"expected_one_online_dir_got_{len(online_dirs)}")
+    else:
+        online_events = _jsonl(online_dirs[0] / "events.jsonl")
+        observation_by_index = {
+            int(item["observation_index"]): item for item in observations
+        }
+        replay_by_observation = {
+            int(record["observation_index"]): record for record in source.records
+        }
+        if len(online_events) != len(q_selected):
+            consistency_errors.append(
+                f"query_count:{len(online_events)}!={len(q_selected)}"
+            )
+        for online in online_events:
+            observation_index = int(online["observation_index"])
+            replayed = replay_by_observation.get(observation_index)
+            if replayed is None:
+                consistency_errors.append(f"missing_replay_observation:{observation_index}")
+                continue
+            observation = observation_by_index.get(observation_index)
+            if observation is None:
+                consistency_errors.append(
+                    f"missing_ledger_observation:{observation_index}"
+                )
+                continue
+            pose = np.ascontiguousarray(
+                (observation.get("pose") or {})[
+                    "stage23_gt_camera_pose_map"
+                ], dtype=np.float32,
+            )
+            expected_pose_hash = hashlib.sha256(pose.tobytes()).hexdigest()
+            if online.get("camera_pose_sha256") != expected_pose_hash:
+                consistency_errors.append(
+                    f"observation_{observation_index}:camera_pose_sha256"
+                )
+            for key in (
+                "rgb_sha256", "depth_sha256", "class_surface_counts",
+                "surface_sample_count",
+            ):
+                if online.get(key) != replayed.get(key):
+                    consistency_errors.append(f"observation_{observation_index}:{key}")
+    result["online_q_consistency"] = {
+        "passed": not consistency_errors, "errors": consistency_errors,
     }
     output.mkdir(parents=True, exist_ok=True)
     (output / "episode_frequency_comparison.json").write_text(

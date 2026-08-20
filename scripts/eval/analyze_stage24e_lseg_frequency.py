@@ -54,6 +54,14 @@ def analyze(root: Path, output: Path) -> Dict[str, Any]:
             aggregate[name]["call_count"] / max(1, aggregate["all"]["call_count"])
         )
     gate = evaluate_frequency_gate(aggregate["q"], aggregate["q_plus_k"], aggregate["all"])
+    consistency_passed = all(
+        bool((episode.get("online_q_consistency") or {}).get("passed"))
+        for episode in episodes
+    )
+    gate["checks"]["online_q_replay_exact_match"] = consistency_passed
+    gate["passed"] = bool(gate["passed"] and consistency_passed)
+    if not gate["passed"]:
+        gate["decision"] = "retain_audit_only_and_tune_keyframes"
     result = {
         "audit_name": "stage24e_lseg_replay_frequency",
         "episode_count": len(episodes), "variants": aggregate, "gate": gate,
