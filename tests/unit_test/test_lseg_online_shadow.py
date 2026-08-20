@@ -50,6 +50,20 @@ def test_disabled_shadow_never_loads_model(tmp_path):
     assert shadow.model is None
 
 
+def test_homogeneous_camera_intrinsic_is_normalized(tmp_path):
+    intrinsic = np.eye(4, dtype=np.float32)
+    intrinsic[0, 0] = 388.0
+    intrinsic[1, 1] = 388.0
+    intrinsic[0, 2] = 319.5
+    intrinsic[1, 2] = 239.5
+    shadow = OnlineLSegSemanticShadow(
+        {"lseg_online_shadow_enable": False}, intrinsic, "cpu"
+    )
+
+    assert shadow.camera_intrinsic.shape == (3, 3)
+    assert np.array_equal(shadow.camera_intrinsic, intrinsic[:3, :3])
+
+
 def test_projection_keeps_unknown_distinct_from_free(tmp_path):
     shadow = _shadow(tmp_path)
     pred = np.zeros((4, 4), dtype=np.int16)

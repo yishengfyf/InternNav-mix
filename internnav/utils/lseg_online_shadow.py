@@ -101,7 +101,15 @@ class OnlineLSegSemanticShadow:
         self.save_visualizations = bool(
             cfg.get("lseg_online_shadow_save_visualizations", True)
         )
-        self.camera_intrinsic = np.asarray(camera_intrinsic, dtype=np.float32).reshape(3, 3)
+        intrinsic = np.asarray(camera_intrinsic, dtype=np.float32)
+        if intrinsic.shape == (4, 4):
+            intrinsic = intrinsic[:3, :3]
+        if intrinsic.shape != (3, 3):
+            raise ValueError(
+                "Expected camera intrinsic shape (3, 3) or (4, 4), "
+                f"got {intrinsic.shape}"
+            )
+        self.camera_intrinsic = intrinsic
         self.root: Optional[Path] = None
         self.episode_dir: Optional[Path] = None
         self.model = None
