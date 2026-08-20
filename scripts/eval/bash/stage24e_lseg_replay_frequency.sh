@@ -39,6 +39,7 @@ mkdir -p "${WORK_DIR}"
 exec > >(tee -a "${WORK_DIR}/pipeline.log") 2>&1
 
 FAILED_STAGE=replay_frequency_evaluation
+CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8} \
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun \
   --standalone --nproc_per_node="${NPROC}" \
   scripts/eval/replay_stage24e_lseg_frequency.py \
