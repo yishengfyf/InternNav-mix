@@ -55,6 +55,7 @@ from internnav.s2_action_loop import (
     observe_s2_action_query,
 )
 from internnav.utils.sparse_occ_memory import SparseOccSemanticMemory
+from internnav.utils.lseg_online_shadow import OnlineLSegSemanticShadow
 from internnav.utils.replay_ledger import ReplayLedger
 from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
@@ -277,6 +278,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.occ_memory.set_debug_dir(self._get_vlmap_run_dir())
         self.replay_ledger = ReplayLedger(vlmap_safety_cfg)
         self.replay_ledger.set_root(self._get_vlmap_run_dir() or self.output_path)
+        self.online_lseg_shadow = OnlineLSegSemanticShadow(
+            vlmap_safety_cfg,
+            get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
+            self.device,
+        )
+        self.online_lseg_shadow.set_root(
+            self._get_vlmap_run_dir() or self.output_path
+        )
         self._stage23a_oracle_pose_enabled = bool(
             vlmap_safety_cfg.get("occ_memory_validation_oracle_pose_enable", False)
         )
@@ -8319,6 +8328,39 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "gt_frame": "habitat_world",
                 },
             )
+            self.online_lseg_shadow.reset_episode(
+                instruction=episode_instruction,
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_index=episode_index,
+                episode_count=episode_count,
+                rank=getattr(self, "rank", 0),
+                world_size=getattr(self, "world_size", 1),
+                semantic_scene_gt=self._stage24a_semantic_scene_snapshot(),
+                coordinate_transforms={
+                    "map_to_habitat_world": (
+                        (
+                            np.asarray(
+                                self._stage23a_initial_agent_matrix,
+                                dtype=np.float32,
+                            )
+                            @ np.asarray(
+                                [
+                                    [0.0, 0.0, -1.0, 0.0],
+                                    [-1.0, 0.0, 0.0, 0.0],
+                                    [0.0, 1.0, 0.0, 0.0],
+                                    [0.0, 0.0, 0.0, 1.0],
+                                ],
+                                dtype=np.float32,
+                            ).T
+                        ).tolist()
+                        if self._stage23a_initial_agent_matrix is not None
+                        else None
+                    ),
+                    "map_frame": "sparse_occ_map",
+                    "gt_frame": "habitat_world",
+                },
+            )
             if self.occ_memory_oracle_pose is not None:
                 self.occ_memory_oracle_pose.reset_episode(
                     instruction=episode_instruction,
@@ -8916,6 +8958,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             "observation_index": int(replay_observation_index - 1),
                         },
                         semantic_state=dict(self.occ_memory.last_semantic_decision or {}),
+                    )
+                    # Stage24D runs only after Frozen S2 has produced this query's
+                    # output. Its result is intentionally discarded by every
+                    # prompt, gate, candidate, and action-selection branch.
+                    self.online_lseg_shadow.process_query_frame(
+                        rgb=rgb,
+                        depth_m=current_depth_m,
+                        camera_pose_map=occ_memory_context.get(
+                            "stage23_gt_camera_pose_map"
+                        ),
+                        step_id=int(step_id),
+                        query_id=int(replay_query_index),
+                        observation_index=int(replay_observation_index - 1),
+                        occ_memory=self.occ_memory,
                     )
                     replay_query_index += 1
                     print('step_id:', step_id, 'output text:', llm_outputs)
@@ -11818,6 +11874,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     pending_s2_loop_path_execution
                 )
                 pending_s2_loop_path_execution = None
+            online_lseg_summary = self.online_lseg_shadow.finish_episode(
+                metrics=metrics, steps=step_id, occ_memory=self.occ_memory
+            )
             semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
             occ_memory_summary = self.occ_memory.finish_episode(metrics=metrics, steps=step_id)
             replay_summary = self.replay_ledger.finish_episode(
@@ -11825,6 +11884,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 steps=step_id,
                 semantic_summary=semantic_summary,
                 occ_summary=occ_memory_summary,
+                online_lseg_summary=online_lseg_summary,
             )
             occ_memory_oracle_pose_summary = {}
             if self.occ_memory_oracle_pose is not None:
@@ -12033,6 +12093,41 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     str(self.replay_ledger.root / "replay_ledger")
                     if self.replay_ledger.enabled and self.replay_ledger.root is not None
                     else None
+                ),
+                "online_lseg_shadow_enabled": bool(
+                    self.online_lseg_shadow.enabled
+                ),
+                "online_lseg_shadow_frame_count": int(
+                    online_lseg_summary.get("frame_count", 0) or 0
+                ),
+                "online_lseg_shadow_valid_frame_count": int(
+                    online_lseg_summary.get("valid_frame_count", 0) or 0
+                ),
+                "online_lseg_shadow_error_count": int(
+                    online_lseg_summary.get("error_count", 0) or 0
+                ),
+                "online_lseg_shadow_inference_seconds_mean": (
+                    online_lseg_summary.get("inference_seconds_mean")
+                ),
+                "online_lseg_shadow_surface_sample_count": int(
+                    online_lseg_summary.get("stored_surface_sample_count", 0)
+                    or 0
+                ),
+                "online_lseg_shadow_node_count": int(
+                    online_lseg_summary.get("node_count", 0) or 0
+                ),
+                "online_lseg_shadow_multi_view_node_rate": (
+                    online_lseg_summary.get("multi_view_node_rate")
+                ),
+                "online_lseg_shadow_cross_label_conflict_count": int(
+                    online_lseg_summary.get("cross_label_conflict_count", 0)
+                    or 0
+                ),
+                "online_lseg_shadow_gt_audit": online_lseg_summary.get(
+                    "gt_audit"
+                ),
+                "online_lseg_shadow_decision_status": online_lseg_summary.get(
+                    "decision_status"
                 ),
             }
             result.update(safety_summary)
