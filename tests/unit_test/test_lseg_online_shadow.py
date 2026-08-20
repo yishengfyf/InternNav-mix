@@ -65,7 +65,7 @@ def test_homogeneous_camera_intrinsic_is_normalized(tmp_path):
     assert np.array_equal(shadow.camera_intrinsic, intrinsic[:3, :3])
 
 
-def test_lightning_checkpoint_load_disables_weights_only(monkeypatch, tmp_path):
+def test_tensor_checkpoint_load_enforces_weights_only(monkeypatch, tmp_path):
     checkpoint = tmp_path / "lseg.ckpt"
     checkpoint.touch()
     captured = {}
@@ -83,7 +83,7 @@ def test_lightning_checkpoint_load_disables_weights_only(monkeypatch, tmp_path):
     assert captured == {
         "path": checkpoint,
         "map_location": "cpu",
-        "weights_only": False,
+        "weights_only": True,
     }
 
 

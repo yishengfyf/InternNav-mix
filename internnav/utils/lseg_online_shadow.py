@@ -228,8 +228,8 @@ class OnlineLSegSemanticShadow:
 
     @staticmethod
     def _load_checkpoint(path: Path) -> Any:
-        # The trusted VLMaps Lightning checkpoint contains callback metadata.
-        return torch.load(path, map_location="cpu", weights_only=False)
+        # Online/replay audits only accept the pre-extracted tensor state dict.
+        return torch.load(path, map_location="cpu", weights_only=True)
 
     def _infer_logits(self, image: np.ndarray) -> np.ndarray:
         from vlmaps.lseg.additional_utils.models import crop_image, pad_image, resize_image
