@@ -12,6 +12,7 @@ import random
 import sys
 import time
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -231,6 +232,39 @@ class OnlineLSegSemanticShadow:
         # Online/replay audits only accept the pre-extracted tensor state dict.
         return torch.load(path, map_location="cpu", weights_only=True)
 
+    @staticmethod
+    @contextmanager
+    def _deterministic_inference():
+        state = {
+            "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "deterministic_warn_only": (
+                torch.is_deterministic_algorithms_warn_only_enabled()
+            ),
+            "matmul_precision": torch.get_float32_matmul_precision(),
+        }
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            torch.set_float32_matmul_precision("highest")
+            torch.use_deterministic_algorithms(True, warn_only=False)
+            yield
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = state["matmul_tf32"]
+            torch.backends.cudnn.allow_tf32 = state["cudnn_tf32"]
+            torch.backends.cudnn.benchmark = state["cudnn_benchmark"]
+            torch.backends.cudnn.deterministic = state["cudnn_deterministic"]
+            torch.set_float32_matmul_precision(state["matmul_precision"])
+            torch.use_deterministic_algorithms(
+                state["deterministic_algorithms"],
+                warn_only=state["deterministic_warn_only"],
+            )
+
     def _infer_logits(self, image: np.ndarray) -> np.ndarray:
         from vlmaps.lseg.additional_utils.models import crop_image, pad_image, resize_image
 
@@ -344,7 +378,8 @@ class OnlineLSegSemanticShadow:
             if before_cuda.get("available"):
                 torch.cuda.reset_peak_memory_stats(torch.device(self.device))
             started = time.perf_counter()
-            logits = self._infer_logits(image)
+            with self._deterministic_inference():
+                logits = self._infer_logits(image)
             elapsed = float(time.perf_counter() - started)
             after_cuda = self._cuda_stats()
             probabilities = torch.softmax(torch.from_numpy(logits), dim=0).numpy()

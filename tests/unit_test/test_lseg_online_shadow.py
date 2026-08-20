@@ -2,6 +2,7 @@ from pathlib import Path
 import hashlib
 
 import numpy as np
+import torch
 
 from internnav.utils.lseg_online_shadow import OnlineLSegSemanticShadow
 
@@ -85,6 +86,38 @@ def test_tensor_checkpoint_load_enforces_weights_only(monkeypatch, tmp_path):
         "map_location": "cpu",
         "weights_only": True,
     }
+
+
+def test_deterministic_inference_restores_backend_state():
+    before = (
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+        torch.backends.cudnn.benchmark,
+        torch.backends.cudnn.deterministic,
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.get_float32_matmul_precision(),
+    )
+
+    with OnlineLSegSemanticShadow._deterministic_inference():
+        assert not torch.backends.cuda.matmul.allow_tf32
+        assert not torch.backends.cudnn.allow_tf32
+        assert not torch.backends.cudnn.benchmark
+        assert torch.backends.cudnn.deterministic
+        assert torch.are_deterministic_algorithms_enabled()
+        assert not torch.is_deterministic_algorithms_warn_only_enabled()
+        assert torch.get_float32_matmul_precision() == "highest"
+
+    after = (
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+        torch.backends.cudnn.benchmark,
+        torch.backends.cudnn.deterministic,
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.get_float32_matmul_precision(),
+    )
+    assert after == before
 
 
 def test_projection_keeps_unknown_distinct_from_free(tmp_path):
