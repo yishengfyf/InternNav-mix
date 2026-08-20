@@ -28,6 +28,12 @@ def analyze(root: Path, output: Path) -> Dict[str, Any]:
         calls = sum(int(item["call_count"]) for item in items)
         nodes = sum(int(item["node_count"]) for item in items)
         conflicts = sum(int(item["conflict_count"]) for item in items)
+        severe_conflicts = sum(int(item["severe_conflict_count"]) for item in items)
+        strong_severe_conflicts = sum(
+            int(item["strong_severe_conflict_count"]) for item in items
+        )
+        strong_nodes = sum(int(item["strong_node_count"]) for item in items)
+        weak_nodes = sum(int(item["weak_node_count"]) for item in items)
         compatible = sum(int(item["gt_compatible_node_count"]) for item in items)
         hits = sum(int(item["gt_hit_count"]) for item in items)
         classes = set().union(*(set(item["classes"]) for item in items))
@@ -40,6 +46,15 @@ def analyze(root: Path, output: Path) -> Dict[str, Any]:
             "call_count": calls, "node_count": nodes,
             "conflict_count": conflicts,
             "conflicts_per_100_nodes": 100.0 * conflicts / max(1, nodes),
+            "severe_conflict_count": severe_conflicts,
+            "severe_conflicts_per_100_nodes": (
+                100.0 * severe_conflicts / max(1, nodes)
+            ),
+            "strong_severe_conflict_count": strong_severe_conflicts,
+            "strong_severe_conflicts_per_100_strong_nodes": (
+                100.0 * strong_severe_conflicts / max(1, strong_nodes)
+            ),
+            "strong_node_count": strong_nodes, "weak_node_count": weak_nodes,
             "gt_compatible_node_count": compatible, "gt_hit_count": hits,
             "gt_hit_rate": hits / max(1, compatible),
             # Counts are episode-label pairs so misses cannot be hidden by another scene.

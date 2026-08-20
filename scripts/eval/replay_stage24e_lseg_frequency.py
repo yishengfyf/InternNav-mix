@@ -192,9 +192,23 @@ def replay_episode(ledger: Path, output: Path, args: argparse.Namespace) -> Dict
             "node_count": nodes,
             "multi_view_node_rate": summary.get("multi_view_node_rate"),
             "conflict_count": int(summary.get("cross_label_conflict_count") or 0),
+            "severe_conflict_count": int(
+                summary.get("severe_cross_label_conflict_count") or 0
+            ),
+            "strong_severe_conflict_count": int(
+                summary.get("strong_severe_cross_label_conflict_count") or 0
+            ),
+            "strong_node_count": int(summary.get("strong_node_count") or 0),
+            "weak_node_count": int(summary.get("weak_node_count") or 0),
             "conflicts_per_100_nodes": 100.0 * int(
                 summary.get("cross_label_conflict_count") or 0
             ) / max(1, nodes),
+            "severe_conflicts_per_100_nodes": 100.0 * int(
+                summary.get("severe_cross_label_conflict_count") or 0
+            ) / max(1, nodes),
+            "strong_severe_conflicts_per_100_strong_nodes": 100.0 * int(
+                summary.get("strong_severe_cross_label_conflict_count") or 0
+            ) / max(1, int(summary.get("strong_node_count") or 0)),
         }
     result = {
         "scene_id": str(meta["scene_id"]), "episode_id": str(meta["episode_id"]),

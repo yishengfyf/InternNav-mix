@@ -175,11 +175,32 @@ def test_node_merge_and_visualizations_are_audit_only(tmp_path):
 
     assert summary["node_count"] == 1
     assert summary["multi_view_node_rate"] == 1.0
+    assert summary["strong_node_count"] == 1
+    assert summary["weak_node_count"] == 0
     assert summary["decision_status"] == "audit_only_not_navigation_ready"
     assert summary["action_applied_count"] == 0
     assert len(summary["visualizations"]) == 5
     for relative in summary["visualizations"].values():
         assert (shadow.episode_dir / relative).is_file()
+
+
+def test_conflict_audit_separates_boundaries_and_evidence_tiers(tmp_path):
+    shadow = _shadow(tmp_path)
+    nodes = [
+        {"class_id": 9, "label": "floor", "centroid": [0.0, 0.0, 0.0],
+         "evidence_tier": "strong"},
+        {"class_id": 3, "label": "stairs", "centroid": [0.1, 0.0, 0.0],
+         "evidence_tier": "strong"},
+        {"class_id": 1, "label": "chair", "centroid": [0.0, 0.1, 0.0],
+         "evidence_tier": "weak"},
+    ]
+
+    audit = shadow._audit_conflicts(nodes)
+
+    assert audit["raw_count"] == 3
+    assert audit["severe_count"] == 2
+    assert audit["strong_severe_count"] == 0
+    assert audit["raw_pairs"]["floor|stairs"] == 1
 
 
 def test_gt_audit_reports_exact_hit_counts_and_per_label(tmp_path):

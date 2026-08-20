@@ -44,6 +44,15 @@ ALIASES = {
     "stairs": {"stairs", "stair", "staircase"},
 }
 
+BENIGN_NEARBY_LABEL_PAIRS = {
+    tuple(sorted(pair)) for pair in (
+        ("floor", "stairs"), ("cabinet", "shelving"),
+        ("bed", "sofa"), ("chair", "sofa"),
+        ("door", "floor"), ("floor", "wall"),
+        ("stairs", "wall"), ("floor", "shelving"),
+    )
+}
+
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, np.ndarray):
@@ -98,6 +107,15 @@ class OnlineLSegSemanticShadow:
         self.max_surface_samples = max(1000, int(
             cfg.get("lseg_online_shadow_max_surface_samples", 250000)
         ))
+        self.strong_min_views = max(2, int(
+            cfg.get("lseg_online_shadow_strong_min_views", 2)
+        ))
+        self.strong_min_points = max(1, int(
+            cfg.get("lseg_online_shadow_strong_min_points", 32)
+        ))
+        self.strong_min_confidence = float(
+            cfg.get("lseg_online_shadow_strong_min_confidence", 0.40)
+        )
         self.save_overlay = bool(cfg.get("lseg_online_shadow_save_overlay", True))
         self.save_surface = bool(cfg.get("lseg_online_shadow_save_surface", True))
         self.save_visualizations = bool(
@@ -494,7 +512,48 @@ class OnlineLSegSemanticShadow:
             )
             node["source_observations"] = sorted(node["source_observations"])
             node["source_steps"] = sorted(node["source_steps"])
+            strong = (
+                len(node["source_observations"]) >= self.strong_min_views
+                or (
+                    node["point_count"] >= self.strong_min_points
+                    and node["mean_confidence"] >= self.strong_min_confidence
+                )
+            )
+            node["evidence_tier"] = "strong" if strong else "weak"
         return nodes
+
+    def _audit_conflicts(self, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        raw_pairs = Counter()
+        severe_pairs = Counter()
+        strong_severe_pairs = Counter()
+        for left_index, left in enumerate(nodes):
+            left_point = np.asarray(left["centroid"], dtype=np.float32)
+            for right in nodes[left_index + 1:]:
+                if left["class_id"] == right["class_id"]:
+                    continue
+                if np.linalg.norm(
+                    left_point - np.asarray(right["centroid"], dtype=np.float32)
+                ) > self.merge_radius_m / 2:
+                    continue
+                pair = tuple(sorted((str(left["label"]), str(right["label"]))))
+                key = "|".join(pair)
+                raw_pairs[key] += 1
+                if pair in BENIGN_NEARBY_LABEL_PAIRS:
+                    continue
+                severe_pairs[key] += 1
+                if (
+                    left.get("evidence_tier") == "strong"
+                    and right.get("evidence_tier") == "strong"
+                ):
+                    strong_severe_pairs[key] += 1
+        return {
+            "raw_count": int(sum(raw_pairs.values())),
+            "raw_pairs": dict(sorted(raw_pairs.items())),
+            "severe_count": int(sum(severe_pairs.values())),
+            "severe_pairs": dict(sorted(severe_pairs.items())),
+            "strong_severe_count": int(sum(strong_severe_pairs.values())),
+            "strong_severe_pairs": dict(sorted(strong_severe_pairs.items())),
+        }
 
     def _audit_nodes_with_gt(self, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
         gt = self.episode_meta.get("semantic_scene_gt") or {}
@@ -647,14 +706,7 @@ class OnlineLSegSemanticShadow:
             occ_state = np.zeros(0, dtype=np.int8)
         nodes = self._merge_nodes(self.surface_frames)
         gt_audit = self._audit_nodes_with_gt(nodes)
-        conflicts = 0
-        for left_index, left in enumerate(nodes):
-            left_point = np.asarray(left["centroid"], dtype=np.float32)
-            for right in nodes[left_index + 1:]:
-                if left["class_id"] == right["class_id"]:
-                    continue
-                if np.linalg.norm(left_point - np.asarray(right["centroid"])) <= self.merge_radius_m / 2:
-                    conflicts += 1
+        conflict_audit = self._audit_conflicts(nodes)
         visualizations = self._save_semantic_visualizations(points, class_id, occ_memory)
         latency = np.asarray(self.inference_seconds, dtype=np.float64)
         class_counts = Counter(self.labels[int(index)] for index in class_id.tolist())
@@ -684,7 +736,18 @@ class OnlineLSegSemanticShadow:
             "multi_view_node_rate": float(
                 sum(len(node["source_observations"]) >= 2 for node in nodes) / max(1, len(nodes))
             ),
-            "cross_label_conflict_count": int(conflicts),
+            "strong_node_count": sum(
+                node.get("evidence_tier") == "strong" for node in nodes
+            ),
+            "weak_node_count": sum(
+                node.get("evidence_tier") == "weak" for node in nodes
+            ),
+            "cross_label_conflict_count": conflict_audit["raw_count"],
+            "severe_cross_label_conflict_count": conflict_audit["severe_count"],
+            "strong_severe_cross_label_conflict_count": (
+                conflict_audit["strong_severe_count"]
+            ),
+            "cross_label_conflict_audit": conflict_audit,
             "gt_audit": gt_audit, "visualizations": visualizations,
             "cuda_s2_loaded_baseline": self._baseline_cuda,
             "cuda_immediately_before_lseg_load": self._before_load_cuda,
@@ -692,6 +755,11 @@ class OnlineLSegSemanticShadow:
             "cuda_final": self._cuda_stats(),
             "confidence_threshold": self.confidence_threshold,
             "sample_stride": self.sample_stride, "merge_radius_m": self.merge_radius_m,
+            "strong_evidence_policy": {
+                "min_views": self.strong_min_views,
+                "single_view_min_points": self.strong_min_points,
+                "single_view_min_confidence": self.strong_min_confidence,
+            },
         }
         if self.episode_dir is not None:
             self._write_json(self.episode_dir / "nodes.json", nodes)
