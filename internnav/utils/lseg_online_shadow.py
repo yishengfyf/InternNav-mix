@@ -209,7 +209,7 @@ class OnlineLSegSemanticShadow:
                 "", arch_option=0, block_depth=0, activation="lrelu",
                 crop_size=self.crop_size,
             )
-            payload = torch.load(self.checkpoint, map_location="cpu")
+            payload = self._load_checkpoint(self.checkpoint)
             state = payload.get("state_dict", payload)
             state = {
                 key[4:] if key.startswith("net.") else key: value
@@ -225,6 +225,11 @@ class OnlineLSegSemanticShadow:
             self._after_load_cuda = self._cuda_stats()
         finally:
             self._restore_rng(rng)
+
+    @staticmethod
+    def _load_checkpoint(path: Path) -> Any:
+        # The trusted VLMaps Lightning checkpoint contains callback metadata.
+        return torch.load(path, map_location="cpu", weights_only=False)
 
     def _infer_logits(self, image: np.ndarray) -> np.ndarray:
         from vlmaps.lseg.additional_utils.models import crop_image, pad_image, resize_image

@@ -65,6 +65,28 @@ def test_homogeneous_camera_intrinsic_is_normalized(tmp_path):
     assert np.array_equal(shadow.camera_intrinsic, intrinsic[:3, :3])
 
 
+def test_lightning_checkpoint_load_disables_weights_only(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "lseg.ckpt"
+    checkpoint.touch()
+    captured = {}
+
+    def fake_load(path, **kwargs):
+        captured["path"] = path
+        captured.update(kwargs)
+        return {"state_dict": {}}
+
+    monkeypatch.setattr("internnav.utils.lseg_online_shadow.torch.load", fake_load)
+
+    payload = OnlineLSegSemanticShadow._load_checkpoint(checkpoint)
+
+    assert payload == {"state_dict": {}}
+    assert captured == {
+        "path": checkpoint,
+        "map_location": "cpu",
+        "weights_only": False,
+    }
+
+
 def test_projection_keeps_unknown_distinct_from_free(tmp_path):
     shadow = _shadow(tmp_path)
     pred = np.zeros((4, 4), dtype=np.int16)
