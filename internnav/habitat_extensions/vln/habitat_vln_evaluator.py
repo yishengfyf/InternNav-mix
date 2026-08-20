@@ -8411,6 +8411,35 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             last_action_applied = False
             replay_observation_index = 0
             replay_query_index = 0
+            replay_previous_collision_count = 0.0
+            replay_previous_action_collision_count = 0.0
+
+            def replay_action_audit_metrics():
+                nonlocal replay_previous_action_collision_count
+                replay_action_metrics = self.env.get_metrics()
+                replay_action_collision_summary = self._extract_collision_summary(
+                    replay_action_metrics, steps=step_id
+                )
+                replay_action_collision_count = float(
+                    replay_action_collision_summary.get("collision_count", 0.0)
+                    or 0.0
+                )
+                result = {
+                    "distance_to_goal": replay_action_metrics.get(
+                        "distance_to_goal"
+                    ),
+                    "success": replay_action_metrics.get("success"),
+                    "collision_count": replay_action_collision_count,
+                    "collision_delta": max(
+                        0.0,
+                        replay_action_collision_count
+                        - replay_previous_action_collision_count,
+                    ),
+                }
+                replay_previous_action_collision_count = (
+                    replay_action_collision_count
+                )
+                return result
             history_id = []
             vlmap_safety_decision = {}
             messages = []
@@ -8673,6 +8702,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "gps": observations.get("gps"),
                     "compass": observations.get("compass"),
                 }
+                replay_metrics = self.env.get_metrics()
+                replay_collision_summary = self._extract_collision_summary(
+                    replay_metrics, steps=step_id
+                )
+                replay_collision_count = float(
+                    replay_collision_summary.get("collision_count", 0.0) or 0.0
+                )
+                replay_audit_metrics = {
+                    "distance_to_goal": replay_metrics.get("distance_to_goal"),
+                    "success": replay_metrics.get("success"),
+                    "oracle_success": replay_metrics.get("oracle_success"),
+                    "spl": replay_metrics.get("spl"),
+                    "collision_count": replay_collision_count,
+                    "collision_delta": max(
+                        0.0,
+                        replay_collision_count - replay_previous_collision_count,
+                    ),
+                }
+                replay_previous_collision_count = replay_collision_count
                 self.replay_ledger.record_observation(
                     step_id=step_id,
                     observation_index=replay_observation_index,
@@ -8687,6 +8735,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     route_node=replay_route_node,
                     occ_summary=replay_occ_summary,
                     semantic_state=dict(self.occ_memory.last_semantic_decision or {}),
+                    audit_metrics=replay_audit_metrics,
                 )
                 replay_observation_index += 1
                 if self.occ_memory_oracle_pose is not None:
@@ -11319,6 +11368,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 pre_safety_action=pre_safety_action,
                                 action_applied=True,
                                 safety_decision={},
+                                audit_metrics=replay_action_audit_metrics(),
                                 next_observation_step_id=step_id,
                             )
                             last_action_applied = True
@@ -11582,6 +11632,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             pre_safety_action=action,
                             action_applied=False,
                             safety_decision={},
+                            audit_metrics=replay_action_audit_metrics(),
                             next_observation_step_id=None,
                         )
                         last_action_applied = False
@@ -11700,6 +11751,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     pre_safety_action=pre_safety_action,
                     action_applied=True,
                     safety_decision=vlmap_safety_decision,
+                    audit_metrics=replay_action_audit_metrics(),
                     next_observation_step_id=next_observation_step_id,
                 )
                 last_action_applied = True
@@ -11882,6 +11934,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             replay_summary = self.replay_ledger.finish_episode(
                 success=metrics.get("success"),
                 steps=step_id,
+                final_metrics={
+                    "success": metrics.get("success"),
+                    "spl": metrics.get("spl"),
+                    "oracle_success": metrics.get("oracle_success"),
+                    "distance_to_goal": metrics.get("distance_to_goal"),
+                    "collision_count": safety_summary.get("collision_count"),
+                    "collision_free": safety_summary.get("collision_free"),
+                },
                 semantic_summary=semantic_summary,
                 occ_summary=occ_memory_summary,
                 online_lseg_summary=online_lseg_summary,

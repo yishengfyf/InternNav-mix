@@ -1,0 +1,8 @@
+[
+  {"scene_id": "5q7pvUzZiYa", "episode_id": 2314, "episode_eval_seed": 200104, "audit_role": "failed_strict_loop_collision"},
+  {"scene_id": "5q7pvUzZiYa", "episode_id": 9357, "episode_eval_seed": 100015, "audit_role": "failed_repeated_loop"},
+  {"scene_id": "2n8kARJN3HM", "episode_id": 9781, "episode_eval_seed": 200102, "audit_role": "successful_loop"},
+  {"scene_id": "82sE5b5pLXE", "episode_id": 9989, "episode_eval_seed": 200105, "audit_role": "historical_d0_d1"},
+  {"scene_id": "XcA2TqTSSAj", "episode_id": 9450, "episode_eval_seed": 200073, "audit_role": "historical_strict_recovery_case"},
+  {"scene_id": "jh4fc5c5qoQ", "episode_id": 2278, "episode_eval_seed": 300112, "audit_role": "latest_occ_lseg_loop_contract"}
+]

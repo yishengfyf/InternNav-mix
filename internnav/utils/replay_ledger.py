@@ -33,6 +33,9 @@ class ReplayLedger:
         )
         self.max_queries = max(0, int(cfg.get("replay_ledger_max_queries", 0) or 0))
         self.max_actions = max(0, int(cfg.get("replay_ledger_max_actions", 0) or 0))
+        self.repeat_episode_meta = bool(
+            cfg.get("replay_ledger_repeat_episode_meta", True)
+        )
         self.root: Optional[Path] = None
         self.episode_dir: Optional[Path] = None
         self._obs_file = None
@@ -44,6 +47,7 @@ class ReplayLedger:
         self._observation_keys = set()
         self._last_observation_key = None
         self._episode_meta: Dict[str, Any] = {}
+        self._record_meta: Dict[str, Any] = {}
 
     @staticmethod
     def _jsonable(value: Any) -> Any:
@@ -69,6 +73,21 @@ class ReplayLedger:
     def reset_episode(self, **meta: Any) -> None:
         self.close()
         self._episode_meta = self._jsonable(meta)
+        self._record_meta = (
+            dict(self._episode_meta)
+            if self.repeat_episode_meta
+            else {
+                key: self._episode_meta.get(key)
+                for key in (
+                    "scene_id",
+                    "episode_id",
+                    "episode_index",
+                    "episode_count",
+                    "rank",
+                    "world_size",
+                )
+            }
+        )
         self._records = 0
         self._queries = 0
         self._actions = 0
@@ -117,6 +136,7 @@ class ReplayLedger:
         route_node: Any = None,
         occ_summary: Optional[Dict[str, Any]] = None,
         semantic_state: Optional[Dict[str, Any]] = None,
+        audit_metrics: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not self.enabled or self.episode_dir is None:
             return None
@@ -130,7 +150,7 @@ class ReplayLedger:
         prefix = f"obs_{self._records:05d}_step_{int(step_id) if step_id is not None else -1}_{int(observation_index)}"
         record: Dict[str, Any] = {
             "event_type": "replay_observation",
-            **self._episode_meta,
+            **self._record_meta,
             "record_index": int(self._records),
             "observation_key": key,
             "step_id": None if step_id is None else int(step_id),
@@ -144,6 +164,7 @@ class ReplayLedger:
             "route_node": route_node,
             "occ_summary": occ_summary or {},
             "semantic_state": semantic_state or {},
+            "audit_metrics": audit_metrics or {},
         }
         if rgb is not None:
             rgb_arr = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
@@ -187,7 +208,7 @@ class ReplayLedger:
             return
         self._write_line(self._query_file, {
             "event_type": "replay_query",
-            **self._episode_meta,
+            **self._record_meta,
             "query_index": int(self._queries),
             "query_id": query_id,
             "step_id": None if step_id is None else int(step_id),
@@ -203,6 +224,7 @@ class ReplayLedger:
     def record_action(self, *, step_id: Any, action: Any, action_source: Any,
                       pre_safety_action: Any, action_applied: bool,
                       safety_decision: Optional[Dict[str, Any]] = None,
+                      audit_metrics: Optional[Dict[str, Any]] = None,
                       next_observation_step_id: Any = None) -> None:
         if not self.enabled or self._action_file is None:
             return
@@ -210,7 +232,7 @@ class ReplayLedger:
             return
         self._write_line(self._action_file, {
             "event_type": "replay_action",
-            **self._episode_meta,
+            **self._record_meta,
             "action_index": int(self._actions),
             "step_id": None if step_id is None else int(step_id),
             "action": action,
@@ -219,6 +241,7 @@ class ReplayLedger:
             "action_applied": bool(action_applied),
             "next_observation_step_id": next_observation_step_id,
             "safety_decision": safety_decision or {},
+            "audit_metrics": audit_metrics or {},
             "observation_key": self._last_observation_key,
         })
         self._actions += 1
