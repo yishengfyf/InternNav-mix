@@ -42,7 +42,7 @@ def test_future_motion_labels_self_recovery_without_changing_onset():
     rows += [observation(index, (index - 8) * 0.1) for index in range(9, 18)]
     result = mine_events(rows, [], [])
     assert result["D1"][0]["step_id"] <= 7
-    assert result["D1"][0]["recoverability_proxy"] == "self_recovered"
+    assert result["D1"][0]["recoverability_proxy"] == "self_recovered_quick"
 
 
 def test_route_revisit_requires_causal_low_progress_confirmation():
@@ -106,3 +106,28 @@ def test_semantic_cells_require_support_and_confidence():
     classes = np.zeros(15, dtype=np.int16)
     confidence = np.asarray([0.5] * 8 + [0.9] * 7, dtype=np.float32)
     assert semantic_cells(points, classes, confidence) == ["0:0:0:0"]
+
+
+def test_delayed_recovery_is_separate_from_persistent_episode():
+    rows = [observation(index, 0.0) for index in range(45)]
+    rows += [observation(index, 0.7) for index in range(45, 50)]
+    result = mine_events(rows, [], [])
+    assert result["D1"][0]["recoverability_proxy"] == "self_recovered_delayed"
+
+
+def test_confirmed_revisit_is_merged_until_region_departure():
+    positions = [
+        0.0, 0.25, 0.50, 0.75, 1.0, 1.25, 1.50,
+        1.25, 1.0, 0.75, 0.50, 0.25, 0.0,
+    ] + [0.0] * 60
+    rows = [observation(index, x, action=2) for index, x in enumerate(positions)]
+    for row in rows:
+        row["occ_summary"].update({
+            "occupied_voxel_count": 100, "free_voxel_count": 200,
+        })
+    result = mine_events(rows, [], [])
+    route_events = [
+        event for event in result["D2"]
+        if event["event_family"] == "G3_route_topology"
+    ]
+    assert len(route_events) == 1

@@ -161,12 +161,13 @@ def recovery_label(rows: Sequence[Mapping[str, Any]], index: int) -> Tuple[str, 
     start = rows[index].get("gps")
     if not isinstance(start, (list, tuple)):
         return "unknown", None, None
-    limit = min(len(rows), index + 33)
-    for later in range(index + 8, limit):
+    for later in range(index + 8, len(rows)):
         moved = distance(start, rows[later].get("gps"))
         if moved >= 0.60:
-            return "self_recovered", int(rows[later]["step_id"]), moved
-    return "persistent_in_observed_horizon", None, None
+            latency = later - index
+            label = "self_recovered_quick" if latency <= 32 else "self_recovered_delayed"
+            return label, int(rows[later]["step_id"]), moved
+    return "persistent_episode", None, None
 
 
 def route_revisit(
@@ -394,9 +395,13 @@ def mine_events(
     last_event_step: Dict[str, int] = {}
     last_raw_revisit_step = -1000
     pending_revisit: Optional[Dict[str, Any]] = None
-    confirmed_regions: List[Tuple[int, Sequence[float]]] = []
+    active_revisit_region: Optional[Sequence[float]] = None
     for index, row in enumerate(rows):
         step = int(row["step_id"] or 0)
+        if active_revisit_region is not None and distance(
+            row.get("gps"), active_revisit_region
+        ) > 0.60:
+            active_revisit_region = None
         recent8 = rows[max(0, index - 7):index + 1]
         recent12 = rows[max(0, index - 11):index + 1]
         collision_burst = sum(float(item.get("collision_delta") or 0.0) for item in recent8)
@@ -431,7 +436,7 @@ def mine_events(
                     extra_window=revisit,
                 ))
                 last_raw_revisit_step = step
-            if pending_revisit is None:
+            if pending_revisit is None and active_revisit_region is None:
                 pending_revisit = {"index": index, "step": step, "revisit": revisit}
 
         if family is not None and step - last_event_step.get(family, -1000) >= 8:
@@ -456,27 +461,21 @@ def mine_events(
                 low_motion = confirm_displacement <= float(route_max_displacement_m)
                 low_growth = confirm_growth <= int(route_max_unique_occ_growth)
                 if low_motion and low_growth:
-                    position = row.get("gps")
-                    same_region = any(
-                        step - prior_step <= 32 and distance(position, prior_position) <= 0.50
-                        for prior_step, prior_position in confirmed_regions
-                    )
-                    if not same_region:
-                        confirmed_revisits.append(_event(
-                            rows, index, family="G3_route_topology",
-                            evidence=["route_revisit_confirmed_low_progress"],
-                            semantic=semantic, signal_step=int(pending_revisit["step"]),
-                            extra_window={
-                                **dict(pending_revisit["revisit"]),
-                                "confirmation_window_steps": age,
-                                "confirmation_displacement_m": confirm_displacement,
-                                "confirmation_unique_occ_growth": confirm_growth,
-                                "semantic_stagnation_at_confirmation": bool(
-                                    sem.get("spatial_stagnation")
-                                ),
-                            },
-                        ))
-                        confirmed_regions.append((step, position))
+                    confirmed_revisits.append(_event(
+                        rows, index, family="G3_route_topology",
+                        evidence=["route_revisit_confirmed_low_progress"],
+                        semantic=semantic, signal_step=int(pending_revisit["step"]),
+                        extra_window={
+                            **dict(pending_revisit["revisit"]),
+                            "confirmation_window_steps": age,
+                            "confirmation_displacement_m": confirm_displacement,
+                            "confirmation_unique_occ_growth": confirm_growth,
+                            "semantic_stagnation_at_confirmation": bool(
+                                sem.get("spatial_stagnation")
+                            ),
+                        },
+                    ))
+                    active_revisit_region = row.get("gps")
                     pending_revisit = None
                 elif age >= int(route_confirm_max_steps) or left_region:
                     pending_revisit = None
@@ -644,7 +643,9 @@ def analyze(
             "event_count": len(events),
             "episode_count": len({episode_key(event) for event in events}),
             "event_family_counts": dict(Counter(event["event_family"] for event in events)),
-            "self_recovered_count": sum(event["recoverability_proxy"] == "self_recovered" for event in events),
+            "self_recovered_count": sum(event["recoverability_proxy"].startswith("self_recovered") for event in events),
+            "quick_self_recovered_count": sum(event["recoverability_proxy"] == "self_recovered_quick" for event in events),
+            "delayed_self_recovered_count": sum(event["recoverability_proxy"] == "self_recovered_delayed" for event in events),
             "persistent_proxy_count": sum(event["recoverability_proxy"].startswith("persistent") for event in events),
         }
     report = {
