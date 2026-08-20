@@ -102,3 +102,25 @@ def test_node_merge_and_visualizations_are_audit_only(tmp_path):
     assert len(summary["visualizations"]) == 5
     for relative in summary["visualizations"].values():
         assert (shadow.episode_dir / relative).is_file()
+
+
+def test_gt_audit_reports_exact_hit_counts_and_per_label(tmp_path):
+    shadow = _shadow(tmp_path)
+    shadow.episode_meta["semantic_scene_gt"] = {
+        "objects": [{
+            "category": "door", "center": [0.0, 0.0, 1.0],
+            "lower": [-0.1, -0.1, 0.9], "upper": [0.1, 0.1, 1.1],
+        }],
+        "regions": [],
+    }
+    nodes = [
+        {"label": "door", "centroid": [0.0, 0.0, 1.0]},
+        {"label": "door", "centroid": [1.0, 0.0, 1.0]},
+    ]
+
+    audit = shadow._audit_nodes_with_gt(nodes)
+
+    assert audit["compatible_node_count"] == 2
+    assert audit["surface_distance_le_050m_count"] == 1
+    assert audit["surface_distance_le_050m_rate"] == 0.5
+    assert audit["per_label"]["door"]["surface_distance_le_050m_count"] == 1

@@ -453,6 +453,7 @@ class OnlineLSegSemanticShadow:
         transforms = self.episode_meta.get("coordinate_transforms") or {}
         map_to_gt = np.asarray(transforms.get("map_to_habitat_world"), dtype=np.float32)
         distances = []
+        per_label_distances: Dict[str, List[float]] = defaultdict(list)
         compatible_nodes = 0
         if not entries or map_to_gt.shape != (4, 4):
             return {"available": False, "compatible_node_count": 0}
@@ -478,13 +479,29 @@ class OnlineLSegSemanticShadow:
             node["gt_nearest_category"] = nearest.get("category")
             node["gt_surface_distance_m"] = distance
             distances.append(distance)
+            per_label_distances[str(node["label"])].append(distance)
             compatible_nodes += 1
         values = np.asarray(distances, dtype=np.float32)
+        per_label = {}
+        for label, label_distances in sorted(per_label_distances.items()):
+            label_values = np.asarray(label_distances, dtype=np.float32)
+            per_label[label] = {
+                "compatible_node_count": int(label_values.size),
+                "surface_distance_le_050m_count": int(
+                    np.count_nonzero(label_values <= 0.50)
+                ),
+                "surface_distance_le_050m_rate": float(
+                    np.mean(label_values <= 0.50)
+                ),
+                "surface_distance_m_median": float(np.median(label_values)),
+            }
         return {
             "available": True, "compatible_node_count": int(compatible_nodes),
+            "surface_distance_le_050m_count": int(np.count_nonzero(values <= 0.50)),
             "surface_distance_m_median": float(np.median(values)) if values.size else None,
             "surface_distance_m_p95": float(np.percentile(values, 95)) if values.size else None,
             "surface_distance_le_050m_rate": float(np.mean(values <= 0.50)) if values.size else None,
+            "per_label": per_label,
         }
 
     @staticmethod
@@ -567,7 +584,7 @@ class OnlineLSegSemanticShadow:
 
     def finish_episode(
         self, *, metrics: Optional[Dict[str, Any]] = None, steps: Any = None,
-        occ_memory: Any = None,
+        occ_memory: Any = None, frequency: str = "s2_query",
     ) -> Dict[str, Any]:
         if self.surface_frames:
             points = np.concatenate([frame["map_xyz"] for frame in self.surface_frames])
@@ -597,7 +614,7 @@ class OnlineLSegSemanticShadow:
             "event_type": "online_lseg_episode_summary", **self.episode_meta,
             "enabled": self.enabled, "shadow_only": True, "action_applied_count": 0,
             "decision_status": "audit_only_not_navigation_ready",
-            "frequency": "s2_query", "steps": steps,
+            "frequency": str(frequency), "steps": steps,
             "success": (metrics or {}).get("success"),
             "frame_count": len(self.records),
             "valid_frame_count": sum(bool(record.get("valid")) for record in self.records),
