@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 def jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -71,7 +71,46 @@ def lseg_events(episode_dir: Path) -> List[Dict[str, Any]]:
     run_dir = episode_dir.parent.parent
     prefix = episode_dir.name.rsplit("_r", 1)[0]
     candidates = sorted((run_dir / "online_lseg_shadow").glob(f"{prefix}_r*/events.jsonl"))
-    return jsonl(candidates[-1]) if candidates else []
+    if not candidates:
+        return []
+    semantic_dir = candidates[-1].parent
+    events = jsonl(candidates[-1])
+    for event in events:
+        relative = event.get("surface_path")
+        path = semantic_dir / str(relative) if relative else None
+        if path is None or not path.is_file():
+            event["spatial_semantic_cells"] = []
+            continue
+        with np.load(path) as payload:
+            points = np.asarray(payload["map_xyz"], dtype=np.float32)
+            class_ids = np.asarray(payload["class_id"], dtype=np.int16)
+            confidence = np.asarray(payload["confidence"], dtype=np.float32)
+        event["spatial_semantic_cells"] = semantic_cells(
+            points, class_ids, confidence
+        )
+    return events
+
+
+def semantic_cells(
+    points: np.ndarray, class_ids: np.ndarray, confidence: np.ndarray,
+    *, cell_size_m: float = 0.50, min_points: int = 8,
+    min_confidence: float = 0.40,
+) -> List[str]:
+    """Build compact strong spatial identities from one causal LSeg frame."""
+    if not len(points):
+        return []
+    cells: Dict[Tuple[int, int, int, int], List[float]] = defaultdict(list)
+    quantized = np.floor(points / float(cell_size_m)).astype(np.int32)
+    for cell, class_id, score in zip(quantized, class_ids, confidence):
+        cells[(int(class_id), int(cell[0]), int(cell[1]), int(cell[2]))].append(
+            float(score)
+        )
+    return [
+        "%d:%d:%d:%d" % key
+        for key, scores in sorted(cells.items())
+        if len(scores) >= int(min_points)
+        and float(np.mean(scores)) >= float(min_confidence)
+    ]
 
 
 def compact_observation(row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -109,6 +148,15 @@ def path_length(rows: Sequence[Mapping[str, Any]]) -> float:
     return sum(distance(a.get("gps"), b.get("gps")) for a, b in zip(rows, rows[1:]))
 
 
+def unique_occ_growth(rows: Sequence[Mapping[str, Any]]) -> int:
+    if len(rows) < 2:
+        return 0
+    start, end = rows[0], rows[-1]
+    return max(0, int(end.get("occupied_voxel_count") or 0) - int(start.get("occupied_voxel_count") or 0)) + max(
+        0, int(end.get("free_voxel_count") or 0) - int(start.get("free_voxel_count") or 0)
+    )
+
+
 def recovery_label(rows: Sequence[Mapping[str, Any]], index: int) -> Tuple[str, Optional[int], Optional[float]]:
     start = rows[index].get("gps")
     if not isinstance(start, (list, tuple)):
@@ -121,13 +169,16 @@ def recovery_label(rows: Sequence[Mapping[str, Any]], index: int) -> Tuple[str, 
     return "persistent_in_observed_horizon", None, None
 
 
-def route_revisit(rows: Sequence[Mapping[str, Any]], index: int) -> Optional[Dict[str, Any]]:
+def route_revisit(
+    rows: Sequence[Mapping[str, Any]], index: int, *, radius_m: float = 0.35,
+    min_path_m: float = 0.75, min_gap: int = 12,
+) -> Optional[Dict[str, Any]]:
     current = rows[index]
-    for prior in range(index - 12, -1, -1):
+    for prior in range(index - int(min_gap), -1, -1):
         segment = rows[prior:index + 1]
         route_m = path_length(segment)
         revisit_m = distance(current.get("gps"), rows[prior].get("gps"))
-        if route_m >= 0.75 and revisit_m <= 0.35:
+        if route_m >= float(min_path_m) and revisit_m <= float(radius_m):
             return {
                 "prior_step": int(rows[prior]["step_id"]),
                 "route_path_m": route_m,
@@ -140,14 +191,190 @@ def semantic_context(events: Sequence[Mapping[str, Any]], step: int) -> Dict[str
     past = [event for event in events if event.get("valid") and int(event.get("step_id", -1)) <= step]
     recent = past[-4:]
     labels = [set((event.get("class_surface_counts") or {}).keys()) for event in recent]
+    cells = [set(event.get("spatial_semantic_cells") or []) for event in recent]
     union = sorted(set().union(*labels)) if labels else []
-    repeated = bool(len(labels) >= 4 and labels[-1] and all(item == labels[-1] for item in labels))
+    previous_cells = set().union(*cells[:-1]) if len(cells) >= 2 else set()
+    latest_cells = cells[-1] if cells else set()
+    overlap = latest_cells & previous_cells
+    novelty = (len(latest_cells - previous_cells) / max(1, len(latest_cells)))
+    recurrence = (len(overlap) / max(1, len(latest_cells)))
+    spatial_stagnation = bool(
+        len(cells) >= 3 and len(latest_cells) >= 2
+        and recurrence >= 0.60 and novelty <= 0.25
+    )
     return {
         "available": bool(past),
         "recent_query_count": len(recent),
         "recent_labels": union,
-        "repeated_label_set": repeated,
+        "strong_spatial_cell_count": len(latest_cells),
+        "repeated_spatial_cell_count": len(overlap),
+        "spatial_recurrence": recurrence,
+        "semantic_novelty": novelty,
+        "spatial_stagnation": spatial_stagnation,
         "last_query_step": int(past[-1]["step_id"]) if past else None,
+    }
+
+
+def canonical_observations(
+    observations: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep the latest ledger observation for each evaluator step."""
+    by_step: Dict[int, Dict[str, Any]] = {}
+    for observation in observations:
+        row = compact_observation(observation)
+        by_step[int(row["step_id"])] = row
+    return [by_step[step] for step in sorted(by_step)]
+
+
+def _fit_panel(image: Image.Image, size: Tuple[int, int]) -> Image.Image:
+    fitted = image.convert("RGB").copy()
+    fitted.thumbnail(size, Image.Resampling.LANCZOS)
+    panel = Image.new("RGB", size, (245, 245, 245))
+    panel.paste(fitted, ((size[0] - fitted.width) // 2, (size[1] - fitted.height) // 2))
+    return panel
+
+
+def render_event_evidence(
+    episode_dir: Path, observations: Sequence[Mapping[str, Any]],
+    semantic: Sequence[Mapping[str, Any]], event: Mapping[str, Any],
+    output_path: Path, *, status: str,
+) -> None:
+    rows = canonical_observations(observations)
+    if not rows:
+        return
+    step = int(event.get("step_id", rows[len(rows) // 2]["step_id"]))
+    signal = int(event.get("signal_step", step))
+    frame_steps = [max(0, signal - 8), signal, step, min(int(rows[-1]["step_id"]), step + 8)]
+    by_step = {int(row["step_id"]): row for row in rows}
+    selected = [min(rows, key=lambda row: abs(int(row["step_id"]) - target)) for target in frame_steps]
+    panel_size = (320, 240)
+    canvas = Image.new("RGB", (1280, 760), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    title = (
+        f"{episode_dir.name} | {status} | {event.get('event_family', 'hard_negative')} "
+        f"signal={signal} detect={step} delay={step - signal}"
+    )
+    draw.text((12, 10), title, fill=(0, 0, 0))
+    draw.text((12, 30), "evidence=" + "+".join(event.get("evidence") or []), fill=(0, 0, 0))
+    for column, (target, row) in enumerate(zip(frame_steps, selected)):
+        relative = row.get("rgb_path")
+        path = episode_dir / str(relative) if relative else None
+        if path is not None and path.is_file():
+            canvas.paste(_fit_panel(Image.open(path), panel_size), (column * 320, 58))
+        draw.text(
+            (column * 320 + 8, 302),
+            f"target={target} actual={row['step_id']} coll={row.get('collision_count')} dgoal={row.get('distance_to_goal')}",
+            fill=(0, 0, 0),
+        )
+
+    chart_top, chart_height = 350, 360
+    chart_width = 410
+    chart_left = 20
+    gps = [row.get("gps") for row in rows if isinstance(row.get("gps"), (list, tuple))]
+    if gps:
+        xs = [float(point[0]) for point in gps]
+        ys = [float(point[1]) for point in gps]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        scale = min((chart_width - 30) / max(0.1, x_max - x_min), (chart_height - 50) / max(0.1, y_max - y_min))
+        trajectory = [
+            (
+                chart_left + 15 + int((float(point[0]) - x_min) * scale),
+                chart_top + chart_height - 25 - int((float(point[1]) - y_min) * scale),
+            )
+            for point in gps
+        ]
+        if len(trajectory) >= 2:
+            draw.line(trajectory, fill=(70, 110, 180), width=3)
+        for target, color in ((signal, (230, 145, 30)), (step, (210, 45, 45))):
+            row = min(rows, key=lambda item: abs(int(item["step_id"]) - target))
+            point = row.get("gps")
+            if isinstance(point, (list, tuple)):
+                px = chart_left + 15 + int((float(point[0]) - x_min) * scale)
+                py = chart_top + chart_height - 25 - int((float(point[1]) - y_min) * scale)
+                draw.ellipse((px - 6, py - 6, px + 6, py + 6), fill=color)
+        draw.text((chart_left, chart_top), "Authoritative executed trajectory", fill=(0, 0, 0))
+
+    plot_left, plot_width = 455, 390
+    window = [row for row in rows if signal - 24 <= int(row["step_id"]) <= step + 32]
+    if window:
+        max_collision = max(float(row.get("collision_count") or 0) for row in window)
+        distances = [float(row.get("distance_to_goal") or 0) for row in window]
+        max_distance = max(distances) if distances else 1.0
+        for offset, row in enumerate(window):
+            x = plot_left + int(offset * (plot_width - 1) / max(1, len(window) - 1))
+            collision_y = chart_top + 170 - int(150 * float(row.get("collision_count") or 0) / max(1.0, max_collision))
+            distance_y = chart_top + 350 - int(150 * float(row.get("distance_to_goal") or 0) / max(0.1, max_distance))
+            if offset:
+                draw.line((prior_x, prior_collision_y, x, collision_y), fill=(190, 40, 40), width=2)
+                draw.line((prior_x, prior_distance_y, x, distance_y), fill=(30, 130, 70), width=2)
+            prior_x, prior_collision_y, prior_distance_y = x, collision_y, distance_y
+        draw.text((plot_left, chart_top), "collision count (red)", fill=(190, 40, 40))
+        draw.text((plot_left, chart_top + 180), "distance to goal (green)", fill=(30, 130, 70))
+
+    recent_semantic = [item for item in semantic if item.get("valid") and int(item.get("step_id", -1)) <= step]
+    semantic_root = None
+    run_dir = episode_dir.parent.parent
+    prefix = episode_dir.name.rsplit("_r", 1)[0]
+    semantic_candidates = sorted((run_dir / "online_lseg_shadow").glob(f"{prefix}_r*"))
+    if semantic_candidates:
+        semantic_root = semantic_candidates[-1]
+    if recent_semantic and semantic_root is not None:
+        sem = recent_semantic[-1]
+        overlay = sem.get("overlay_path")
+        overlay_path = semantic_root / str(overlay) if overlay else None
+        if overlay_path is not None and overlay_path.is_file():
+            canvas.paste(_fit_panel(Image.open(overlay_path), (390, 292)), (875, 370))
+            draw.text((875, 350), f"latest causal Q-frame LSeg step={sem.get('step_id')}", fill=(0, 0, 0))
+    draw.text((875, 680), "semantic is confirmation-only; unknown remains unknown", fill=(0, 0, 0))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+
+
+def _event(
+    rows: Sequence[Mapping[str, Any]], index: int, *, family: str,
+    evidence: Sequence[str], semantic: Sequence[Mapping[str, Any]],
+    signal_step: Optional[int] = None, extra_window: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    row = rows[index]
+    recent8 = rows[max(0, index - 7):index + 1]
+    recent12 = rows[max(0, index - 11):index + 1]
+    collision_burst = sum(float(item.get("collision_delta") or 0.0) for item in recent8)
+    forward_count = sum(
+        int(item.get("previous_action") == 1 and item.get("previous_action_applied") is not False)
+        for item in recent8
+    )
+    recovery, recovery_step, recovery_m = recovery_label(rows, index)
+    sem = semantic_context(semantic, int(row["step_id"]))
+    onset = int(row["step_id"] if signal_step is None else signal_step)
+    return {
+        "step_id": int(row["step_id"]),
+        "signal_step": onset,
+        "confirmation_delay_steps": int(row["step_id"]) - onset,
+        "observation_index": int(row["record_index"]),
+        "event_family": family,
+        "evidence": list(evidence),
+        "window": {
+            "collision_delta_8": collision_burst,
+            "forward_count_8": forward_count,
+            "displacement_8_m": window_displacement(recent8),
+            "path_length_8_m": path_length(recent8),
+            "occ_new_voxels_12": sum(
+                int(item.get("occupied_added") or 0) + int(item.get("free_added") or 0)
+                for item in recent12
+            ),
+            "occ_unique_growth_12": unique_occ_growth(recent12),
+            **dict(extra_window or {}),
+        },
+        "semantic_confirmation": {
+            **sem,
+            "supports_existing_suspicion": bool(sem.get("spatial_stagnation")),
+        },
+        "recoverability_proxy": recovery,
+        "recovery_step": recovery_step,
+        "recovery_displacement_m": recovery_m,
+        "rgb_path": row.get("rgb_path"),
+        "position": row.get("gps"),
     }
 
 
@@ -155,11 +382,19 @@ def mine_events(
     observations: Sequence[Mapping[str, Any]],
     loops: Sequence[Mapping[str, Any]],
     semantic: Sequence[Mapping[str, Any]],
+    *, route_radius_m: float = 0.35, route_min_path_m: float = 0.75,
+    route_confirm_min_steps: int = 8, route_confirm_max_steps: int = 16,
+    route_max_displacement_m: float = 0.25, route_max_unique_occ_growth: int = 512,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    rows = [compact_observation(row) for row in observations]
-    candidates: List[Dict[str, Any]] = []
+    rows = canonical_observations(observations)
+    immediate: List[Dict[str, Any]] = []
+    raw_revisits: List[Dict[str, Any]] = []
+    confirmed_revisits: List[Dict[str, Any]] = []
     loop_steps = {int(row.get("step_id", -1)): row for row in loops}
     last_event_step: Dict[str, int] = {}
+    last_raw_revisit_step = -1000
+    pending_revisit: Optional[Dict[str, Any]] = None
+    confirmed_regions: List[Tuple[int, Sequence[float]]] = []
     for index, row in enumerate(rows):
         step = int(row["step_id"] or 0)
         recent8 = rows[max(0, index - 7):index + 1]
@@ -185,44 +420,81 @@ def mine_events(
         if forward_count >= 3 and displacement <= 0.15:
             family = family or "G1_geometry_execution"
             evidence.append("commanded_forward_not_realized")
-        revisit = route_revisit(rows, index)
+        revisit = route_revisit(
+            rows, index, radius_m=route_radius_m, min_path_m=route_min_path_m
+        )
         if revisit is not None:
-            family = family or "G3_route_topology"
-            evidence.append("route_revisit")
-        if family is None:
-            continue
-        if step - last_event_step.get(family, -1000) < 8:
-            continue
-        last_event_step[family] = step
-        recovery, recovery_step, recovery_m = recovery_label(rows, index)
-        sem = semantic_context(semantic, step)
-        candidates.append({
-            "step_id": step,
-            "observation_index": int(row["record_index"]),
-            "event_family": family,
-            "evidence": evidence,
-            "window": {
-                "collision_delta_8": collision_burst,
-                "forward_count_8": forward_count,
-                "displacement_8_m": displacement,
-                "path_length_8_m": path_length(recent8),
-                "occ_new_voxels_12": occ_growth,
-                **(revisit or {}),
-            },
-            "semantic_confirmation": {
-                **sem,
-                "supports_existing_suspicion": bool(sem.get("repeated_label_set")),
-            },
-            "recoverability_proxy": recovery,
-            "recovery_step": recovery_step,
-            "recovery_displacement_m": recovery_m,
-            "rgb_path": row.get("rgb_path"),
-        })
+            if step - last_raw_revisit_step >= 8:
+                raw_revisits.append(_event(
+                    rows, index, family="G3_route_topology",
+                    evidence=["route_revisit_signal"], semantic=semantic,
+                    extra_window=revisit,
+                ))
+                last_raw_revisit_step = step
+            if pending_revisit is None:
+                pending_revisit = {"index": index, "step": step, "revisit": revisit}
+
+        if family is not None and step - last_event_step.get(family, -1000) >= 8:
+            last_event_step[family] = step
+            immediate.append(_event(
+                rows, index, family=family, evidence=evidence, semantic=semantic,
+                extra_window=revisit or {},
+            ))
+
+        if pending_revisit is not None:
+            onset_index = int(pending_revisit["index"])
+            age = index - onset_index
+            confirm_rows = rows[onset_index:index + 1]
+            confirm_displacement = window_displacement(confirm_rows)
+            confirm_growth = unique_occ_growth(confirm_rows)
+            left_region = max(
+                (distance(confirm_rows[0].get("gps"), item.get("gps")) for item in confirm_rows),
+                default=0.0,
+            ) > 0.60
+            if age >= int(route_confirm_min_steps):
+                sem = semantic_context(semantic, step)
+                low_motion = confirm_displacement <= float(route_max_displacement_m)
+                low_growth = confirm_growth <= int(route_max_unique_occ_growth)
+                if low_motion and low_growth:
+                    position = row.get("gps")
+                    same_region = any(
+                        step - prior_step <= 32 and distance(position, prior_position) <= 0.50
+                        for prior_step, prior_position in confirmed_regions
+                    )
+                    if not same_region:
+                        confirmed_revisits.append(_event(
+                            rows, index, family="G3_route_topology",
+                            evidence=["route_revisit_confirmed_low_progress"],
+                            semantic=semantic, signal_step=int(pending_revisit["step"]),
+                            extra_window={
+                                **dict(pending_revisit["revisit"]),
+                                "confirmation_window_steps": age,
+                                "confirmation_displacement_m": confirm_displacement,
+                                "confirmation_unique_occ_growth": confirm_growth,
+                                "semantic_stagnation_at_confirmation": bool(
+                                    sem.get("spatial_stagnation")
+                                ),
+                            },
+                        ))
+                        confirmed_regions.append((step, position))
+                    pending_revisit = None
+                elif age >= int(route_confirm_max_steps) or left_region:
+                    pending_revisit = None
+            elif left_region:
+                pending_revisit = None
+
+    d0 = [event for event in immediate if "strict_s2_turn_loop" in event["evidence"]]
+    d1 = [event for event in immediate if event["event_family"] in {"G1_geometry_execution", "G2_policy_loop"}]
+    d2 = d1 + confirmed_revisits
     return {
-        "D0": [event for event in candidates if "strict_s2_turn_loop" in event["evidence"]],
-        "D1": [event for event in candidates if event["event_family"] in {"G1_geometry_execution", "G2_policy_loop"}],
-        "D2": candidates,
-        "D3Q_confirmed": [event for event in candidates if event["semantic_confirmation"]["supports_existing_suspicion"]],
+        "D0": d0,
+        "D1": d1,
+        "D2_raw_revisit": d1 + raw_revisits,
+        "D2": d2,
+        "D3Q_confirmed": [
+            event for event in d2
+            if event["semantic_confirmation"]["supports_existing_suspicion"]
+        ],
     }
 
 
@@ -293,8 +565,13 @@ def audit_episode(episode_dir: Path, loops: Sequence[Mapping[str, Any]]) -> Tupl
     }, errors
 
 
-def analyze(run_root: Path, output: Path, require_all: bool) -> Dict[str, Any]:
+def analyze(
+    run_root: Path, output: Path, require_all: bool,
+    *, detector_options: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
+    evidence_dir = output / "event_evidence"
+    options = dict(detector_options or {})
     progress = progress_by_episode(run_root)
     loops = loop_events_by_episode(run_root)
     contract_errors = []
@@ -309,7 +586,7 @@ def analyze(run_root: Path, output: Path, require_all: bool) -> Dict[str, Any]:
         contract_errors.extend(f"{key}:{error}" for error in errors)
         observations = jsonl(episode_dir / "observations.jsonl")
         semantic = lseg_events(episode_dir)
-        variants = mine_events(observations, loops.get(key, []), semantic)
+        variants = mine_events(observations, loops.get(key, []), semantic, **options)
         outcome = progress.get(key, {})
         for variant, events in variants.items():
             for event in events:
@@ -324,6 +601,17 @@ def analyze(run_root: Path, output: Path, require_all: bool) -> Dict[str, Any]:
                 })
                 all_events[variant].append(event)
                 if variant == "D2":
+                    evidence_name = (
+                        f"{meta.get('scene_id')}_{meta.get('episode_id')}_"
+                        f"step{int(event['step_id']):04d}_{event['event_family']}.png"
+                    )
+                    render_event_evidence(
+                        episode_dir, observations, semantic, event,
+                        evidence_dir / evidence_name, status="D2_candidate",
+                    )
+                    event["evidence_image"] = str(
+                        (Path("event_evidence") / evidence_name)
+                    )
                     annotation.append({
                         **event,
                         "annotation": {
@@ -338,8 +626,19 @@ def analyze(run_root: Path, output: Path, require_all: bool) -> Dict[str, Any]:
                             "notes": "",
                         },
                     })
+        if not variants["D2"]:
+            negative = {
+                "step_id": len(canonical_observations(observations)) // 2,
+                "signal_step": len(canonical_observations(observations)) // 2,
+                "event_family": "hard_negative_no_D2", "evidence": [],
+            }
+            evidence_name = f"{meta.get('scene_id')}_{meta.get('episode_id')}_hard_negative.png"
+            render_event_evidence(
+                episode_dir, observations, semantic, negative,
+                evidence_dir / evidence_name, status="hard_negative_no_D2",
+            )
     detector_summary = {}
-    for variant in ("D0", "D1", "D2", "D3Q_confirmed"):
+    for variant in ("D0", "D1", "D2_raw_revisit", "D2", "D3Q_confirmed"):
         events = all_events.get(variant, [])
         detector_summary[variant] = {
             "event_count": len(events),
@@ -355,6 +654,7 @@ def analyze(run_root: Path, output: Path, require_all: bool) -> Dict[str, Any]:
         "outcome_is_event_gt": False,
         "future_used_by_detector": False,
         "future_used_for_recoverability_label_only": True,
+        "detector_options": options,
         "episode_count": len(episode_reports),
         "episodes": episode_reports,
         "detectors": detector_summary,
@@ -374,8 +674,23 @@ def main() -> None:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-all", action="store_true")
+    parser.add_argument("--route-radius-m", type=float, default=0.35)
+    parser.add_argument("--route-min-path-m", type=float, default=0.75)
+    parser.add_argument("--route-confirm-min-steps", type=int, default=8)
+    parser.add_argument("--route-confirm-max-steps", type=int, default=16)
+    parser.add_argument("--route-max-displacement-m", type=float, default=0.25)
+    parser.add_argument("--route-max-unique-occ-growth", type=int, default=512)
     args = parser.parse_args()
-    analyze(args.run_root, args.output, args.require_all)
+    analyze(
+        args.run_root, args.output, args.require_all, detector_options={
+            "route_radius_m": args.route_radius_m,
+            "route_min_path_m": args.route_min_path_m,
+            "route_confirm_min_steps": args.route_confirm_min_steps,
+            "route_confirm_max_steps": args.route_confirm_max_steps,
+            "route_max_displacement_m": args.route_max_displacement_m,
+            "route_max_unique_occ_growth": args.route_max_unique_occ_growth,
+        },
+    )
 
 
 if __name__ == "__main__":
