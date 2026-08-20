@@ -1,0 +1,14 @@
+[
+  {"scene_id": "JF19kD82Mey", "episode_id": 8628, "episode_eval_seed": 200041, "audit_role": "failure_persistent_d0_no_collision"},
+  {"scene_id": "Pm6F8kyY3z2", "episode_id": 4387, "episode_eval_seed": 49, "audit_role": "failure_persistent_d0_collision"},
+  {"scene_id": "gZ6f7yhEvPG", "episode_id": 2023, "episode_eval_seed": 300092, "audit_role": "failure_persistent_d0_high_collision"},
+  {"scene_id": "XcA2TqTSSAj", "episode_id": 1765, "episode_eval_seed": 200072, "audit_role": "failure_persistent_d0_timeout"},
+  {"scene_id": "17DRP5sb8fy", "episode_id": 9072, "episode_eval_seed": 100001, "audit_role": "success_self_recovered_d0"},
+  {"scene_id": "1pXnuDYAj8r", "episode_id": 9979, "episode_eval_seed": 200006, "audit_role": "success_self_recovered_d0"},
+  {"scene_id": "B6ByNegPMKs", "episode_id": 328, "episode_eval_seed": 300024, "audit_role": "success_self_recovered_d0"},
+  {"scene_id": "JF19kD82Mey", "episode_id": 130, "episode_eval_seed": 100040, "audit_role": "success_self_recovered_d0"},
+  {"scene_id": "5q7pvUzZiYa", "episode_id": 9640, "episode_eval_seed": 300011, "audit_role": "success_hard_negative_no_loop"},
+  {"scene_id": "17DRP5sb8fy", "episode_id": 3717, "episode_eval_seed": 300486, "audit_role": "success_hard_negative_no_loop"},
+  {"scene_id": "29hnd4uzFmX", "episode_id": 467, "episode_eval_seed": 300190, "audit_role": "success_hard_negative_no_loop"},
+  {"scene_id": "1pXnuDYAj8r", "episode_id": 4147, "episode_eval_seed": 300068, "audit_role": "success_hard_negative_no_loop"}
+]
