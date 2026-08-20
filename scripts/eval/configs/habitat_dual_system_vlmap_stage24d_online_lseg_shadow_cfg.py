@@ -21,7 +21,10 @@ vlmap_cfg["lseg_online_shadow_repo"] = os.environ.get(
 )
 vlmap_cfg["lseg_online_shadow_checkpoint"] = os.environ.get(
     "STAGE24D_LSEG_CHECKPOINT",
-    "/home/yifeifeng/workspace/vlmaps/vlmaps/lseg/checkpoints/demo_e200.ckpt",
+    (
+        "/home/yifeifeng/workspace/InternNav/results/stage_17/"
+        "stage24d_lseg_safe_checkpoint_20260820/demo_e200_state_dict.pt"
+    ),
 )
 vlmap_cfg["lseg_online_shadow_device"] = "same"
 vlmap_cfg["lseg_online_shadow_confidence_threshold"] = float(
