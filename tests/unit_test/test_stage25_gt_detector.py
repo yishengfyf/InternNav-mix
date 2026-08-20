@@ -1,6 +1,9 @@
 import numpy as np
 
-from scripts.eval.analyze_stage25_gt_detector import mine_events, semantic_cells
+from scripts.eval.analyze_stage25_gt_detector import (
+    compact_observation, cumulative_path_length, mine_events, route_revisit,
+    semantic_cells,
+)
 
 
 def observation(index, x, action=1, collision=0, collision_delta=0):
@@ -131,3 +134,14 @@ def test_confirmed_revisit_is_merged_until_region_departure():
         if event["event_family"] == "G3_route_topology"
     ]
     assert len(route_events) == 1
+
+
+def test_cumulative_route_length_preserves_revisit_result():
+    positions = [0.0, 0.25, 0.50, 0.75, 1.0, 1.25, 1.50, 1.0, 0.5, 0.0]
+    rows = [compact_observation(observation(index, x)) for index, x in enumerate(positions)]
+    original = route_revisit(rows, len(rows) - 1, min_gap=4)
+    optimized = route_revisit(
+        rows, len(rows) - 1, min_gap=4,
+        cumulative_path_m=cumulative_path_length(rows),
+    )
+    assert optimized == original

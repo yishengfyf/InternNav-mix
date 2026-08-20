@@ -148,6 +148,15 @@ def path_length(rows: Sequence[Mapping[str, Any]]) -> float:
     return sum(distance(a.get("gps"), b.get("gps")) for a, b in zip(rows, rows[1:]))
 
 
+def cumulative_path_length(rows: Sequence[Mapping[str, Any]]) -> List[float]:
+    cumulative = [0.0]
+    for previous, current in zip(rows, rows[1:]):
+        cumulative.append(
+            cumulative[-1] + distance(previous.get("gps"), current.get("gps"))
+        )
+    return cumulative
+
+
 def unique_occ_growth(rows: Sequence[Mapping[str, Any]]) -> int:
     if len(rows) < 2:
         return 0
@@ -173,11 +182,15 @@ def recovery_label(rows: Sequence[Mapping[str, Any]], index: int) -> Tuple[str, 
 def route_revisit(
     rows: Sequence[Mapping[str, Any]], index: int, *, radius_m: float = 0.35,
     min_path_m: float = 0.75, min_gap: int = 12,
+    cumulative_path_m: Optional[Sequence[float]] = None,
 ) -> Optional[Dict[str, Any]]:
     current = rows[index]
     for prior in range(index - int(min_gap), -1, -1):
-        segment = rows[prior:index + 1]
-        route_m = path_length(segment)
+        route_m = (
+            float(cumulative_path_m[index]) - float(cumulative_path_m[prior])
+            if cumulative_path_m is not None
+            else path_length(rows[prior:index + 1])
+        )
         revisit_m = distance(current.get("gps"), rows[prior].get("gps"))
         if route_m >= float(min_path_m) and revisit_m <= float(radius_m):
             return {
@@ -392,6 +405,7 @@ def mine_events(
     raw_revisits: List[Dict[str, Any]] = []
     confirmed_revisits: List[Dict[str, Any]] = []
     loop_steps = {int(row.get("step_id", -1)): row for row in loops}
+    cumulative_path_m = cumulative_path_length(rows)
     last_event_step: Dict[str, int] = {}
     last_raw_revisit_step = -1000
     pending_revisit: Optional[Dict[str, Any]] = None
@@ -426,7 +440,8 @@ def mine_events(
             family = family or "G1_geometry_execution"
             evidence.append("commanded_forward_not_realized")
         revisit = route_revisit(
-            rows, index, radius_m=route_radius_m, min_path_m=route_min_path_m
+            rows, index, radius_m=route_radius_m, min_path_m=route_min_path_m,
+            cumulative_path_m=cumulative_path_m,
         )
         if revisit is not None:
             if step - last_raw_revisit_step >= 8:
