@@ -2,7 +2,7 @@ import numpy as np
 
 from scripts.eval.analyze_stage25_gt_detector import (
     compact_observation, cumulative_path_length, mine_events, route_revisit,
-    semantic_cells, merge_geometry_intervals,
+    semantic_cells, merge_geometry_intervals, resolve_episode_eval_seed,
 )
 
 
@@ -170,3 +170,13 @@ def test_geometry_intervals_split_after_gap_or_departure():
         {**base, "step_id": 10, "position": [1.0, 0.0]},
     ]
     assert len(merge_geometry_intervals(events)) == 3
+
+
+def test_episode_seed_prefers_meta_and_falls_back_to_progress():
+    assert resolve_episode_eval_seed(
+        {"episode_eval_seed": 41}, {"episode_eval_seed": 42}
+    ) == (41, "episode_meta")
+    assert resolve_episode_eval_seed(
+        {"episode_eval_seed": None}, {"episode_eval_seed": 42}
+    ) == (42, "progress_fallback")
+    assert resolve_episode_eval_seed({}, {}) == (None, "missing")

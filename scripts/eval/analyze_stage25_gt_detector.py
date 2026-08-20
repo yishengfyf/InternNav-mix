@@ -58,6 +58,17 @@ def progress_by_episode(run_root: Path) -> Dict[str, Dict[str, Any]]:
     return output
 
 
+def resolve_episode_eval_seed(
+    meta: Mapping[str, Any], progress: Mapping[str, Any],
+) -> Tuple[Optional[Any], str]:
+    """Resolve a causal run seed while supporting ledgers predating meta storage."""
+    if meta.get("episode_eval_seed") is not None:
+        return meta["episode_eval_seed"], "episode_meta"
+    if progress.get("episode_eval_seed") is not None:
+        return progress["episode_eval_seed"], "progress_fallback"
+    return None, "missing"
+
+
 def loop_events_by_episode(run_root: Path) -> Dict[str, List[Dict[str, Any]]]:
     output: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for path in run_root.glob("**/s2_action_loop_events.jsonl"):
@@ -646,12 +657,26 @@ def analyze(
         observed_keys.add(key)
         report, errors = audit_episode(episode_dir, loops.get(key, []))
         expected = expected_manifest.get(key)
+        actual_seed, seed_source = resolve_episode_eval_seed(
+            meta, progress.get(key, {})
+        )
+        report["episode_eval_seed"] = actual_seed
+        report["episode_eval_seed_source"] = seed_source
+        report["expected_episode_eval_seed"] = (
+            None if expected is None else expected.get("episode_eval_seed")
+        )
         if expected_manifest and expected is None:
             errors.append("episode_not_in_manifest")
-        if expected is not None and int(meta.get("episode_eval_seed", -1)) != int(
-            expected["episode_eval_seed"]
-        ):
-            errors.append("episode_eval_seed_mismatch")
+        if expected is not None:
+            try:
+                seed_matches = (
+                    actual_seed is not None
+                    and int(actual_seed) == int(expected["episode_eval_seed"])
+                )
+            except (TypeError, ValueError):
+                seed_matches = False
+            if not seed_matches:
+                errors.append("episode_eval_seed_mismatch")
         report["audit_role"] = None if expected is None else expected.get("audit_role")
         episode_reports.append(report)
         contract_errors.extend(f"{key}:{error}" for error in errors)
