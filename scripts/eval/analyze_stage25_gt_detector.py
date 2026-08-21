@@ -279,7 +279,9 @@ def canonical_observations(
 
 def _fit_panel(image: Image.Image, size: Tuple[int, int]) -> Image.Image:
     fitted = image.convert("RGB").copy()
-    fitted.thumbnail(size, Image.Resampling.LANCZOS)
+    # Pillow < 9.1 exposes the resampling constants directly on Image.
+    resampling = getattr(Image, "Resampling", Image)
+    fitted.thumbnail(size, resampling.LANCZOS)
     panel = Image.new("RGB", size, (245, 245, 245))
     panel.paste(fitted, ((size[0] - fitted.width) // 2, (size[1] - fitted.height) // 2))
     return panel
