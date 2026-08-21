@@ -180,3 +180,17 @@ def test_episode_seed_prefers_meta_and_falls_back_to_progress():
         {"episode_eval_seed": None}, {"episode_eval_seed": 42}
     ) == (42, "progress_fallback")
     assert resolve_episode_eval_seed({}, {}) == (None, "missing")
+
+
+def test_geometry_thresholds_are_explicit_and_default_compatible():
+    rows = [
+        observation(index, 0.0, collision=index, collision_delta=1)
+        for index in range(8)
+    ]
+    default = mine_events(rows, [], [])
+    strict = mine_events(
+        rows, [], [], collision_burst_min=4, geometry_max_displacement_m=0.10
+    )
+    assert len(default["D1"]) == 1
+    assert len(strict["D1"]) == 1
+    assert default["D1"][0]["event_family"] == "G1_geometry_execution"

@@ -453,6 +453,10 @@ def mine_events(
     *, route_radius_m: float = 0.35, route_min_path_m: float = 0.75,
     route_confirm_min_steps: int = 8, route_confirm_max_steps: int = 16,
     route_max_displacement_m: float = 0.25, route_max_unique_occ_growth: int = 512,
+    collision_burst_min: float = 2.0,
+    geometry_max_displacement_m: float = 0.25,
+    forward_min_count: int = 3,
+    forward_max_displacement_m: float = 0.15,
 ) -> Dict[str, List[Dict[str, Any]]]:
     rows = canonical_observations(observations)
     policy_loops: List[Dict[str, Any]] = []
@@ -488,9 +492,15 @@ def mine_events(
                 rows, index, family="G2_policy_loop",
                 evidence=["strict_s2_turn_loop"], semantic=semantic,
             ))
-        if collision_burst >= 2 and displacement <= 0.25:
+        if (
+            collision_burst >= float(collision_burst_min)
+            and displacement <= float(geometry_max_displacement_m)
+        ):
             geometry_evidence.append("collision_burst_low_displacement")
-        if forward_count >= 3 and displacement <= 0.15:
+        if (
+            forward_count >= int(forward_min_count)
+            and displacement <= float(forward_max_displacement_m)
+        ):
             geometry_evidence.append("commanded_forward_not_realized")
         if geometry_evidence:
             geometry_samples.append(_event(
@@ -784,6 +794,10 @@ def main() -> None:
     parser.add_argument("--route-confirm-max-steps", type=int, default=16)
     parser.add_argument("--route-max-displacement-m", type=float, default=0.25)
     parser.add_argument("--route-max-unique-occ-growth", type=int, default=512)
+    parser.add_argument("--collision-burst-min", type=float, default=2.0)
+    parser.add_argument("--geometry-max-displacement-m", type=float, default=0.25)
+    parser.add_argument("--forward-min-count", type=int, default=3)
+    parser.add_argument("--forward-max-displacement-m", type=float, default=0.15)
     args = parser.parse_args()
     analyze(
         args.run_root, args.output, args.require_all, episode_manifest=args.episode_manifest,
@@ -794,6 +808,10 @@ def main() -> None:
             "route_confirm_max_steps": args.route_confirm_max_steps,
             "route_max_displacement_m": args.route_max_displacement_m,
             "route_max_unique_occ_growth": args.route_max_unique_occ_growth,
+            "collision_burst_min": args.collision_burst_min,
+            "geometry_max_displacement_m": args.geometry_max_displacement_m,
+            "forward_min_count": args.forward_min_count,
+            "forward_max_displacement_m": args.forward_max_displacement_m,
         },
     )
 
