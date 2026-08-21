@@ -486,7 +486,7 @@ def mine_events(
     executed_rotation_window: int = 32,
     executed_rotation_min_turn_actions: int = 20,
     executed_rotation_min_degrees: float = 345.0,
-    executed_rotation_max_forward_actions: int = 2,
+    executed_rotation_max_forward_actions: int = 0,
     executed_rotation_max_displacement_m: float = 0.35,
 ) -> Dict[str, List[Dict[str, Any]]]:
     rows = canonical_observations(observations)
@@ -801,6 +801,22 @@ def analyze(
                             "notes": "",
                         },
                     })
+                elif (
+                    variant == "D2_executed_rotation"
+                    and event["event_family"] == "G2_executed_rotation_loop"
+                ):
+                    evidence_name = (
+                        f"{meta.get('scene_id')}_{meta.get('episode_id')}_"
+                        f"step{int(event['step_id']):04d}_G2_executed_rotation_loop.png"
+                    )
+                    render_event_evidence(
+                        episode_dir, observations, semantic, event,
+                        output / "executed_rotation_evidence" / evidence_name,
+                        status="D2_executed_rotation_shadow",
+                    )
+                    event["evidence_image"] = str(
+                        Path("executed_rotation_evidence") / evidence_name
+                    )
         if not variants["D2"]:
             negative = {
                 "step_id": len(canonical_observations(observations)) // 2,
@@ -874,7 +890,7 @@ def main() -> None:
     parser.add_argument("--executed-rotation-window", type=int, default=32)
     parser.add_argument("--executed-rotation-min-turn-actions", type=int, default=20)
     parser.add_argument("--executed-rotation-min-degrees", type=float, default=345.0)
-    parser.add_argument("--executed-rotation-max-forward-actions", type=int, default=2)
+    parser.add_argument("--executed-rotation-max-forward-actions", type=int, default=0)
     parser.add_argument("--executed-rotation-max-displacement-m", type=float, default=0.35)
     args = parser.parse_args()
     analyze(

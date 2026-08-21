@@ -236,3 +236,8 @@ def test_partial_scan_or_translating_turns_are_not_executed_rotation_loop():
     for index, item in enumerate(moving):
         item["pose"]["compass"] = [np.deg2rad(index * 15.0)]
     assert mine_events(moving, [], [])["D2_executed_rotation"] == []
+    mixed = [observation(index, 0.0, action=3) for index in range(26)]
+    mixed[8]["previous_action"] = 1
+    for index, item in enumerate(mixed):
+        item["pose"]["compass"] = [np.deg2rad(index * 15.0)]
+    assert mine_events(mixed, [], [])["D2_executed_rotation"] == []
