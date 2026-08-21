@@ -39,6 +39,15 @@ vlmap_cfg["lseg_online_shadow_max_surface_samples"] = int(
     os.environ.get("STAGE25_MAX_SURFACE_SAMPLES", "12000")
 )
 
+# SparseOcc precision was already audited in the dedicated Stage23 runs.  Keep
+# its causal per-step summaries, but do not duplicate large RGB/PLY validation
+# snapshots for every episode in this detector-scale collection.
+vlmap_cfg["occ_memory_validation_enable"] = False
+vlmap_cfg["occ_memory_validation_save_rgb_depth"] = False
+vlmap_cfg["occ_memory_validation_save_current_rgb_ply"] = False
+vlmap_cfg["occ_memory_validation_save_memory_ply"] = False
+vlmap_cfg["occ_memory_validation_save_final_memory_ply"] = False
+
 # Defense in depth: detector collection remains shadow-only.
 vlmap_cfg["occ_memory_shadow_only"] = True
 vlmap_cfg["s2_action_loop_shadow_only"] = True
