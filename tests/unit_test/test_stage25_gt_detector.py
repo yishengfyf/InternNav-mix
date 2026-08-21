@@ -118,6 +118,12 @@ def test_delayed_recovery_is_separate_from_persistent_episode():
     assert result["D1"][0]["recoverability_proxy"] == "self_recovered_delayed"
 
 
+def test_short_terminal_horizon_is_not_labeled_persistent():
+    rows = [observation(index, 0.0, collision=index, collision_delta=1) for index in range(20)]
+    result = mine_events(rows, [], [])
+    assert result["D1"][0]["recoverability_proxy"] == "episode_ended"
+
+
 def test_confirmed_revisit_is_merged_until_region_departure():
     positions = [
         0.0, 0.25, 0.50, 0.75, 1.0, 1.25, 1.50,

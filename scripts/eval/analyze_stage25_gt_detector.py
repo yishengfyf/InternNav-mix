@@ -187,6 +187,8 @@ def recovery_label(rows: Sequence[Mapping[str, Any]], index: int) -> Tuple[str, 
             latency = later - index
             label = "self_recovered_quick" if latency <= 32 else "self_recovered_delayed"
             return label, int(rows[later]["step_id"]), moved
+    if len(rows) - index - 1 < 32:
+        return "episode_ended", None, None
     return "persistent_episode", None, None
 
 
@@ -755,6 +757,7 @@ def analyze(
             "self_recovered_count": sum(event["recoverability_proxy"].startswith("self_recovered") for event in events),
             "quick_self_recovered_count": sum(event["recoverability_proxy"] == "self_recovered_quick" for event in events),
             "delayed_self_recovered_count": sum(event["recoverability_proxy"] == "self_recovered_delayed" for event in events),
+            "episode_ended_count": sum(event["recoverability_proxy"] == "episode_ended" for event in events),
             "persistent_proxy_count": sum(event["recoverability_proxy"].startswith("persistent") for event in events),
         }
     report = {
