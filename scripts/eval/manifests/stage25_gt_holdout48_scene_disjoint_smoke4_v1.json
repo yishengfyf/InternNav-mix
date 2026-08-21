@@ -1,0 +1,6 @@
+[
+  {"scene_id":"cV4RVeZvu5T","episode_id":6659,"episode_eval_seed":420000,"audit_role":"scene_disjoint_unbiased_holdout"},
+  {"scene_id":"Vvot9Ly1tCj","episode_id":3260,"episode_eval_seed":420004,"audit_role":"scene_disjoint_unbiased_holdout"},
+  {"scene_id":"HxpKQynjfin","episode_id":5943,"episode_eval_seed":420008,"audit_role":"scene_disjoint_unbiased_holdout"},
+  {"scene_id":"mJXqzFtmKg4","episode_id":961,"episode_eval_seed":420012,"audit_role":"scene_disjoint_unbiased_holdout"}
+]
