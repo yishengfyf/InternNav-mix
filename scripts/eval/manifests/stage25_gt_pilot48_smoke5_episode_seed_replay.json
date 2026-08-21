@@ -1,0 +1,7 @@
+[
+  {"scene_id":"5q7pvUzZiYa","episode_id":2314,"episode_eval_seed":420000,"audit_role":"failure_persistent_or_loop"},
+  {"scene_id":"GdvgFV5R1Z5","episode_id":1747,"episode_eval_seed":420001,"audit_role":"success_long_loop_self_recovered"},
+  {"scene_id":"17DRP5sb8fy","episode_id":10515,"episode_eval_seed":420002,"audit_role":"success_matched_normal_hard_negative"},
+  {"scene_id":"1LXtFkjw3qL","episode_id":7110,"episode_eval_seed":420003,"audit_role":"success_matched_normal_hard_negative"},
+  {"scene_id":"1pXnuDYAj8r","episode_id":7620,"episode_eval_seed":420004,"audit_role":"success_matched_normal_hard_negative"}
+]
