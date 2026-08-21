@@ -11,7 +11,7 @@ def observation(index, x, action=1, collision=0, collision_delta=0):
         "record_index": index,
         "step_id": index,
         "observation_key": f"{index}:{index}",
-        "pose": {"gps": [x, 0.0]},
+        "pose": {"gps": [x, 0.0], "compass": [0.0]},
         "previous_action": action,
         "previous_action_applied": True,
         "occ_summary": {"occupied_added": 1, "free_added": 1},
@@ -200,3 +200,29 @@ def test_geometry_thresholds_are_explicit_and_default_compatible():
     assert len(default["D1"]) == 1
     assert len(strict["D1"]) == 1
     assert default["D1"][0]["event_family"] == "G1_geometry_execution"
+
+
+def test_executed_near_full_rotation_is_strict_separate_variant():
+    rows = [observation(index, 0.0, action=3) for index in range(26)]
+    for index, item in enumerate(rows):
+        item["pose"]["compass"] = [np.deg2rad(index * 15.0)]
+    result = mine_events(rows, [], [])
+    assert result["D2"] == []
+    rotation = [
+        event for event in result["D2_executed_rotation"]
+        if event["event_family"] == "G2_executed_rotation_loop"
+    ]
+    assert len(rotation) == 1
+    assert rotation[0]["window"]["executed_rotation_degrees"] >= 345.0
+    assert rotation[0]["window"]["executed_rotation_displacement_m"] == 0.0
+
+
+def test_partial_scan_or_translating_turns_are_not_executed_rotation_loop():
+    partial = [observation(index, 0.0, action=3) for index in range(14)]
+    for index, item in enumerate(partial):
+        item["pose"]["compass"] = [np.deg2rad(index * 15.0)]
+    assert mine_events(partial, [], [])["D2_executed_rotation"] == []
+    moving = [observation(index, index * 0.05, action=3) for index in range(26)]
+    for index, item in enumerate(moving):
+        item["pose"]["compass"] = [np.deg2rad(index * 15.0)]
+    assert mine_events(moving, [], [])["D2_executed_rotation"] == []

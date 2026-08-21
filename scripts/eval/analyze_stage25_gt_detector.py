@@ -168,6 +168,21 @@ def cumulative_path_length(rows: Sequence[Mapping[str, Any]]) -> List[float]:
     return cumulative
 
 
+def cumulative_abs_turn_degrees(rows: Sequence[Mapping[str, Any]]) -> float:
+    total = 0.0
+    for previous, current in zip(rows, rows[1:]):
+        previous_heading = _heading(previous.get("compass"))
+        current_heading = _heading(current.get("compass"))
+        if previous_heading is None or current_heading is None:
+            continue
+        delta = math.atan2(
+            math.sin(current_heading - previous_heading),
+            math.cos(current_heading - previous_heading),
+        )
+        total += abs(math.degrees(delta))
+    return total
+
+
 def unique_occ_growth(rows: Sequence[Mapping[str, Any]]) -> int:
     if len(rows) < 2:
         return 0
@@ -459,23 +474,34 @@ def mine_events(
     geometry_max_displacement_m: float = 0.25,
     forward_min_count: int = 3,
     forward_max_displacement_m: float = 0.15,
+    executed_rotation_window: int = 32,
+    executed_rotation_min_turn_actions: int = 20,
+    executed_rotation_min_degrees: float = 345.0,
+    executed_rotation_max_forward_actions: int = 2,
+    executed_rotation_max_displacement_m: float = 0.35,
 ) -> Dict[str, List[Dict[str, Any]]]:
     rows = canonical_observations(observations)
     policy_loops: List[Dict[str, Any]] = []
     geometry_samples: List[Dict[str, Any]] = []
     raw_revisits: List[Dict[str, Any]] = []
     confirmed_revisits: List[Dict[str, Any]] = []
+    executed_rotation_loops: List[Dict[str, Any]] = []
     loop_steps = {int(row.get("step_id", -1)): row for row in loops}
     cumulative_path_m = cumulative_path_length(rows)
     last_raw_revisit_step = -1000
     pending_revisit: Optional[Dict[str, Any]] = None
     active_revisit_region: Optional[Sequence[float]] = None
+    active_rotation_region: Optional[Sequence[float]] = None
     for index, row in enumerate(rows):
         step = int(row["step_id"] or 0)
         if active_revisit_region is not None and distance(
             row.get("gps"), active_revisit_region
         ) > 0.60:
             active_revisit_region = None
+        if active_rotation_region is not None and distance(
+            row.get("gps"), active_rotation_region
+        ) > 0.60:
+            active_rotation_region = None
         recent8 = rows[max(0, index - 7):index + 1]
         recent12 = rows[max(0, index - 11):index + 1]
         collision_burst = sum(float(item.get("collision_delta") or 0.0) for item in recent8)
@@ -509,6 +535,36 @@ def mine_events(
                 rows, index, family="G1_geometry_execution",
                 evidence=geometry_evidence, semantic=semantic,
             ))
+        rotation_rows = rows[max(0, index - int(executed_rotation_window) + 1):index + 1]
+        rotation_turn_actions = sum(
+            int(item.get("previous_action") in (2, 3)) for item in rotation_rows
+        )
+        rotation_forward_actions = sum(
+            int(item.get("previous_action") == 1) for item in rotation_rows
+        )
+        rotation_degrees = cumulative_abs_turn_degrees(rotation_rows)
+        rotation_displacement = window_displacement(rotation_rows)
+        if (
+            active_rotation_region is None
+            and rotation_turn_actions >= int(executed_rotation_min_turn_actions)
+            and rotation_degrees >= float(executed_rotation_min_degrees)
+            and rotation_forward_actions <= int(executed_rotation_max_forward_actions)
+            and rotation_displacement <= float(executed_rotation_max_displacement_m)
+        ):
+            signal_index = max(0, index - len(rotation_rows) + 1)
+            executed_rotation_loops.append(_event(
+                rows, index, family="G2_executed_rotation_loop",
+                evidence=["near_full_rotation_low_translation"], semantic=semantic,
+                signal_step=int(rows[signal_index]["step_id"]),
+                extra_window={
+                    "executed_rotation_window_steps": len(rotation_rows),
+                    "executed_rotation_turn_actions": rotation_turn_actions,
+                    "executed_rotation_forward_actions": rotation_forward_actions,
+                    "executed_rotation_degrees": rotation_degrees,
+                    "executed_rotation_displacement_m": rotation_displacement,
+                },
+            ))
+            active_rotation_region = row.get("gps")
         revisit = route_revisit(
             rows, index, radius_m=route_radius_m, min_path_m=route_min_path_m,
             cumulative_path_m=cumulative_path_m,
@@ -564,11 +620,13 @@ def mine_events(
     d0 = policy_loops
     d1 = policy_loops + geometry_intervals
     d2 = d1 + confirmed_revisits
+    d2_executed_rotation = d2 + executed_rotation_loops
     return {
         "D0": d0,
         "D1": d1,
         "D2_raw_revisit": d1 + raw_revisits,
         "D2": d2,
+        "D2_executed_rotation": d2_executed_rotation,
         "D3Q_confirmed": [
             event for event in d2
             if event["semantic_confirmation"]["supports_existing_suspicion"]
@@ -748,7 +806,10 @@ def analyze(
     missing_manifest = sorted(set(expected_manifest) - observed_keys)
     contract_errors.extend(f"{key}:manifest_episode_missing" for key in missing_manifest)
     detector_summary = {}
-    for variant in ("D0", "D1", "D2_raw_revisit", "D2", "D3Q_confirmed"):
+    for variant in (
+        "D0", "D1", "D2_raw_revisit", "D2", "D2_executed_rotation",
+        "D3Q_confirmed",
+    ):
         events = all_events.get(variant, [])
         detector_summary[variant] = {
             "event_count": len(events),
@@ -801,6 +862,11 @@ def main() -> None:
     parser.add_argument("--geometry-max-displacement-m", type=float, default=0.25)
     parser.add_argument("--forward-min-count", type=int, default=3)
     parser.add_argument("--forward-max-displacement-m", type=float, default=0.15)
+    parser.add_argument("--executed-rotation-window", type=int, default=32)
+    parser.add_argument("--executed-rotation-min-turn-actions", type=int, default=20)
+    parser.add_argument("--executed-rotation-min-degrees", type=float, default=345.0)
+    parser.add_argument("--executed-rotation-max-forward-actions", type=int, default=2)
+    parser.add_argument("--executed-rotation-max-displacement-m", type=float, default=0.35)
     args = parser.parse_args()
     analyze(
         args.run_root, args.output, args.require_all, episode_manifest=args.episode_manifest,
@@ -815,6 +881,11 @@ def main() -> None:
             "geometry_max_displacement_m": args.geometry_max_displacement_m,
             "forward_min_count": args.forward_min_count,
             "forward_max_displacement_m": args.forward_max_displacement_m,
+            "executed_rotation_window": args.executed_rotation_window,
+            "executed_rotation_min_turn_actions": args.executed_rotation_min_turn_actions,
+            "executed_rotation_min_degrees": args.executed_rotation_min_degrees,
+            "executed_rotation_max_forward_actions": args.executed_rotation_max_forward_actions,
+            "executed_rotation_max_displacement_m": args.executed_rotation_max_displacement_m,
         },
     )
 
