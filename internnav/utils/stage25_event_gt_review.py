@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from typing import Any, Dict, List, Mapping, Sequence
 
 
@@ -21,28 +22,38 @@ def merge_windows(
     windows: Sequence[Mapping[str, Any]], *, max_gap_steps: int = 4,
 ) -> List[Dict[str, Any]]:
     merged: List[Dict[str, Any]] = []
-    for window in sorted(windows, key=lambda item: int(item["onset_step"])):
-        current = dict(window)
-        if (
-            merged
-            and current["review_family"] == merged[-1]["review_family"]
-            and int(current["onset_step"]) <= int(merged[-1]["end_step"]) + max_gap_steps
-        ):
-            merged[-1]["end_step"] = max(
-                int(merged[-1]["end_step"]), int(current["end_step"])
-            )
-            merged[-1]["step_id"] = int(merged[-1]["end_step"])
-            merged[-1]["support_count"] = int(merged[-1]["support_count"]) + 1
-            for field in (
-                "displacement_m", "path_length_m", "goal_distance_increase_m",
+    by_family: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for window in windows:
+        by_family[str(window["review_family"])].append(window)
+    for family_windows in by_family.values():
+        family_merged: List[Dict[str, Any]] = []
+        for window in sorted(family_windows, key=lambda item: int(item["onset_step"])):
+            current = dict(window)
+            if (
+                family_merged
+                and int(current["onset_step"])
+                <= int(family_merged[-1]["end_step"]) + max_gap_steps
             ):
-                if field in current:
-                    merged[-1][field] = max(
-                        float(merged[-1].get(field, 0.0)), float(current[field])
-                    )
-        else:
-            current["support_count"] = 1
-            merged.append(current)
+                family_merged[-1]["end_step"] = max(
+                    int(family_merged[-1]["end_step"]), int(current["end_step"])
+                )
+                family_merged[-1]["step_id"] = int(family_merged[-1]["end_step"])
+                family_merged[-1]["support_count"] = (
+                    int(family_merged[-1]["support_count"]) + 1
+                )
+                for field in (
+                    "displacement_m", "path_length_m", "goal_distance_increase_m",
+                ):
+                    if field in current:
+                        family_merged[-1][field] = max(
+                            float(family_merged[-1].get(field, 0.0)),
+                            float(current[field]),
+                        )
+            else:
+                current["support_count"] = 1
+                family_merged.append(current)
+        merged.extend(family_merged)
+    merged.sort(key=lambda item: (int(item["onset_step"]), item["review_family"]))
     for window in merged:
         window["duration_steps"] = (
             int(window["end_step"]) - int(window["onset_step"]) + 1

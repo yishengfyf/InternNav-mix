@@ -42,3 +42,28 @@ def test_merged_window_uses_full_interval_and_latest_evidence_step():
     assert merged[0]["step_id"] == 12
     assert merged[0]["duration_steps"] == 12
     assert merged[0]["path_length_m"] == 0.2
+
+
+def test_interleaved_families_do_not_prevent_same_family_merge():
+    merged = merge_windows([
+        {
+            "review_family": "offline_local_stagnation",
+            "onset_step": 1, "end_step": 8, "step_id": 8,
+        },
+        {
+            "review_family": "offline_wrong_way_progress",
+            "onset_step": 2, "end_step": 9, "step_id": 9,
+        },
+        {
+            "review_family": "offline_local_stagnation",
+            "onset_step": 3, "end_step": 10, "step_id": 10,
+        },
+    ])
+    assert len(merged) == 2
+    local = next(
+        row for row in merged
+        if row["review_family"] == "offline_local_stagnation"
+    )
+    assert local["onset_step"] == 1
+    assert local["end_step"] == 10
+    assert local["support_count"] == 2
