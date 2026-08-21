@@ -25,7 +25,9 @@ vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
 # expansion that exhausted the server during the previous 96-episode run.
 vlmap_cfg["replay_ledger_rgb_format"] = "jpg"
 vlmap_cfg["replay_ledger_save_rgb"] = True
-vlmap_cfg["replay_ledger_save_depth"] = True
+# Online LSeg and SparseOcc still consume metric depth before this audit write.
+# Keep source hashes/statistics in JSONL but avoid duplicating every depth array.
+vlmap_cfg["replay_ledger_save_depth"] = False
 vlmap_cfg["replay_ledger_repeat_episode_meta"] = False
 
 # Keep online semantic inference and compact 3-D semantic summaries, but defer

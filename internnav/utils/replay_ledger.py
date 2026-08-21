@@ -165,6 +165,8 @@ class ReplayLedger:
             "occ_summary": occ_summary or {},
             "semantic_state": semantic_state or {},
             "audit_metrics": audit_metrics or {},
+            "rgb_saved": bool(self.save_rgb and rgb is not None),
+            "depth_saved": bool(self.save_depth and depth is not None),
         }
         if rgb is not None:
             rgb_arr = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))

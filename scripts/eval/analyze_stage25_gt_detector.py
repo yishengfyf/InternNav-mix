@@ -653,6 +653,7 @@ def audit_episode(episode_dir: Path, loops: Sequence[Mapping[str, Any]]) -> Tupl
     queries = jsonl(episode_dir / "queries.jsonl")
     actions = jsonl(episode_dir / "actions.jsonl")
     keys = {row.get("observation_key") for row in observations}
+    storage_counts = Counter()
     prior_collision = 0.0
     for row in observations:
         key = row.get("observation_key")
@@ -670,12 +671,32 @@ def audit_episode(episode_dir: Path, loops: Sequence[Mapping[str, Any]]) -> Tupl
         prior_collision = current_collision
         if pose.get("gps") is None or pose.get("stage23_gt_camera_pose_map") is None:
             errors.append(f"pose_missing:{key}")
-        for field, rgb in (("rgb_path", True), ("depth_path", False)):
+        for field, rgb, saved_field in (
+            ("rgb_path", True, "rgb_saved"),
+            ("depth_path", False, "depth_saved"),
+        ):
             relative = row.get(field)
             path = episode_dir / str(relative) if relative else None
+            saved = row.get(saved_field)
+            if saved is None:
+                saved = bool(relative)
+            storage_counts[f"{field}_{'saved' if saved else 'hash_only'}"] += 1
+            expected_hash = row.get("rgb_sha256" if rgb else "depth_sha256")
+            if not expected_hash:
+                errors.append(f"{field}_source_hash_missing:{key}")
+            if not saved:
+                continue
             if path is None or not path.is_file():
                 errors.append(f"{field}_missing:{key}")
-            elif sha256_array(path, rgb=rgb) != row.get("rgb_sha256" if rgb else "depth_sha256"):
+            elif rgb and str(row.get("rgb_storage_format", "jpg")).lower() != "png":
+                try:
+                    stored = np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+                    if list(stored.shape) != list(row.get("rgb_shape") or []):
+                        errors.append(f"{field}_shape_mismatch:{key}")
+                    storage_counts["rgb_lossy_decodable"] += 1
+                except Exception:
+                    errors.append(f"{field}_decode_error:{key}")
+            elif sha256_array(path, rgb=rgb) != expected_hash:
                 errors.append(f"{field}_hash_mismatch:{key}")
     if any(row.get("observation_key") not in keys for row in queries + actions):
         errors.append("invalid_observation_reference")
@@ -708,6 +729,7 @@ def audit_episode(episode_dir: Path, loops: Sequence[Mapping[str, Any]]) -> Tupl
         "query_count": len(queries),
         "action_count": len(actions),
         "loop_count": len(loops),
+        "storage_contract": dict(storage_counts),
         "final_metrics": summary.get("final_metrics") or {},
         "ledger_dir": str(episode_dir),
     }, errors

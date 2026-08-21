@@ -78,10 +78,22 @@ def analyze(run_root: Path, output: Path):
                     and all(isinstance(row, list) and len(row) == 4 for row in camera_pose)
                 ):
                     errors.append(f"camera_pose_map_missing:{scene_id}/{episode_id}:{item.get('observation_key')}")
-                for path_key in ("rgb_path", "depth_path"):
+                for path_key, saved_key in (
+                    ("rgb_path", "rgb_saved"), ("depth_path", "depth_saved")
+                ):
                     relative = item.get(path_key)
-                    if not relative or not (episode_dir / relative).is_file():
+                    saved = item.get(saved_key)
+                    if saved is None:
+                        saved = bool(relative)
+                    if saved and (not relative or not (episode_dir / relative).is_file()):
                         errors.append(f"{path_key}_missing:{scene_id}/{episode_id}:{item.get('observation_key')}")
+                    if not saved:
+                        hash_key = "rgb_sha256" if path_key == "rgb_path" else "depth_sha256"
+                        if not item.get(hash_key):
+                            errors.append(
+                                f"{hash_key}_missing:{scene_id}/{episode_id}:"
+                                f"{item.get('observation_key')}"
+                            )
             for kind, items in (("query", queries), ("action", actions)):
                 for item in items:
                     if item.get("observation_key") not in key_set:
