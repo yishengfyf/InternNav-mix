@@ -1,4 +1,6 @@
-from internnav.utils.stage25_event_gt_review import merge_windows, mine_review_windows
+from internnav.utils.stage25_event_gt_review import (
+    action_interval_summary, merge_windows, mine_review_windows,
+)
 
 
 def row(step, x, goal):
@@ -67,3 +69,44 @@ def test_interleaved_families_do_not_prevent_same_family_merge():
     assert local["onset_step"] == 1
     assert local["end_step"] == 10
     assert local["support_count"] == 2
+
+
+def test_action_interval_summary_uses_executed_interval_only():
+    observations = [
+        {
+            **row(1, 0.0, 5.0), "compass": [0.0],
+        },
+        {
+            **row(2, 0.0, 5.0), "compass": [0.2617993878],
+        },
+        {
+            **row(3, 0.0, 5.2), "compass": [0.5235987756],
+        },
+    ]
+    actions = [
+        {
+            "step_id": 0, "action": 1, "action_applied": True,
+            "action_source": "outside", "audit_metrics": {},
+        },
+        {
+            "step_id": 1, "action": 2, "action_applied": True,
+            "action_source": "s2", "audit_metrics": {"collision_delta": 0},
+        },
+        {
+            "step_id": 2, "action": 2, "action_applied": True,
+            "action_source": "s2", "audit_metrics": {"collision_delta": 1},
+        },
+        {
+            "step_id": 3, "action": 1, "action_applied": False,
+            "action_source": "s2", "audit_metrics": {"collision_delta": 1},
+        },
+    ]
+    summary = action_interval_summary(
+        observations, actions, onset_step=1, end_step=3
+    )
+    assert summary["applied_action_count"] == 2
+    assert summary["action_counts"]["left"] == 2
+    assert summary["action_counts"]["forward"] == 0
+    assert summary["collision_delta"] == 1.0
+    assert abs(summary["total_abs_turn_deg"] - 30.0) < 1e-4
+    assert abs(summary["goal_distance_delta_m"] - 0.2) < 1e-6

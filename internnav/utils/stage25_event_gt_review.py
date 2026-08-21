@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+
+ACTION_NAMES = {
+    0: "stop", 1: "forward", 2: "left", 3: "right", 4: "lookup", 5: "lookdown",
+}
 
 
 def distance(a: Any, b: Any) -> float:
@@ -16,6 +21,75 @@ def distance(a: Any, b: Any) -> float:
 
 def path_length(rows: Sequence[Mapping[str, Any]]) -> float:
     return sum(distance(a.get("gps"), b.get("gps")) for a, b in zip(rows, rows[1:]))
+
+
+def _compass_radians(row: Mapping[str, Any]) -> Optional[float]:
+    value = row.get("compass")
+    try:
+        return float(value[0] if isinstance(value, (list, tuple)) else value)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def action_interval_summary(
+    observations: Sequence[Mapping[str, Any]], actions: Sequence[Mapping[str, Any]],
+    *, onset_step: int, end_step: int,
+) -> Dict[str, Any]:
+    """Summarize executed actions for review; these are never detector features."""
+    interval_actions = [
+        row for row in actions
+        if onset_step <= int(row.get("step_id", -1)) <= end_step
+        and row.get("action_applied") is not False
+    ]
+    counts = {name: 0 for name in ACTION_NAMES.values()}
+    sources: Dict[str, int] = defaultdict(int)
+    collision_delta = 0.0
+    for row in interval_actions:
+        try:
+            action = int(row.get("action"))
+        except (TypeError, ValueError):
+            continue
+        counts[ACTION_NAMES.get(action, f"other_{action}")] = (
+            counts.get(ACTION_NAMES.get(action, f"other_{action}"), 0) + 1
+        )
+        sources[str(row.get("action_source") or "unknown")] += 1
+        collision_delta += float((row.get("audit_metrics") or {}).get("collision_delta") or 0.0)
+    interval_observations = [
+        row for row in observations
+        if onset_step <= int(row.get("step_id", -1)) <= end_step
+    ]
+    turn_degrees = 0.0
+    for previous, current in zip(interval_observations, interval_observations[1:]):
+        previous_yaw = _compass_radians(previous)
+        current_yaw = _compass_radians(current)
+        if previous_yaw is None or current_yaw is None:
+            continue
+        delta = math.atan2(
+            math.sin(current_yaw - previous_yaw),
+            math.cos(current_yaw - previous_yaw),
+        )
+        turn_degrees += abs(math.degrees(delta))
+    goal_delta = None
+    if interval_observations:
+        try:
+            goal_delta = float(interval_observations[-1]["distance_to_goal"]) - float(
+                interval_observations[0]["distance_to_goal"]
+            )
+        except (TypeError, ValueError):
+            pass
+    locomotion_count = counts["forward"] + counts["left"] + counts["right"]
+    return {
+        "applied_action_count": len(interval_actions),
+        "action_counts": counts,
+        "action_source_counts": dict(sorted(sources.items())),
+        "collision_delta": collision_delta,
+        "total_abs_turn_deg": turn_degrees,
+        "turn_only_ratio": (
+            (counts["left"] + counts["right"]) / max(1, locomotion_count)
+        ),
+        "goal_distance_delta_m": goal_delta,
+        "uses_future_for_review_only": True,
+    }
 
 
 def merge_windows(

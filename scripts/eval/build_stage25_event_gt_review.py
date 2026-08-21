@@ -14,7 +14,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from internnav.utils.stage25_event_gt_review import mine_review_windows
+from internnav.utils.stage25_event_gt_review import (
+    action_interval_summary, mine_review_windows,
+)
 from scripts.eval.analyze_stage25_gt_detector import (
     canonical_observations, discover_episodes, jsonl, lseg_events,
     progress_by_episode, render_event_evidence,
@@ -52,6 +54,7 @@ def main() -> None:
     for episode_dir in discover_episodes(args.run_root):
         meta = json.loads((episode_dir / "episode_meta.json").read_text(encoding="utf-8"))
         observations = jsonl(episode_dir / "observations.jsonl")
+        actions = jsonl(episode_dir / "actions.jsonl")
         rows = canonical_observations(observations)
         episode_events = by_episode.get(key(meta), [])
         outcome = progress.get(key(meta), {})
@@ -66,6 +69,11 @@ def main() -> None:
                     "spl": outcome.get("spl"),
                     "steps": outcome.get("steps"),
                 },
+                "offline_action_audit": action_interval_summary(
+                    rows, actions,
+                    onset_step=int(candidate["onset_step"]),
+                    end_step=int(candidate["end_step"]),
+                ),
                 "annotation": {
                     "state": None, "type": None, "onset_step": None,
                     "end_step": None, "recoverability": None,
