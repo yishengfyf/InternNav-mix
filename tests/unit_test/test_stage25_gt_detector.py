@@ -1,7 +1,8 @@
 import numpy as np
 
 from scripts.eval.analyze_stage25_gt_detector import (
-    compact_observation, cumulative_path_length, mine_events, route_revisit,
+    compact_observation, cumulative_abs_turn_degrees, cumulative_path_length,
+    mine_events, route_revisit,
     semantic_cells, merge_geometry_intervals, resolve_episode_eval_seed,
 )
 
@@ -215,6 +216,15 @@ def test_executed_near_full_rotation_is_strict_separate_variant():
     assert len(rotation) == 1
     assert rotation[0]["window"]["executed_rotation_degrees"] >= 345.0
     assert rotation[0]["window"]["executed_rotation_displacement_m"] == 0.0
+
+
+def test_cumulative_turn_handles_wrapped_and_missing_compass():
+    rows = [
+        {"compass": [np.deg2rad(170.0)]},
+        {"compass": [np.deg2rad(-175.0)]},
+        {"compass": None},
+    ]
+    assert abs(cumulative_abs_turn_degrees(rows) - 15.0) < 1e-4
 
 
 def test_partial_scan_or_translating_turns_are_not_executed_rotation_loop():

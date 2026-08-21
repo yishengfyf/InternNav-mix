@@ -168,11 +168,20 @@ def cumulative_path_length(rows: Sequence[Mapping[str, Any]]) -> List[float]:
     return cumulative
 
 
+def heading_radians(value: Any) -> Optional[float]:
+    try:
+        raw = value[0] if isinstance(value, (list, tuple, np.ndarray)) else value
+        parsed = float(raw)
+    except (TypeError, ValueError, IndexError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def cumulative_abs_turn_degrees(rows: Sequence[Mapping[str, Any]]) -> float:
     total = 0.0
     for previous, current in zip(rows, rows[1:]):
-        previous_heading = _heading(previous.get("compass"))
-        current_heading = _heading(current.get("compass"))
+        previous_heading = heading_radians(previous.get("compass"))
+        current_heading = heading_radians(current.get("compass"))
         if previous_heading is None or current_heading is None:
             continue
         delta = math.atan2(
