@@ -16,6 +16,7 @@ FAILURE_DIR="${RETURN_ROOT}/stage25_d3r_lseg_failure_return_${TAG}"
 CUDA_DEVICES=${STAGE25_D3R_CUDA_VISIBLE_DEVICES:-0,1,2,3}
 NPROC=${STAGE25_D3R_NPROC_PER_NODE:-4}
 WINDOW_STEPS=${STAGE25_D3R_WINDOW_STEPS:-24}
+MAX_FRAMES=${STAGE25_D3R_MAX_FRAMES:-}
 FAILED_STAGE=initialization
 COMPLETE=0
 
@@ -45,11 +46,18 @@ python3 -m pytest -q tests/unit_test/test_stage25_semantic_confirmation.py
 
 FAILED_STAGE=d3r_replay
 CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8} \
+REPLAY_ARGS=(
+  --run-root "${RUN_ROOT}" --candidates "${CANDIDATES}"
+  --output-root "${WORK_DIR}/d3r_audit" --vlmaps-repo "${VLMAPS_REPO}"
+  --checkpoint "${CHECKPOINT}" --device distributed --window-steps "${WINDOW_STEPS}"
+)
+if [[ -n "${MAX_FRAMES}" ]]; then
+  REPLAY_ARGS+=(--max-frames "${MAX_FRAMES}")
+fi
+CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8} \
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun --standalone --nproc_per_node="${NPROC}" \
   scripts/eval/replay_stage25_d3r_lseg.py \
-  --run-root "${RUN_ROOT}" --candidates "${CANDIDATES}" \
-  --output-root "${WORK_DIR}/d3r_audit" --vlmaps-repo "${VLMAPS_REPO}" \
-  --checkpoint "${CHECKPOINT}" --device distributed --window-steps "${WINDOW_STEPS}"
+  "${REPLAY_ARGS[@]}"
 
 FAILED_STAGE=d3r_analysis
 python3 scripts/eval/analyze_stage25_d3r_lseg.py \

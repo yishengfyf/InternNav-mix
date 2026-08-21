@@ -9,6 +9,14 @@ def test_causal_window_never_selects_future_observations():
     assert [item["step_id"] for item in selected] == [8, 9, 10, 11, 12]
 
 
+def test_causal_window_can_keep_only_latest_frames():
+    observations = [{"step_id": step} for step in range(20)]
+    selected = select_causal_window(
+        observations, event_step=12, window_steps=8, max_frames=4
+    )
+    assert [item["step_id"] for item in selected] == [9, 10, 11, 12]
+
+
 def test_semantic_recurrence_confirms_existing_suspicion():
     cells = ["0:1:2:3", "8:2:2:3"]
     frames = [

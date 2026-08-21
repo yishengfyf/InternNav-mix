@@ -59,7 +59,8 @@ def replay_episode(
     observations = jsonl(ledger / "observations.jsonl")
     selected_by_event = {
         int(event["step_id"]): select_causal_window(
-            observations, int(event["step_id"]), args.window_steps
+            observations, int(event["step_id"]), args.window_steps,
+            max_frames=args.max_frames,
         )
         for event in candidates
     }
@@ -163,6 +164,7 @@ def replay_episode(
         "unique_lseg_call_count": len(selected_indices),
         "inference_seconds_total": float(sum(source.inference_seconds)),
         "window_steps": args.window_steps,
+        "max_frames": args.max_frames,
         "future_used_by_detector": False,
         "semantic_can_create_event": False,
         "events": event_results,
@@ -183,6 +185,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--window-steps", type=int, default=24)
+    parser.add_argument("--max-frames", type=int)
     parser.add_argument("--confidence", type=float, default=0.35)
     parser.add_argument("--stride", type=int, default=8)
     parser.add_argument("--max-surface-samples", type=int, default=10000000)

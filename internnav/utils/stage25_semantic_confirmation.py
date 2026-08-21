@@ -8,12 +8,16 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 def select_causal_window(
     observations: Sequence[Mapping[str, Any]], event_step: int, window_steps: int,
+    *, max_frames: int | None = None,
 ) -> List[Mapping[str, Any]]:
     start = int(event_step) - int(window_steps)
-    return [
+    selected = [
         observation for observation in observations
         if start <= int(observation["step_id"]) <= int(event_step)
     ]
+    if max_frames is not None:
+        selected = selected[-int(max_frames):]
+    return selected
 
 
 def summarize_semantic_window(
