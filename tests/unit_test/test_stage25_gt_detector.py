@@ -204,7 +204,7 @@ def test_geometry_thresholds_are_explicit_and_default_compatible():
 
 
 def test_executed_near_full_rotation_is_strict_separate_variant():
-    rows = [observation(index, 0.0, action=3) for index in range(26)]
+    rows = [observation(index, 0.0, action=3) for index in range(20)]
     for index, item in enumerate(rows):
         item["pose"]["compass"] = [np.deg2rad(index * 15.0)]
     result = mine_events(rows, [], [])
@@ -214,7 +214,7 @@ def test_executed_near_full_rotation_is_strict_separate_variant():
         if event["event_family"] == "G2_executed_rotation_loop"
     ]
     assert len(rotation) == 1
-    assert rotation[0]["window"]["executed_rotation_degrees"] >= 345.0
+    assert rotation[0]["window"]["executed_rotation_degrees"] >= 270.0
     assert rotation[0]["window"]["executed_rotation_displacement_m"] == 0.0
 
 

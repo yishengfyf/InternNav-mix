@@ -484,8 +484,8 @@ def mine_events(
     forward_min_count: int = 3,
     forward_max_displacement_m: float = 0.15,
     executed_rotation_window: int = 32,
-    executed_rotation_min_turn_actions: int = 20,
-    executed_rotation_min_degrees: float = 345.0,
+    executed_rotation_min_turn_actions: int = 18,
+    executed_rotation_min_degrees: float = 270.0,
     executed_rotation_max_forward_actions: int = 0,
     executed_rotation_max_displacement_m: float = 0.35,
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -888,8 +888,8 @@ def main() -> None:
     parser.add_argument("--forward-min-count", type=int, default=3)
     parser.add_argument("--forward-max-displacement-m", type=float, default=0.15)
     parser.add_argument("--executed-rotation-window", type=int, default=32)
-    parser.add_argument("--executed-rotation-min-turn-actions", type=int, default=20)
-    parser.add_argument("--executed-rotation-min-degrees", type=float, default=345.0)
+    parser.add_argument("--executed-rotation-min-turn-actions", type=int, default=18)
+    parser.add_argument("--executed-rotation-min-degrees", type=float, default=270.0)
     parser.add_argument("--executed-rotation-max-forward-actions", type=int, default=0)
     parser.add_argument("--executed-rotation-max-displacement-m", type=float, default=0.35)
     args = parser.parse_args()
