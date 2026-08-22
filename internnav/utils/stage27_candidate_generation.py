@@ -30,10 +30,11 @@ def _dedupe_translation_nodes(nodes: Iterable[Mapping[str, Any]]) -> List[Dict[s
             xy = [float(item["xy"][0]), float(item["xy"][1])]
         except (KeyError, TypeError, ValueError, IndexError):
             continue
+        z = float(item.get("z", 0.0) or 0.0)
         if result and _distance(result[-1]["xy"], xy) <= 1e-4:
-            result[-1] = {**result[-1], "step_id": step, "grid": grid, "xy": xy}
+            result[-1] = {**result[-1], "step_id": step, "grid": grid, "xy": xy, "z": z}
             continue
-        result.append({"step_id": step, "grid": grid, "xy": xy})
+        result.append({"step_id": step, "grid": grid, "xy": xy, "z": z})
     return result
 
 
@@ -60,10 +61,22 @@ def _path_cells_for_node(
     return cells
 
 
-def _state_counts(cells: Iterable[Tuple[int, int]], state_fn) -> Counter:
+def _call_state_fn(state_fn, row: int, col: int, floor_z_m: Optional[float] = None):
+    """Call a 2-D state reader, or its optional floor-aware form."""
+    if floor_z_m is None:
+        return state_fn(int(row), int(col))
+    try:
+        return state_fn(int(row), int(col), float(floor_z_m))
+    except TypeError:
+        return state_fn(int(row), int(col))
+
+
+def _state_counts(
+    cells: Iterable[Tuple[int, int]], state_fn, *, floor_z_m: Optional[float] = None
+) -> Counter:
     counts = Counter()
     for row, col in cells:
-        counts[str(state_fn(int(row), int(col)))] += 1
+        counts[str(_call_state_fn(state_fn, row, col, floor_z_m))] += 1
     for name in ("free", "occupied", "unknown"):
         counts.setdefault(name, 0)
     return counts
@@ -78,6 +91,7 @@ def _candidate_record(
     path_cells: Sequence[Tuple[int, int]],
     state_counts: Mapping[str, int],
     floor_state_counts: Optional[Mapping[str, int]],
+    floor_z_m: float,
     path_length_m: float,
     floor_aligned_height_max_m: float,
     footprint_radius_m: float,
@@ -105,6 +119,7 @@ def _candidate_record(
         "unknown_fraction": float(state_counts.get("unknown", 0) / total),
         "route_occ_conflict": bool(state_counts.get("occupied", 0)),
         "floor_aligned_height_max_m": float(floor_aligned_height_max_m),
+        "floor_z_m": float(floor_z_m),
         "footprint_radius_m": float(footprint_radius_m),
         "floor_aligned_known_free": bool(
             (floor_state_counts or state_counts).get("free", 0) > 0
@@ -203,8 +218,9 @@ def generate_stage27_candidates(
             sample_spacing_m=float(cfg.get("sample_spacing_m", 0.05)),
         )
         states = _state_counts(path_cells, state_fn)
+        floor_z_m = float(nodes[index].get("z", 0.0) or 0.0)
         floor_states = (
-            _state_counts(path_cells, floor_state_fn)
+            _state_counts(path_cells, floor_state_fn, floor_z_m=floor_z_m)
             if floor_state_fn is not None else states
         )
         semantic = {}
@@ -217,6 +233,7 @@ def generate_stage27_candidates(
             node=nodes[index], node_index=index, trigger_grid=trigger,
             path_cells=path_cells, state_counts=states,
             floor_state_counts=floor_states,
+            floor_z_m=floor_z_m,
             path_length_m=sum(
                 _distance(first["xy"], second["xy"])
                 for first, second in zip(nodes[index:], nodes[index + 1 :])
@@ -232,8 +249,12 @@ def generate_stage27_candidates(
     open_candidates = sorted(
         route_candidates,
         key=lambda item: (
+            float(item.get("floor_aligned_known_free", False)),
+            float(item.get("floor_aligned_state_counts", {}).get("free", 0))
+            / max(1, sum(item.get("floor_aligned_state_counts", {}).values())),
             float(item.get("free_fraction", 0.0)),
-            float(item.get("free_fraction", 0.0)),
+            -float(item.get("unknown_fraction", 0.0)),
+            -float(item.get("occupied_fraction", 0.0)),
             -float(item.get("path_length_m", 0.0)),
         ), reverse=True,
     )[: max(1, int(cfg.get("open_count", 1)))]
@@ -284,11 +305,12 @@ def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: 
         0,
         int(math.ceil(float(cfg.get("footprint_radius_m", 0.18)) / float(getattr(memory, "cs", 0.05)))),
     )
-    current_floor_z = float(nodes[-1].get("z", 0.0) or 0.0) if nodes else 0.0
-
-    def floor_aligned_state(row, col):
+    def floor_aligned_state(row, col, floor_z_m=None):
+        # A historical route node can be on a different level from the
+        # trigger (e.g. stairs). Read its footprint at that node's floor.
+        floor_z = float(floor_z_m or 0.0)
         center = memory.validation_floor_aligned_cell_evidence(
-            int(row), int(col), current_floor_z,
+            int(row), int(col), floor_z,
             height_max_m=float(cfg.get("floor_aligned_height_max_m", 1.5)),
         )
         any_free = center["state"] == "free"
@@ -297,7 +319,7 @@ def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: 
                 if math.hypot(dr, dc) > radius_cells:
                     continue
                 evidence = memory.validation_floor_aligned_cell_evidence(
-                    int(row) + dr, int(col) + dc, current_floor_z,
+                    int(row) + dr, int(col) + dc, floor_z,
                     height_max_m=float(cfg.get("floor_aligned_height_max_m", 1.5)),
                 )
                 if evidence["state"] == "blocked":

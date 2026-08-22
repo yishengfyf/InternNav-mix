@@ -90,3 +90,24 @@ def test_route_near_and_open_families_remain_distinct_when_possible():
     assert opened["source_step"] in {0, 1, 2}
     assert near["shadow_only"] and not near["action_applied"]
     assert near["gt_fields_used"] == []
+
+
+def test_floor_readout_uses_source_route_node_height():
+    nodes = [dict(item, z=0.0 if item["step_id"] < 2 else 1.0) for item in _nodes()]
+    seen_heights = []
+
+    def floor_state(row, col, floor_z_m):
+        seen_heights.append(float(floor_z_m))
+        return "free" if float(floor_z_m) == 0.0 else "occupied"
+
+    result = generate_stage27_candidates(
+        route_nodes=nodes,
+        trigger_grid=[0, 15],
+        state_fn=lambda row, col: "free",
+        rasterize_edge=_rasterize,
+        floor_state_fn=floor_state,
+        config={"cell_size_m": 0.05, "min_distance_m": 0.25, "max_distance_m": 4.0},
+    )
+    assert seen_heights
+    assert result["families"]["R-route-near"][0]["floor_z_m"] == 1.0
+    assert result["families"]["R-route-near"][0]["floor_aligned_known_free"] is False
