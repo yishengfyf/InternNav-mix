@@ -40,6 +40,15 @@ def _shadow(tmp_path: Path, enabled: bool = True):
     return shadow
 
 
+def _filtered_shadow(tmp_path: Path):
+    shadow = _shadow(tmp_path)
+    shadow.component_filter_enable = True
+    shadow.component_filter_min_samples = 3
+    shadow.component_filter_radius_m = 0.25
+    shadow.component_filter_min_neighbors = 2
+    return shadow
+
+
 def test_disabled_shadow_never_loads_model(tmp_path):
     shadow = _shadow(tmp_path, enabled=False)
     event = shadow.process_query_frame(
@@ -135,6 +144,51 @@ def test_projection_keeps_unknown_distinct_from_free(tmp_path):
     assert np.all(samples["occ_state"] == 2)
 
 
+def test_component_filter_removes_small_islands_and_3d_outlier(tmp_path):
+    shadow = _filtered_shadow(tmp_path)
+    samples = {
+        "map_xyz": np.asarray([
+            [0.00, 0.00, 1.0], [0.05, 0.00, 1.0], [0.10, 0.00, 1.0],
+            [2.00, 0.00, 1.0], [3.00, 0.00, 1.0],
+        ], dtype=np.float32),
+        "class_id": np.asarray([0, 0, 0, 0, 1], dtype=np.int16),
+        "confidence": np.full(5, 0.8, dtype=np.float32),
+        "depth_m": np.ones(5, dtype=np.float32),
+        "pixel_y": np.asarray([0, 0, 0, 0, 8], dtype=np.int16),
+        "pixel_x": np.asarray([0, 1, 2, 3, 8], dtype=np.int16),
+        "occ_state": np.full(5, 2, dtype=np.int8),
+        "sampled_count": np.asarray(81),
+        "valid_depth_count": np.asarray(81),
+    }
+
+    filtered, stats, source_indices = shadow._filter_surface_samples(samples, (9, 9))
+
+    assert source_indices.tolist() == [0, 1, 2]
+    assert filtered["map_xyz"].shape == (3, 3)
+    assert stats["component_count"] == 2
+    assert stats["small_component_rejected_sample_count"] == 1
+    assert stats["density_rejected_sample_count"] == 1
+    assert stats["edge_touch_component_count"] == 2
+
+
+def test_disabled_component_filter_is_exact_identity(tmp_path):
+    shadow = _shadow(tmp_path)
+    samples = {
+        "map_xyz": np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        "class_id": np.asarray([0], dtype=np.int16),
+        "confidence": np.asarray([0.8], dtype=np.float32),
+        "pixel_y": np.asarray([0], dtype=np.int16),
+        "pixel_x": np.asarray([0], dtype=np.int16),
+        "occ_state": np.asarray([2], dtype=np.int8),
+    }
+
+    filtered, stats, source_indices = shadow._filter_surface_samples(samples, (1, 1))
+
+    assert source_indices.tolist() == [0]
+    assert np.array_equal(filtered["map_xyz"], samples["map_xyz"])
+    assert stats["retention_rate"] == 1.0
+
+
 def test_query_event_hashes_exact_inputs(tmp_path):
     shadow = _shadow(tmp_path)
     shadow._load_model = lambda: None
@@ -170,6 +224,9 @@ def test_node_merge_and_visualizations_are_audit_only(tmp_path):
         }
     ]
     shadow._stored_surface_count = 2
+    shadow.filtered_surface_frames = [{
+        key: value[:1] for key, value in shadow.surface_frames[0].items()
+    }]
 
     summary = shadow.finish_episode(metrics={"success": 1}, steps=4, occ_memory=_OccMemory())
 
@@ -177,11 +234,15 @@ def test_node_merge_and_visualizations_are_audit_only(tmp_path):
     assert summary["multi_view_node_rate"] == 1.0
     assert summary["strong_node_count"] == 1
     assert summary["weak_node_count"] == 0
+    assert summary["component_filter"]["raw_node_count"] == 1
+    assert summary["component_filter"]["filtered_node_count"] == 1
+    assert summary["component_filter"]["filtered_strong_node_count"] == 0
     assert summary["decision_status"] == "audit_only_not_navigation_ready"
     assert summary["action_applied_count"] == 0
     assert len(summary["visualizations"]) == 5
     for relative in summary["visualizations"].values():
         assert (shadow.episode_dir / relative).is_file()
+    assert (shadow.episode_dir / "nodes_filtered.json").is_file()
 
 
 def test_conflict_audit_separates_boundaries_and_evidence_tiers(tmp_path):

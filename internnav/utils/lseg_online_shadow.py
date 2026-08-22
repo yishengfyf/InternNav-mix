@@ -107,6 +107,18 @@ class OnlineLSegSemanticShadow:
         self.max_surface_samples = max(1000, int(
             cfg.get("lseg_online_shadow_max_surface_samples", 250000)
         ))
+        self.component_filter_enable = bool(
+            cfg.get("lseg_online_shadow_component_filter_enable", False)
+        )
+        self.component_filter_min_samples = max(1, int(
+            cfg.get("lseg_online_shadow_component_filter_min_samples", 4)
+        ))
+        self.component_filter_radius_m = max(0.01, float(
+            cfg.get("lseg_online_shadow_component_filter_radius_m", 0.20)
+        ))
+        self.component_filter_min_neighbors = max(1, int(
+            cfg.get("lseg_online_shadow_component_filter_min_neighbors", 2)
+        ))
         self.strong_min_views = max(2, int(
             cfg.get("lseg_online_shadow_strong_min_views", 2)
         ))
@@ -184,6 +196,7 @@ class OnlineLSegSemanticShadow:
         self.episode_meta = _jsonable(meta)
         self.records: List[Dict[str, Any]] = []
         self.surface_frames: List[Dict[str, np.ndarray]] = []
+        self.filtered_surface_frames: List[Dict[str, np.ndarray]] = []
         self.inference_seconds: List[float] = []
         self.errors: List[str] = []
         self._stored_surface_count = 0
@@ -414,6 +427,136 @@ class OnlineLSegSemanticShadow:
             "valid_depth_count": np.asarray(int(np.count_nonzero(valid))),
         }
 
+    @staticmethod
+    def _slice_samples(
+        samples: Dict[str, np.ndarray], indices: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        count = len(samples["map_xyz"])
+        return {
+            key: value[indices]
+            if isinstance(value, np.ndarray) and value.ndim and len(value) == count
+            else value
+            for key, value in samples.items()
+        }
+
+    def _filter_surface_samples(
+        self, samples: Dict[str, np.ndarray], image_shape: Tuple[int, int],
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any], np.ndarray]:
+        """Remove tiny 2-D islands and spatially isolated 3-D attachments.
+
+        The result is always an indexed subset of ``samples``. Connectivity is
+        evaluated on the sampled image grid and 3-D density only within each
+        same-label component, so nearby surfaces with different labels cannot
+        validate one another.
+        """
+        count = len(samples["map_xyz"])
+        all_indices = np.arange(count, dtype=np.int64)
+        if not self.component_filter_enable or not count:
+            stats = {
+                "enabled": self.component_filter_enable,
+                "raw_sample_count": count,
+                "retained_sample_count": count,
+                "rejected_sample_count": 0,
+                "retention_rate": 1.0 if count else None,
+                "component_count": 0,
+                "small_component_count": 0,
+                "edge_touch_component_count": 0,
+                "small_component_rejected_sample_count": 0,
+                "density_rejected_sample_count": 0,
+            }
+            return self._slice_samples(samples, all_indices), stats, all_indices
+
+        pixel_y = samples["pixel_y"].astype(np.int64)
+        pixel_x = samples["pixel_x"].astype(np.int64)
+        class_id = samples["class_id"].astype(np.int64)
+        lookup = {
+            (int(label), int(y), int(x)): index
+            for index, (label, y, x) in enumerate(zip(class_id, pixel_y, pixel_x))
+        }
+        unseen = set(range(count))
+        components: List[List[int]] = []
+        stride = self.sample_stride
+        while unseen:
+            seed = unseen.pop()
+            component = [seed]
+            stack = [seed]
+            while stack:
+                index = stack.pop()
+                label = int(class_id[index])
+                y, x = int(pixel_y[index]), int(pixel_x[index])
+                for dy in (-stride, 0, stride):
+                    for dx in (-stride, 0, stride):
+                        if dy == 0 and dx == 0:
+                            continue
+                        neighbor = lookup.get((label, y + dy, x + dx))
+                        if neighbor is not None and neighbor in unseen:
+                            unseen.remove(neighbor)
+                            component.append(neighbor)
+                            stack.append(neighbor)
+            components.append(component)
+
+        keep = np.zeros(count, dtype=bool)
+        small_component_count = 0
+        small_rejected = 0
+        density_rejected = 0
+        edge_touch_count = 0
+        height, width = image_shape
+        radius = self.component_filter_radius_m
+        radius_sq = radius * radius
+        for component in components:
+            component_indices = np.asarray(component, dtype=np.int64)
+            if np.any(
+                (pixel_y[component_indices] == 0)
+                | (pixel_x[component_indices] == 0)
+                | (pixel_y[component_indices] + stride >= height)
+                | (pixel_x[component_indices] + stride >= width)
+            ):
+                edge_touch_count += 1
+            if len(component) < self.component_filter_min_samples:
+                small_component_count += 1
+                small_rejected += len(component)
+                continue
+
+            points = samples["map_xyz"][component_indices]
+            cells = np.floor(points / radius).astype(np.int64)
+            buckets: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+            for local_index, cell in enumerate(cells):
+                buckets[tuple(cell.tolist())].append(local_index)
+            for local_index, (point, cell) in enumerate(zip(points, cells)):
+                neighbor_count = 0
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        for dz in (-1, 0, 1):
+                            candidates = buckets.get(
+                                (int(cell[0] + dx), int(cell[1] + dy), int(cell[2] + dz)),
+                                [],
+                            )
+                            if candidates:
+                                delta = points[candidates] - point
+                                neighbor_count += int(np.count_nonzero(
+                                    np.einsum("ij,ij->i", delta, delta) <= radius_sq
+                                ))
+                if neighbor_count >= self.component_filter_min_neighbors:
+                    keep[component_indices[local_index]] = True
+                else:
+                    density_rejected += 1
+
+        kept_indices = np.flatnonzero(keep)
+        retained = int(len(kept_indices))
+        stats = {
+            "enabled": True,
+            "raw_sample_count": count,
+            "retained_sample_count": retained,
+            "rejected_sample_count": count - retained,
+            "retention_rate": float(retained / count),
+            "component_count": len(components),
+            "small_component_count": small_component_count,
+            "edge_touch_component_count": edge_touch_count,
+            "small_component_rejected_sample_count": small_rejected,
+            "density_rejected_sample_count": density_rejected,
+        }
+        return self._slice_samples(samples, kept_indices), stats, kept_indices
+
     def _save_overlay(
         self, rgb: np.ndarray, pred: np.ndarray, confidence: np.ndarray, frame_name: str
     ) -> Optional[str]:
@@ -468,6 +611,9 @@ class OnlineLSegSemanticShadow:
             pred = np.argmax(probabilities, axis=0).astype(np.int16)
             confidence = np.max(probabilities, axis=0).astype(np.float32)
             samples = self._project(pred, confidence, depth, pose, occ_memory)
+            filtered_samples, filter_stats, filtered_source_indices = (
+                self._filter_surface_samples(samples, image.shape[:2])
+            )
             frame_name = f"q{int(query_id):04d}_step{int(step_id):04d}_obs{int(observation_index):04d}"
             overlay_path = self._save_overlay(image, pred, confidence, frame_name)
             surface_path = None
@@ -488,6 +634,22 @@ class OnlineLSegSemanticShadow:
                     "observation_index": np.full(stored, int(observation_index), dtype=np.int32),
                     "step_id": np.full(stored, int(step_id), dtype=np.int32),
                 })
+                filtered_ids = np.intersect1d(
+                    ids, filtered_source_indices, assume_unique=True
+                )
+                if len(filtered_ids):
+                    self.filtered_surface_frames.append({
+                        "map_xyz": samples["map_xyz"][filtered_ids],
+                        "class_id": samples["class_id"][filtered_ids],
+                        "confidence": samples["confidence"][filtered_ids],
+                        "occ_state": samples["occ_state"][filtered_ids],
+                        "observation_index": np.full(
+                            len(filtered_ids), int(observation_index), dtype=np.int32
+                        ),
+                        "step_id": np.full(
+                            len(filtered_ids), int(step_id), dtype=np.int32
+                        ),
+                    })
                 self._stored_surface_count += stored
             state_counts = Counter(samples["occ_state"].tolist())
             class_counts = Counter(
@@ -507,6 +669,11 @@ class OnlineLSegSemanticShadow:
                 "valid_depth_count": int(samples["valid_depth_count"]),
                 "surface_sample_count": int(len(samples["map_xyz"])),
                 "stored_surface_sample_count": int(stored),
+                "filtered_surface_sample_count": int(len(filtered_samples["map_xyz"])),
+                "stored_filtered_surface_sample_count": int(
+                    len(filtered_ids) if stored else 0
+                ),
+                "component_filter": filter_stats,
                 "class_surface_counts": dict(sorted(class_counts.items())),
                 "occ_state_counts": {
                     "occupied": int(state_counts.get(0, 0)),
@@ -771,6 +938,27 @@ class OnlineLSegSemanticShadow:
         nodes = self._merge_nodes(self.surface_frames)
         gt_audit = self._audit_nodes_with_gt(nodes)
         conflict_audit = self._audit_conflicts(nodes)
+        filtered_nodes = self._merge_nodes(self.filtered_surface_frames)
+        filtered_gt_audit = self._audit_nodes_with_gt(filtered_nodes)
+        filtered_conflict_audit = self._audit_conflicts(filtered_nodes)
+        if self.filtered_surface_frames:
+            filtered_points = np.concatenate([
+                frame["map_xyz"] for frame in self.filtered_surface_frames
+            ])
+            filtered_class_id = np.concatenate([
+                frame["class_id"] for frame in self.filtered_surface_frames
+            ])
+            filtered_confidence = np.concatenate([
+                frame["confidence"] for frame in self.filtered_surface_frames
+            ])
+            filtered_occ_state = np.concatenate([
+                frame["occ_state"] for frame in self.filtered_surface_frames
+            ])
+        else:
+            filtered_points = np.zeros((0, 3), dtype=np.float32)
+            filtered_class_id = np.zeros(0, dtype=np.int16)
+            filtered_confidence = np.zeros(0, dtype=np.float32)
+            filtered_occ_state = np.zeros(0, dtype=np.int8)
         visualizations = self._save_semantic_visualizations(points, class_id, occ_memory)
         latency = np.asarray(self.inference_seconds, dtype=np.float64)
         class_counts = Counter(self.labels[int(index)] for index in class_id.tolist())
@@ -813,6 +1001,33 @@ class OnlineLSegSemanticShadow:
             ),
             "cross_label_conflict_audit": conflict_audit,
             "gt_audit": gt_audit, "visualizations": visualizations,
+            "component_filter": {
+                "enabled": self.component_filter_enable,
+                "min_samples": self.component_filter_min_samples,
+                "radius_m": self.component_filter_radius_m,
+                "min_neighbors_including_self": self.component_filter_min_neighbors,
+                "raw_stored_surface_sample_count": int(len(points)),
+                "filtered_stored_surface_sample_count": int(len(filtered_points)),
+                "stored_surface_retention_rate": float(
+                    len(filtered_points) / len(points)
+                ) if len(points) else None,
+                "raw_node_count": len(nodes),
+                "filtered_node_count": len(filtered_nodes),
+                "node_retention_rate": float(
+                    len(filtered_nodes) / len(nodes)
+                ) if nodes else None,
+                "filtered_multi_view_node_count": sum(
+                    len(node["source_observations"]) >= 2 for node in filtered_nodes
+                ),
+                "filtered_strong_node_count": sum(
+                    node.get("evidence_tier") == "strong" for node in filtered_nodes
+                ),
+                "filtered_weak_node_count": sum(
+                    node.get("evidence_tier") == "weak" for node in filtered_nodes
+                ),
+                "filtered_cross_label_conflict_audit": filtered_conflict_audit,
+                "filtered_gt_audit": filtered_gt_audit,
+            },
             "cuda_s2_loaded_baseline": self._baseline_cuda,
             "cuda_immediately_before_lseg_load": self._before_load_cuda,
             "cuda_after_lseg_load": self._after_load_cuda,
@@ -827,10 +1042,17 @@ class OnlineLSegSemanticShadow:
         }
         if self.episode_dir is not None:
             self._write_json(self.episode_dir / "nodes.json", nodes)
+            self._write_json(self.episode_dir / "nodes_filtered.json", filtered_nodes)
             if len(points):
                 np.savez_compressed(
                     self.episode_dir / "semantic_surface_memory.npz", map_xyz=points,
                     class_id=class_id, confidence=confidence, occ_state=occ_state,
+                )
+            if len(filtered_points):
+                np.savez_compressed(
+                    self.episode_dir / "semantic_surface_memory_filtered.npz",
+                    map_xyz=filtered_points, class_id=filtered_class_id,
+                    confidence=filtered_confidence, occ_state=filtered_occ_state,
                 )
             self._write_json(self.episode_dir / "summary.json", summary)
         return summary

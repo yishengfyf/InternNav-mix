@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+cd "${REPO_ROOT}"
+CHECKPOINT=${STAGE21C_SCORER_CHECKPOINT:-results/stage_17/stage21b_multitask_scorer_smoke_to_pilot_return_20260814_011349/pilot/seed_53/best.pt}
+MANIFEST=${STAGE26_MANIFEST:-scripts/eval/manifests/stage25_gt_detector_fresh500_smoke4.json}
+CONFIG=${STAGE26_CONFIG:-scripts/eval/configs/habitat_dual_system_vlmap_stage26_hsgm_semantic_filter_cfg.py}
+BASELINE_ROOT=${STAGE26_BASELINE_ROOT:-results/stage_17/stage25_gt_detector_return_fresh500_full_v1_20260822}
+RETURN_ROOT=${STAGE21_RETURN_ROOT:-results/stage_17}
+PIPELINE_TAG=${STAGE21_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
+CUDA_DEVICES=${STAGE21_CUDA_VISIBLE_DEVICES:-0,1,2,3}
+NPROC=${STAGE26_NPROC_PER_NODE:-4}
+RUN_NAME="compare_vlmap_stage26_hsgm_semantic_filter_${PIPELINE_TAG}"
+RUN_ROOT="logs/habitat/${RUN_NAME}"
+WORK_DIR="${RETURN_ROOT}/stage26_hsgm_semantic_filter_running_${PIPELINE_TAG}"
+SUCCESS_DEST="${RETURN_ROOT}/stage26_hsgm_semantic_filter_return_${PIPELINE_TAG}"
+FAILURE_DEST="${RETURN_ROOT}/stage26_hsgm_semantic_filter_failure_return_${PIPELINE_TAG}"
+FAILED_STAGE=initialization
+PIPELINE_COMPLETE=0
+
+package_failure() {
+  local status=$?
+  if [[ "${PIPELINE_COMPLETE}" == 1 || "${status}" == 0 ]]; then return; fi
+  mkdir -p "${WORK_DIR}"
+  if [[ -d "${RUN_ROOT}" && ! -e "${WORK_DIR}/run" ]]; then
+    mv "${RUN_ROOT}" "${WORK_DIR}/run"
+  fi
+  printf '%s\n' "${FAILED_STAGE}" > "${WORK_DIR}/FAILED_STAGE.txt"
+  printf '%s\n' "${status}" > "${WORK_DIR}/EXIT_STATUS.txt"
+  git rev-parse HEAD > "${WORK_DIR}/git_commit.txt"
+  git status --short > "${WORK_DIR}/git_status_short.txt"
+  mv "${WORK_DIR}" "${FAILURE_DEST}"
+  find "${FAILURE_DEST}" -type f | sort > "${FAILURE_DEST}/RETURN_MANIFEST.txt"
+  echo "STAGE26_STATUS=failed"
+  echo "FAILED_STAGE=${FAILED_STAGE}"
+  echo "DEST=$(readlink -f "${FAILURE_DEST}")"
+}
+trap package_failure EXIT
+
+test -f "${CHECKPOINT}"
+test -f "${MANIFEST}"
+test -f "${CONFIG}"
+test -d "${BASELINE_ROOT}"
+test -d "${STAGE24D_VLMAPS_REPO:-/home/yifeifeng/workspace/vlmaps}"
+test -f "${STAGE24D_LSEG_CHECKPOINT:-results/stage_17/stage24d_lseg_safe_checkpoint_20260820/demo_e200_state_dict.pt}"
+test ! -e "${WORK_DIR}"
+test ! -e "${SUCCESS_DEST}"
+test ! -e "${FAILURE_DEST}"
+test ! -e "${RUN_ROOT}"
+mkdir -p "${WORK_DIR}/episode_manifests"
+exec > >(tee -a "${WORK_DIR}/pipeline.log") 2>&1
+
+FAILED_STAGE=targeted_tests
+python3 -m pytest -q tests/unit_test/test_lseg_online_shadow.py
+python3 -m py_compile \
+  scripts/eval/analyze_stage26_hsgm_semantic_filter.py \
+  scripts/eval/configs/habitat_dual_system_vlmap_stage26_hsgm_semantic_filter_cfg.py
+
+FAILED_STAGE=frozen_s2_semantic_filter_evaluation
+CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8} \
+CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" \
+STAGE21_EPISODE_IDS="${MANIFEST}" STAGE21_RUN_NAME="${RUN_NAME}" \
+STAGE21_EPISODE_SEED_REPLAY_MANIFEST="${MANIFEST}" \
+STAGE21C_SCORER_CHECKPOINT="${CHECKPOINT}" STAGE21C_SCORER_DEVICE=cpu \
+STAGE26_EVAL_PORT=${STAGE26_EVAL_PORT:-2995} \
+NPROC_PER_NODE="${NPROC}" MASTER_PORT=${STAGE26_MASTER_PORT:-2996} \
+bash scripts/eval/bash/stage21_torchrun_eval.sh --config "${CONFIG}"
+
+FAILED_STAGE=shadow_integrity_and_semantic_audit
+python3 scripts/eval/analyze_stage24a_replay_ledger.py \
+  --run-root "${RUN_ROOT}" \
+  --output "${RUN_ROOT}/stage26_replay_ledger_integrity.json"
+python3 scripts/eval/analyze_stage26_hsgm_semantic_filter.py \
+  --run-root "${RUN_ROOT}" \
+  --baseline-root "${BASELINE_ROOT}" \
+  --manifest "${MANIFEST}" \
+  --output "${RUN_ROOT}/stage26_hsgm_semantic_filter_audit.json"
+
+FAILED_STAGE=return_packaging
+mv "${RUN_ROOT}" "${WORK_DIR}/run"
+cp -a "${MANIFEST}" "${WORK_DIR}/episode_manifests/"
+printf '%s\n' 0 > "${WORK_DIR}/EXIT_STATUS.txt"
+printf '%s\n' "${CHECKPOINT}" > "${WORK_DIR}/SOURCE_CHECKPOINT.txt"
+printf '%s\n' "${BASELINE_ROOT}" > "${WORK_DIR}/BASELINE_ROOT.txt"
+sha256sum "${MANIFEST}" > "${WORK_DIR}/MANIFEST_SHA256.txt"
+git rev-parse HEAD > "${WORK_DIR}/git_commit.txt"
+git status --short > "${WORK_DIR}/git_status_short.txt"
+find "${WORK_DIR}" -type f | sort > "${WORK_DIR}/RETURN_MANIFEST.txt"
+mv "${WORK_DIR}" "${SUCCESS_DEST}"
+PIPELINE_COMPLETE=1
+echo "STAGE26_STATUS=complete"
+echo "DEST=$(readlink -f "${SUCCESS_DEST}")"
+du -sh "${SUCCESS_DEST}"
