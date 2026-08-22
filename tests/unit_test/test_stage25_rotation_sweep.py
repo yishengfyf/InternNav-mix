@@ -2,6 +2,7 @@ from internnav.utils.stage25_event_gt_review import annotate_review_candidates
 from scripts.eval.sweep_stage25_executed_rotation import (
     evaluation_for_split, variant_rank,
 )
+from scripts.eval.finalize_stage25_event_gt_review import evaluate_final
 
 
 def variant(recall, protection, events=10):
@@ -76,3 +77,31 @@ def test_evaluation_for_split_excludes_other_split_scenes():
     report = evaluation_for_split(events, annotated, "dev")
     assert report["detector_event_count"] == 1
     assert report["detected_true_trap_count"] == 1
+
+
+def test_final_audit_keeps_objective_and_visual_sources_separate():
+    objective = annotate_review_candidates([
+        gt_candidate("scene_a", "true_trap"),
+        gt_candidate("scene_b", "wrong_way_progress"),
+    ])
+    events = [
+        {"scene_id": "scene_a", "episode_id": 1, "step_id": 40,
+         "event_family": "G2_policy_loop"},
+        {"scene_id": "scene_c", "episode_id": 2, "step_id": 20,
+         "event_family": "G1_geometry_execution"},
+        {"scene_id": "scene_d", "episode_id": 3, "step_id": 30,
+         "event_family": "G1_geometry_execution"},
+    ]
+    visual = [
+        {**events[1], "state": "true_trap"},
+        {**events[2], "state": "hesitation"},
+    ]
+    report = evaluate_final(events, objective, visual)["all"]
+    assert report["event_adjudication_counts"] == {
+        "objective_true_trap": 1,
+        "visual_true_trap": 1,
+        "visual_hesitation": 1,
+    }
+    assert report["event_precision_on_adjudicated"] == 2 / 3
+    assert report["combined_confirmed_true_trap_count"] == 2
+    assert report["combined_confirmed_recall"] == 1.0

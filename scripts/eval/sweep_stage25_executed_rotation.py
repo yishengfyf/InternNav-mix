@@ -173,6 +173,7 @@ def main() -> None:
         "variant_count": len(variants),
         "baseline_D2": {"dev": baseline_dev, "holdout": baseline_holdout},
         "selected": selected,
+        "selected_detector_events": selected_events_by_key[selected_key],
         "dev_variants": variants,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -180,7 +181,10 @@ def main() -> None:
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     print(json.dumps({
-        **{key: value for key, value in report.items() if key != "dev_variants"},
+        **{
+            key: value for key, value in report.items()
+            if key not in {"dev_variants", "selected_detector_events"}
+        },
         "top_dev_variants": variants[:10],
     }, indent=2, ensure_ascii=False))
 
