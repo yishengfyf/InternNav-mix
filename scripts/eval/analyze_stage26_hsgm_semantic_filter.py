@@ -75,14 +75,18 @@ def _ratio(numerator: float, denominator: float) -> float | None:
 
 def _surface_rows(path: Path) -> Counter:
     with np.load(path, allow_pickle=False) as payload:
+        map_xyz = payload["map_xyz"]
+        class_id = payload["class_id"]
+        confidence = payload["confidence"]
+        occ_state = payload["occ_state"]
         return Counter(
             (
-                payload["map_xyz"][index].tobytes(),
-                int(payload["class_id"][index]),
-                payload["confidence"][index].tobytes(),
-                int(payload["occ_state"][index]),
+                map_xyz[index].tobytes(),
+                int(class_id[index]),
+                confidence[index].tobytes(),
+                int(occ_state[index]),
             )
-            for index in range(len(payload["map_xyz"]))
+            for index in range(len(map_xyz))
         )
 
 

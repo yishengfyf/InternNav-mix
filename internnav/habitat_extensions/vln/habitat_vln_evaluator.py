@@ -8333,6 +8333,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 instruction=episode_instruction,
                 scene_id=scene_id,
                 episode_id=episode_id,
+                episode_eval_seed=episode_eval_seed,
                 episode_index=episode_index,
                 episode_count=episode_count,
                 rank=getattr(self, "rank", 0),
