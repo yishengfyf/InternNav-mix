@@ -1,5 +1,7 @@
 from internnav.utils.stage25_event_gt_review import (
-    action_interval_summary, merge_windows, mine_review_windows,
+    action_interval_summary, annotate_review_candidates,
+    evaluate_detector_against_gt_lite, intervals_overlap, merge_windows,
+    mine_review_windows, objective_review_annotation, scene_split,
 )
 
 
@@ -110,3 +112,82 @@ def test_action_interval_summary_uses_executed_interval_only():
     assert summary["collision_delta"] == 1.0
     assert abs(summary["total_abs_turn_deg"] - 30.0) < 1e-4
     assert abs(summary["goal_distance_delta_m"] - 0.2) < 1e-6
+
+
+def review_candidate(family="offline_local_stagnation", scene="scene_a"):
+    return {
+        "review_family": family,
+        "scene_id": scene,
+        "episode_id": 1,
+        "onset_step": 10,
+        "end_step": 49,
+        "step_id": 49,
+        "duration_steps": 40,
+        "displacement_m": 0.05,
+        "path_length_m": 0.10 if family == "offline_local_stagnation" else 2.0,
+        "goal_distance_increase_m": 1.5,
+        "offline_action_audit": {
+            "applied_action_count": 40,
+            "action_counts": {
+                "stop": 0, "forward": 0, "left": 24, "right": 16,
+                "lookup": 0, "lookdown": 0,
+            },
+            "collision_delta": 0.0,
+            "total_abs_turn_deg": 600.0,
+            "turn_only_ratio": 1.0,
+        },
+        "outcome": {"success": 1.0, "steps": 100},
+    }
+
+
+def test_objective_rotation_stagnation_is_true_trap():
+    annotation = objective_review_annotation(review_candidate())
+    assert annotation["auto_status"] == "objective_confirmed"
+    assert annotation["state"] == "true_trap"
+    assert annotation["type"] == "G2_local_rotation_loop"
+    assert annotation["recoverability"] == "self_recovered_delayed"
+
+
+def test_wrong_way_is_confirmed_but_not_local_trap():
+    annotation = objective_review_annotation(
+        review_candidate("offline_wrong_way_progress")
+    )
+    assert annotation["auto_status"] == "objective_confirmed"
+    assert annotation["state"] == "wrong_way_progress"
+    assert annotation["recoverability"] == "not_a_local_trap"
+
+
+def test_short_ambiguous_stagnation_abstains():
+    candidate = review_candidate()
+    candidate["duration_steps"] = 12
+    candidate["offline_action_audit"]["applied_action_count"] = 12
+    assert objective_review_annotation(candidate)["auto_status"] == "abstain"
+
+
+def test_scene_split_is_deterministic_and_scene_disjoint():
+    assert scene_split("scene_a") == scene_split("scene_a")
+    rows = annotate_review_candidates([
+        review_candidate(scene="scene_a"),
+        {**review_candidate(scene="scene_a"), "episode_id": 2},
+    ])
+    assert len({row["split"] for row in rows}) == 1
+
+
+def test_interval_overlap_requires_same_episode():
+    first = review_candidate()
+    detector = {"scene_id": "scene_a", "episode_id": 1, "step_id": 45}
+    assert intervals_overlap(first, detector)
+    assert not intervals_overlap(first, {**detector, "episode_id": 2})
+
+
+def test_gt_lite_evaluation_reports_recall_not_precision():
+    gt = annotate_review_candidates([
+        review_candidate(),
+        review_candidate("offline_wrong_way_progress", scene="scene_b"),
+    ])
+    detector = [{"scene_id": "scene_a", "episode_id": 1, "step_id": 45}]
+    report = evaluate_detector_against_gt_lite(detector, gt)["all"]
+    assert report["objective_true_trap_count"] == 1
+    assert report["true_trap_recall"] == 1.0
+    assert report["wrong_way_protection_rate"] == 1.0
+    assert report["precision_status"].startswith("not_computed")
