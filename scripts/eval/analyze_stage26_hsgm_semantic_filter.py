@@ -10,12 +10,14 @@ from typing import Any, Dict, Iterable, List
 
 import numpy as np
 
-from analyze_stage24d_online_lseg_shadow import (
-    _compare_ledgers,
-    _jsonl,
-    _ledgers,
-    _semantic_dirs,
-)
+try:
+    from scripts.eval.analyze_stage24d_online_lseg_shadow import (
+        _compare_ledgers, _jsonl, _ledgers, _semantic_dirs,
+    )
+except ModuleNotFoundError:
+    from analyze_stage24d_online_lseg_shadow import (
+        _compare_ledgers, _jsonl, _ledgers, _semantic_dirs,
+    )
 
 
 def _load_json(path: Path) -> Any:
