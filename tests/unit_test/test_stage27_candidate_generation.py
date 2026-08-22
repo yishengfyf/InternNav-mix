@@ -90,6 +90,12 @@ def test_route_near_and_open_families_remain_distinct_when_possible():
     assert opened["source_step"] in {0, 1, 2}
     assert near["shadow_only"] and not near["action_applied"]
     assert near["gt_fields_used"] == []
+    assert result["route_candidate_universe_count"] == 3
+    assert result["candidate_count"] <= 2
+    assert all(
+        candidate["source_families"]
+        for candidate in result["ablation"]["route_only"]["candidates"]
+    )
 
 
 def test_floor_readout_uses_source_route_node_height():

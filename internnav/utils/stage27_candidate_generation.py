@@ -31,10 +31,17 @@ def _dedupe_translation_nodes(nodes: Iterable[Mapping[str, Any]]) -> List[Dict[s
         except (KeyError, TypeError, ValueError, IndexError):
             continue
         z = float(item.get("z", 0.0) or 0.0)
+        z_source = str(item.get("z_source") or "unspecified")
         if result and _distance(result[-1]["xy"], xy) <= 1e-4:
-            result[-1] = {**result[-1], "step_id": step, "grid": grid, "xy": xy, "z": z}
+            result[-1] = {
+                **result[-1], "step_id": step, "grid": grid, "xy": xy,
+                "z": z, "z_source": z_source,
+            }
             continue
-        result.append({"step_id": step, "grid": grid, "xy": xy, "z": z})
+        result.append({
+            "step_id": step, "grid": grid, "xy": xy,
+            "z": z, "z_source": z_source,
+        })
     return result
 
 
@@ -82,6 +89,17 @@ def _state_counts(
     return counts
 
 
+def _local_state_counts(
+    grid: Sequence[int], state_fn, *, radius_cells: int
+) -> Counter:
+    cells = []
+    for dr in range(-radius_cells, radius_cells + 1):
+        for dc in range(-radius_cells, radius_cells + 1):
+            if math.hypot(dr, dc) <= radius_cells:
+                cells.append((int(grid[0]) + dr, int(grid[1]) + dc))
+    return _state_counts(cells, state_fn)
+
+
 def _candidate_record(
     *,
     source_type: str,
@@ -92,6 +110,8 @@ def _candidate_record(
     state_counts: Mapping[str, int],
     floor_state_counts: Optional[Mapping[str, int]],
     floor_z_m: float,
+    floor_z_source: str,
+    local_state_counts: Mapping[str, int],
     path_length_m: float,
     floor_aligned_height_max_m: float,
     footprint_radius_m: float,
@@ -99,6 +119,7 @@ def _candidate_record(
     semantic: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     total = max(1, sum(int(value) for value in state_counts.values()))
+    local_total = max(1, sum(int(value) for value in local_state_counts.values()))
     semantic = dict(semantic or {})
     return {
         "candidate_id": f"{source_type}:{node.get('step_id', node_index)}",
@@ -120,6 +141,7 @@ def _candidate_record(
         "route_occ_conflict": bool(state_counts.get("occupied", 0)),
         "floor_aligned_height_max_m": float(floor_aligned_height_max_m),
         "floor_z_m": float(floor_z_m),
+        "floor_z_source": str(floor_z_source),
         "footprint_radius_m": float(footprint_radius_m),
         "floor_aligned_known_free": bool(
             (floor_state_counts or state_counts).get("free", 0) > 0
@@ -130,6 +152,13 @@ def _candidate_record(
             name: int((floor_state_counts or state_counts).get(name, 0))
             for name in ("free", "occupied", "unknown")
         },
+        "local_state_counts": {
+            name: int(local_state_counts.get(name, 0))
+            for name in ("free", "occupied", "unknown")
+        },
+        "local_free_fraction": float(local_state_counts.get("free", 0) / local_total),
+        "local_occupied_fraction": float(local_state_counts.get("occupied", 0) / local_total),
+        "local_unknown_fraction": float(local_state_counts.get("unknown", 0) / local_total),
         "semantic_evidence": semantic,
         "gt_fields_used": [],
         "shadow_only": True,
@@ -181,7 +210,7 @@ def generate_stage27_candidates(
     nodes = _dedupe_translation_nodes(route_nodes)
     trigger = [int(trigger_grid[0]), int(trigger_grid[1])]
     result: Dict[str, Any] = {
-        "event_schema_version": "stage27_m3_candidate_generation_v1",
+        "event_schema_version": "stage27_m3_candidate_generation_v2",
         "shadow_only": True,
         "action_applied": False,
         "gt_fields_used": [],
@@ -193,6 +222,7 @@ def generate_stage27_candidates(
         "eligible_candidate_count": 0,
         "candidate_direction_count": 0,
         "unknown_is_free": False,
+        "candidate_pool_contract": "R-route-near_union_R-route-open",
     }
     if len(nodes) < 2:
         result["reason"] = "insufficient_executed_route_nodes"
@@ -219,6 +249,14 @@ def generate_stage27_candidates(
         )
         states = _state_counts(path_cells, state_fn)
         floor_z_m = float(nodes[index].get("z", 0.0) or 0.0)
+        floor_z_source = str(nodes[index].get("z_source") or "unspecified")
+        local_states = _local_state_counts(
+            nodes[index]["grid"], state_fn,
+            radius_cells=max(1, int(math.ceil(
+                float(cfg.get("open_radius_m", 0.50))
+                / float(cfg.get("cell_size_m", 0.05))
+            ))),
+        )
         floor_states = (
             _state_counts(path_cells, floor_state_fn, floor_z_m=floor_z_m)
             if floor_state_fn is not None else states
@@ -234,6 +272,8 @@ def generate_stage27_candidates(
             path_cells=path_cells, state_counts=states,
             floor_state_counts=floor_states,
             floor_z_m=floor_z_m,
+            floor_z_source=floor_z_source,
+            local_state_counts=local_states,
             path_length_m=sum(
                 _distance(first["xy"], second["xy"])
                 for first, second in zip(nodes[index:], nodes[index + 1 :])
@@ -243,27 +283,42 @@ def generate_stage27_candidates(
             route_node_count=len(nodes), semantic=semantic,
         ))
 
-    near = route_candidates[: max(1, int(cfg.get("near_count", 1)))]
+    near = [
+        {**item, "source_type": "R-route-near", "source_families": ["R-route-near"]}
+        for item in route_candidates[: max(1, int(cfg.get("near_count", 1)))]
+    ]
     # Open is the best historical node by observed free fraction, then by
     # clearance and shorter path.  It remains a generator result, not a ranker.
     open_candidates = sorted(
         route_candidates,
         key=lambda item: (
-            float(item.get("floor_aligned_known_free", False)),
-            float(item.get("floor_aligned_state_counts", {}).get("free", 0))
-            / max(1, sum(item.get("floor_aligned_state_counts", {}).values())),
-            float(item.get("free_fraction", 0.0)),
-            -float(item.get("unknown_fraction", 0.0)),
-            -float(item.get("occupied_fraction", 0.0)),
+            float(item.get("local_free_fraction", 0.0)),
+            -float(item.get("local_unknown_fraction", 0.0)),
+            -float(item.get("local_occupied_fraction", 0.0)),
             -float(item.get("path_length_m", 0.0)),
         ), reverse=True,
     )[: max(1, int(cfg.get("open_count", 1)))]
+    open_candidates = [
+        {**item, "source_type": "R-route-open", "source_families": ["R-route-open"]}
+        for item in open_candidates
+    ]
     families = {
         "R-route-near": _dedupe(near, float(cfg.get("min_separation_m", 0.25))),
         "R-route-open": _dedupe(open_candidates, float(cfg.get("min_separation_m", 0.25))),
     }
     result["families"] = families
-    all_candidates = _dedupe(route_candidates, float(cfg.get("min_separation_m", 0.25)))
+    all_candidates = _dedupe(
+        families["R-route-near"] + families["R-route-open"],
+        float(cfg.get("min_separation_m", 0.25)),
+    )
+    for item in all_candidates:
+        matching_families = [
+            name for name, family in families.items()
+            if any(candidate["candidate_id"] == item["candidate_id"] for candidate in family)
+        ]
+        item["source_families"] = matching_families
+        item["source_type"] = "+".join(matching_families)
+    result["route_candidate_universe_count"] = len(route_candidates)
     result["candidate_count"] = len(all_candidates)
     result["candidate_direction_count"] = len({
         round(math.degrees(math.atan2(
@@ -297,6 +352,7 @@ def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: 
             "grid": [item.get("row"), item.get("col")],
             "xy": [item.get("x"), item.get("y")],
             "z": item.get("z", 0.0),
+            "z_source": item.get("pose_height_source", "unspecified"),
         }
         for item in raw_nodes
         if item.get("row") is not None and item.get("col") is not None

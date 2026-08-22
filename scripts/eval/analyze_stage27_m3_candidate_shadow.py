@@ -46,6 +46,7 @@ def _overlap(a: Mapping[str, Any], b: Mapping[str, Any], tolerance: int = 8) -> 
 
 
 def _stage_report(events: Iterable[Mapping[str, Any]], stage: str) -> Dict[str, Any]:
+    events = list(events)
     rows = [row.get("ablation", {}).get(stage, {}) for row in events]
     pools = [list(row.get("candidates") or []) for row in rows]
     candidates = [item for pool in pools for item in pool]
@@ -53,14 +54,28 @@ def _stage_report(events: Iterable[Mapping[str, Any]], stage: str) -> Dict[str, 
     unknown = [float(item.get("unknown_fraction", 0.0) or 0.0) for item in candidates]
     conflict = sum(bool(item.get("route_occ_conflict")) for item in candidates)
     floor_safe = sum(bool(item.get("floor_aligned_known_free")) for item in candidates)
+    floor_sources = Counter(item.get("floor_z_source", "unspecified") for item in candidates)
+    local_free = [float(item.get("local_free_fraction", 0.0) or 0.0) for item in candidates]
     return {
         "event_count": len(rows),
         "event_coverage": sum(bool(pool) for pool in pools) / max(1, len(rows)),
         "candidate_count": len(candidates),
         "candidate_per_event_mean": len(candidates) / max(1, len(rows)),
         "candidate_family_counts": dict(sorted(family_counts.items())),
+        "route_candidate_universe_mean": sum(
+            int(row.get("route_candidate_universe_count", 0) or 0) for row in events
+        ) / max(1, len(events)),
+        "candidate_direction_count_mean": sum(
+            int(row.get("candidate_direction_count", 0) or 0) for row in events
+        ) / max(1, len(events)),
         "route_occ_conflict_count": int(conflict),
         "floor_aligned_known_free_count": int(floor_safe),
+        "floor_z_source_counts": dict(sorted(floor_sources.items())),
+        "nonzero_floor_z_count": sum(
+            abs(float(item.get("floor_z_m", 0.0) or 0.0)) > 1e-4
+            for item in candidates
+        ),
+        "local_free_fraction_mean": sum(local_free) / max(1, len(local_free)),
         "unknown_fraction_mean": sum(unknown) / max(1, len(unknown)),
         "unknown_fraction_max": max(unknown) if unknown else 0.0,
         "action_applied_count": sum(bool(row.get("action_applied")) for row in events),
@@ -81,7 +96,7 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
     }
     return {
         "task": "stage27_m3_candidate_generation_shadow_audit",
-        "event_schema": "stage27_m3_candidate_generation_v1",
+        "event_schema": "stage27_m3_candidate_generation_v2",
         "event_count": len(events),
         "reports": reports,
         "gt_overlap_diagnostic": matched,
@@ -89,8 +104,15 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
         "ranker_trained": False,
         "unknown_is_free": False,
         "success_is_event_gt": False,
+        "candidate_pool_contracts": sorted({
+            str(row.get("candidate_pool_contract") or "legacy_all_route_nodes")
+            for row in events
+        }),
         "integrity_passed": bool(events) and all(
-            bool(row.get("shadow_only")) and not bool(row.get("action_applied")) and not row.get("gt_fields_used")
+            bool(row.get("shadow_only"))
+            and not bool(row.get("action_applied"))
+            and not row.get("gt_fields_used")
+            and row.get("candidate_pool_contract") == "R-route-near_union_R-route-open"
             for row in events
         ),
     }

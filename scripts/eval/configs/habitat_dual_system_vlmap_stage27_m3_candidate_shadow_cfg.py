@@ -26,6 +26,7 @@ vlmap_cfg["stage27_candidate_audit_config"] = {
     "near_count": 1,
     "open_count": 2,
     "sample_spacing_m": 0.05,
+    "open_radius_m": 0.50,
     "floor_aligned_height_max_m": 1.5,
     "footprint_radius_m": 0.18,
     "max_occupied_fraction": 0.0,
