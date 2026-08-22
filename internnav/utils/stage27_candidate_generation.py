@@ -1,0 +1,315 @@
+"""Stage27/M3 shadow candidate generation.
+
+The generator is deliberately a data-only adapter.  It exposes the executed
+route as strong historical support, but never treats that support as a
+replacement for current SparseOcc evidence.  In particular, ``unknown`` is
+never converted to ``free`` and an OCC conflict is retained in the record.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import Counter
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+
+def _distance(a: Sequence[float], b: Sequence[float]) -> float:
+    return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+
+def _grid_distance(a: Sequence[int], b: Sequence[int]) -> float:
+    return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+
+def _dedupe_translation_nodes(nodes: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for item in nodes:
+        try:
+            grid = [int(item["grid"][0]), int(item["grid"][1])]
+            step = int(item.get("step_id", len(result)))
+            xy = [float(item["xy"][0]), float(item["xy"][1])]
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        if result and _distance(result[-1]["xy"], xy) <= 1e-4:
+            result[-1] = {**result[-1], "step_id": step, "grid": grid, "xy": xy}
+            continue
+        result.append({"step_id": step, "grid": grid, "xy": xy})
+    return result
+
+
+def _path_cells_for_node(
+    node_index: int,
+    nodes: Sequence[Mapping[str, Any]],
+    *,
+    rasterize_edge,
+    sample_spacing_m: float,
+) -> List[Tuple[int, int]]:
+    cells: List[Tuple[int, int]] = []
+    for first, second in zip(nodes[node_index:], nodes[node_index + 1 :]):
+        length = _distance(first["xy"], second["xy"])
+        edge = rasterize_edge(
+            first["grid"],
+            second["grid"],
+            edge_length_m=length,
+            sample_spacing_m=sample_spacing_m,
+        )
+        for cell in edge:
+            pair = (int(cell[0]), int(cell[1]))
+            if not cells or pair != cells[-1]:
+                cells.append(pair)
+    return cells
+
+
+def _state_counts(cells: Iterable[Tuple[int, int]], state_fn) -> Counter:
+    counts = Counter()
+    for row, col in cells:
+        counts[str(state_fn(int(row), int(col)))] += 1
+    for name in ("free", "occupied", "unknown"):
+        counts.setdefault(name, 0)
+    return counts
+
+
+def _candidate_record(
+    *,
+    source_type: str,
+    node: Mapping[str, Any],
+    node_index: int,
+    trigger_grid: Sequence[int],
+    path_cells: Sequence[Tuple[int, int]],
+    state_counts: Mapping[str, int],
+    floor_state_counts: Optional[Mapping[str, int]],
+    path_length_m: float,
+    floor_aligned_height_max_m: float,
+    footprint_radius_m: float,
+    route_node_count: int,
+    semantic: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    total = max(1, sum(int(value) for value in state_counts.values()))
+    semantic = dict(semantic or {})
+    return {
+        "candidate_id": f"{source_type}:{node.get('step_id', node_index)}",
+        "source_type": source_type,
+        "route_node_index": int(node_index),
+        "source_step": node.get("step_id"),
+        "grid": [int(node["grid"][0]), int(node["grid"][1])],
+        "xy": [float(node["xy"][0]), float(node["xy"][1])],
+        "trigger_grid": [int(trigger_grid[0]), int(trigger_grid[1])],
+        "route_node_count": int(route_node_count),
+        "path_cells": [[int(row), int(col)] for row, col in path_cells],
+        "path_length_m": float(path_length_m),
+        "route_support": "executed_transition_chain",
+        "route_support_edge_count": int(max(0, route_node_count - node_index - 1)),
+        "state_counts": {name: int(state_counts.get(name, 0)) for name in ("free", "occupied", "unknown")},
+        "free_fraction": float(state_counts.get("free", 0) / total),
+        "occupied_fraction": float(state_counts.get("occupied", 0) / total),
+        "unknown_fraction": float(state_counts.get("unknown", 0) / total),
+        "route_occ_conflict": bool(state_counts.get("occupied", 0)),
+        "floor_aligned_height_max_m": float(floor_aligned_height_max_m),
+        "footprint_radius_m": float(footprint_radius_m),
+        "floor_aligned_known_free": bool(
+            (floor_state_counts or state_counts).get("free", 0) > 0
+            and (floor_state_counts or state_counts).get("occupied", 0) == 0
+            and (floor_state_counts or state_counts).get("unknown", 0) == 0
+        ),
+        "floor_aligned_state_counts": {
+            name: int((floor_state_counts or state_counts).get(name, 0))
+            for name in ("free", "occupied", "unknown")
+        },
+        "semantic_evidence": semantic,
+        "gt_fields_used": [],
+        "shadow_only": True,
+        "action_applied": False,
+    }
+
+
+def _passes(candidate: Mapping[str, Any], config: Mapping[str, Any], stage: str) -> bool:
+    if float(candidate.get("path_length_m", 0.0)) < float(config.get("min_distance_m", 0.50)):
+        return False
+    if float(candidate.get("path_length_m", 0.0)) > float(config.get("max_distance_m", 4.0)):
+        return False
+    if stage in {"route_occ", "route_occ_clearance"}:
+        if float(candidate.get("occupied_fraction", 0.0)) > float(config.get("max_occupied_fraction", 0.0)):
+            return False
+        if float(candidate.get("unknown_fraction", 0.0)) > float(config.get("max_unknown_fraction", 0.0)):
+            return False
+    if stage == "route_occ_clearance":
+        if not bool(candidate.get("floor_aligned_known_free")):
+            return False
+    return True
+
+
+def _dedupe(candidates: Sequence[Mapping[str, Any]], min_separation_m: float) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    for item in candidates:
+        if any(_distance(item["xy"], other["xy"]) < float(min_separation_m) for other in selected):
+            continue
+        selected.append(dict(item))
+    return selected
+
+
+def generate_stage27_candidates(
+    *,
+    route_nodes: Sequence[Mapping[str, Any]],
+    trigger_grid: Sequence[int],
+    state_fn,
+    rasterize_edge,
+    floor_state_fn=None,
+    semantic_nodes: Optional[Sequence[Mapping[str, Any]]] = None,
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Generate M3 candidate families and cumulative safety ablations.
+
+    ``route_nodes`` must contain only poses observed before the trigger.  The
+    function is suitable for live shadow calls and replay audits alike.
+    """
+    cfg = dict(config or {})
+    nodes = _dedupe_translation_nodes(route_nodes)
+    trigger = [int(trigger_grid[0]), int(trigger_grid[1])]
+    result: Dict[str, Any] = {
+        "event_schema_version": "stage27_m3_candidate_generation_v1",
+        "shadow_only": True,
+        "action_applied": False,
+        "gt_fields_used": [],
+        "trigger_grid": trigger,
+        "route_node_count": len(nodes),
+        "families": {},
+        "ablation": {},
+        "candidate_count": 0,
+        "eligible_candidate_count": 0,
+        "candidate_direction_count": 0,
+        "unknown_is_free": False,
+    }
+    if len(nodes) < 2:
+        result["reason"] = "insufficient_executed_route_nodes"
+        return result
+
+    # Candidate source points are strictly before the current pose and are
+    # ordered nearest-first to preserve the route-near baseline.
+    eligible_indices = [
+        index for index, node in enumerate(nodes[:-1])
+        if float(_grid_distance(node["grid"], trigger)) * float(cfg.get("cell_size_m", 0.05))
+        >= float(cfg.get("min_distance_m", 0.50))
+    ]
+    eligible_indices.sort(key=lambda index: _grid_distance(nodes[index]["grid"], trigger))
+    if not eligible_indices:
+        result["reason"] = "no_distance_eligible_route_node"
+        return result
+
+    route_candidates: List[Dict[str, Any]] = []
+    for index in eligible_indices:
+        path_cells = _path_cells_for_node(
+            index, nodes,
+            rasterize_edge=rasterize_edge,
+            sample_spacing_m=float(cfg.get("sample_spacing_m", 0.05)),
+        )
+        states = _state_counts(path_cells, state_fn)
+        floor_states = (
+            _state_counts(path_cells, floor_state_fn)
+            if floor_state_fn is not None else states
+        )
+        semantic = {}
+        for item in semantic_nodes or ():
+            if item.get("grid") and _grid_distance(item["grid"], nodes[index]["grid"]) <= float(cfg.get("semantic_bind_radius_cells", 50)):
+                semantic = dict(item)
+                break
+        route_candidates.append(_candidate_record(
+            source_type="route_node",
+            node=nodes[index], node_index=index, trigger_grid=trigger,
+            path_cells=path_cells, state_counts=states,
+            floor_state_counts=floor_states,
+            path_length_m=sum(
+                _distance(first["xy"], second["xy"])
+                for first, second in zip(nodes[index:], nodes[index + 1 :])
+            ),
+            floor_aligned_height_max_m=float(cfg.get("floor_aligned_height_max_m", 1.5)),
+            footprint_radius_m=float(cfg.get("footprint_radius_m", 0.18)),
+            route_node_count=len(nodes), semantic=semantic,
+        ))
+
+    near = route_candidates[: max(1, int(cfg.get("near_count", 1)))]
+    # Open is the best historical node by observed free fraction, then by
+    # clearance and shorter path.  It remains a generator result, not a ranker.
+    open_candidates = sorted(
+        route_candidates,
+        key=lambda item: (
+            float(item.get("free_fraction", 0.0)),
+            float(item.get("free_fraction", 0.0)),
+            -float(item.get("path_length_m", 0.0)),
+        ), reverse=True,
+    )[: max(1, int(cfg.get("open_count", 1)))]
+    families = {
+        "R-route-near": _dedupe(near, float(cfg.get("min_separation_m", 0.25))),
+        "R-route-open": _dedupe(open_candidates, float(cfg.get("min_separation_m", 0.25))),
+    }
+    result["families"] = families
+    all_candidates = _dedupe(route_candidates, float(cfg.get("min_separation_m", 0.25)))
+    result["candidate_count"] = len(all_candidates)
+    result["candidate_direction_count"] = len({
+        round(math.degrees(math.atan2(
+            float(item["xy"][1]) - float(nodes[-1]["xy"][1]),
+            float(item["xy"][0]) - float(nodes[-1]["xy"][0]),
+        )) / 45.0) for item in all_candidates
+    })
+    for stage in ("route_only", "route_occ", "route_occ_clearance"):
+        pool = [item for item in all_candidates if _passes(item, cfg, stage)]
+        result["ablation"][stage] = {
+            "candidates": pool,
+            "candidate_count": len(pool),
+            "event_has_candidate": bool(pool),
+            "safe_candidate_count": sum(
+                int(item.get("occupied_fraction", 0.0) == 0.0 and item.get("unknown_fraction", 0.0) == 0.0)
+                for item in pool
+            ),
+        }
+    result["eligible_candidate_count"] = int(result["ablation"]["route_occ_clearance"]["candidate_count"])
+    result["reason"] = "ok"
+    return result
+
+
+def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Build a Stage27 event from a live ``SparseOccSemanticMemory`` object."""
+    cfg = {"cell_size_m": float(getattr(memory, "cs", 0.05)), **dict(config or {})}
+    raw_nodes = list(getattr(memory, "pose_trace", []) or [])
+    nodes = [
+        {
+            "step_id": item.get("step_id"),
+            "grid": [item.get("row"), item.get("col")],
+            "xy": [item.get("x"), item.get("y")],
+            "z": item.get("z", 0.0),
+        }
+        for item in raw_nodes
+        if item.get("row") is not None and item.get("col") is not None
+    ]
+    radius_cells = max(
+        0,
+        int(math.ceil(float(cfg.get("footprint_radius_m", 0.18)) / float(getattr(memory, "cs", 0.05)))),
+    )
+    current_floor_z = float(nodes[-1].get("z", 0.0) or 0.0) if nodes else 0.0
+
+    def floor_aligned_state(row, col):
+        center = memory.validation_floor_aligned_cell_evidence(
+            int(row), int(col), current_floor_z,
+            height_max_m=float(cfg.get("floor_aligned_height_max_m", 1.5)),
+        )
+        any_free = center["state"] == "free"
+        for dr in range(-radius_cells, radius_cells + 1):
+            for dc in range(-radius_cells, radius_cells + 1):
+                if math.hypot(dr, dc) > radius_cells:
+                    continue
+                evidence = memory.validation_floor_aligned_cell_evidence(
+                    int(row) + dr, int(col) + dc, current_floor_z,
+                    height_max_m=float(cfg.get("floor_aligned_height_max_m", 1.5)),
+                )
+                if evidence["state"] == "blocked":
+                    return "occupied"
+                any_free = any_free or evidence["state"] == "free"
+        return "free" if any_free else "unknown"
+    return generate_stage27_candidates(
+        route_nodes=nodes,
+        trigger_grid=trigger_grid,
+        state_fn=memory._cell_state,
+        rasterize_edge=memory._rasterize_executed_route_edge,
+        floor_state_fn=floor_aligned_state,
+        semantic_nodes=getattr(memory, "semantic_anchors", None),
+        config=cfg,
+    )

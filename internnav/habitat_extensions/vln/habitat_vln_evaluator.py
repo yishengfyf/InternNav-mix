@@ -59,6 +59,7 @@ from internnav.utils.lseg_online_shadow import OnlineLSegSemanticShadow
 from internnav.utils.replay_ledger import ReplayLedger
 from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
+from internnav.utils.stage27_candidate_generation import generate_from_sparse_memory
 
 # Import for Habitat registry side effects — do not remove
 import internnav.habitat_extensions.vln.measures  # noqa: F401 # isort: skip
@@ -377,6 +378,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
             ),
         )
+        self._stage27_candidate_audit_enabled = bool(
+            vlmap_safety_cfg.get("stage27_candidate_audit_enable", False)
+        )
+        self._stage27_candidate_audit_cfg = dict(
+            vlmap_safety_cfg.get("stage27_candidate_audit_config", {}) or {}
+        )
+        self._stage27_candidate_audit_entries = {
+            (
+                str(item.get("scene_id")),
+                int(item.get("episode_id", -1)),
+                int(item.get("step_id", -1)),
+            ): dict(item)
+            for item in list(
+                vlmap_safety_cfg.get("stage27_candidate_audit_entries", []) or []
+            )
+            if isinstance(item, dict)
+        }
         self.occ_memory_oracle_pose = None
         if self._stage23a_oracle_pose_enabled:
             oracle_cfg = copy.deepcopy(vlmap_safety_cfg)
@@ -2772,6 +2790,49 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(log_path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
+    def _write_stage27_candidate_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "stage27_m3_candidate_events.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _maybe_write_stage27_candidate_audit(
+        self, *, scene_id: str, episode_id: int, episode_index: int,
+        episode_count: int, episode_eval_seed: Optional[int], step_id: int,
+        allow_unscheduled: bool = False,
+    ) -> None:
+        if not self._stage27_candidate_audit_enabled:
+            return
+        key = (str(scene_id), int(episode_id), int(step_id))
+        entry = self._stage27_candidate_audit_entries.get(key)
+        if entry is None and not allow_unscheduled:
+            return
+        entry = entry or {"selection": "all_detector_shadow_starts"}
+        trigger_grid = getattr(self.occ_memory, "last_pose_grid", None)
+        if trigger_grid is None:
+            return
+        event = generate_from_sparse_memory(
+            self.occ_memory,
+            trigger_grid=trigger_grid,
+            config=self._stage27_candidate_audit_cfg,
+        )
+        self._write_stage27_candidate_event({
+            "event_type": "stage27_m3_candidate_generation",
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "episode_index": int(episode_index),
+            "episode_count": int(episode_count),
+            "episode_eval_seed": episode_eval_seed,
+            "step_id": int(step_id),
+            "audit_selection": entry,
+            "audit_selection_fields_used": ["pre_registered_event_step"],
+            "candidate_feature_gt_fields_used": [],
+            **event,
+        })
+
     def _write_s2_loop_fixed_route_occ_audit_event(self, event: dict) -> None:
         run_dir = self._get_vlmap_run_dir()
         log_dir = run_dir or self.output_path
@@ -2910,6 +2971,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 ),
             },
         )
+        # An empty audit manifest is a smoke-only mode: record only actual D0
+        # loop starts, never every environment step.
+        if not self._stage27_candidate_audit_entries:
+            self._maybe_write_stage27_candidate_audit(
+                scene_id=scene_id,
+                episode_id=int(episode_id),
+                episode_index=int(episode_index),
+                episode_count=int(episode_count),
+                episode_eval_seed=episode_eval_seed,
+                step_id=int(step_id),
+                allow_unscheduled=True,
+            )
         candidate = self._best_semantic_resilience_backtrack_candidate(candidate_event)
         current_free_ratio = float(
             (candidate or {}).get("current_visible_free_ratio", 1.0) or 0.0
@@ -8645,6 +8718,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     current_depth_m,
                     rgb=rgb,
                     context=occ_memory_context,
+                )
+                # Stage27 is invoked only for the pre-registered detector
+                # event steps. It serializes shadow evidence and cannot affect
+                # the frozen action path.
+                self._maybe_write_stage27_candidate_audit(
+                    scene_id=scene_id,
+                    episode_id=int(episode_id),
+                    episode_index=int(episode_index),
+                    episode_count=int(episode_count),
+                    episode_eval_seed=episode_eval_seed,
+                    step_id=int(step_id),
                 )
                 # Stage24A is audit-only.  Keep the raw RGB-D in the ledger while
                 # indexing only compact map/pose state in JSONL; no ledger field is
