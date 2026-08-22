@@ -94,6 +94,7 @@ def analyze(
     ledgers = _ledgers(run_root)
     baseline_ledgers = _ledgers(baseline_root)
     semantic_dirs = _semantic_dirs(run_root)
+    baseline_semantic_dirs = _semantic_dirs(baseline_root)
     errors: List[str] = []
     raw_nodes: List[Dict[str, Any]] = []
     filtered_nodes: List[Dict[str, Any]] = []
@@ -109,6 +110,7 @@ def analyze(
         ledger = ledgers.get(key)
         baseline = baseline_ledgers.get(key)
         semantic_dir = semantic_dirs.get(key)
+        baseline_semantic_dir = baseline_semantic_dirs.get(key)
         if ledger is None:
             errors.append(f"{label}:missing_ledger")
             continue
@@ -117,6 +119,8 @@ def analyze(
         if semantic_dir is None:
             errors.append(f"{label}:missing_semantic_dir")
             continue
+        if baseline_semantic_dir is None:
+            errors.append(f"{label}:missing_baseline_semantic_dir")
         meta = _load_json(semantic_dir / "episode_meta.json")
         if int(meta.get("episode_eval_seed", -1)) != int(row["episode_eval_seed"]):
             errors.append(f"{label}:episode_eval_seed_mismatch")
@@ -141,11 +145,24 @@ def analyze(
             errors.append(f"{label}:filtered_node_count_mismatch")
         raw_surface_path = semantic_dir / "semantic_surface_memory.npz"
         filtered_surface_path = semantic_dir / "semantic_surface_memory_filtered.npz"
+        raw_rows = _surface_rows(raw_surface_path) if raw_surface_path.is_file() else Counter()
+        raw_semantics_exact = False
+        if baseline_semantic_dir is not None:
+            baseline_nodes_path = baseline_semantic_dir / "nodes.json"
+            baseline_surface_path = baseline_semantic_dir / "semantic_surface_memory.npz"
+            if not baseline_nodes_path.is_file() or not baseline_surface_path.is_file():
+                errors.append(f"{label}:missing_baseline_raw_semantics")
+            else:
+                raw_semantics_exact = (
+                    current_raw == _load_json(baseline_nodes_path)
+                    and raw_rows == _surface_rows(baseline_surface_path)
+                )
+                if not raw_semantics_exact:
+                    errors.append(f"{label}:raw_semantics_mismatch")
         if filtered_surface_path.is_file():
             if not raw_surface_path.is_file():
                 errors.append(f"{label}:filtered_surface_without_raw_surface")
             else:
-                raw_rows = _surface_rows(raw_surface_path)
                 filtered_rows = _surface_rows(filtered_surface_path)
                 if any(filtered_rows[item] > raw_rows[item] for item in filtered_rows):
                     errors.append(f"{label}:filtered_surface_not_exact_raw_subset")
@@ -175,6 +192,7 @@ def analyze(
             "episode_id": key[1],
             "episode_eval_seed": int(row["episode_eval_seed"]),
             "trajectory_exact_match": baseline is not None and not mismatch,
+            "raw_semantics_exact_match": raw_semantics_exact,
             "valid_frame_count": summary.get("valid_frame_count"),
             "raw_node_count": len(current_raw),
             "filtered_node_count": len(current_filtered),
@@ -213,6 +231,9 @@ def analyze(
         "manifest_expected_count": len(expected),
         "all_trajectories_exact_match": bool(episode_reports) and all(
             item["trajectory_exact_match"] for item in episode_reports
+        ),
+        "all_raw_semantics_exact_match": bool(episode_reports) and all(
+            item["raw_semantics_exact_match"] for item in episode_reports
         ),
         "errors": errors,
         "frame_filter": {

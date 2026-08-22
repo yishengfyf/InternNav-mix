@@ -104,6 +104,16 @@ def test_stage26_analyzer_checks_exact_subset_and_aggregates_gate(tmp_path):
         semantic / "semantic_surface_memory_filtered.npz",
         **{key: value[:3] for key, value in surface.items()},
     )
+    baseline_semantic = (
+        baseline_root / "online_lseg_shadow" / f"{scene_id}_{episode_id}_r0"
+    )
+    _write_json(baseline_semantic / "episode_meta.json", {
+        "scene_id": scene_id, "episode_id": episode_id,
+    })
+    _write_json(baseline_semantic / "nodes.json", raw_nodes)
+    np.savez_compressed(
+        baseline_semantic / "semantic_surface_memory.npz", **surface
+    )
     manifest = tmp_path / "manifest.json"
     _write_json(manifest, [{
         "scene_id": scene_id, "episode_id": episode_id,
@@ -116,6 +126,7 @@ def test_stage26_analyzer_checks_exact_subset_and_aggregates_gate(tmp_path):
 
     assert result["integrity_passed"]
     assert result["all_trajectories_exact_match"]
+    assert result["all_raw_semantics_exact_match"]
     assert result["frame_filter"]["sample_retention_rate"] == 0.75
     assert result["delta"]["gt_hit_count_retention"] == 1.0
     assert result["delta"]["strong_node_retention"] == 0.75
