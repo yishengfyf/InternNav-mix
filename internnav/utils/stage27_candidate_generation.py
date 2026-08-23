@@ -8,6 +8,7 @@ never converted to ``free`` and an OCC conflict is retained in the record.
 
 from __future__ import annotations
 
+import heapq
 import math
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -191,6 +192,105 @@ def _dedupe(candidates: Sequence[Mapping[str, Any]], min_separation_m: float) ->
     return selected
 
 
+def _sample_evenly(items: Sequence[Any], limit: int) -> List[Any]:
+    if limit <= 0 or len(items) <= limit:
+        return list(items)
+    if limit == 1:
+        return [items[0]]
+    return [
+        items[int(round(index * (len(items) - 1) / (limit - 1)))]
+        for index in range(limit)
+    ]
+
+
+def _known_free_geodesic_paths(
+    start: Sequence[int],
+    targets: Sequence[Sequence[int]],
+    *,
+    free_cells: Iterable[Tuple[int, int]],
+    neighbors_fn,
+    cell_size_m: float,
+    max_distance_m: float,
+    max_visited_cells: int,
+) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """Find bounded known-free paths without diagonal corner cutting."""
+    start_cell = (int(start[0]), int(start[1]))
+    remaining = {(int(cell[0]), int(cell[1])) for cell in targets}
+    free = {(int(cell[0]), int(cell[1])) for cell in free_cells}
+    distance = {start_cell: 0.0}
+    parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start_cell: None}
+    queue = [(0.0, start_cell)]
+    reached: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    visited = 0
+    while queue and remaining and visited < max(1, int(max_visited_cells)):
+        path_m, cell = heapq.heappop(queue)
+        if path_m > distance.get(cell, float("inf")) + 1e-9:
+            continue
+        if path_m > float(max_distance_m) + 1e-9:
+            break
+        visited += 1
+        if cell in remaining:
+            path = []
+            cursor: Optional[Tuple[int, int]] = cell
+            while cursor is not None:
+                path.append(cursor)
+                cursor = parent[cursor]
+            path.reverse()
+            reached[cell] = {
+                "path_cells": path,
+                "path_length_m": float(path_m),
+                "visited_cell_count": int(visited),
+            }
+            remaining.remove(cell)
+        for raw_neighbor in neighbors_fn(cell[0], cell[1]):
+            neighbor = (int(raw_neighbor[0]), int(raw_neighbor[1]))
+            if neighbor not in free:
+                continue
+            dr = int(neighbor[0] - cell[0])
+            dc = int(neighbor[1] - cell[1])
+            if dr and dc:
+                if (cell[0] + dr, cell[1]) not in free:
+                    continue
+                if (cell[0], cell[1] + dc) not in free:
+                    continue
+            next_m = float(path_m + math.hypot(dr, dc) * float(cell_size_m))
+            if next_m > float(max_distance_m) + 1e-9:
+                continue
+            if next_m + 1e-9 >= distance.get(neighbor, float("inf")):
+                continue
+            distance[neighbor] = next_m
+            parent[neighbor] = cell
+            heapq.heappush(queue, (next_m, neighbor))
+    return reached
+
+
+def _frontier_standoff_path(
+    path_cells: Sequence[Sequence[int]], *, cell_size_m: float, standoff_m: float
+) -> Dict[str, Any]:
+    cells = [(int(cell[0]), int(cell[1])) for cell in path_cells]
+    if not cells:
+        return {"path_cells": [], "path_length_m": 0.0, "standoff_m": 0.0}
+    index = len(cells) - 1
+    backed_off_m = 0.0
+    while index > 0 and backed_off_m + 1e-9 < float(standoff_m):
+        first, second = cells[index - 1], cells[index]
+        backed_off_m += math.hypot(
+            second[0] - first[0], second[1] - first[1]
+        ) * float(cell_size_m)
+        index -= 1
+    candidate_path = cells[: index + 1]
+    path_length_m = sum(
+        math.hypot(second[0] - first[0], second[1] - first[1])
+        * float(cell_size_m)
+        for first, second in zip(candidate_path, candidate_path[1:])
+    )
+    return {
+        "path_cells": candidate_path,
+        "path_length_m": float(path_length_m),
+        "standoff_m": float(backed_off_m),
+    }
+
+
 def generate_stage27_candidates(
     *,
     route_nodes: Sequence[Mapping[str, Any]],
@@ -211,7 +311,7 @@ def generate_stage27_candidates(
     nodes = _dedupe_translation_nodes(route_nodes)
     trigger = [int(trigger_grid[0]), int(trigger_grid[1])]
     result: Dict[str, Any] = {
-        "event_schema_version": "stage27_m3_candidate_generation_v4",
+        "event_schema_version": "stage27_m3_candidate_generation_v5",
         "shadow_only": True,
         "action_applied": False,
         "gt_fields_used": [],
@@ -373,16 +473,26 @@ def generate_stage27_candidates(
                 for route_node in nodes
             ):
                 continue
-            path_length = _distance(nodes[-1]["xy"], xy)
+            path_length = float(
+                node.get("path_length_m", _distance(nodes[-1]["xy"], xy))
+            )
             if not (min_path_m <= path_length <= max_path_m):
                 continue
-            path_cells = list(dict.fromkeys(
-                (int(cell[0]), int(cell[1]))
-                for cell in rasterize_edge(
-                    trigger, grid, edge_length_m=path_length,
-                    sample_spacing_m=float(cfg.get("sample_spacing_m", 0.05)),
-                )
-            ))
+            if node.get("path_cells"):
+                path_cells = list(dict.fromkeys(
+                    (int(cell[0]), int(cell[1]))
+                    for cell in node.get("path_cells", [])
+                ))
+                path_geometry = str(node.get("path_geometry") or "known_free_geodesic")
+            else:
+                path_cells = list(dict.fromkeys(
+                    (int(cell[0]), int(cell[1]))
+                    for cell in rasterize_edge(
+                        trigger, grid, edge_length_m=path_length,
+                        sample_spacing_m=float(cfg.get("sample_spacing_m", 0.05)),
+                    )
+                ))
+                path_geometry = "straight_line_fallback"
             states = _state_counts(path_cells, state_fn)
             floor_z_m = float(node.get("z", nodes[-1].get("z", 0.0)) or 0.0)
             floor_z_source = str(
@@ -413,6 +523,13 @@ def generate_stage27_candidates(
             )
             frontier_candidate["route_support"] = "local_known_safe_frontier"
             frontier_candidate["route_support_edge_count"] = 0
+            frontier_candidate["path_geometry"] = path_geometry
+            frontier_candidate["frontier_boundary_grid"] = [
+                int(value) for value in node.get("frontier_boundary_grid", grid)
+            ]
+            frontier_candidate["frontier_standoff_m"] = float(
+                node.get("frontier_standoff_m", 0.0) or 0.0
+            )
             frontier_candidates.append(frontier_candidate)
         frontier_candidates = _dedupe(
             frontier_candidates, float(cfg.get("min_separation_m", 0.25))
@@ -466,7 +583,7 @@ def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: 
             int(row), int(col), floor_z,
             height_max_m=float(cfg.get("floor_aligned_height_max_m", 1.5)),
         )
-        any_free = center["state"] == "free"
+        all_free = center["state"] == "free"
         for dr in range(-radius_cells, radius_cells + 1):
             for dc in range(-radius_cells, radius_cells + 1):
                 if math.hypot(dr, dc) > radius_cells:
@@ -477,28 +594,62 @@ def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: 
                 )
                 if evidence["state"] == "blocked":
                     return "occupied"
-                any_free = any_free or evidence["state"] == "free"
-        return "free" if any_free else "unknown"
+                all_free = all_free and evidence["state"] == "free"
+        return "free" if all_free else "unknown"
     frontier_nodes = []
+    frontier_local_cell_count = 0
+    frontier_sampled_cell_count = 0
     if bool(cfg.get("known_safe_frontier_enable", False)) and hasattr(memory, "get_frontier_cells"):
         max_frontier_distance_m = float(cfg.get("frontier_search_radius_m", 4.0))
-        for index, cell in enumerate(memory.get_frontier_cells(
-            sample_limit=int(cfg.get("frontier_sample_limit", 512))
-        )):
-            if _grid_distance(cell, trigger_grid) * float(memory.cs) > max_frontier_distance_m:
+        local_frontiers = [
+            cell for cell in memory.get_frontier_cells(sample_limit=0)
+            if _grid_distance(cell, trigger_grid) * float(memory.cs)
+            <= max_frontier_distance_m
+        ]
+        frontier_local_cell_count = len(local_frontiers)
+        sampled_frontiers = _sample_evenly(
+            local_frontiers, int(cfg.get("frontier_sample_limit", 512))
+        )
+        frontier_sampled_cell_count = len(sampled_frontiers)
+        free_cells = set(getattr(memory, "free2d_counts", {}).keys()) - set(
+            getattr(memory, "occ2d_counts", {}).keys()
+        )
+        paths = _known_free_geodesic_paths(
+            trigger_grid, sampled_frontiers,
+            free_cells=free_cells,
+            neighbors_fn=memory._neighbors2d,
+            cell_size_m=float(memory.cs),
+            max_distance_m=max_frontier_distance_m,
+            max_visited_cells=int(cfg.get("frontier_path_max_visited_cells", 30000)),
+        )
+        for index, cell in enumerate(sampled_frontiers):
+            path = paths.get((int(cell[0]), int(cell[1])))
+            if path is None:
                 continue
-            xy = memory._grid_to_xy([int(cell[0]), int(cell[1])])
+            standoff = _frontier_standoff_path(
+                path["path_cells"], cell_size_m=float(memory.cs),
+                standoff_m=float(cfg.get("frontier_standoff_m", 0.25)),
+            )
+            if not standoff["path_cells"]:
+                continue
+            candidate_cell = standoff["path_cells"][-1]
+            xy = memory._grid_to_xy(candidate_cell)
             nearest = min(
-                nodes, key=lambda item: _grid_distance(item["grid"], cell), default=None
+                nodes, key=lambda item: _grid_distance(item["grid"], candidate_cell), default=None
             )
             frontier_nodes.append({
                 "step_id": f"frontier_{index}",
-                "grid": [int(cell[0]), int(cell[1])],
+                "grid": [int(candidate_cell[0]), int(candidate_cell[1])],
                 "xy": [float(xy[0]), float(xy[1])],
                 "z": float((nearest or {}).get("z", 0.0) or 0.0),
                 "z_source": str((nearest or {}).get("z_source", "unspecified")),
+                "path_cells": standoff["path_cells"],
+                "path_length_m": float(standoff["path_length_m"]),
+                "path_geometry": "known_free_geodesic",
+                "frontier_boundary_grid": [int(cell[0]), int(cell[1])],
+                "frontier_standoff_m": float(standoff["standoff_m"]),
             })
-    return generate_stage27_candidates(
+    result = generate_stage27_candidates(
         route_nodes=nodes,
         trigger_grid=trigger_grid,
         state_fn=memory._cell_state,
@@ -508,3 +659,8 @@ def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: 
         frontier_nodes=frontier_nodes,
         config=cfg,
     )
+    result["frontier_path_mode"] = "known_free_geodesic"
+    result["frontier_local_cell_count"] = int(frontier_local_cell_count)
+    result["frontier_sampled_cell_count"] = int(frontier_sampled_cell_count)
+    result["frontier_geodesic_reachable_count"] = int(len(frontier_nodes))
+    return result

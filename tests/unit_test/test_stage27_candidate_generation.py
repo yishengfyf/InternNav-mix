@@ -12,6 +12,8 @@ SPEC = importlib.util.spec_from_file_location("stage27_candidate_generation", MO
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 generate_stage27_candidates = MODULE.generate_stage27_candidates
+known_free_geodesic_paths = MODULE._known_free_geodesic_paths
+frontier_standoff_path = MODULE._frontier_standoff_path
 
 
 def _nodes():
@@ -235,5 +237,65 @@ def test_frontier_near_executed_route_is_separated():
     )
     assert result["frontier_triggered"] is True
     assert all(item["source_step"] != "frontier_near_route" for item in result["frontier_candidates"])
-    assert result["event_schema_version"] == "stage27_m3_candidate_generation_v4"
+    assert result["event_schema_version"] == "stage27_m3_candidate_generation_v5"
     assert result["shadow_only"] is True and result["action_applied"] is False
+
+
+def _neighbors8(row, col):
+    return [
+        (row + dr, col + dc)
+        for dr in (-1, 0, 1)
+        for dc in (-1, 0, 1)
+        if dr or dc
+    ]
+
+
+def test_known_free_geodesic_routes_around_blocked_straight_line():
+    free = {(0, 0), (1, 0), (1, 1), (1, 2), (0, 2)}
+    paths = known_free_geodesic_paths(
+        [0, 0], [[0, 2]],
+        free_cells=free, neighbors_fn=_neighbors8,
+        cell_size_m=0.1, max_distance_m=1.0, max_visited_cells=100,
+    )
+    path = paths[(0, 2)]
+    assert (0, 1) not in path["path_cells"]
+    assert path["path_cells"][0] == (0, 0)
+    assert path["path_cells"][-1] == (0, 2)
+    assert path["path_length_m"] == 0.4
+
+
+def test_known_free_geodesic_does_not_cut_unknown_diagonal_corner():
+    paths = known_free_geodesic_paths(
+        [0, 0], [[1, 1]],
+        free_cells={(0, 0), (1, 1)}, neighbors_fn=_neighbors8,
+        cell_size_m=0.1, max_distance_m=1.0, max_visited_cells=100,
+    )
+    assert paths == {}
+
+
+def test_frontier_standoff_moves_candidate_inside_known_path():
+    standoff = frontier_standoff_path(
+        [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5)],
+        cell_size_m=0.05, standoff_m=0.18,
+    )
+    assert standoff["path_cells"] == [(0, 0), (0, 1)]
+    assert standoff["path_length_m"] == 0.05
+    assert round(standoff["standoff_m"], 6) == 0.2
+
+
+def test_frontier_uses_precomputed_known_free_geodesic_path():
+    frontier = [{
+        "step_id": "frontier_detour", "grid": [2, 25], "xy": [0.1, 1.25],
+        "path_cells": [(0, 15), (1, 15), (2, 15), (2, 20), (2, 25)],
+        "path_length_m": 0.6, "path_geometry": "known_free_geodesic",
+    }]
+    result = generate_stage27_candidates(
+        route_nodes=_nodes(), trigger_grid=[0, 15],
+        state_fn=lambda row, col: "unknown" if (row, col) == (0, 12) else "free",
+        rasterize_edge=_rasterize, frontier_nodes=frontier,
+        config=_frontier_config(),
+    )
+    candidate = result["ablation"]["route_occ_clearance_frontier"]["candidates"][0]
+    assert candidate["source_type"] == "F-local-known-safe-frontier"
+    assert candidate["path_geometry"] == "known_free_geodesic"
+    assert candidate["path_cells"] == [[0, 15], [1, 15], [2, 15], [2, 20], [2, 25]]

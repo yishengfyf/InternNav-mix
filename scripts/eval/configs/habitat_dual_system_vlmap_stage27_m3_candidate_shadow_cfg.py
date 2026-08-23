@@ -38,6 +38,8 @@ vlmap_cfg["stage27_candidate_audit_config"] = {
     "known_safe_frontier_enable": True,
     "frontier_search_radius_m": 4.0,
     "frontier_sample_limit": 512,
+    "frontier_path_max_visited_cells": 30000,
+    "frontier_standoff_m": 0.25,
     "frontier_min_route_separation_m": 0.25,
     "frontier_trigger_min_route_candidates": 1,
 }
