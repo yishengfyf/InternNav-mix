@@ -56,6 +56,14 @@ def _stage_report(events: Iterable[Mapping[str, Any]], stage: str) -> Dict[str, 
     floor_safe = sum(bool(item.get("floor_aligned_known_free")) for item in candidates)
     floor_sources = Counter(item.get("floor_z_source", "unspecified") for item in candidates)
     local_free = [float(item.get("local_free_fraction", 0.0) or 0.0) for item in candidates]
+    occupied = [float(item.get("occupied_fraction", 0.0) or 0.0) for item in candidates]
+    clearance_failures = sum(
+        not bool(item.get("floor_aligned_known_free")) for item in candidates
+    )
+    frontier_candidates = [
+        item for item in candidates
+        if str(item.get("source_type", "")).startswith("F-local-known-safe-frontier")
+    ]
     return {
         "event_count": len(rows),
         "event_coverage": sum(bool(pool) for pool in pools) / max(1, len(rows)),
@@ -81,6 +89,13 @@ def _stage_report(events: Iterable[Mapping[str, Any]], stage: str) -> Dict[str, 
         "local_free_fraction_mean": sum(local_free) / max(1, len(local_free)),
         "unknown_fraction_mean": sum(unknown) / max(1, len(unknown)),
         "unknown_fraction_max": max(unknown) if unknown else 0.0,
+        "occupied_fraction_mean": sum(occupied) / max(1, len(occupied)),
+        "clearance_failure_count": int(clearance_failures),
+        "frontier_candidate_count": len(frontier_candidates),
+        "frontier_event_count": sum(bool(pool) for pool in pools if any(
+            str(item.get("source_type", "")).startswith("F-local-known-safe-frontier")
+            for item in pool
+        )),
         "action_applied_count": sum(bool(row.get("action_applied")) for row in events),
         "gt_fields_used_union": sorted({field for row in events for field in row.get("gt_fields_used", [])}),
     }
@@ -89,19 +104,83 @@ def _stage_report(events: Iterable[Mapping[str, Any]], stage: str) -> Dict[str, 
 def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
     events = _load_events(root)
     gt = _load_gt(gt_path)
-    reports = {stage: _stage_report(events, stage) for stage in ("route_only", "route_occ", "route_occ_clearance")}
+    stages = ("route_only", "route_occ", "route_occ_clearance", "route_occ_clearance_frontier")
+    reports = {stage: _stage_report(events, stage) for stage in stages}
+    frontier_triggered_event_count = sum(bool(row.get("frontier_triggered")) for row in events)
+    raw_frontier_candidate_count = sum(
+        int(row.get("frontier_candidate_count", 0) or 0) for row in events
+    )
+    safe_frontier_candidate_count = sum(
+        int(row.get("frontier_safe_candidate_count", 0) or 0) for row in events
+    )
+    frontier_increment_event_count = sum(
+        int(row.get("frontier_safe_candidate_count", 0) or 0) > 0
+        and not bool(row.get("ablation", {}).get("route_occ_clearance", {}).get("event_has_candidate"))
+        for row in events
+    )
+    cumulative_candidate_count = sum(
+        len(row.get("ablation", {}).get("route_occ_clearance_frontier", {}).get("candidates") or [])
+        for row in events
+    )
     matched = {
         "all_gt_events": len(gt),
         "route_only": sum(any(_overlap(event, row) for row in gt) for event in events if event.get("ablation", {}).get("route_only", {}).get("event_has_candidate")),
         "route_occ": sum(any(_overlap(event, row) for row in gt) for event in events if event.get("ablation", {}).get("route_occ", {}).get("event_has_candidate")),
         "route_occ_clearance": sum(any(_overlap(event, row) for row in gt) for event in events if event.get("ablation", {}).get("route_occ_clearance", {}).get("event_has_candidate")),
+        "route_occ_clearance_frontier": sum(any(_overlap(event, row) for row in gt) for event in events if event.get("ablation", {}).get("route_occ_clearance_frontier", {}).get("event_has_candidate")),
         "label_status": "coverage_overlap_only_not_event_gt",
     }
+    def _candidate_contract_ok(row: Mapping[str, Any]) -> bool:
+        for stage in stages:
+            for candidate in row.get("ablation", {}).get(stage, {}).get("candidates", []) or []:
+                if (
+                    not bool(candidate.get("shadow_only"))
+                    or bool(candidate.get("action_applied"))
+                    or candidate.get("gt_fields_used")
+                    or str(candidate.get("source_type", "")).split("+")[0]
+                    not in {"R-route-near", "R-route-open", "F-local-known-safe-frontier"}
+                ):
+                    return False
+        return True
+
+    schema_ok = all(
+        row.get("event_schema_version") == "stage27_m3_candidate_generation_v4"
+        for row in events
+    )
+    route_contract_ok = all(
+        row.get("candidate_pool_contract") == "R-route-near_union_R-route-open"
+        for row in events
+    )
+    frontier_contract_ok = all(
+        row.get("frontier_pool_contract") == "F-local-known-safe-frontier"
+        for row in events
+    )
     return {
         "task": "stage27_m3_candidate_generation_shadow_audit",
-        "event_schema": "stage27_m3_candidate_generation_v3",
+        "event_schema": "stage27_m3_candidate_generation_v4",
         "event_count": len(events),
         "reports": reports,
+        "frontier_metrics": {
+            "frontier_triggered_event_count": frontier_triggered_event_count,
+            "frontier_triggered_event_rate": frontier_triggered_event_count / max(1, len(events)),
+            "raw_frontier_candidate_count": raw_frontier_candidate_count,
+            "safe_frontier_candidate_count": safe_frontier_candidate_count,
+            "frontier_increment_event_count": frontier_increment_event_count,
+            "frontier_incremental_event_coverage": frontier_increment_event_count / max(1, len(events)),
+            "cumulative_candidate_count": cumulative_candidate_count,
+            "frontier_unknown_fraction_mean": sum(
+                float(item.get("unknown_fraction", 0.0) or 0.0)
+                for row in events for item in row.get("frontier_candidates", []) or []
+            ) / max(1, raw_frontier_candidate_count),
+            "frontier_occupied_fraction_mean": sum(
+                float(item.get("occupied_fraction", 0.0) or 0.0)
+                for row in events for item in row.get("frontier_candidates", []) or []
+            ) / max(1, raw_frontier_candidate_count),
+            "frontier_clearance_failure_count": sum(
+                not bool(item.get("floor_aligned_known_free"))
+                for row in events for item in row.get("frontier_candidates", []) or []
+            ),
+        },
         "gt_overlap_diagnostic": matched,
         "active_recovery_enabled": False,
         "ranker_trained": False,
@@ -114,12 +193,23 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
         "event_schema_versions": sorted({
             str(row.get("event_schema_version") or "legacy") for row in events
         }),
+        "integrity_checks": {
+            "schema_v4": schema_ok,
+            "route_pool_contract": route_contract_ok,
+            "frontier_pool_contract": frontier_contract_ok,
+            "shadow_only": all(bool(row.get("shadow_only")) for row in events),
+            "no_action": all(not bool(row.get("action_applied")) for row in events),
+            "no_gt_fields": all(not row.get("gt_fields_used") for row in events),
+            "candidate_records_shadow_only": all(_candidate_contract_ok(row) for row in events),
+        },
         "integrity_passed": bool(events) and all(
             bool(row.get("shadow_only"))
             and not bool(row.get("action_applied"))
             and not row.get("gt_fields_used")
-            and row.get("event_schema_version") == "stage27_m3_candidate_generation_v3"
+            and row.get("event_schema_version") == "stage27_m3_candidate_generation_v4"
             and row.get("candidate_pool_contract") == "R-route-near_union_R-route-open"
+            and row.get("frontier_pool_contract") == "F-local-known-safe-frontier"
+            and _candidate_contract_ok(row)
             for row in events
         ),
     }

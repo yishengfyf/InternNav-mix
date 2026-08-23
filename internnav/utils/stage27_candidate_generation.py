@@ -199,6 +199,7 @@ def generate_stage27_candidates(
     rasterize_edge,
     floor_state_fn=None,
     semantic_nodes: Optional[Sequence[Mapping[str, Any]]] = None,
+    frontier_nodes: Optional[Sequence[Mapping[str, Any]]] = None,
     config: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Generate M3 candidate families and cumulative safety ablations.
@@ -210,7 +211,7 @@ def generate_stage27_candidates(
     nodes = _dedupe_translation_nodes(route_nodes)
     trigger = [int(trigger_grid[0]), int(trigger_grid[1])]
     result: Dict[str, Any] = {
-        "event_schema_version": "stage27_m3_candidate_generation_v3",
+        "event_schema_version": "stage27_m3_candidate_generation_v4",
         "shadow_only": True,
         "action_applied": False,
         "gt_fields_used": [],
@@ -223,6 +224,7 @@ def generate_stage27_candidates(
         "candidate_direction_count": 0,
         "unknown_is_free": False,
         "candidate_pool_contract": "R-route-near_union_R-route-open",
+        "frontier_pool_contract": "F-local-known-safe-frontier",
     }
     if len(nodes) < 2:
         result["reason"] = "insufficient_executed_route_nodes"
@@ -352,6 +354,86 @@ def generate_stage27_candidates(
                 for item in pool
             ),
         }
+    route_clearance_pool = result["ablation"]["route_occ_clearance"]["candidates"]
+    frontier_triggered = (
+        len(route_clearance_pool)
+        < max(1, int(cfg.get("frontier_trigger_min_route_candidates", 1)))
+    )
+    frontier_candidates: List[Dict[str, Any]] = []
+    if frontier_triggered:
+        for frontier_index, node in enumerate(frontier_nodes or ()):
+            try:
+                grid = [int(node["grid"][0]), int(node["grid"][1])]
+                xy = [float(node["xy"][0]), float(node["xy"][1])]
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            if any(
+                _distance(xy, route_node["xy"])
+                < float(cfg.get("frontier_min_route_separation_m", 0.25))
+                for route_node in nodes
+            ):
+                continue
+            path_length = _distance(nodes[-1]["xy"], xy)
+            if not (min_path_m <= path_length <= max_path_m):
+                continue
+            path_cells = list(dict.fromkeys(
+                (int(cell[0]), int(cell[1]))
+                for cell in rasterize_edge(
+                    trigger, grid, edge_length_m=path_length,
+                    sample_spacing_m=float(cfg.get("sample_spacing_m", 0.05)),
+                )
+            ))
+            states = _state_counts(path_cells, state_fn)
+            floor_z_m = float(node.get("z", nodes[-1].get("z", 0.0)) or 0.0)
+            floor_z_source = str(
+                node.get("z_source") or nodes[-1].get("z_source") or "unspecified"
+            )
+            floor_states = (
+                _state_counts(path_cells, floor_state_fn, floor_z_m=floor_z_m)
+                if floor_state_fn is not None else states
+            )
+            local_states = _local_state_counts(
+                grid, state_fn,
+                radius_cells=max(1, int(math.ceil(
+                    float(cfg.get("open_radius_m", 0.50))
+                    / float(cfg.get("cell_size_m", 0.05))
+                ))),
+            )
+            frontier_candidate = _candidate_record(
+                source_type="F-local-known-safe-frontier",
+                node={"step_id": node.get("step_id", frontier_index), "grid": grid, "xy": xy},
+                node_index=-1, trigger_grid=trigger,
+                path_cells=path_cells, state_counts=states,
+                floor_state_counts=floor_states, floor_z_m=floor_z_m,
+                floor_z_source=floor_z_source, local_state_counts=local_states,
+                path_length_m=path_length,
+                floor_aligned_height_max_m=float(cfg.get("floor_aligned_height_max_m", 1.5)),
+                footprint_radius_m=float(cfg.get("footprint_radius_m", 0.18)),
+                route_node_count=len(nodes),
+            )
+            frontier_candidate["route_support"] = "local_known_safe_frontier"
+            frontier_candidate["route_support_edge_count"] = 0
+            frontier_candidates.append(frontier_candidate)
+        frontier_candidates = _dedupe(
+            frontier_candidates, float(cfg.get("min_separation_m", 0.25))
+        )
+    frontier_safe = [
+        item for item in frontier_candidates
+        if _passes(item, cfg, "route_occ_clearance")
+    ]
+    cumulative = _dedupe(
+        route_clearance_pool + frontier_safe,
+        float(cfg.get("min_separation_m", 0.25)),
+    )
+    result["frontier_triggered"] = bool(frontier_triggered)
+    result["frontier_candidates"] = frontier_candidates
+    result["frontier_candidate_count"] = len(frontier_candidates)
+    result["frontier_safe_candidate_count"] = len(frontier_safe)
+    result["ablation"]["route_occ_clearance_frontier"] = {
+        "candidates": cumulative, "candidate_count": len(cumulative),
+        "event_has_candidate": bool(cumulative), "safe_candidate_count": len(cumulative),
+        "frontier_increment_count": max(0, len(cumulative) - len(route_clearance_pool)),
+    }
     result["eligible_candidate_count"] = int(result["ablation"]["route_occ_clearance"]["candidate_count"])
     result["reason"] = "ok"
     return result
@@ -397,6 +479,25 @@ def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: 
                     return "occupied"
                 any_free = any_free or evidence["state"] == "free"
         return "free" if any_free else "unknown"
+    frontier_nodes = []
+    if bool(cfg.get("known_safe_frontier_enable", False)) and hasattr(memory, "get_frontier_cells"):
+        max_frontier_distance_m = float(cfg.get("frontier_search_radius_m", 4.0))
+        for index, cell in enumerate(memory.get_frontier_cells(
+            sample_limit=int(cfg.get("frontier_sample_limit", 512))
+        )):
+            if _grid_distance(cell, trigger_grid) * float(memory.cs) > max_frontier_distance_m:
+                continue
+            xy = memory._grid_to_xy([int(cell[0]), int(cell[1])])
+            nearest = min(
+                nodes, key=lambda item: _grid_distance(item["grid"], cell), default=None
+            )
+            frontier_nodes.append({
+                "step_id": f"frontier_{index}",
+                "grid": [int(cell[0]), int(cell[1])],
+                "xy": [float(xy[0]), float(xy[1])],
+                "z": float((nearest or {}).get("z", 0.0) or 0.0),
+                "z_source": str((nearest or {}).get("z_source", "unspecified")),
+            })
     return generate_stage27_candidates(
         route_nodes=nodes,
         trigger_grid=trigger_grid,
@@ -404,5 +505,6 @@ def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: 
         rasterize_edge=memory._rasterize_executed_route_edge,
         floor_state_fn=floor_aligned_state,
         semantic_nodes=getattr(memory, "semantic_anchors", None),
+        frontier_nodes=frontier_nodes,
         config=cfg,
     )

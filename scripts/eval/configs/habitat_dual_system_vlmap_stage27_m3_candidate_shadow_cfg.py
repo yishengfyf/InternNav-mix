@@ -31,6 +31,15 @@ vlmap_cfg["stage27_candidate_audit_config"] = {
     "footprint_radius_m": 0.18,
     "max_occupied_fraction": 0.0,
     "max_unknown_fraction": 0.0,
+    # Known-safe frontier is a shadow-only fallback after the route pool has
+    # been exhausted.  Frontier cells themselves are known free; the adjacent
+    # unknown cell is only the reason for considering the boundary, never a
+    # safety vote for the candidate path.
+    "known_safe_frontier_enable": True,
+    "frontier_search_radius_m": 4.0,
+    "frontier_sample_limit": 512,
+    "frontier_min_route_separation_m": 0.25,
+    "frontier_trigger_min_route_candidates": 1,
 }
 # No candidate output can influence the navigator.  These assignments are
 # intentionally duplicated as a review-time guard.

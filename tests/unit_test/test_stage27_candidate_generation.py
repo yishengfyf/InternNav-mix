@@ -146,3 +146,94 @@ def test_route_near_uses_executed_path_distance_after_loop():
     assert result["route_candidate_universe_count"] == 4
     assert result["route_path_eligible_candidate_count"] == 3
     assert result["ablation"]["route_only"]["event_has_candidate"] is True
+
+
+def _frontier_nodes():
+    return [
+        {"step_id": "frontier_0", "grid": [0, 25], "xy": [0.0, 1.25], "z": 0.0},
+        {"step_id": "frontier_near_route", "grid": [0, 16], "xy": [0.0, 0.8], "z": 0.0},
+    ]
+
+
+def _frontier_config():
+    return {
+        "cell_size_m": 0.05,
+        "min_distance_m": 0.25,
+        "max_distance_m": 4.0,
+        "frontier_trigger_min_route_candidates": 1,
+        "frontier_min_route_separation_m": 0.25,
+    }
+
+
+def test_known_safe_frontier_is_only_fallback_after_route_clearance_empty():
+    result = generate_stage27_candidates(
+        route_nodes=_nodes(),
+        trigger_grid=[0, 15],
+        state_fn=lambda row, col: "unknown" if (row, col) == (0, 12) else "free",
+        rasterize_edge=_rasterize,
+        frontier_nodes=_frontier_nodes(),
+        config=_frontier_config(),
+    )
+    assert result["frontier_triggered"] is True
+    assert result["ablation"]["route_occ_clearance"]["event_has_candidate"] is False
+    frontier = result["ablation"]["route_occ_clearance_frontier"]
+    assert frontier["event_has_candidate"] is True
+    assert frontier["frontier_increment_count"] >= 1
+    assert all(item["source_type"].startswith("F-local-known-safe-frontier") for item in frontier["candidates"])
+
+
+def test_frontier_path_unknown_is_rejected():
+    result = generate_stage27_candidates(
+        route_nodes=_nodes(),
+        trigger_grid=[0, 15],
+        state_fn=lambda row, col: "unknown" if (row, col) in {(0, 12), (0, 20)} else "free",
+        rasterize_edge=_rasterize,
+        frontier_nodes=_frontier_nodes()[:1],
+        config=_frontier_config(),
+    )
+    assert result["frontier_triggered"] is True
+    assert result["frontier_candidate_count"] == 1
+    assert result["frontier_safe_candidate_count"] == 0
+    assert result["ablation"]["route_occ_clearance_frontier"]["event_has_candidate"] is False
+
+
+def test_frontier_path_occupied_is_rejected():
+    result = generate_stage27_candidates(
+        route_nodes=_nodes(),
+        trigger_grid=[0, 15],
+        state_fn=lambda row, col: "occupied" if (row, col) in {(0, 12), (0, 20)} else "free",
+        rasterize_edge=_rasterize,
+        frontier_nodes=_frontier_nodes()[:1],
+        config=_frontier_config(),
+    )
+    assert result["frontier_triggered"] is True
+    assert result["frontier_safe_candidate_count"] == 0
+
+
+def test_frontier_not_added_when_route_clearance_candidate_exists():
+    result = generate_stage27_candidates(
+        route_nodes=_nodes(),
+        trigger_grid=[0, 15],
+        state_fn=lambda row, col: "free",
+        rasterize_edge=_rasterize,
+        frontier_nodes=_frontier_nodes(),
+        config=_frontier_config(),
+    )
+    assert result["frontier_triggered"] is False
+    assert result["frontier_candidate_count"] == 0
+    assert result["ablation"]["route_occ_clearance_frontier"]["candidate_count"] == result["ablation"]["route_occ_clearance"]["candidate_count"]
+
+
+def test_frontier_near_executed_route_is_separated():
+    result = generate_stage27_candidates(
+        route_nodes=_nodes(),
+        trigger_grid=[0, 15],
+        state_fn=lambda row, col: "unknown" if (row, col) == (0, 12) else "free",
+        rasterize_edge=_rasterize,
+        frontier_nodes=_frontier_nodes(),
+        config=_frontier_config(),
+    )
+    assert result["frontier_triggered"] is True
+    assert all(item["source_step"] != "frontier_near_route" for item in result["frontier_candidates"])
+    assert result["event_schema_version"] == "stage27_m3_candidate_generation_v4"
+    assert result["shadow_only"] is True and result["action_applied"] is False
