@@ -210,7 +210,7 @@ def generate_stage27_candidates(
     nodes = _dedupe_translation_nodes(route_nodes)
     trigger = [int(trigger_grid[0]), int(trigger_grid[1])]
     result: Dict[str, Any] = {
-        "event_schema_version": "stage27_m3_candidate_generation_v2",
+        "event_schema_version": "stage27_m3_candidate_generation_v3",
         "shadow_only": True,
         "action_applied": False,
         "gt_fields_used": [],
@@ -283,14 +283,28 @@ def generate_stage27_candidates(
             route_node_count=len(nodes), semantic=semantic,
         ))
 
+    min_path_m = float(cfg.get("min_distance_m", 0.50))
+    max_path_m = float(cfg.get("max_distance_m", 4.0))
+    path_eligible_candidates = [
+        item for item in route_candidates
+        if min_path_m <= float(item.get("path_length_m", 0.0)) <= max_path_m
+    ]
+    # Route-near means the shortest authoritative retreat along the executed
+    # transition chain.  Spatial proximity alone is ambiguous after a loop.
+    path_eligible_candidates.sort(
+        key=lambda item: (
+            float(item.get("path_length_m", 0.0)),
+            -int(item.get("source_step", -1) or -1),
+        )
+    )
     near = [
         {**item, "source_type": "R-route-near", "source_families": ["R-route-near"]}
-        for item in route_candidates[: max(1, int(cfg.get("near_count", 1)))]
+        for item in path_eligible_candidates[: max(1, int(cfg.get("near_count", 1)))]
     ]
     # Open is the best historical node by observed free fraction, then by
     # clearance and shorter path.  It remains a generator result, not a ranker.
     open_candidates = sorted(
-        route_candidates,
+        path_eligible_candidates,
         key=lambda item: (
             float(item.get("local_free_fraction", 0.0)),
             -float(item.get("local_unknown_fraction", 0.0)),
@@ -319,6 +333,7 @@ def generate_stage27_candidates(
         item["source_families"] = matching_families
         item["source_type"] = "+".join(matching_families)
     result["route_candidate_universe_count"] = len(route_candidates)
+    result["route_path_eligible_candidate_count"] = len(path_eligible_candidates)
     result["candidate_count"] = len(all_candidates)
     result["candidate_direction_count"] = len({
         round(math.degrees(math.atan2(

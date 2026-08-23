@@ -117,3 +117,32 @@ def test_floor_readout_uses_source_route_node_height():
     assert seen_heights
     assert result["families"]["R-route-near"][0]["floor_z_m"] == 1.0
     assert result["families"]["R-route-near"][0]["floor_aligned_known_free"] is False
+
+
+def test_route_near_uses_executed_path_distance_after_loop():
+    nodes = [
+        {"step_id": 0, "grid": [0, 12], "xy": [0.0, 0.6]},
+        {"step_id": 1, "grid": [0, 40], "xy": [0.0, 2.0]},
+        {"step_id": 2, "grid": [0, 60], "xy": [0.0, 3.0]},
+        {"step_id": 3, "grid": [0, 20], "xy": [0.0, 1.0]},
+        {"step_id": 4, "grid": [0, 0], "xy": [0.0, 0.0]},
+    ]
+    result = generate_stage27_candidates(
+        route_nodes=nodes,
+        trigger_grid=[0, 0],
+        state_fn=lambda row, col: "free",
+        rasterize_edge=_rasterize,
+        config={
+            "cell_size_m": 0.05,
+            "min_distance_m": 0.50,
+            "max_distance_m": 4.0,
+            "near_count": 1,
+            "open_count": 1,
+        },
+    )
+    near = result["families"]["R-route-near"][0]
+    assert near["source_step"] == 3
+    assert near["path_length_m"] == 1.0
+    assert result["route_candidate_universe_count"] == 4
+    assert result["route_path_eligible_candidate_count"] == 3
+    assert result["ablation"]["route_only"]["event_has_candidate"] is True

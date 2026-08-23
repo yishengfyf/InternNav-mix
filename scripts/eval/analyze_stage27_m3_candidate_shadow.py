@@ -65,6 +65,9 @@ def _stage_report(events: Iterable[Mapping[str, Any]], stage: str) -> Dict[str, 
         "route_candidate_universe_mean": sum(
             int(row.get("route_candidate_universe_count", 0) or 0) for row in events
         ) / max(1, len(events)),
+        "route_path_eligible_candidate_mean": sum(
+            int(row.get("route_path_eligible_candidate_count", 0) or 0) for row in events
+        ) / max(1, len(events)),
         "candidate_direction_count_mean": sum(
             int(row.get("candidate_direction_count", 0) or 0) for row in events
         ) / max(1, len(events)),
@@ -96,7 +99,7 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
     }
     return {
         "task": "stage27_m3_candidate_generation_shadow_audit",
-        "event_schema": "stage27_m3_candidate_generation_v2",
+        "event_schema": "stage27_m3_candidate_generation_v3",
         "event_count": len(events),
         "reports": reports,
         "gt_overlap_diagnostic": matched,
@@ -108,10 +111,14 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
             str(row.get("candidate_pool_contract") or "legacy_all_route_nodes")
             for row in events
         }),
+        "event_schema_versions": sorted({
+            str(row.get("event_schema_version") or "legacy") for row in events
+        }),
         "integrity_passed": bool(events) and all(
             bool(row.get("shadow_only"))
             and not bool(row.get("action_applied"))
             and not row.get("gt_fields_used")
+            and row.get("event_schema_version") == "stage27_m3_candidate_generation_v3"
             and row.get("candidate_pool_contract") == "R-route-near_union_R-route-open"
             for row in events
         ),
