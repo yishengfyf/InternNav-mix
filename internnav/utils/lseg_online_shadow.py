@@ -753,6 +753,11 @@ class OnlineLSegSemanticShadow:
             node["evidence_tier"] = "strong" if strong else "weak"
         return nodes
 
+    def snapshot_nodes(self, *, filtered: bool = False) -> List[Dict[str, Any]]:
+        """Return a causal node snapshot from frames observed so far."""
+        frames = self.filtered_surface_frames if filtered else self.surface_frames
+        return self._merge_nodes(frames)
+
     def _audit_conflicts(self, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
         raw_pairs = Counter()
         severe_pairs = Counter()

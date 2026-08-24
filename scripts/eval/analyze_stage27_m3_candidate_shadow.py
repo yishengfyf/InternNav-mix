@@ -15,6 +15,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
 
+STAGES = (
+    "route_only",
+    "route_occ",
+    "route_occ_clearance",
+    "route_occ_clearance_frontier",
+    "route_occ_clearance_frontier_semantic_raw",
+    "route_occ_clearance_frontier_semantic_filtered",
+)
+
+
 def _jsonl(path: Path) -> List[Dict[str, Any]]:
     if not path.is_file():
         return []
@@ -128,12 +138,7 @@ def _manifest_group_report(
     events_by_key: Mapping[tuple[str, int, int], Mapping[str, Any]],
 ) -> Dict[str, Any]:
     expected = list(expected)
-    stages = (
-        "route_only",
-        "route_occ",
-        "route_occ_clearance",
-        "route_occ_clearance_frontier",
-    )
+    stages = STAGES
     observed = [events_by_key[_event_key(row)] for row in expected if _event_key(row) in events_by_key]
     stage_reports: Dict[str, Any] = {}
     for stage in stages:
@@ -213,7 +218,7 @@ def _manifest_coverage_report(
 def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
     events = _load_events(root)
     gt = _load_gt(gt_path)
-    stages = ("route_only", "route_occ", "route_occ_clearance", "route_occ_clearance_frontier")
+    stages = STAGES
     reports = {stage: _stage_report(events, stage) for stage in stages}
     frontier_triggered_event_count = sum(bool(row.get("frontier_triggered")) for row in events)
     raw_frontier_candidate_count = sum(
@@ -231,12 +236,63 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
         len(row.get("ablation", {}).get("route_occ_clearance_frontier", {}).get("candidates") or [])
         for row in events
     )
+    semantic_metrics = {}
+    for branch in ("raw", "filtered"):
+        stage = f"route_occ_clearance_frontier_semantic_{branch}"
+        semantic_metrics[branch] = {
+            "semantic_triggered_event_count": sum(
+                bool(row.get("semantic_triggered")) for row in events
+            ),
+            "semantic_node_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("semantic_node_count", 0) or 0)
+                for row in events
+            ),
+            "relevant_semantic_node_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("relevant_semantic_node_count", 0) or 0)
+                for row in events
+            ),
+            "proposed_candidate_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("proposed_candidate_count", 0) or 0)
+                for row in events
+            ),
+            "safe_proposed_candidate_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("safe_proposed_candidate_count", 0) or 0)
+                for row in events
+            ),
+            "selected_candidate_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("selected_candidate_count", 0) or 0)
+                for row in events
+            ),
+            "increment_candidate_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("increment_candidate_count", 0) or 0)
+                for row in events
+            ),
+            "increment_event_count": sum(
+                int(row.get("ablation", {}).get(stage, {}).get("semantic_increment_count", 0) or 0) > 0
+                for row in events
+            ),
+        }
+        semantic_metrics[branch]["incremental_event_coverage"] = (
+            semantic_metrics[branch]["increment_event_count"] / max(1, len(events))
+        )
     matched = {
         "all_gt_events": len(gt),
         "route_only": sum(any(_overlap(event, row) for row in gt) for event in events if event.get("ablation", {}).get("route_only", {}).get("event_has_candidate")),
         "route_occ": sum(any(_overlap(event, row) for row in gt) for event in events if event.get("ablation", {}).get("route_occ", {}).get("event_has_candidate")),
         "route_occ_clearance": sum(any(_overlap(event, row) for row in gt) for event in events if event.get("ablation", {}).get("route_occ_clearance", {}).get("event_has_candidate")),
         "route_occ_clearance_frontier": sum(any(_overlap(event, row) for row in gt) for event in events if event.get("ablation", {}).get("route_occ_clearance_frontier", {}).get("event_has_candidate")),
+        "route_occ_clearance_frontier_semantic_raw": sum(
+            any(_overlap(event, row) for row in gt) for event in events
+            if event.get("ablation", {}).get(
+                "route_occ_clearance_frontier_semantic_raw", {}
+            ).get("event_has_candidate")
+        ),
+        "route_occ_clearance_frontier_semantic_filtered": sum(
+            any(_overlap(event, row) for row in gt) for event in events
+            if event.get("ablation", {}).get(
+                "route_occ_clearance_frontier_semantic_filtered", {}
+            ).get("event_has_candidate")
+        ),
         "label_status": "coverage_overlap_only_not_event_gt",
     }
     def _candidate_contract_ok(row: Mapping[str, Any]) -> bool:
@@ -247,7 +303,10 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
                     or bool(candidate.get("action_applied"))
                     or candidate.get("gt_fields_used")
                     or str(candidate.get("source_type", "")).split("+")[0]
-                    not in {"R-route-near", "R-route-open", "F-local-known-safe-frontier"}
+                    not in {
+                        "R-route-near", "R-route-open", "F-local-known-safe-frontier",
+                        "S-route-reobserve-raw", "S-route-reobserve-filtered",
+                    }
                 ):
                     return False
         return True
@@ -263,9 +322,38 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
             for candidate in row.get("frontier_candidates", []) or []
         )
 
+    def _semantic_contract_ok(row: Mapping[str, Any]) -> bool:
+        if row.get("event_schema_version") != "stage27_m3_candidate_generation_v6":
+            return True
+        if (
+            row.get("semantic_pool_contract")
+            != "instruction_relevant_LSeg_to_executed_route_reobserve"
+            or row.get("semantic_safety_contract")
+            != "proposal_only_then_route_OCC_strict_unknown_1.5m_full_footprint"
+        ):
+            return False
+        for branch in ("raw", "filtered"):
+            stage = f"route_occ_clearance_frontier_semantic_{branch}"
+            for candidate in row.get("ablation", {}).get(stage, {}).get("candidates", []) or []:
+                if not str(candidate.get("source_type", "")).startswith("S-route-reobserve-"):
+                    continue
+                evidence = candidate.get("semantic_evidence") or {}
+                if (
+                    candidate.get("route_support") != "executed_transition_chain"
+                    or candidate.get("semantic_role") != "proposal_only_not_safety_evidence"
+                    or evidence.get("safety_vote") is not False
+                    or float(candidate.get("unknown_fraction", 0.0) or 0.0) != 0.0
+                    or float(candidate.get("occupied_fraction", 0.0) or 0.0) != 0.0
+                    or not bool(candidate.get("floor_aligned_known_free"))
+                ):
+                    return False
+        return True
+
     schema_ok = all(
-        row.get("event_schema_version") == "stage27_m3_candidate_generation_v5"
-        for row in events
+        row.get("event_schema_version") in {
+            "stage27_m3_candidate_generation_v5",
+            "stage27_m3_candidate_generation_v6",
+        } for row in events
     )
     route_contract_ok = all(
         row.get("candidate_pool_contract") == "R-route-near_union_R-route-open"
@@ -277,7 +365,11 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
     )
     return {
         "task": "stage27_m3_candidate_generation_shadow_audit",
-        "event_schema": "stage27_m3_candidate_generation_v5",
+        "event_schema": (
+            next(iter({str(row.get("event_schema_version")) for row in events}), "unknown")
+            if len({str(row.get("event_schema_version")) for row in events}) <= 1
+            else "mixed"
+        ),
         "event_count": len(events),
         "reports": reports,
         "frontier_metrics": {
@@ -324,6 +416,7 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
                 str(row.get("frontier_path_mode") or "unspecified") for row in events
             }),
         },
+        "semantic_metrics": semantic_metrics,
         "manifest_candidate_coverage": _manifest_coverage_report(events, gt),
         "gt_overlap_diagnostic": matched,
         "active_recovery_enabled": False,
@@ -338,11 +431,14 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
             str(row.get("event_schema_version") or "legacy") for row in events
         }),
         "integrity_checks": {
-            "schema_v5": schema_ok,
+            "schema_v5_or_v6": schema_ok,
             "route_pool_contract": route_contract_ok,
             "frontier_pool_contract": frontier_pool_contract_ok,
             "frontier_geodesic_standoff_contract": all(
                 _frontier_contract_ok(row) for row in events
+            ),
+            "semantic_proposal_safety_contract": all(
+                _semantic_contract_ok(row) for row in events
             ),
             "shadow_only": all(bool(row.get("shadow_only")) for row in events),
             "no_action": all(not bool(row.get("action_applied")) for row in events),
@@ -353,11 +449,15 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
             bool(row.get("shadow_only"))
             and not bool(row.get("action_applied"))
             and not row.get("gt_fields_used")
-            and row.get("event_schema_version") == "stage27_m3_candidate_generation_v5"
+            and row.get("event_schema_version") in {
+                "stage27_m3_candidate_generation_v5",
+                "stage27_m3_candidate_generation_v6",
+            }
             and row.get("candidate_pool_contract") == "R-route-near_union_R-route-open"
             and row.get("frontier_pool_contract") == "F-local-known-safe-frontier"
             and _candidate_contract_ok(row)
             and _frontier_contract_ok(row)
+            and _semantic_contract_ok(row)
             for row in events
         ),
     }

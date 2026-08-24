@@ -245,6 +245,45 @@ def test_node_merge_and_visualizations_are_audit_only(tmp_path):
     assert (shadow.episode_dir / "nodes_filtered.json").is_file()
 
 
+def test_snapshot_nodes_is_causal_and_selects_requested_surface_stream(tmp_path):
+    shadow = _shadow(tmp_path)
+    first_frame = {
+        "map_xyz": np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        "class_id": np.asarray([0], dtype=np.int16),
+        "confidence": np.asarray([0.8], dtype=np.float32),
+        "occ_state": np.asarray([2], dtype=np.int8),
+        "observation_index": np.asarray([0], dtype=np.int32),
+        "step_id": np.asarray([3], dtype=np.int32),
+    }
+    filtered_frame = {
+        key: value.copy() for key, value in first_frame.items()
+    }
+    filtered_frame["map_xyz"] = np.asarray([[0.1, 0.0, 1.0]], dtype=np.float32)
+    shadow.surface_frames = [first_frame]
+    shadow.filtered_surface_frames = [filtered_frame]
+
+    raw_before = shadow.snapshot_nodes(filtered=False)
+    filtered_before = shadow.snapshot_nodes(filtered=True)
+    assert len(raw_before) == len(filtered_before) == 1
+    assert np.allclose(raw_before[0]["centroid"], [0.0, 0.0, 1.0])
+    assert np.allclose(filtered_before[0]["centroid"], [0.1, 0.0, 1.0])
+    assert raw_before[0]["source_steps"] == [3]
+
+    future_frame = {
+        key: value.copy() for key, value in first_frame.items()
+    }
+    future_frame["map_xyz"] = np.asarray([[2.0, 0.0, 1.0]], dtype=np.float32)
+    future_frame["observation_index"] = np.asarray([1], dtype=np.int32)
+    future_frame["step_id"] = np.asarray([9], dtype=np.int32)
+    shadow.surface_frames.append(future_frame)
+
+    assert raw_before[0]["source_steps"] == [3]
+    raw_after = shadow.snapshot_nodes(filtered=False)
+    assert raw_after[0]["source_steps"] == [3]
+    assert np.allclose(raw_after[0]["centroid"], [0.0, 0.0, 1.0])
+    assert len(raw_after) == 2
+
+
 def test_conflict_audit_separates_boundaries_and_evidence_tiers(tmp_path):
     shadow = _shadow(tmp_path)
     nodes = [

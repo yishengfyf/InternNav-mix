@@ -2814,10 +2814,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         trigger_grid = getattr(self.occ_memory, "last_pose_grid", None)
         if trigger_grid is None:
             return
+        semantic_candidate_enabled = bool(
+            self._stage27_candidate_audit_cfg.get("semantic_candidate_enable", False)
+        )
+        semantic_raw_nodes = []
+        semantic_filtered_nodes = []
+        instruction = ""
+        if semantic_candidate_enabled:
+            semantic_raw_nodes = self.online_lseg_shadow.snapshot_nodes(filtered=False)
+            semantic_filtered_nodes = self.online_lseg_shadow.snapshot_nodes(filtered=True)
+            instruction = str(
+                (self.online_lseg_shadow.episode_meta or {}).get("instruction") or ""
+            )
         event = generate_from_sparse_memory(
             self.occ_memory,
             trigger_grid=trigger_grid,
             config=self._stage27_candidate_audit_cfg,
+            semantic_raw_nodes=semantic_raw_nodes,
+            semantic_filtered_nodes=semantic_filtered_nodes,
+            instruction=instruction,
         )
         self._write_stage27_candidate_event({
             "event_type": "stage27_m3_candidate_generation",
