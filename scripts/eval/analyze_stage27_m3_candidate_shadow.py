@@ -110,6 +110,106 @@ def _stage_report(events: Iterable[Mapping[str, Any]], stage: str) -> Dict[str, 
     }
 
 
+def _candidate_direction_count(
+    event: Mapping[str, Any], candidates: Iterable[Mapping[str, Any]]
+) -> int:
+    trigger = event.get("trigger_grid") or [0, 0]
+    return len({
+        round(math.degrees(math.atan2(
+            float(item.get("grid", [0, 0])[0]) - float(trigger[0]),
+            float(item.get("grid", [0, 0])[1]) - float(trigger[1]),
+        )) / 45.0)
+        for item in candidates
+    })
+
+
+def _manifest_group_report(
+    expected: Iterable[Mapping[str, Any]],
+    events_by_key: Mapping[tuple[str, int, int], Mapping[str, Any]],
+) -> Dict[str, Any]:
+    expected = list(expected)
+    stages = (
+        "route_only",
+        "route_occ",
+        "route_occ_clearance",
+        "route_occ_clearance_frontier",
+    )
+    observed = [events_by_key[_event_key(row)] for row in expected if _event_key(row) in events_by_key]
+    stage_reports: Dict[str, Any] = {}
+    for stage in stages:
+        pools = [
+            list(events_by_key.get(_event_key(row), {}).get("ablation", {}).get(stage, {}).get("candidates") or [])
+            for row in expected
+        ]
+        direction_counts = [
+            _candidate_direction_count(events_by_key[_event_key(row)], pool)
+            if _event_key(row) in events_by_key else 0
+            for row, pool in zip(expected, pools)
+        ]
+        counts = [len(pool) for pool in pools]
+        denominator = max(1, len(expected))
+        stage_reports[stage] = {
+            "event_coverage": sum(count >= 1 for count in counts) / denominator,
+            "event_coverage_at_least_2": sum(count >= 2 for count in counts) / denominator,
+            "event_coverage_at_least_3": sum(count >= 3 for count in counts) / denominator,
+            "candidate_count": sum(counts),
+            "candidate_per_expected_event_mean": sum(counts) / denominator,
+            "multi_candidate_event_count": sum(count >= 2 for count in counts),
+            "multi_direction_event_count": sum(count >= 2 for count in direction_counts),
+            "candidate_direction_count_mean": sum(direction_counts) / denominator,
+        }
+    return {
+        "expected_event_count": len(expected),
+        "observed_exact_event_count": len(observed),
+        "emitted_event_recall": len(observed) / max(1, len(expected)),
+        "reports": stage_reports,
+    }
+
+
+def _manifest_coverage_report(
+    events: Iterable[Mapping[str, Any]], gt: Iterable[Mapping[str, Any]]
+) -> Dict[str, Any]:
+    events = list(events)
+    gt = list(gt)
+    events_by_key = {_event_key(row): row for row in events}
+    expected_by_key = {_event_key(row): row for row in gt}
+    expected = [expected_by_key[key] for key in sorted(expected_by_key)]
+    missing_keys = sorted(set(expected_by_key) - set(events_by_key))
+    unexpected_keys = sorted(set(events_by_key) - set(expected_by_key))
+
+    def grouped(field: str) -> Dict[str, Any]:
+        values = sorted({str(row.get(field) or "unspecified") for row in expected})
+        return {
+            value: _manifest_group_report(
+                [row for row in expected if str(row.get(field) or "unspecified") == value],
+                events_by_key,
+            )
+            for value in values
+        }
+
+    return {
+        "denominator_contract": "exact_manifest_key_missing_events_count_as_zero_coverage",
+        "raw_manifest_event_count": len(gt),
+        "unique_expected_event_count": len(expected),
+        "duplicate_manifest_event_count": len(gt) - len(expected),
+        "observed_event_count": len(events),
+        "observed_exact_event_count": len(set(expected_by_key) & set(events_by_key)),
+        "missing_expected_event_count": len(missing_keys),
+        "unexpected_event_count": len(unexpected_keys),
+        "missing_expected_event_keys": [
+            {"scene_id": key[0], "episode_id": key[1], "step_id": key[2]}
+            for key in missing_keys
+        ],
+        "unexpected_event_keys": [
+            {"scene_id": key[0], "episode_id": key[1], "step_id": key[2]}
+            for key in unexpected_keys
+        ],
+        "all": _manifest_group_report(expected, events_by_key),
+        "by_gt_state": grouped("gt_state"),
+        "by_gt_split": grouped("gt_split"),
+    }
+
+
 def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
     events = _load_events(root)
     gt = _load_gt(gt_path)
@@ -224,6 +324,7 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
                 str(row.get("frontier_path_mode") or "unspecified") for row in events
             }),
         },
+        "manifest_candidate_coverage": _manifest_coverage_report(events, gt),
         "gt_overlap_diagnostic": matched,
         "active_recovery_enabled": False,
         "ranker_trained": False,
