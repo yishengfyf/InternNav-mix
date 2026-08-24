@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import re
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -20,6 +21,110 @@ def _distance(a: Sequence[float], b: Sequence[float]) -> float:
 
 def _grid_distance(a: Sequence[int], b: Sequence[int]) -> float:
     return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+
+_SEMANTIC_INSTRUCTION_TERMS = {
+    "door": {"door", "doorway", "entrance", "entry"},
+    "chair": {"chair", "chairs", "seat"},
+    "table": {"table", "tables", "desk"},
+    "stairs": {"stairs", "stair", "staircase", "steps"},
+    "sofa": {"sofa", "couch"},
+    "bed": {"bed", "bedroom"},
+    "cabinet": {"cabinet", "cabinets", "drawer", "drawers", "chest"},
+    "window": {"window", "windows"},
+    "wall": {"wall", "walls"},
+    "floor": {"floor", "ground"},
+    "shelving": {"shelf", "shelves", "shelving"},
+    "closet": {"closet", "wardrobe"},
+    "painting": {"painting", "picture", "artwork"},
+}
+
+
+def _instruction_semantic_labels(instruction: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]+", str(instruction or "").lower()))
+    return {
+        label for label, terms in _SEMANTIC_INSTRUCTION_TERMS.items()
+        if tokens.intersection(terms)
+    }
+
+
+def _semantic_route_reobserve_candidates(
+    *,
+    semantic_nodes: Sequence[Mapping[str, Any]],
+    route_candidates: Sequence[Mapping[str, Any]],
+    instruction: str,
+    branch: str,
+    config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    relevant_labels = _instruction_semantic_labels(instruction)
+    relevant_nodes = [
+        dict(node) for node in semantic_nodes
+        if str(node.get("label") or "").lower() in relevant_labels
+        and list(node.get("source_steps") or [])
+    ]
+    neighbors_per_node = max(
+        1, int(config.get("semantic_route_neighbors_per_node", 3))
+    )
+    proposals: Dict[str, Tuple[Tuple[Any, ...], Dict[str, Any]]] = {}
+    for node in relevant_nodes:
+        source_steps = []
+        for value in node.get("source_steps") or []:
+            try:
+                source_steps.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        if not source_steps:
+            continue
+        ranked_route = sorted(
+            route_candidates,
+            key=lambda candidate: min(
+                abs(int(candidate.get("source_step", -10**9)) - step)
+                for step in source_steps
+            ),
+        )[:neighbors_per_node]
+        for candidate in ranked_route:
+            step_distance = min(
+                abs(int(candidate.get("source_step", -10**9)) - step)
+                for step in source_steps
+            )
+            priority = (
+                0 if node.get("evidence_tier") == "strong" else 1,
+                -float(node.get("mean_confidence", 0.0) or 0.0),
+                -int(node.get("point_count", 0) or 0),
+                int(step_distance),
+                -max(source_steps),
+            )
+            item = dict(candidate)
+            item["source_type"] = f"S-route-reobserve-{branch}"
+            item["source_families"] = [item["source_type"]]
+            item["semantic_role"] = "proposal_only_not_safety_evidence"
+            item["semantic_evidence"] = {
+                "branch": str(branch),
+                "node_id": node.get("node_id"),
+                "label": node.get("label"),
+                "evidence_tier": node.get("evidence_tier"),
+                "mean_confidence": node.get("mean_confidence"),
+                "point_count": node.get("point_count"),
+                "source_steps": source_steps,
+                "route_step_distance": int(step_distance),
+                "instruction_relevant": True,
+                "safety_vote": False,
+            }
+            candidate_id = str(item.get("candidate_id"))
+            previous = proposals.get(candidate_id)
+            if previous is None or priority < previous[0]:
+                proposals[candidate_id] = (priority, item)
+    ordered = [item for _, item in sorted(proposals.values(), key=lambda value: value[0])]
+    safe = [item for item in ordered if _passes(item, config, "route_occ_clearance")]
+    selected = safe[:max(1, int(config.get("semantic_candidate_count", 3)))]
+    return {
+        "instruction_relevant_labels": sorted(relevant_labels),
+        "semantic_node_count": len(semantic_nodes),
+        "relevant_semantic_node_count": len(relevant_nodes),
+        "proposed_candidate_count": len(ordered),
+        "safe_proposed_candidate_count": len(safe),
+        "selected_candidates": selected,
+    }
 
 
 def _dedupe_translation_nodes(nodes: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -299,6 +404,9 @@ def generate_stage27_candidates(
     rasterize_edge,
     floor_state_fn=None,
     semantic_nodes: Optional[Sequence[Mapping[str, Any]]] = None,
+    semantic_raw_nodes: Optional[Sequence[Mapping[str, Any]]] = None,
+    semantic_filtered_nodes: Optional[Sequence[Mapping[str, Any]]] = None,
+    instruction: str = "",
     frontier_nodes: Optional[Sequence[Mapping[str, Any]]] = None,
     config: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -308,10 +416,14 @@ def generate_stage27_candidates(
     function is suitable for live shadow calls and replay audits alike.
     """
     cfg = dict(config or {})
+    semantic_candidate_enabled = bool(cfg.get("semantic_candidate_enable", False))
     nodes = _dedupe_translation_nodes(route_nodes)
     trigger = [int(trigger_grid[0]), int(trigger_grid[1])]
     result: Dict[str, Any] = {
-        "event_schema_version": "stage27_m3_candidate_generation_v5",
+        "event_schema_version": (
+            "stage27_m3_candidate_generation_v6"
+            if semantic_candidate_enabled else "stage27_m3_candidate_generation_v5"
+        ),
         "shadow_only": True,
         "action_applied": False,
         "gt_fields_used": [],
@@ -325,6 +437,9 @@ def generate_stage27_candidates(
         "unknown_is_free": False,
         "candidate_pool_contract": "R-route-near_union_R-route-open",
         "frontier_pool_contract": "F-local-known-safe-frontier",
+        "semantic_candidate_enabled": semantic_candidate_enabled,
+        "semantic_pool_contract": "instruction_relevant_LSeg_to_executed_route_reobserve",
+        "semantic_safety_contract": "proposal_only_then_route_OCC_strict_unknown_1.5m_full_footprint",
     }
     if len(nodes) < 2:
         result["reason"] = "insufficient_executed_route_nodes"
@@ -551,12 +666,68 @@ def generate_stage27_candidates(
         "event_has_candidate": bool(cumulative), "safe_candidate_count": len(cumulative),
         "frontier_increment_count": max(0, len(cumulative) - len(route_clearance_pool)),
     }
+    if semantic_candidate_enabled:
+        semantic_triggered = len(cumulative) < max(
+            1, int(cfg.get("semantic_trigger_min_base_candidates", 1))
+        )
+        semantic_reports = {}
+        for branch, branch_nodes in (
+            ("raw", list(semantic_raw_nodes or [])),
+            ("filtered", list(semantic_filtered_nodes or [])),
+        ):
+            report = {
+                "instruction_relevant_labels": sorted(
+                    _instruction_semantic_labels(instruction)
+                ),
+                "semantic_node_count": len(branch_nodes),
+                "relevant_semantic_node_count": 0,
+                "proposed_candidate_count": 0,
+                "safe_proposed_candidate_count": 0,
+                "selected_candidates": [],
+            }
+            if semantic_triggered:
+                report = _semantic_route_reobserve_candidates(
+                    semantic_nodes=branch_nodes,
+                    route_candidates=path_eligible_candidates,
+                    instruction=instruction,
+                    branch=branch,
+                    config=cfg,
+                )
+            semantic_candidates = list(report.pop("selected_candidates"))
+            semantic_cumulative = _dedupe(
+                cumulative + semantic_candidates,
+                float(cfg.get("min_separation_m", 0.25)),
+            )
+            stage = f"route_occ_clearance_frontier_semantic_{branch}"
+            result["ablation"][stage] = {
+                "candidates": semantic_cumulative,
+                "candidate_count": len(semantic_cumulative),
+                "event_has_candidate": bool(semantic_cumulative),
+                "safe_candidate_count": len(semantic_cumulative),
+                "semantic_increment_count": max(
+                    0, len(semantic_cumulative) - len(cumulative)
+                ),
+            }
+            semantic_reports[branch] = {
+                **report,
+                "selected_candidate_count": len(semantic_candidates),
+                "increment_candidate_count": max(
+                    0, len(semantic_cumulative) - len(cumulative)
+                ),
+            }
+        result["semantic_triggered"] = bool(semantic_triggered)
+        result["semantic_reports"] = semantic_reports
     result["eligible_candidate_count"] = int(result["ablation"]["route_occ_clearance"]["candidate_count"])
     result["reason"] = "ok"
     return result
 
 
-def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+def generate_from_sparse_memory(
+    memory, *, trigger_grid: Sequence[int], config: Optional[Mapping[str, Any]] = None,
+    semantic_raw_nodes: Optional[Sequence[Mapping[str, Any]]] = None,
+    semantic_filtered_nodes: Optional[Sequence[Mapping[str, Any]]] = None,
+    instruction: str = "",
+) -> Dict[str, Any]:
     """Build a Stage27 event from a live ``SparseOccSemanticMemory`` object."""
     cfg = {"cell_size_m": float(getattr(memory, "cs", 0.05)), **dict(config or {})}
     raw_nodes = list(getattr(memory, "pose_trace", []) or [])
@@ -656,6 +827,9 @@ def generate_from_sparse_memory(memory, *, trigger_grid: Sequence[int], config: 
         rasterize_edge=memory._rasterize_executed_route_edge,
         floor_state_fn=floor_aligned_state,
         semantic_nodes=getattr(memory, "semantic_anchors", None),
+        semantic_raw_nodes=semantic_raw_nodes,
+        semantic_filtered_nodes=semantic_filtered_nodes,
+        instruction=instruction,
         frontier_nodes=frontier_nodes,
         config=cfg,
     )

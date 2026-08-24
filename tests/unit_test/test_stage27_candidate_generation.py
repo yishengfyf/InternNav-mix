@@ -299,3 +299,85 @@ def test_frontier_uses_precomputed_known_free_geodesic_path():
     assert candidate["source_type"] == "F-local-known-safe-frontier"
     assert candidate["path_geometry"] == "known_free_geodesic"
     assert candidate["path_cells"] == [[0, 15], [1, 15], [2, 15], [2, 20], [2, 25]]
+
+
+def _semantic_nodes(label="bed"):
+    return [{
+        "node_id": "SN00001", "label": label, "source_steps": [0],
+        "evidence_tier": "strong", "mean_confidence": 0.72,
+        "point_count": 48,
+    }]
+
+
+def test_semantic_route_reobserve_adds_only_hard_safe_executed_route_node():
+    nodes = [
+        {**item, "z": 0.0 if item["step_id"] == 0 else 1.0}
+        for item in _nodes()
+    ]
+
+    def floor_state(_row, _col, floor_z_m):
+        return "free" if float(floor_z_m) == 0.0 else "occupied"
+
+    result = generate_stage27_candidates(
+        route_nodes=nodes, trigger_grid=[0, 15],
+        state_fn=lambda row, col: "free", rasterize_edge=_rasterize,
+        floor_state_fn=floor_state,
+        semantic_raw_nodes=_semantic_nodes(),
+        semantic_filtered_nodes=_semantic_nodes(),
+        instruction="Leave the bedroom and turn toward the hall.",
+        config={
+            "cell_size_m": 0.05, "min_distance_m": 0.25,
+            "max_distance_m": 4.0, "near_count": 1, "open_count": 1,
+            "semantic_candidate_enable": True,
+            "semantic_route_neighbors_per_node": 1,
+            "semantic_candidate_count": 1,
+        },
+    )
+    assert result["event_schema_version"] == "stage27_m3_candidate_generation_v6"
+    assert not result["ablation"]["route_occ_clearance_frontier"]["event_has_candidate"]
+    for branch in ("raw", "filtered"):
+        stage = f"route_occ_clearance_frontier_semantic_{branch}"
+        candidate = result["ablation"][stage]["candidates"][0]
+        assert candidate["source_step"] == 0
+        assert candidate["route_support"] == "executed_transition_chain"
+        assert candidate["floor_aligned_known_free"] is True
+        assert candidate["semantic_evidence"]["safety_vote"] is False
+        assert candidate["semantic_role"] == "proposal_only_not_safety_evidence"
+
+
+def test_semantic_candidate_requires_instruction_relevance():
+    result = generate_stage27_candidates(
+        route_nodes=_nodes(), trigger_grid=[0, 15],
+        state_fn=lambda row, col: "unknown", rasterize_edge=_rasterize,
+        semantic_raw_nodes=_semantic_nodes("chair"),
+        semantic_filtered_nodes=_semantic_nodes("chair"),
+        instruction="Walk down the hallway.",
+        config={
+            "cell_size_m": 0.05, "min_distance_m": 0.25,
+            "max_distance_m": 4.0, "semantic_candidate_enable": True,
+        },
+    )
+    for branch in ("raw", "filtered"):
+        report = result["semantic_reports"][branch]
+        assert report["relevant_semantic_node_count"] == 0
+        assert report["selected_candidate_count"] == 0
+
+
+def test_semantic_evidence_never_overrides_unknown_path():
+    result = generate_stage27_candidates(
+        route_nodes=_nodes(), trigger_grid=[0, 15],
+        state_fn=lambda row, col: "unknown" if col <= 10 else "free",
+        rasterize_edge=_rasterize,
+        semantic_raw_nodes=_semantic_nodes(),
+        semantic_filtered_nodes=_semantic_nodes(),
+        instruction="Return toward the bed.",
+        config={
+            "cell_size_m": 0.05, "min_distance_m": 0.25,
+            "max_distance_m": 4.0, "semantic_candidate_enable": True,
+            "semantic_route_neighbors_per_node": 1,
+        },
+    )
+    for branch in ("raw", "filtered"):
+        stage = f"route_occ_clearance_frontier_semantic_{branch}"
+        assert result["semantic_reports"][branch]["safe_proposed_candidate_count"] == 0
+        assert not result["ablation"][stage]["event_has_candidate"]
