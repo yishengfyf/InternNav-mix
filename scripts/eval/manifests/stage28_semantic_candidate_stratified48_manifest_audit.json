@@ -1,0 +1,890 @@
+{
+  "task": "stage28_stratified_semantic_candidate_pilot_manifest",
+  "selection_inputs": "frozen_stage27_e1_geometry_and_gtlite_split_only",
+  "semantic_fields_used": [],
+  "future_success_used_as_event_gt": false,
+  "episode_count": 48,
+  "scene_count": 38,
+  "event_count": 62,
+  "selection_reason_counts": {
+    "all_holdout_event_episode": 15,
+    "dev_geometry_nonzero_true_trap": 4,
+    "dev_geometry_nonzero_wrong_way_progress": 4,
+    "dev_geometry_zero_true_trap": 6,
+    "dev_geometry_zero_wrong_way_progress": 6,
+    "preregistered_success_collision_free_no_gtlite_event_control": 13
+  },
+  "event_strata": {
+    "dev/true_trap/nonzero": 6,
+    "dev/true_trap/zero": 11,
+    "dev/wrong_way_progress/nonzero": 9,
+    "dev/wrong_way_progress/zero": 14,
+    "holdout/true_trap/nonzero": 1,
+    "holdout/true_trap/zero": 8,
+    "holdout/wrong_way_progress/nonzero": 4,
+    "holdout/wrong_way_progress/zero": 9
+  },
+  "e1_zero_event_count": 42,
+  "e1_nonzero_event_count": 20,
+  "holdout_zero_event_count": 17,
+  "episodes": [
+    {
+      "scene_id": "17DRP5sb8fy",
+      "episode_id": 10356,
+      "episode_eval_seed": 440000,
+      "selection_reason": "dev_geometry_nonzero_true_trap"
+    },
+    {
+      "scene_id": "1LXtFkjw3qL",
+      "episode_id": 7241,
+      "episode_eval_seed": 440001,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "1pXnuDYAj8r",
+      "episode_id": 2454,
+      "episode_eval_seed": 440002,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "29hnd4uzFmX",
+      "episode_id": 4353,
+      "episode_eval_seed": 440003,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "5LpN3gDmAk7",
+      "episode_id": 10307,
+      "episode_eval_seed": 440005,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "episode_eval_seed": 440006,
+      "selection_reason": "dev_geometry_zero_true_trap"
+    },
+    {
+      "scene_id": "7y3sRwLe3Va",
+      "episode_id": 9155,
+      "episode_eval_seed": 440008,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "82sE5b5pLXE",
+      "episode_id": 4402,
+      "episode_eval_seed": 440009,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "8WUmhLawc2A",
+      "episode_id": 1734,
+      "episode_eval_seed": 440010,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "E9uDoFAP3SH",
+      "episode_id": 1298,
+      "episode_eval_seed": 440014,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "EDJbREhghzL",
+      "episode_id": 8698,
+      "episode_eval_seed": 440015,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "GdvgFV5R1Z5",
+      "episode_id": 9558,
+      "episode_eval_seed": 440016,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "HxpKQynjfin",
+      "episode_id": 8557,
+      "episode_eval_seed": 440017,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "JF19kD82Mey",
+      "episode_id": 8628,
+      "episode_eval_seed": 440018,
+      "selection_reason": "dev_geometry_nonzero_true_trap"
+    },
+    {
+      "scene_id": "JeFG25nYj2p",
+      "episode_id": 8329,
+      "episode_eval_seed": 440019,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "JmbYfDe2QKZ",
+      "episode_id": 10550,
+      "episode_eval_seed": 440020,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "PX4nDJXEHrG",
+      "episode_id": 1210,
+      "episode_eval_seed": 440021,
+      "selection_reason": "preregistered_success_collision_free_no_gtlite_event_control"
+    },
+    {
+      "scene_id": "SN83YJsR3w2",
+      "episode_id": 5982,
+      "episode_eval_seed": 440025,
+      "selection_reason": "dev_geometry_zero_true_trap"
+    },
+    {
+      "scene_id": "VLzqgDo317F",
+      "episode_id": 4442,
+      "episode_eval_seed": 440030,
+      "selection_reason": "dev_geometry_zero_true_trap"
+    },
+    {
+      "scene_id": "gZ6f7yhEvPG",
+      "episode_id": 2023,
+      "episode_eval_seed": 440044,
+      "selection_reason": "dev_geometry_zero_true_trap"
+    },
+    {
+      "scene_id": "jh4fc5c5qoQ",
+      "episode_id": 605,
+      "episode_eval_seed": 440046,
+      "selection_reason": "dev_geometry_nonzero_true_trap"
+    },
+    {
+      "scene_id": "r1Q1Z4BcV1o",
+      "episode_id": 4962,
+      "episode_eval_seed": 440052,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "vyrNrziPKCB",
+      "episode_id": 5218,
+      "episode_eval_seed": 440060,
+      "selection_reason": "dev_geometry_zero_wrong_way_progress"
+    },
+    {
+      "scene_id": "759xd9YjKW5",
+      "episode_id": 10400,
+      "episode_eval_seed": 440068,
+      "selection_reason": "dev_geometry_zero_true_trap"
+    },
+    {
+      "scene_id": "8WUmhLawc2A",
+      "episode_id": 8579,
+      "episode_eval_seed": 440071,
+      "selection_reason": "dev_geometry_nonzero_true_trap"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 4376,
+      "episode_eval_seed": 440084,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "XcA2TqTSSAj",
+      "episode_id": 10530,
+      "episode_eval_seed": 440095,
+      "selection_reason": "dev_geometry_zero_true_trap"
+    },
+    {
+      "scene_id": "E9uDoFAP3SH",
+      "episode_id": 3500,
+      "episode_eval_seed": 440136,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 6966,
+      "episode_eval_seed": 440145,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "p5wJjkQkbXX",
+      "episode_id": 1272,
+      "episode_eval_seed": 440171,
+      "selection_reason": "dev_geometry_nonzero_wrong_way_progress"
+    },
+    {
+      "scene_id": "uNb9QFRL6hY",
+      "episode_id": 9533,
+      "episode_eval_seed": 440180,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "D7N2EKCX4Sj",
+      "episode_id": 1674,
+      "episode_eval_seed": 440196,
+      "selection_reason": "dev_geometry_zero_wrong_way_progress"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 7728,
+      "episode_eval_seed": 440206,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "ZMojNkEp431",
+      "episode_id": 1575,
+      "episode_eval_seed": 440219,
+      "selection_reason": "dev_geometry_zero_wrong_way_progress"
+    },
+    {
+      "scene_id": "ac26ZMwG7aT",
+      "episode_id": 1237,
+      "episode_eval_seed": 440221,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "kEZ7cmS4wCh",
+      "episode_id": 1854,
+      "episode_eval_seed": 440229,
+      "selection_reason": "dev_geometry_zero_wrong_way_progress"
+    },
+    {
+      "scene_id": "ur6pFq6Qu1A",
+      "episode_id": 7713,
+      "episode_eval_seed": 440241,
+      "selection_reason": "dev_geometry_zero_wrong_way_progress"
+    },
+    {
+      "scene_id": "JeFG25nYj2p",
+      "episode_id": 2965,
+      "episode_eval_seed": 440262,
+      "selection_reason": "dev_geometry_zero_wrong_way_progress"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 6965,
+      "episode_eval_seed": 440266,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "Uxmj2M2itWa",
+      "episode_id": 8129,
+      "episode_eval_seed": 440270,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "dhjEzFoUFzH",
+      "episode_id": 6763,
+      "episode_eval_seed": 440284,
+      "selection_reason": "dev_geometry_nonzero_wrong_way_progress"
+    },
+    {
+      "scene_id": "Uxmj2M2itWa",
+      "episode_id": 306,
+      "episode_eval_seed": 440330,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "E9uDoFAP3SH",
+      "episode_id": 3126,
+      "episode_eval_seed": 440377,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 10095,
+      "episode_eval_seed": 440386,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "Uxmj2M2itWa",
+      "episode_id": 9642,
+      "episode_eval_seed": 440390,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "e9zR4mvMWw7",
+      "episode_id": 9994,
+      "episode_eval_seed": 440405,
+      "selection_reason": "dev_geometry_nonzero_wrong_way_progress"
+    },
+    {
+      "scene_id": "sT4fr6TAbpF",
+      "episode_id": 973,
+      "episode_eval_seed": 440419,
+      "selection_reason": "all_holdout_event_episode"
+    },
+    {
+      "scene_id": "b8cTxDM8gDG",
+      "episode_id": 4550,
+      "episode_eval_seed": 440462,
+      "selection_reason": "dev_geometry_nonzero_wrong_way_progress"
+    }
+  ],
+  "events": [
+    {
+      "scene_id": "17DRP5sb8fy",
+      "episode_id": 10356,
+      "step_id": 33,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 2,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "step_id": 0,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "step_id": 16,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "step_id": 78,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "step_id": 108,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "step_id": 222,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "step_id": 253,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "step_id": 369,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "step_id": 403,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 1,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "5q7pvUzZiYa",
+      "episode_id": 9357,
+      "step_id": 452,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "759xd9YjKW5",
+      "episode_id": 10400,
+      "step_id": 47,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "759xd9YjKW5",
+      "episode_id": 10400,
+      "step_id": 300,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "8WUmhLawc2A",
+      "episode_id": 8579,
+      "step_id": 60,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 1,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "D7N2EKCX4Sj",
+      "episode_id": 1674,
+      "step_id": 0,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "JF19kD82Mey",
+      "episode_id": 8628,
+      "step_id": 106,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 3,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "JF19kD82Mey",
+      "episode_id": 8628,
+      "step_id": 315,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 1,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "JeFG25nYj2p",
+      "episode_id": 2965,
+      "step_id": 0,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "SN83YJsR3w2",
+      "episode_id": 5982,
+      "step_id": 29,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "VLzqgDo317F",
+      "episode_id": 4442,
+      "step_id": 39,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 3,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "VLzqgDo317F",
+      "episode_id": 4442,
+      "step_id": 52,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "VLzqgDo317F",
+      "episode_id": 4442,
+      "step_id": 304,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "VLzqgDo317F",
+      "episode_id": 4442,
+      "step_id": 336,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "XcA2TqTSSAj",
+      "episode_id": 10530,
+      "step_id": 34,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "ZMojNkEp431",
+      "episode_id": 1575,
+      "step_id": 0,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "b8cTxDM8gDG",
+      "episode_id": 4550,
+      "step_id": 73,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 3,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "dhjEzFoUFzH",
+      "episode_id": 6763,
+      "step_id": 35,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 2,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "dhjEzFoUFzH",
+      "episode_id": 6763,
+      "step_id": 39,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "dhjEzFoUFzH",
+      "episode_id": 6763,
+      "step_id": 275,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 1,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "e9zR4mvMWw7",
+      "episode_id": 9994,
+      "step_id": 48,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 3,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "gZ6f7yhEvPG",
+      "episode_id": 2023,
+      "step_id": 0,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "gZ6f7yhEvPG",
+      "episode_id": 2023,
+      "step_id": 43,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 1,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "jh4fc5c5qoQ",
+      "episode_id": 605,
+      "step_id": 52,
+      "gt_split": "dev",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 3,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "kEZ7cmS4wCh",
+      "episode_id": 1854,
+      "step_id": 35,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "p5wJjkQkbXX",
+      "episode_id": 1272,
+      "step_id": 39,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 1,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "ur6pFq6Qu1A",
+      "episode_id": 7713,
+      "step_id": 15,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "vyrNrziPKCB",
+      "episode_id": 5218,
+      "step_id": 76,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "vyrNrziPKCB",
+      "episode_id": 5218,
+      "step_id": 211,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "vyrNrziPKCB",
+      "episode_id": 5218,
+      "step_id": 318,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 1,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "vyrNrziPKCB",
+      "episode_id": 5218,
+      "step_id": 370,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "vyrNrziPKCB",
+      "episode_id": 5218,
+      "step_id": 461,
+      "gt_split": "dev",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 2,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "29hnd4uzFmX",
+      "episode_id": 4353,
+      "step_id": 46,
+      "gt_split": "holdout",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 1,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "E9uDoFAP3SH",
+      "episode_id": 3126,
+      "step_id": 11,
+      "gt_split": "holdout",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "E9uDoFAP3SH",
+      "episode_id": 3500,
+      "step_id": 10,
+      "gt_split": "holdout",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 4376,
+      "step_id": 0,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 6965,
+      "step_id": 21,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 6965,
+      "step_id": 122,
+      "gt_split": "holdout",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 6965,
+      "step_id": 143,
+      "gt_split": "holdout",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 6965,
+      "step_id": 263,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 2,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 6965,
+      "step_id": 428,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 2,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 6966,
+      "step_id": 17,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 6966,
+      "step_id": 109,
+      "gt_split": "holdout",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 7728,
+      "step_id": 0,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 7728,
+      "step_id": 83,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "PuKPg4mmafe",
+      "episode_id": 10095,
+      "step_id": 102,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 2,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "Uxmj2M2itWa",
+      "episode_id": 306,
+      "step_id": 47,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 1,
+      "e1_candidate_stratum": "nonzero"
+    },
+    {
+      "scene_id": "Uxmj2M2itWa",
+      "episode_id": 306,
+      "step_id": 65,
+      "gt_split": "holdout",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "Uxmj2M2itWa",
+      "episode_id": 8129,
+      "step_id": 0,
+      "gt_split": "holdout",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "Uxmj2M2itWa",
+      "episode_id": 9642,
+      "step_id": 19,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "ac26ZMwG7aT",
+      "episode_id": 1237,
+      "step_id": 0,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "r1Q1Z4BcV1o",
+      "episode_id": 4962,
+      "step_id": 0,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "sT4fr6TAbpF",
+      "episode_id": 973,
+      "step_id": 0,
+      "gt_split": "holdout",
+      "gt_state": "wrong_way_progress",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    },
+    {
+      "scene_id": "uNb9QFRL6hY",
+      "episode_id": 9533,
+      "step_id": 0,
+      "gt_split": "holdout",
+      "gt_state": "true_trap",
+      "e1_final_candidate_count": 0,
+      "e1_candidate_stratum": "zero"
+    }
+  ],
+  "input_sha256": {
+    "all_event_manifest": "a64d5abdfbd375eed13629d91675c6034c05743333cdc18cf498c02d52d0e57a",
+    "full_episode_manifest": "2288437c4ffa03e2ef6e3f5ca1652e542aa8291706cf883b832d03daaa7792f5",
+    "control_episode_manifest": "1b0d0e80e72fbb090ceaff968a3c48e9c57adacd36ff68cc2f3e867367bb4ed1",
+    "progress": "01e7a5988e2e0a75644e8e4c884096eaa893025b2fa9f21563c7d56c8978e7bf"
+  },
+  "output_sha256": {
+    "episode_manifest": "247a9b6a84e395f0ca06d50344a509bc741886aeeaf70690ec17605293bdb30e",
+    "event_manifest": "2e00bf7ee04130b40c11f8247fe00ad3c2841d63c0f45fcabd90a257f4ab6209"
+  }
+}

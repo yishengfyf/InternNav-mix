@@ -61,9 +61,14 @@ NPROC_PER_NODE="${NPROC}" MASTER_PORT=${STAGE27_MASTER_PORT:-3096} \
 bash scripts/eval/bash/stage21_torchrun_eval.sh --config "${CONFIG}"
 
 FAILED_STAGE=stage27_audit
-python3 scripts/eval/analyze_stage27_m3_candidate_shadow.py \
-  --run-root "${RUN_ROOT}" \
+AUDIT_ARGS=(
+  --run-root "${RUN_ROOT}"
   --output "${RUN_ROOT}/stage27_m3_candidate_shadow_audit.json"
+)
+if [[ -n "${EVENT_MANIFEST}" ]]; then
+  AUDIT_ARGS+=(--gt-manifest "${EVENT_MANIFEST}")
+fi
+python3 scripts/eval/analyze_stage27_m3_candidate_shadow.py "${AUDIT_ARGS[@]}"
 
 FAILED_STAGE=return_packaging
 mv "${RUN_ROOT}" "${WORK_DIR}/run"
