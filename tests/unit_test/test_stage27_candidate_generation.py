@@ -14,6 +14,7 @@ SPEC.loader.exec_module(MODULE)
 generate_stage27_candidates = MODULE.generate_stage27_candidates
 known_free_geodesic_paths = MODULE._known_free_geodesic_paths
 frontier_standoff_path = MODULE._frontier_standoff_path
+estimate_local_floor_z_from_occ = MODULE._estimate_local_floor_z_from_occ
 
 
 def _nodes():
@@ -43,6 +44,29 @@ def test_unknown_is_never_promoted_to_free():
     assert result["ablation"]["route_only"]["event_has_candidate"] is True
     assert result["ablation"]["route_occ"]["event_has_candidate"] is False
     assert any(item["unknown_fraction"] > 0 for item in result["ablation"]["route_only"]["candidates"])
+
+
+def test_local_floor_estimate_requires_broad_low_surface():
+    occ = {}
+    for row in range(-2, 3):
+        for col in range(-2, 3):
+            occ[(row, col, 2)] = 1
+    estimate = estimate_local_floor_z_from_occ(
+        occ, 0, 0, cell_size_m=0.05, min_support_cells=8,
+    )
+    assert estimate["accepted"] is True
+    assert estimate["floor_z_m"] == 0.1
+    assert estimate["source"] == "local_occupied_floor_surface"
+
+
+def test_local_floor_estimate_falls_back_on_sparse_obstacle_evidence():
+    estimate = estimate_local_floor_z_from_occ(
+        {(0, 0, 8), (0, 1, 8), (1, 0, 8)},
+        0, 0, cell_size_m=0.05, min_support_cells=8,
+    )
+    assert estimate["accepted"] is False
+    assert estimate["floor_z_m"] == 0.0
+    assert estimate["source"].startswith("gps_compass_2d_fallback")
 
 
 def test_occupied_conflict_is_explicit_and_filtered():

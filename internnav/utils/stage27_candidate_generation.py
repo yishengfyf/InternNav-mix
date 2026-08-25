@@ -40,6 +40,86 @@ _SEMANTIC_INSTRUCTION_TERMS = {
 }
 
 
+def _estimate_local_floor_z_from_occ(
+    occ_counts: Mapping[Tuple[int, int, int], int],
+    row: int,
+    col: int,
+    *,
+    cell_size_m: float,
+    radius_m: float = 0.75,
+    min_z_m: float = 0.0,
+    max_z_m: float = 0.80,
+    min_support_cells: int = 8,
+    min_support_ratio: float = 0.25,
+) -> Dict[str, Any]:
+    """Conservatively estimate a local floor height from observed surfaces.
+
+    This is a readout-only aid for maps whose pose z is unavailable.  It uses
+    only occupied endpoint evidence, requires a spatially broad low surface,
+    and returns ``accepted=False`` when the map does not support a stable
+    estimate.  It never changes the underlying occupied/free/unknown sets.
+    """
+    cs = max(1e-6, float(cell_size_m))
+    radius_cells = max(1, int(math.ceil(float(radius_m) / cs)))
+    min_height = int(math.floor(float(min_z_m) / cs))
+    max_height = int(math.ceil(float(max_z_m) / cs))
+    by_height: Dict[int, set[Tuple[int, int]]] = {}
+    for key in occ_counts:
+        try:
+            cell_row, cell_col, height = (int(key[0]), int(key[1]), int(key[2]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if abs(cell_row - int(row)) > radius_cells or abs(cell_col - int(col)) > radius_cells:
+            continue
+        if (cell_row - int(row)) ** 2 + (cell_col - int(col)) ** 2 > radius_cells ** 2:
+            continue
+        if height < min_height or height > max_height:
+            continue
+        by_height.setdefault(height, set()).add((cell_row, cell_col))
+    if not by_height:
+        return {
+            "accepted": False,
+            "floor_z_m": 0.0,
+            "support_cells": 0,
+            "support_ratio": 0.0,
+            "height_bin": None,
+            "source": "gps_compass_2d_fallback",
+        }
+
+    # Merge adjacent 5cm bins so quantization does not split one floor plane.
+    candidates: List[Tuple[int, int, set[Tuple[int, int]]]] = []
+    for height in sorted(by_height):
+        support = set()
+        for neighbor in (height - 1, height, height + 1):
+            support.update(by_height.get(neighbor, set()))
+        candidates.append((len(support), height, support))
+    support_cells, height, support = max(
+        candidates, key=lambda item: (item[0], -item[1])
+    )
+    all_cells = set().union(*(value for value in by_height.values()))
+    support_ratio = float(support_cells / max(1, len(all_cells)))
+    if (
+        support_cells < max(1, int(min_support_cells))
+        or support_ratio < float(min_support_ratio)
+    ):
+        return {
+            "accepted": False,
+            "floor_z_m": 0.0,
+            "support_cells": int(support_cells),
+            "support_ratio": support_ratio,
+            "height_bin": int(height),
+            "source": "gps_compass_2d_fallback_insufficient_surface",
+        }
+    return {
+        "accepted": True,
+        "floor_z_m": float(height * cs),
+        "support_cells": int(support_cells),
+        "support_ratio": support_ratio,
+        "height_bin": int(height),
+        "source": "local_occupied_floor_surface",
+    }
+
+
 def _instruction_semantic_labels(instruction: str) -> set[str]:
     tokens = set(re.findall(r"[a-z0-9]+", str(instruction or "").lower()))
     return {
@@ -248,6 +328,12 @@ def _candidate_record(
         "floor_aligned_height_max_m": float(floor_aligned_height_max_m),
         "floor_z_m": float(floor_z_m),
         "floor_z_source": str(floor_z_source),
+        "floor_z_estimate_support_cells": int(
+            node.get("floor_z_estimate_support_cells", 0) or 0
+        ),
+        "floor_z_estimate_support_ratio": float(
+            node.get("floor_z_estimate_support_ratio", 0.0) or 0.0
+        ),
         "footprint_radius_m": float(footprint_radius_m),
         "floor_aligned_known_free": bool(
             (floor_state_counts or state_counts).get("free", 0) > 0
@@ -742,6 +828,36 @@ def generate_from_sparse_memory(
         for item in raw_nodes
         if item.get("row") is not None and item.get("col") is not None
     ]
+    floor_estimation_enabled = bool(cfg.get("floor_z_estimation_enable", False))
+    floor_estimation_accepted = 0
+    if floor_estimation_enabled:
+        adjusted_nodes = []
+        for node in nodes:
+            adjusted = dict(node)
+            estimate = _estimate_local_floor_z_from_occ(
+                getattr(memory, "occ_counts", {}),
+                int(adjusted["grid"][0]),
+                int(adjusted["grid"][1]),
+                cell_size_m=float(getattr(memory, "cs", 0.05)),
+                radius_m=float(cfg.get("floor_z_estimation_radius_m", 0.75)),
+                min_z_m=float(cfg.get("floor_z_estimation_min_m", 0.0)),
+                max_z_m=float(cfg.get("floor_z_estimation_max_m", 0.80)),
+                min_support_cells=int(cfg.get("floor_z_estimation_min_support_cells", 8)),
+                min_support_ratio=float(cfg.get("floor_z_estimation_min_support_ratio", 0.25)),
+            )
+            adjusted["floor_z_estimate_support_cells"] = int(
+                estimate["support_cells"]
+            )
+            adjusted["floor_z_estimate_support_ratio"] = float(
+                estimate["support_ratio"]
+            )
+            adjusted["floor_z_estimate_source"] = str(estimate["source"])
+            if estimate["accepted"] and str(adjusted.get("z_source")) == "gps_compass_2d":
+                adjusted["z"] = float(estimate["floor_z_m"])
+                adjusted["z_source"] = str(estimate["source"])
+                floor_estimation_accepted += 1
+            adjusted_nodes.append(adjusted)
+        nodes = adjusted_nodes
     radius_cells = max(
         0,
         int(math.ceil(float(cfg.get("footprint_radius_m", 0.18)) / float(getattr(memory, "cs", 0.05)))),
@@ -837,4 +953,11 @@ def generate_from_sparse_memory(
     result["frontier_local_cell_count"] = int(frontier_local_cell_count)
     result["frontier_sampled_cell_count"] = int(frontier_sampled_cell_count)
     result["frontier_geodesic_reachable_count"] = int(len(frontier_nodes))
+    result["floor_z_estimation"] = {
+        "enabled": floor_estimation_enabled,
+        "accepted_node_count": int(floor_estimation_accepted),
+        "node_count": int(len(nodes)),
+        "uses_gt": False,
+        "fallback": "gps_compass_2d",
+    }
     return result
