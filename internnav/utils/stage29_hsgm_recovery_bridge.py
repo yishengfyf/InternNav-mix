@@ -265,6 +265,13 @@ def audit(
 ) -> dict[str, Any]:
     events = load_events(root)
     observations = load_observations(root)
+    expected_events = list(expected_events) if expected_events is not None else None
+    if expected_events is not None:
+        expected_keys = {_event_key(row) for row in expected_events}
+        events = [row for row in events if _event_key(row) in expected_keys]
+        observations = {
+            key: row for key, row in observations.items() if key in expected_keys
+        }
     records = []
     for event in events:
         for candidate in _safe_candidates(event):
