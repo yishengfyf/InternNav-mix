@@ -15,6 +15,7 @@ generate_stage27_candidates = MODULE.generate_stage27_candidates
 known_free_geodesic_paths = MODULE._known_free_geodesic_paths
 frontier_standoff_path = MODULE._frontier_standoff_path
 estimate_local_floor_z_from_occ = MODULE._estimate_local_floor_z_from_occ
+floor_estimate_continuity_ok = MODULE._floor_estimate_continuity_ok
 
 
 def _nodes():
@@ -67,6 +68,12 @@ def test_local_floor_estimate_falls_back_on_sparse_obstacle_evidence():
     assert estimate["accepted"] is False
     assert estimate["floor_z_m"] == 0.0
     assert estimate["source"].startswith("gps_compass_2d_fallback")
+
+
+def test_floor_estimate_rejects_furniture_height_discontinuity():
+    assert floor_estimate_continuity_ok(0.15, 0.0, 0.20) is True
+    assert floor_estimate_continuity_ok(0.70, 0.0, 0.20) is False
+    assert floor_estimate_continuity_ok(0.35, 0.15, 0.20) is True
 
 
 def test_occupied_conflict_is_explicit_and_filtered():

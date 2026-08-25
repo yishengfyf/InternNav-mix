@@ -120,6 +120,16 @@ def _estimate_local_floor_z_from_occ(
     }
 
 
+def _floor_estimate_continuity_ok(
+    estimated_z_m: float, tracked_floor_z_m: float, max_step_m: float
+) -> bool:
+    """Reject a surface height that cannot be reached by one route edge."""
+    return bool(
+        abs(float(estimated_z_m) - float(tracked_floor_z_m))
+        <= max(0.0, float(max_step_m)) + 1e-9
+    )
+
+
 def _instruction_semantic_labels(instruction: str) -> set[str]:
     tokens = set(re.findall(r"[a-z0-9]+", str(instruction or "").lower()))
     return {
@@ -218,15 +228,21 @@ def _dedupe_translation_nodes(nodes: Iterable[Mapping[str, Any]]) -> List[Dict[s
             continue
         z = float(item.get("z", 0.0) or 0.0)
         z_source = str(item.get("z_source") or "unspecified")
+        floor_support_cells = int(item.get("floor_z_estimate_support_cells", 0) or 0)
+        floor_support_ratio = float(item.get("floor_z_estimate_support_ratio", 0.0) or 0.0)
         if result and _distance(result[-1]["xy"], xy) <= 1e-4:
             result[-1] = {
                 **result[-1], "step_id": step, "grid": grid, "xy": xy,
                 "z": z, "z_source": z_source,
+                "floor_z_estimate_support_cells": floor_support_cells,
+                "floor_z_estimate_support_ratio": floor_support_ratio,
             }
             continue
         result.append({
             "step_id": step, "grid": grid, "xy": xy,
             "z": z, "z_source": z_source,
+            "floor_z_estimate_support_cells": floor_support_cells,
+            "floor_z_estimate_support_ratio": floor_support_ratio,
         })
     return result
 
@@ -830,8 +846,11 @@ def generate_from_sparse_memory(
     ]
     floor_estimation_enabled = bool(cfg.get("floor_z_estimation_enable", False))
     floor_estimation_accepted = 0
+    floor_estimation_continuity_rejected = 0
     if floor_estimation_enabled:
         adjusted_nodes = []
+        tracked_floor_z_m = 0.0
+        max_step_m = float(cfg.get("floor_z_estimation_max_step_m", 0.20))
         for node in nodes:
             adjusted = dict(node)
             estimate = _estimate_local_floor_z_from_occ(
@@ -852,10 +871,25 @@ def generate_from_sparse_memory(
                 estimate["support_ratio"]
             )
             adjusted["floor_z_estimate_source"] = str(estimate["source"])
-            if estimate["accepted"] and str(adjusted.get("z_source")) == "gps_compass_2d":
+            continuity_ok = bool(
+                estimate["accepted"]
+                and _floor_estimate_continuity_ok(
+                    float(estimate["floor_z_m"]), tracked_floor_z_m, max_step_m
+                )
+            )
+            if (
+                continuity_ok
+                and str(adjusted.get("z_source")) == "gps_compass_2d"
+            ):
                 adjusted["z"] = float(estimate["floor_z_m"])
                 adjusted["z_source"] = str(estimate["source"])
+                tracked_floor_z_m = float(estimate["floor_z_m"])
                 floor_estimation_accepted += 1
+            elif estimate["accepted"]:
+                adjusted["floor_z_estimate_source"] = (
+                    "gps_compass_2d_fallback_route_height_discontinuity"
+                )
+                floor_estimation_continuity_rejected += 1
             adjusted_nodes.append(adjusted)
         nodes = adjusted_nodes
     radius_cells = max(
@@ -956,6 +990,9 @@ def generate_from_sparse_memory(
     result["floor_z_estimation"] = {
         "enabled": floor_estimation_enabled,
         "accepted_node_count": int(floor_estimation_accepted),
+        "continuity_rejected_node_count": int(
+            floor_estimation_continuity_rejected
+        ),
         "node_count": int(len(nodes)),
         "uses_gt": False,
         "fallback": "gps_compass_2d",

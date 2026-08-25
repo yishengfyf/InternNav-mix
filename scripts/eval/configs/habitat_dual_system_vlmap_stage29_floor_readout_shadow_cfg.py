@@ -24,6 +24,9 @@ candidate_cfg.update({
     "floor_z_estimation_max_m": 0.80,
     "floor_z_estimation_min_support_cells": 8,
     "floor_z_estimation_min_support_ratio": 0.25,
+    # A traversed floor can rise only continuously along executed movement.
+    # This rejects furniture-height planes without using scene-specific data.
+    "floor_z_estimation_max_step_m": 0.20,
 })
 
 # Defense in depth: Stage29 remains shadow-only and cannot affect actions.
