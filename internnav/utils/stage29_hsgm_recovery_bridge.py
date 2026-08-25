@@ -112,6 +112,35 @@ def _visibility(
     }
 
 
+def _ideal_reorientation(edge_reports: Sequence[Mapping[str, Any]], *, max_distance_m: float) -> dict[str, Any]:
+    """Describe the first route edge reachable after an ideal in-place turn.
+
+    This is a geometric audit only: no turn is issued and no collision or
+    visibility claim is made beyond the existing route/Occ safety evidence.
+    """
+    if not edge_reports:
+        return {
+            "required_turn_deg": None,
+            "ideal_reorientation_in_fov": False,
+            "first_visible_edge_index": None,
+            "first_visible_edge_grid": None,
+        }
+    first = edge_reports[0]
+    required_turn = float(first.get("relative_bearing_deg"))
+    first_visible = next(
+        (edge for edge in edge_reports if float(edge.get("distance_m", float("inf"))) <= float(max_distance_m)),
+        None,
+    )
+    return {
+        "required_turn_deg": required_turn,
+        "required_turn_abs_deg": abs(required_turn),
+        "ideal_reorientation_in_fov": first_visible is not None,
+        "first_visible_edge_index": first_visible.get("edge_index") if first_visible else None,
+        "first_visible_edge_grid": first_visible.get("grid") if first_visible else None,
+        "ideal_reorientation_visibility_is_depth_checked": False,
+    }
+
+
 def bridge_candidate(
     event: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -182,6 +211,12 @@ def bridge_candidate(
         edge_reports.append({"edge_index": edge_index, "grid": list(cell), "xy": list(target_xy), **visibility})
     first_edge = edge_reports[0]
     record["edge_reports"] = edge_reports
+    record["route_edge_count"] = len(edge_reports)
+    record["route_edge_path_contiguous"] = True
+    record["ideal_reorientation"] = _ideal_reorientation(
+        edge_reports,
+        max_distance_m=max_visible_distance_m,
+    )
     record["first_visible_subgoal"] = first_edge["grid"] if first_edge["in_horizontal_fov"] else None
     if first_edge["in_horizontal_fov"]:
         record["bridge_status"] = "first_edge_horizontally_visible"
@@ -299,6 +334,17 @@ def audit(
         "safe_candidate_count": len(safe_records),
         "bridgeable_first_edge_count": sum(row.get("bridge_status") == "first_edge_horizontally_visible" for row in safe_records),
         "offscreen_requires_reobserve_count": sum(row.get("bridge_status") == "offscreen_requires_turn_reobserve" for row in safe_records),
+        "ideal_reorientation_bridgeable_count": sum(
+            bool((row.get("ideal_reorientation") or {}).get("ideal_reorientation_in_fov"))
+            for row in safe_records
+        ),
+        "ideal_reorientation_not_bridgeable_count": sum(
+            not bool((row.get("ideal_reorientation") or {}).get("ideal_reorientation_in_fov"))
+            for row in safe_records
+        ),
+        "route_edge_noncontiguous_count": sum(
+            not bool(row.get("route_edge_path_contiguous")) for row in safe_records
+        ),
         "status_counts": dict(sorted(status_counts.items())),
         "event_zero_count": sum(not _safe_candidates(event) for event in events),
         "event_one_count": sum(len(_safe_candidates(event)) == 1 for event in events),

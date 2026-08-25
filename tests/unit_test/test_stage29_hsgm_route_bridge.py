@@ -52,6 +52,17 @@ def test_offscreen_candidate_requires_reobserve_bridge():
     result = bridge_candidate(_event(), candidate, _observation())
     assert result["bridge_status"] == "offscreen_requires_turn_reobserve"
     assert result["first_visible_subgoal"] is None
+    assert result["ideal_reorientation"]["required_turn_abs_deg"] > 90.0
+    assert result["ideal_reorientation"]["ideal_reorientation_in_fov"] is True
+    assert result["ideal_reorientation"]["first_visible_edge_index"] == 1
+
+
+def test_ideal_reorientation_is_audit_only():
+    result = bridge_candidate(_event(), _candidate(), _observation())
+    ideal = result["ideal_reorientation"]
+    assert ideal["required_turn_deg"] != 0.0
+    assert ideal["ideal_reorientation_visibility_is_depth_checked"] is False
+    assert result["action_applied"] is False
 
 
 def test_unknown_and_route_conflict_are_rejected_before_visibility():
