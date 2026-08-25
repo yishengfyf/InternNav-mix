@@ -58,7 +58,11 @@ def test_offscreen_candidate_requires_reobserve_bridge():
 
 
 def test_ideal_reorientation_is_audit_only():
-    result = bridge_candidate(_event(), _candidate(), _observation())
+    result = bridge_candidate(
+        _event(),
+        _candidate(path=[[504, 500], [503, 500], [502, 500], [501, 500], [500, 500]]),
+        _observation(),
+    )
     ideal = result["ideal_reorientation"]
     assert ideal["required_turn_deg"] != 0.0
     assert ideal["ideal_reorientation_visibility_is_depth_checked"] is False
