@@ -259,6 +259,22 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
                 int(row.get("semantic_reports", {}).get(branch, {}).get("safe_proposed_candidate_count", 0) or 0)
                 for row in events
             ),
+            "safe_direction_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("safe_direction_count", 0) or 0)
+                for row in events
+            ),
+            "novel_direction_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("novel_direction_count", 0) or 0)
+                for row in events
+            ),
+            "novel_direction_event_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("novel_direction_count", 0) or 0) > 0
+                for row in events
+            ),
+            "repeated_direction_rejected_count": sum(
+                int(row.get("semantic_reports", {}).get(branch, {}).get("repeated_direction_rejected_count", 0) or 0)
+                for row in events
+            ),
             "selected_candidate_count": sum(
                 int(row.get("semantic_reports", {}).get(branch, {}).get("selected_candidate_count", 0) or 0)
                 for row in events

@@ -16,6 +16,7 @@ known_free_geodesic_paths = MODULE._known_free_geodesic_paths
 frontier_standoff_path = MODULE._frontier_standoff_path
 estimate_local_floor_z_from_occ = MODULE._estimate_local_floor_z_from_occ
 floor_estimate_continuity_ok = MODULE._floor_estimate_continuity_ok
+semantic_route_reobserve_candidates = MODULE._semantic_route_reobserve_candidates
 
 
 def _nodes():
@@ -423,6 +424,47 @@ def test_semantic_candidate_requires_instruction_relevance():
         report = result["semantic_reports"][branch]
         assert report["relevant_semantic_node_count"] == 0
         assert report["selected_candidate_count"] == 0
+
+
+def test_semantic_direction_novelty_rejects_redundant_route_points():
+    def candidate(candidate_id, source_step, xy):
+        return {
+            "candidate_id": candidate_id,
+            "source_step": source_step,
+            "xy": xy,
+            "path_length_m": 1.0,
+            "occupied_fraction": 0.0,
+            "unknown_fraction": 0.0,
+            "floor_aligned_known_free": True,
+        }
+
+    reference = [candidate("base", 8, [1.0, 0.0])]
+    report = semantic_route_reobserve_candidates(
+        semantic_nodes=_semantic_nodes(),
+        route_candidates=[
+            candidate("same-near", 0, [1.5, 0.0]),
+            candidate("same-far", 1, [2.0, 0.0]),
+            candidate("novel", 2, [0.0, 1.0]),
+        ],
+        reference_candidates=reference,
+        origin_xy=[0.0, 0.0],
+        instruction="Return toward the bed.",
+        branch="filtered",
+        config={
+            "min_distance_m": 0.5,
+            "max_distance_m": 4.0,
+            "semantic_route_neighbors_per_node": 3,
+            "semantic_candidate_count": 3,
+            "semantic_direction_novelty_enable": True,
+            "semantic_direction_novelty_require_new": True,
+        },
+    )
+    assert report["safe_proposed_candidate_count"] == 3
+    assert report["safe_direction_count"] == 2
+    assert report["reference_direction_count"] == 1
+    assert report["novel_direction_count"] == 1
+    assert report["repeated_direction_rejected_count"] == 2
+    assert [item["candidate_id"] for item in report["selected_candidates"]] == ["novel"]
 
 
 def test_semantic_evidence_never_overrides_unknown_path():

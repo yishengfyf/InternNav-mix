@@ -23,6 +23,14 @@ def _grid_distance(a: Sequence[int], b: Sequence[int]) -> float:
     return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
 
 
+def _direction_bucket(candidate: Mapping[str, Any], origin_xy: Sequence[float]) -> int:
+    angle = math.degrees(math.atan2(
+        float(candidate["xy"][1]) - float(origin_xy[1]),
+        float(candidate["xy"][0]) - float(origin_xy[0]),
+    ))
+    return int(round(angle / 45.0)) % 8
+
+
 _SEMANTIC_INSTRUCTION_TERMS = {
     "door": {"door", "doorway", "entrance", "entry"},
     "chair": {"chair", "chairs", "seat"},
@@ -142,6 +150,8 @@ def _semantic_route_reobserve_candidates(
     *,
     semantic_nodes: Sequence[Mapping[str, Any]],
     route_candidates: Sequence[Mapping[str, Any]],
+    reference_candidates: Sequence[Mapping[str, Any]],
+    origin_xy: Sequence[float],
     instruction: str,
     branch: str,
     config: Mapping[str, Any],
@@ -206,13 +216,40 @@ def _semantic_route_reobserve_candidates(
                 proposals[candidate_id] = (priority, item)
     ordered = [item for _, item in sorted(proposals.values(), key=lambda value: value[0])]
     safe = [item for item in ordered if _passes(item, config, "route_occ_clearance")]
-    selected = safe[:max(1, int(config.get("semantic_candidate_count", 3)))]
+    safe_buckets = {_direction_bucket(item, origin_xy) for item in safe}
+    reference_buckets = {
+        _direction_bucket(item, origin_xy) for item in reference_candidates
+    }
+    novel_buckets = safe_buckets - reference_buckets
+    candidate_limit = max(1, int(config.get("semantic_candidate_count", 3)))
+    novelty_enabled = bool(config.get("semantic_direction_novelty_enable", False))
+    require_novel = bool(config.get("semantic_direction_novelty_require_new", False))
+    repeated_direction_rejected = 0
+    if novelty_enabled:
+        direction_novel = []
+        seen_buckets = set(reference_buckets) if require_novel else set()
+        for item in safe:
+            bucket = _direction_bucket(item, origin_xy)
+            if bucket in seen_buckets:
+                repeated_direction_rejected += 1
+                continue
+            direction_novel.append({
+                **item, "semantic_direction_bucket": int(bucket)
+            })
+            seen_buckets.add(bucket)
+        selected = direction_novel[:candidate_limit]
+    else:
+        selected = safe[:candidate_limit]
     return {
         "instruction_relevant_labels": sorted(relevant_labels),
         "semantic_node_count": len(semantic_nodes),
         "relevant_semantic_node_count": len(relevant_nodes),
         "proposed_candidate_count": len(ordered),
         "safe_proposed_candidate_count": len(safe),
+        "safe_direction_count": len(safe_buckets),
+        "reference_direction_count": len(reference_buckets),
+        "novel_direction_count": len(novel_buckets),
+        "repeated_direction_rejected_count": int(repeated_direction_rejected),
         "selected_candidates": selected,
     }
 
@@ -792,12 +829,18 @@ def generate_stage27_candidates(
                 "relevant_semantic_node_count": 0,
                 "proposed_candidate_count": 0,
                 "safe_proposed_candidate_count": 0,
+                "safe_direction_count": 0,
+                "reference_direction_count": 0,
+                "novel_direction_count": 0,
+                "repeated_direction_rejected_count": 0,
                 "selected_candidates": [],
             }
             if semantic_triggered:
                 report = _semantic_route_reobserve_candidates(
                     semantic_nodes=branch_nodes,
                     route_candidates=path_eligible_candidates,
+                    reference_candidates=cumulative,
+                    origin_xy=nodes[-1]["xy"],
                     instruction=instruction,
                     branch=branch,
                     config=cfg,
