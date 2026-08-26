@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import runpy
 import time
 from collections import Counter, defaultdict
@@ -405,7 +406,7 @@ def _bev(path: Path, instances: list[dict[str, Any]], route: list[list[float]]) 
 
 
 class YOLOERunner:
-    def __init__(self, checkpoint: Path, hsgm_root: Path, device: str) -> None:
+    def __init__(self, checkpoint: Path, mobileclip: Path, hsgm_root: Path, device: str) -> None:
         import torch
         from ultralytics import YOLOE
 
@@ -414,7 +415,19 @@ class YOLOERunner:
         self.torch, self.device = torch, device
         started = time.perf_counter()
         self.model = YOLOE(str(checkpoint))
-        self.model.set_classes(self.class_names, self.model.get_text_pe(self.class_names))
+        expected_mobileclip = mobileclip.parent / "mobileclip2_b.ts"
+        if mobileclip.resolve() != expected_mobileclip.resolve() or not mobileclip.is_file():
+            raise FileNotFoundError(
+                "YOLOE expects an existing asset named mobileclip2_b.ts; "
+                f"received {mobileclip}"
+            )
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(mobileclip.parent)
+            text_pe = self.model.get_text_pe(self.class_names)
+        finally:
+            os.chdir(previous_cwd)
+        self.model.set_classes(self.class_names, text_pe)
         self.load_seconds = time.perf_counter() - started
 
     def predict(self, image: np.ndarray) -> tuple[list[dict[str, Any]], float]:
@@ -458,7 +471,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     annotations = _episode_annotations(args.replay_root)
     if args.max_episodes > 0:
         episode_dirs = episode_dirs[:args.max_episodes]
-    runner = YOLOERunner(args.checkpoint, args.hsgm_root, args.device)
+    runner = YOLOERunner(args.checkpoint, args.mobileclip, args.hsgm_root, args.device)
     aggregate: dict[str, list[dict[str, Any]]] = {"raw": [], "hsgm_center_filtered": []}
     episode_reports = []
     manifest = []
@@ -665,6 +678,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "input": {
             "replay_root": str(args.replay_root),
             "checkpoint": str(args.checkpoint),
+            "checkpoint_sha256": _sha256(args.checkpoint),
+            "mobileclip": str(args.mobileclip),
+            "mobileclip_sha256": _sha256(args.mobileclip),
             "hsgm_root": str(args.hsgm_root),
             "model_confidence": 0.6,
             "model_iou": 0.3,
@@ -709,6 +725,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--replay-root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--mobileclip", type=Path, required=True)
     parser.add_argument("--hsgm-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
