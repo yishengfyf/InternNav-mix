@@ -25,6 +25,7 @@ vlmap_cfg["stage27_candidate_audit_config"] = {
     "min_separation_m": 0.25,
     "near_count": 1,
     "open_count": 2,
+    "open_rank_floor_safe_first": True,
     "sample_spacing_m": 0.05,
     "open_radius_m": 0.50,
     "floor_aligned_height_max_m": 1.5,

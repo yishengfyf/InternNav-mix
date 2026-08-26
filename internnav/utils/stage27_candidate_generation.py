@@ -620,11 +620,18 @@ def generate_stage27_candidates(
         {**item, "source_type": "R-route-near", "source_families": ["R-route-near"]}
         for item in path_eligible_candidates[: max(1, int(cfg.get("near_count", 1)))]
     ]
-    # Open is the best historical node by observed free fraction, then by
-    # clearance and shorter path.  It remains a generator result, not a ranker.
+    # Open is a safety-aware historical node proposal.  Complete floor-aligned
+    # known-free evidence must win before local openness; otherwise a node can
+    # look open in a 2-D neighborhood while failing the actual 1.5m footprint
+    # readout used by the hard clearance gate.  This is still only ordering:
+    # every cumulative pool is filtered by the unchanged strict gates below.
+    floor_safe_first = bool(cfg.get("open_rank_floor_safe_first", False))
     open_candidates = sorted(
         path_eligible_candidates,
         key=lambda item: (
+            bool(item.get("floor_aligned_known_free", False)) if floor_safe_first else False,
+            -float(item.get("floor_aligned_state_counts", {}).get("unknown", 0)) if floor_safe_first else 0.0,
+            -float(item.get("floor_aligned_state_counts", {}).get("occupied", 0)) if floor_safe_first else 0.0,
             float(item.get("local_free_fraction", 0.0)),
             -float(item.get("local_unknown_fraction", 0.0)),
             -float(item.get("local_occupied_fraction", 0.0)),

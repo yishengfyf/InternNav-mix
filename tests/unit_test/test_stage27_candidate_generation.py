@@ -152,6 +152,37 @@ def test_floor_readout_uses_source_route_node_height():
     assert result["families"]["R-route-near"][0]["floor_aligned_known_free"] is False
 
 
+def test_route_open_prefers_floor_aligned_safe_evidence_over_local_openness():
+    nodes = [
+        {**item, "z": 0.0 if item["step_id"] < 2 else 1.0}
+        for item in _nodes()
+    ]
+
+    def floor_state(_row, _col, floor_z_m):
+        return "free" if float(floor_z_m) == 0.0 else "occupied"
+
+    result = generate_stage27_candidates(
+        route_nodes=nodes,
+        trigger_grid=[0, 15],
+        state_fn=lambda _row, _col: "free",
+        rasterize_edge=_rasterize,
+        floor_state_fn=floor_state,
+        config={
+            "cell_size_m": 0.05,
+            "min_distance_m": 0.25,
+            "max_distance_m": 4.0,
+            "near_count": 1,
+            "open_count": 1,
+            "open_rank_floor_safe_first": True,
+        },
+    )
+    near = result["families"]["R-route-near"][0]
+    opened = result["families"]["R-route-open"][0]
+    assert near["floor_aligned_known_free"] is False
+    assert opened["floor_aligned_known_free"] is True
+    assert opened["source_step"] in {0, 1}
+
+
 def test_route_near_uses_executed_path_distance_after_loop():
     nodes = [
         {"step_id": 0, "grid": [0, 12], "xy": [0.0, 0.6]},
