@@ -1,0 +1,32 @@
+[
+  {
+    "scene_id": "17DRP5sb8fy",
+    "episode_id": 10356,
+    "step_id": 33,
+    "audit_role": "gt_lite_true_trap",
+    "gt_state": "true_trap",
+    "gt_type": "G2_local_rotation_loop",
+    "gt_split": "dev",
+    "gt_end_step": 68,
+    "gt_recoverability": "self_recovered_delayed",
+    "gt_intervention_likely_needed": true,
+    "gt_fields_used": [],
+    "future_used_for_review_only": true,
+    "episode_eval_seed": 440000
+  },
+  {
+    "scene_id": "29hnd4uzFmX",
+    "episode_id": 4353,
+    "step_id": 46,
+    "audit_role": "gt_lite_true_trap",
+    "gt_state": "true_trap",
+    "gt_type": "G2_local_rotation_loop",
+    "gt_split": "holdout",
+    "gt_end_step": 500,
+    "gt_recoverability": "persistent",
+    "gt_intervention_likely_needed": true,
+    "gt_fields_used": [],
+    "future_used_for_review_only": true,
+    "episode_eval_seed": 440003
+  }
+]
