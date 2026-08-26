@@ -60,6 +60,7 @@ from internnav.utils.replay_ledger import ReplayLedger
 from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
 from internnav.utils.stage27_candidate_generation import generate_from_sparse_memory
+from internnav.utils.stage41_executor_contract import validate_executor_contract
 
 # Import for Habitat registry side effects — do not remove
 import internnav.habitat_extensions.vln.measures  # noqa: F401 # isort: skip
@@ -2799,9 +2800,89 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(os.path.join(log_dir, "stage27_m3_candidate_events.jsonl"), "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
+    def _write_stage41_executor_contract_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "stage41_executor_contract_events.jsonl")
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _stage41_executor_contract_shadow(
+        self, event: dict, *, observations: Optional[dict], depth_m: Optional[np.ndarray]
+    ) -> None:
+        if not bool(self._stage27_candidate_audit_cfg.get("stage41_executor_contract_enable", False)):
+            return
+        pool = list(
+            event.get("ablation", {}).get(
+                "route_occ_clearance_frontier", {}
+            ).get("candidates") or []
+        )
+        depth_readable = bool(
+            isinstance(depth_m, np.ndarray)
+            and depth_m.size > 0
+            and np.isfinite(depth_m).any()
+        )
+        sensor = {
+            "hfov_deg": float(self.sim_sensors_config.depth_sensor.hfov),
+            "hfov_source": "habitat_depth_sensor_config",
+            "depth_readable": depth_readable,
+        }
+        contracts = []
+        for candidate in pool:
+            bridge = self._recovery_path_bridge(
+                {**event, "candidate": candidate},
+                observations=observations,
+                depth_m=depth_m,
+                probe_source="stage41_executor_contract_shadow",
+            )
+            path = list(bridge.get("path") or [])
+            edge_audits = []
+            for index, cell in enumerate(path[1:], start=1):
+                state = self.occ_memory._cell_state(int(cell[0]), int(cell[1]))
+                edge_audits.append({
+                    "edge_index": int(index),
+                    "grid": list(cell),
+                    "state": str(state),
+                    "sparseocc_safe": state == "free",
+                    "unknown": state == "unknown",
+                    "occupied": state == "occupied",
+                    "depth_occlusion_checked": bool(index == 1 and bridge.get("base_projection_bridge") is not None),
+                    "depth_readable": bool(depth_readable),
+                    "depth_clear": bool(index == 1 and bridge.get("valid")),
+                })
+            report = validate_executor_contract(
+                sensor=sensor,
+                edge_audits=edge_audits,
+                candidate_safety=candidate,
+            )
+            contracts.append({
+                "candidate_id": candidate.get("candidate_id"),
+                "bridge": bridge,
+                "edge_audits": edge_audits,
+                "contract": report,
+            })
+        self._write_stage41_executor_contract_event({
+            "event_type": "stage41_executor_contract_shadow",
+            "scene_id": event.get("scene_id"),
+            "episode_id": event.get("episode_id"),
+            "step_id": event.get("step_id"),
+            "sensor": sensor,
+            "candidate_count": len(pool),
+            "contracts": contracts,
+            "shadow_only": True,
+            "action_applied": False,
+            "unknown_is_free": False,
+            "gt_fields_used": [],
+        })
+
     def _maybe_write_stage27_candidate_audit(
         self, *, scene_id: str, episode_id: int, episode_index: int,
         episode_count: int, episode_eval_seed: Optional[int], step_id: int,
+        observations: Optional[dict] = None,
+        depth_m: Optional[np.ndarray] = None,
         allow_unscheduled: bool = False,
     ) -> None:
         if not self._stage27_candidate_audit_enabled:
@@ -2834,7 +2915,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             semantic_filtered_nodes=semantic_filtered_nodes,
             instruction=instruction,
         )
-        self._write_stage27_candidate_event({
+        record = {
             "event_type": "stage27_m3_candidate_generation",
             "scene_id": scene_id,
             "episode_id": int(episode_id),
@@ -2846,7 +2927,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "audit_selection_fields_used": ["pre_registered_event_step"],
             "candidate_feature_gt_fields_used": [],
             **event,
-        })
+        }
+        self._write_stage27_candidate_event(record)
+        self._stage41_executor_contract_shadow(
+            record, observations=observations, depth_m=depth_m
+        )
 
     def _write_s2_loop_fixed_route_occ_audit_event(self, event: dict) -> None:
         run_dir = self._get_vlmap_run_dir()
@@ -8744,6 +8829,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     episode_count=int(episode_count),
                     episode_eval_seed=episode_eval_seed,
                     step_id=int(step_id),
+                    observations=observations,
+                    depth_m=current_depth_m,
                 )
                 # Stage24A is audit-only.  Keep the raw RGB-D in the ledger while
                 # indexing only compact map/pose state in JSONL; no ledger field is

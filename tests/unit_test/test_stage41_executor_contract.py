@@ -16,7 +16,7 @@ def _candidate(**extra):
 
 
 def _edge(**extra):
-    value = {"sparseocc_safe": True, "depth_occlusion_checked": True, "depth_readable": True, "unknown": False, "occupied": False}
+    value = {"sparseocc_safe": True, "depth_occlusion_checked": True, "depth_readable": True, "depth_clear": True, "unknown": False, "occupied": False}
     value.update(extra)
     return value
 
@@ -24,7 +24,7 @@ def _edge(**extra):
 def test_contract_uses_sensor_hfov_and_readable_depth():
     report = _module.validate_executor_contract(
         sensor={"hfov_deg": 79, "hfov_source": "rgb_sensor", "depth_readable": True},
-        edge_audits=[_edge(), _edge()],
+        edge_audits=[_edge(), _edge(depth_occlusion_checked=False)],
         candidate_safety=_candidate(),
     )
     assert report["executor_eligible"] is True
