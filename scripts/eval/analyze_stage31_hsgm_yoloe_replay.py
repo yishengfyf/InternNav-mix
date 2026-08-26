@@ -286,12 +286,17 @@ def _query_observations(episode_dir: Path, max_frames: int) -> list[dict[str, An
     return rows
 
 
-def _landmark_terms(rows: list[dict[str, Any]]) -> list[str]:
-    terms = set()
+def _landmarks(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    terms: dict[str, str] = {}
     for row in rows:
         semantic = row.get("semantic_state") or {}
-        terms.update(str(term).lower() for term in semantic.get("landmark_terms") or [])
-    return sorted(terms)
+        for landmark in semantic.get("landmarks") or []:
+            term = str(landmark.get("term") or "").lower()
+            if term:
+                terms[term] = str(landmark.get("term_type") or "unknown").lower()
+        for term in semantic.get("landmark_terms") or []:
+            terms.setdefault(str(term).lower(), "unknown")
+    return [{"term": term, "term_type": terms[term]} for term in sorted(terms)]
 
 
 def _episode_dirs(root: Path) -> list[Path]:
@@ -480,11 +485,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         meta = _load_json(episode_dir / "episode_meta.json")
         annotation = annotations.get((str(meta.get("scene_id")), str(meta.get("episode_id"))), {})
         rows = _query_observations(episode_dir, args.max_frames_per_episode)
-        terms = _landmark_terms(rows)
+        landmarks = _landmarks(rows)
+        terms = [row["term"] for row in landmarks]
         episode_key = f"{meta.get('scene_id')}|{meta.get('episode_id')}|r{meta.get('rank', 0)}"
         per_variant: dict[str, Any] = {}
         paired_lseg = _lseg_summary(episode_dir)
         route = []
+        geometry_surface = Counter()
         for row in rows:
             route_node = row.get("route_node") or {}
             gps = route_node.get("gps")
@@ -503,6 +510,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             camera = meta.get("camera_model") or {}
             intrinsic = np.asarray(camera.get("intrinsic"), dtype=np.float32)
             pose = np.asarray((row.get("pose") or {}).get("stage23_gt_camera_pose_map"), dtype=np.float32)
+            if depth is not None and intrinsic.shape == (3, 3) and pose.shape == (4, 4):
+                geometry_projection = project_mask_depth(
+                    np.ones_like(depth, dtype=bool), depth, intrinsic, pose,
+                    sample_stride=args.geometry_sample_stride,
+                    max_points=args.max_geometry_points_per_frame,
+                )
+                for key, value in hsgm_height_band_counts(
+                    geometry_projection["map_xyz"], _base_z(row)
+                ).items():
+                    geometry_surface[key] += value
             for variant in aggregate:
                 kept = detections if variant == "raw" else [
                     det for det in detections if hsgm_center_filter(det["box_xyxy"], image.shape[1], image.shape[0])
@@ -563,6 +580,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             nodes = associate_instances(instances, args.merge_radius_m)
             gt = gt_surface_audit(nodes, meta)
             coverage = instruction_coverage((row["label"] for row in instances), terms)
+            coverage_by_type = {
+                term_type: instruction_coverage(
+                    (row["label"] for row in instances),
+                    (landmark["term"] for landmark in landmarks if landmark["term_type"] == term_type),
+                )
+                for term_type in sorted({landmark["term_type"] for landmark in landmarks})
+            }
             bands = Counter()
             for row in instances:
                 points = np.asarray(row["points_map"], dtype=np.float32).reshape(-1, 3)
@@ -580,7 +604,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "cross_label_conflict": conflict_audit(nodes),
                 "gt_audit": gt,
                 "instruction_coverage": coverage,
-                "height_band_surface": dict(bands),
+                "instruction_coverage_by_type": coverage_by_type,
+                "semantic_instance_height_bands": dict(bands),
             }
             _write_json(output / "episodes" / episode_key / f"{variant}_nodes.json", nodes)
             if variant == "hsgm_center_filtered":
@@ -591,6 +616,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "audit_role": annotation.get("audit_role"),
             "query_frame_count": len(rows),
             "readable_depth_frame_count": sum(_load_depth(episode_dir, row) is not None for row in rows),
+            "hsgm_geometry_height_surface_audit": dict(geometry_surface),
             "paired_lseg": paired_lseg,
             "variants": per_variant,
         })
@@ -617,6 +643,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         variant_summary[variant]["instruction_landmark_coverage"] = (
             variant_summary[variant]["instruction_landmark_matched_count"] / terms if terms else None
         )
+        for term_type in ("object", "room"):
+            typed = [
+                row["instruction_coverage_by_type"].get(term_type) or {}
+                for row in episode_rows
+            ]
+            typed_terms = sum(int(row.get("term_count") or 0) for row in typed)
+            typed_matched = sum(int(row.get("matched_count") or 0) for row in typed)
+            variant_summary[variant][f"instruction_{term_type}_term_count"] = typed_terms
+            variant_summary[variant][f"instruction_{term_type}_matched_count"] = typed_matched
+            variant_summary[variant][f"instruction_{term_type}_coverage"] = (
+                typed_matched / typed_terms if typed_terms else None
+            )
     raw_count = variant_summary["raw"]["detection_count"]
     lseg_episodes = [row["paired_lseg"] for row in episode_reports if row.get("paired_lseg")]
     paired_lseg_summary = {"episode_count": len(lseg_episodes)}
@@ -686,6 +724,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "model_iou": 0.3,
             "class_count": len(runner.class_names),
             "query_frames_only": True,
+            "geometry_sample_stride": args.geometry_sample_stride,
             "episode_count": len(episode_reports),
             "query_frame_count": len(manifest),
             "readable_depth_frame_count": sum(row["readable_depth_frame_count"] for row in episode_reports),
@@ -733,6 +772,8 @@ def main() -> None:
     parser.add_argument("--max-frames-per-episode", type=int, default=0)
     parser.add_argument("--sample-stride", type=int, default=4)
     parser.add_argument("--max-points-per-instance", type=int, default=4096)
+    parser.add_argument("--geometry-sample-stride", type=int, default=8)
+    parser.add_argument("--max-geometry-points-per-frame", type=int, default=20000)
     parser.add_argument("--merge-radius-m", type=float, default=0.5)
     args = parser.parse_args()
     run(args)
