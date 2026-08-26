@@ -427,6 +427,68 @@ def _passes(candidate: Mapping[str, Any], config: Mapping[str, Any], stage: str)
     return True
 
 
+def _history_rejection_reason(
+    candidate: Mapping[str, Any], config: Mapping[str, Any]
+) -> str:
+    """Assign one sequential hard-gate outcome to a historical route node."""
+    if float(candidate.get("occupied_fraction", 0.0)) > float(
+        config.get("max_occupied_fraction", 0.0)
+    ):
+        return "route_occ"
+    if float(candidate.get("unknown_fraction", 0.0)) > float(
+        config.get("max_unknown_fraction", 0.0)
+    ):
+        return "strict_unknown"
+    floor = candidate.get("floor_aligned_state_counts") or {}
+    if int(floor.get("occupied", 0) or 0) > 0:
+        return "floor_or_footprint_occupied"
+    if int(floor.get("unknown", 0) or 0) > 0:
+        return "floor_or_footprint_unknown"
+    if not bool(candidate.get("floor_aligned_known_free")):
+        return "clearance_other"
+    return "safe"
+
+
+def _history_fallback_pool(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    origin_xy: Sequence[float],
+    config: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Select a compact direction-diverse pool after every hard gate passes."""
+    ordered = sorted(
+        candidates,
+        key=lambda item: (
+            float(item.get("path_length_m", float("inf"))),
+            -float(item.get("local_free_fraction", 0.0)),
+            -int(item.get("source_step", -1) or -1),
+        ),
+    )
+    limit = max(1, int(config.get("history_fallback_count", 3)))
+    selected: List[Dict[str, Any]] = []
+    seen_directions = set()
+    for require_novel_direction in (True, False):
+        for candidate in ordered:
+            if len(selected) >= limit:
+                break
+            if any(candidate.get("candidate_id") == item.get("candidate_id") for item in selected):
+                continue
+            bucket = _direction_bucket(candidate, origin_xy)
+            if require_novel_direction and bucket in seen_directions:
+                continue
+            item = {
+                **candidate,
+                "source_type": "R-route-history-safe",
+                "source_families": ["R-route-history-safe"],
+                "history_direction_bucket": int(bucket),
+            }
+            selected.append(item)
+            seen_directions.add(bucket)
+        if len(selected) >= limit:
+            break
+    return _dedupe(selected, float(config.get("min_separation_m", 0.25)))
+
+
 def _dedupe(candidates: Sequence[Mapping[str, Any]], min_separation_m: float) -> List[Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
     for item in candidates:
@@ -653,6 +715,25 @@ def generate_stage27_candidates(
             -int(item.get("source_step", -1) or -1),
         )
     )
+    history_rejection_counts = Counter(
+        _history_rejection_reason(item, cfg)
+        for item in path_eligible_candidates
+    )
+    history_safe_universe = [
+        item for item in path_eligible_candidates
+        if _history_rejection_reason(item, cfg) == "safe"
+    ]
+    result["history_fallback_enabled"] = bool(
+        cfg.get("history_fallback_enable", False)
+    )
+    result["history_route_rejection_counts"] = {
+        name: int(history_rejection_counts.get(name, 0))
+        for name in (
+            "route_occ", "strict_unknown", "floor_or_footprint_occupied",
+            "floor_or_footprint_unknown", "clearance_other", "safe",
+        )
+    }
+    result["history_safe_universe_count"] = len(history_safe_universe)
     near = [
         {**item, "source_type": "R-route-near", "source_families": ["R-route-near"]}
         for item in path_eligible_candidates[: max(1, int(cfg.get("near_count", 1)))]
@@ -716,8 +797,35 @@ def generate_stage27_candidates(
             ),
         }
     route_clearance_pool = result["ablation"]["route_occ_clearance"]["candidates"]
+    history_fallback_triggered = not route_clearance_pool
+    history_fallback_candidates: List[Dict[str, Any]] = []
+    if bool(cfg.get("history_fallback_enable", False)) and history_fallback_triggered:
+        history_fallback_candidates = _history_fallback_pool(
+            history_safe_universe,
+            origin_xy=nodes[-1]["xy"],
+            config=cfg,
+        )
+    route_with_history = _dedupe(
+        route_clearance_pool + history_fallback_candidates,
+        float(cfg.get("min_separation_m", 0.25)),
+    )
+    result["history_fallback_triggered"] = bool(history_fallback_triggered)
+    result["history_preselection_false_negative"] = bool(
+        not route_clearance_pool and history_safe_universe
+    )
+    result["history_fallback_candidates"] = history_fallback_candidates
+    result["history_fallback_candidate_count"] = len(history_fallback_candidates)
+    result["ablation"]["route_occ_clearance_history"] = {
+        "candidates": route_with_history,
+        "candidate_count": len(route_with_history),
+        "event_has_candidate": bool(route_with_history),
+        "safe_candidate_count": len(route_with_history),
+        "history_increment_count": max(
+            0, len(route_with_history) - len(route_clearance_pool)
+        ),
+    }
     frontier_triggered = (
-        len(route_clearance_pool)
+        len(route_with_history)
         < max(1, int(cfg.get("frontier_trigger_min_route_candidates", 1)))
     )
     frontier_candidates: List[Dict[str, Any]] = []
@@ -800,7 +908,7 @@ def generate_stage27_candidates(
         if _passes(item, cfg, "route_occ_clearance")
     ]
     cumulative = _dedupe(
-        route_clearance_pool + frontier_safe,
+        route_with_history + frontier_safe,
         float(cfg.get("min_separation_m", 0.25)),
     )
     result["frontier_triggered"] = bool(frontier_triggered)

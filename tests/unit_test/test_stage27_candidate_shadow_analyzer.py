@@ -54,6 +54,7 @@ def test_manifest_coverage_counts_missing_events_as_zero(tmp_path: Path) -> None
         "route_only",
         "route_occ",
         "route_occ_clearance",
+        "route_occ_clearance_history",
         "route_occ_clearance_frontier",
     )
     events = [

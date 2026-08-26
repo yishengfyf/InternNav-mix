@@ -19,6 +19,7 @@ STAGES = (
     "route_only",
     "route_occ",
     "route_occ_clearance",
+    "route_occ_clearance_history",
     "route_occ_clearance_frontier",
     "route_occ_clearance_frontier_semantic_raw",
     "route_occ_clearance_frontier_semantic_filtered",
@@ -236,6 +237,23 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
         len(row.get("ablation", {}).get("route_occ_clearance_frontier", {}).get("candidates") or [])
         for row in events
     )
+    history_rejection_counts = Counter()
+    for row in events:
+        history_rejection_counts.update({
+            str(name): int(count or 0)
+            for name, count in (
+                row.get("history_route_rejection_counts") or {}
+            ).items()
+        })
+    history_preselection_false_negative_count = sum(
+        bool(row.get("history_preselection_false_negative")) for row in events
+    )
+    history_increment_event_count = sum(
+        int(row.get("ablation", {}).get(
+            "route_occ_clearance_history", {}
+        ).get("history_increment_count", 0) or 0) > 0
+        for row in events
+    )
     semantic_metrics = {}
     for branch in ("raw", "filtered"):
         stage = f"route_occ_clearance_frontier_semantic_{branch}"
@@ -320,7 +338,8 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
                     or candidate.get("gt_fields_used")
                     or str(candidate.get("source_type", "")).split("+")[0]
                     not in {
-                        "R-route-near", "R-route-open", "F-local-known-safe-frontier",
+                        "R-route-near", "R-route-open", "R-route-history-safe",
+                        "F-local-known-safe-frontier",
                         "S-route-reobserve-raw", "S-route-reobserve-filtered",
                     }
                 ):
@@ -431,6 +450,32 @@ def analyze(root: Path, gt_path: Path | None = None) -> Dict[str, Any]:
             "frontier_path_modes": sorted({
                 str(row.get("frontier_path_mode") or "unspecified") for row in events
             }),
+        },
+        "history_fallback_metrics": {
+            "enabled_event_count": sum(
+                bool(row.get("history_fallback_enabled")) for row in events
+            ),
+            "triggered_event_count": sum(
+                bool(row.get("history_fallback_triggered")) for row in events
+            ),
+            "path_eligible_candidate_count": sum(
+                int(row.get("route_path_eligible_candidate_count", 0) or 0)
+                for row in events
+            ),
+            "safe_universe_candidate_count": sum(
+                int(row.get("history_safe_universe_count", 0) or 0)
+                for row in events
+            ),
+            "rejection_counts": dict(sorted(history_rejection_counts.items())),
+            "preselection_false_negative_event_count": int(
+                history_preselection_false_negative_count
+            ),
+            "increment_candidate_count": sum(
+                int(row.get("history_fallback_candidate_count", 0) or 0)
+                for row in events
+            ),
+            "increment_event_count": int(history_increment_event_count),
+            "zero_to_nonzero_event_count": int(history_increment_event_count),
         },
         "semantic_metrics": semantic_metrics,
         "manifest_candidate_coverage": _manifest_coverage_report(events, gt),

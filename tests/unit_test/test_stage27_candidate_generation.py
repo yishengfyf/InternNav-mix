@@ -184,6 +184,63 @@ def test_route_open_prefers_floor_aligned_safe_evidence_over_local_openness():
     assert opened["source_step"] in {0, 1}
 
 
+def test_history_fallback_filters_full_universe_before_selection():
+    nodes = [
+        {**item, "z": 1.0 if item["step_id"] >= 1 else 0.0}
+        for item in _nodes()
+    ]
+
+    def floor_state(_row, _col, floor_z_m):
+        return "free" if float(floor_z_m) == 0.0 else "occupied"
+
+    result = generate_stage27_candidates(
+        route_nodes=nodes,
+        trigger_grid=[0, 15],
+        state_fn=lambda _row, _col: "free",
+        rasterize_edge=_rasterize,
+        floor_state_fn=floor_state,
+        config={
+            "cell_size_m": 0.05,
+            "min_distance_m": 0.25,
+            "max_distance_m": 4.0,
+            "near_count": 1,
+            "open_count": 1,
+            "history_fallback_enable": True,
+            "history_fallback_count": 3,
+        },
+    )
+    assert not result["ablation"]["route_occ_clearance"]["event_has_candidate"]
+    assert result["history_preselection_false_negative"] is True
+    assert result["history_route_rejection_counts"]["safe"] == 1
+    fallback = result["ablation"]["route_occ_clearance_history"]
+    assert fallback["event_has_candidate"] is True
+    assert fallback["history_increment_count"] == 1
+    candidate = fallback["candidates"][0]
+    assert candidate["source_type"] == "R-route-history-safe"
+    assert candidate["source_step"] == 0
+    assert candidate["unknown_fraction"] == 0.0
+    assert candidate["occupied_fraction"] == 0.0
+    assert candidate["floor_aligned_known_free"] is True
+
+
+def test_history_fallback_never_promotes_unknown_route():
+    result = generate_stage27_candidates(
+        route_nodes=_nodes(),
+        trigger_grid=[0, 15],
+        state_fn=lambda _row, col: "unknown" if col == 12 else "free",
+        rasterize_edge=_rasterize,
+        config={
+            "cell_size_m": 0.05,
+            "min_distance_m": 0.25,
+            "max_distance_m": 4.0,
+            "history_fallback_enable": True,
+        },
+    )
+    assert result["history_route_rejection_counts"]["strict_unknown"] > 0
+    assert result["history_safe_universe_count"] == 0
+    assert not result["ablation"]["route_occ_clearance_history"]["event_has_candidate"]
+
+
 def test_route_near_uses_executed_path_distance_after_loop():
     nodes = [
         {"step_id": 0, "grid": [0, 12], "xy": [0.0, 0.6]},
