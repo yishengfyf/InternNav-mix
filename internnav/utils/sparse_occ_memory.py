@@ -3133,7 +3133,11 @@ class SparseOccSemanticMemory:
         return event
 
     def _current_pose_state(self, obs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if self.pose_trace:
+        # Counterfactual probes keep the official trace frozen. They must
+        # still use the temporary observation yaw during a path re-audit;
+        # normal callers retain the persistent pose contract by default.
+        prefer_observation_pose = bool(obs.get("_prefer_observation_pose"))
+        if self.pose_trace and not prefer_observation_pose:
             pose = self.pose_trace[-1]
             return {
                 "grid": [int(pose["row"]), int(pose["col"])],
@@ -5856,6 +5860,8 @@ class SparseOccSemanticMemory:
             "path_edge_count": 0,
             "path_m": None,
             "path_visited_cell_count": 0,
+            "path_pose_source": None,
+            "path_pose_yaw_rad": None,
             "initial_path_grid": None,
             "initial_direction_bucket": None,
             "initial_direction_angle_deg": None,
@@ -5873,6 +5879,12 @@ class SparseOccSemanticMemory:
         if pose_state is None:
             result["reason"] = "missing_pose_or_memory"
             return result
+        result["path_pose_source"] = (
+            "current_observation"
+            if bool((obs or {}).get("_prefer_observation_pose"))
+            else "persistent_pose_trace"
+        )
+        result["path_pose_yaw_rad"] = float(pose_state.get("yaw", 0.0) or 0.0)
         try:
             start_values = list(pose_state.get("grid") or [])
             anchor_values = list(candidate.get("grid") or [])

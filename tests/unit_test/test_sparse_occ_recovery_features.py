@@ -112,3 +112,48 @@ def test_path_bridge_derives_projection_geometry_without_mutating_candidate(monk
         "distance_m": captured["distance_m"],
         "candidate_mutated": False,
     }
+
+
+def test_current_pose_state_can_prefer_temporary_observation_over_trace(monkeypatch):
+    memory = _memory()
+    memory.pose_trace = [{"row": 32, "col": 32, "x": 0.0, "y": 0.0, "yaw": 0.0}]
+    memory.init_base_tf = np.eye(4, dtype=np.float32)
+    observed_tf = np.eye(4, dtype=np.float32)
+    monkeypatch.setattr(memory, "_pose_from_obs", lambda _obs: observed_tf)
+    monkeypatch.setattr(memory, "_relative_base_tf", lambda _tf: observed_tf)
+    monkeypatch.setattr(memory, "_pose_to_grid", lambda _tf: (40, 41, 1.25))
+
+    state = memory._current_pose_state({"_prefer_observation_pose": True})
+
+    assert state == {"grid": [40, 41], "xy": [0.0, 0.0], "yaw": 1.25}
+    assert memory._current_pose_state({})["grid"] == [32, 32]
+
+
+def test_path_bridge_reports_counterfactual_observation_pose(monkeypatch):
+    memory = _memory()
+    path = [(32, col) for col in range(32, 37)]
+    for cell in path:
+        memory.free2d_counts[cell] = 1
+    monkeypatch.setattr(
+        memory,
+        "_current_pose_state",
+        lambda _obs: {"grid": [32, 32], "yaw": 1.25},
+    )
+    monkeypatch.setattr(
+        memory,
+        "plan_recovery_projection_bridge",
+        lambda *_args, **_kwargs: {
+            "valid": False,
+            "reason": "test_capture",
+            "sample_records": [],
+        },
+    )
+
+    report = memory.plan_recovery_path_bridge(
+        {"candidate_id": "route_node:4", "grid": [32, 36]},
+        {"_prefer_observation_pose": True},
+        np.ones((8, 8), dtype=np.float32),
+    )
+
+    assert report["path_pose_source"] == "current_observation"
+    assert report["path_pose_yaw_rad"] == 1.25

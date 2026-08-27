@@ -1270,6 +1270,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             {
                 "gps": observations.get("gps"),
                 "compass": observations.get("compass"),
+                "_prefer_observation_pose": str(probe_source).startswith(
+                    "stage43_counterfactual"
+                ),
             },
             depth_m,
             context={
