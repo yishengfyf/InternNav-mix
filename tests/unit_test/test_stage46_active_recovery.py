@@ -73,3 +73,24 @@ def test_binding_marks_only_existing_safe_candidate_executable():
     assert result["candidate"]["geometry_safe"] is True
     assert result["candidate"]["active_gate_safe"] is True
     assert result["triage_tier"] == "strict_intervention"
+
+
+def test_selector_report_keeps_pool_accounting_for_post_selection_gates():
+    selected, report = _module.select_frozen_m3_candidate(
+        _event(
+            [
+                _candidate("safe", support=2, openness=0.8, path=0.6),
+                _candidate("unsafe", support=8, openness=1.0, path=0.2, occupied_fraction=0.1),
+            ]
+        )
+    )
+    assert selected["candidate_id"] == "safe"
+    assert report["pool_count"] == 2
+    assert report["safe_count"] == 1
+    assert report["unsafe_record_count"] == 1
+
+
+def test_active_path_bound_is_local_and_zero_disables_it():
+    assert _module.active_path_within_bound(0.95, 1.0)
+    assert not _module.active_path_within_bound(1.65, 1.0)
+    assert _module.active_path_within_bound(1.65, 0.0)

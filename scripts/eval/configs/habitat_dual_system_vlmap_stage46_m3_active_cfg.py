@@ -29,6 +29,12 @@ vlmap_cfg["s2_loop_strict_active_allowed_directions"] = ["path"]
 vlmap_cfg["s2_loop_path_reobserve_turn_deadband_deg"] = 7.5
 vlmap_cfg["s2_loop_path_reobserve_scan_when_aligned"] = True
 vlmap_cfg["s2_loop_path_reobserve_max_path_cells"] = 160
+# Keep treatment local: v1 showed that a 1.65m observation turn perturbed an
+# already-successful route, while the 0.95m candidate resolved a persistent
+# failure. This post-v1 gate must be revalidated and is not a learned score.
+vlmap_cfg["s2_loop_path_reobserve_max_active_path_m"] = float(
+    os.environ.get("STAGE46_MAX_ACTIVE_PATH_M", "1.0")
+)
 vlmap_cfg["s2_loop_path_reobserve_path_corridor_m"] = 0.35
 vlmap_cfg["s2_loop_path_reobserve_min_path_progress_m"] = 0.25
 vlmap_cfg["s2_loop_path_reobserve_max_local_subgoal_m"] = 3.0

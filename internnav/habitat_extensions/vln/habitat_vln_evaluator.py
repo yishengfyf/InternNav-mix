@@ -66,7 +66,10 @@ from internnav.utils.stage45_candidate_rejection_truth import (
     audit_candidate_rejection_truth,
     summarize_event_audits,
 )
-from internnav.utils.stage46_active_recovery import bind_candidate_to_loop_event
+from internnav.utils.stage46_active_recovery import (
+    active_path_within_bound,
+    bind_candidate_to_loop_event,
+)
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -833,6 +836,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "path_reobserve_max_path_cells": max(
                 1,
                 int(vlmap_safety_cfg.get("s2_loop_path_reobserve_max_path_cells", 160)),
+            ),
+            "path_reobserve_max_active_path_m": max(
+                0.0,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_max_active_path_m", 0.0
+                    )
+                ),
             ),
             "path_reobserve_path_corridor_m": max(
                 0.05,
@@ -2684,6 +2695,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             probe_source="s2_loop_path_reobserve_initial",
         )
         result["path_bridge"] = bridge
+        max_active_path_m = float(
+            cfg.get("path_reobserve_max_active_path_m", 0.0) or 0.0
+        )
+        path_m = bridge.get("path_m")
+        if not active_path_within_bound(path_m, max_active_path_m):
+            result.update(
+                {
+                    "reason": "candidate_path_beyond_active_bound",
+                    "max_active_path_m": float(max_active_path_m),
+                    "candidate_path_m": float(path_m),
+                }
+            )
+            return result
         if bridge.get("valid"):
             result.update(
                 {

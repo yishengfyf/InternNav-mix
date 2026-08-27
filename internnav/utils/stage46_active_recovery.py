@@ -107,3 +107,13 @@ def bind_candidate_to_loop_event(
         }
     )
     return result
+
+
+def active_path_within_bound(path_m: Any, max_active_path_m: float) -> bool:
+    """A zero bound disables the post-selection local-distance gate."""
+    try:
+        bound = float(max_active_path_m)
+        distance = float(path_m)
+    except (TypeError, ValueError):
+        return True
+    return bool(bound <= 0.0 or distance <= bound + 1e-9)
