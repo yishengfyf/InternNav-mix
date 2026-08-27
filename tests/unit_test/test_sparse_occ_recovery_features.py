@@ -1,3 +1,7 @@
+import math
+
+import numpy as np
+
 from internnav.utils.sparse_occ_memory import SparseOccSemanticMemory
 
 
@@ -66,3 +70,44 @@ def test_revisit_interval_uses_visit_segments_not_consecutive_near_steps():
     info = memory._anchor_trace_information((32, 32), latest_step=9)
 
     assert info["revisit_interval_steps"] == [8]
+
+
+def test_path_bridge_derives_projection_geometry_without_mutating_candidate(monkeypatch):
+    memory = _memory()
+    path = [(32, col) for col in range(32, 37)]
+    for cell in path:
+        memory.free2d_counts[cell] = 1
+    monkeypatch.setattr(
+        memory,
+        "_current_pose_state",
+        lambda _obs: {"grid": [32, 32], "yaw": 0.0},
+    )
+    captured = {}
+
+    def capture_projection(candidate, *_args, **_kwargs):
+        captured.update(candidate)
+        return {"valid": False, "reason": "test_capture", "sample_records": []}
+
+    monkeypatch.setattr(memory, "plan_recovery_projection_bridge", capture_projection)
+    candidate = {"candidate_id": "route_node:4", "grid": [32, 36]}
+    original = dict(candidate)
+
+    report = memory.plan_recovery_path_bridge(
+        candidate,
+        {},
+        np.ones((8, 8), dtype=np.float32),
+        reorient_lookahead_m=0.50,
+    )
+
+    assert report["path_reachable"] is True
+    assert candidate == original
+    assert captured["grid"] == [32, 36]
+    assert math.isfinite(captured["direction_angle_deg"])
+    assert captured["distance_m"] == report["path_m"]
+    assert report["projection_candidate_geometry"] == {
+        "source": "current_sparseocc_path_reaudit",
+        "direction_bucket": captured["direction_bucket"],
+        "direction_angle_deg": captured["direction_angle_deg"],
+        "distance_m": captured["distance_m"],
+        "candidate_mutated": False,
+    }

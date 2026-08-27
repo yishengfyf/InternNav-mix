@@ -5859,6 +5859,7 @@ class SparseOccSemanticMemory:
             "initial_path_grid": None,
             "initial_direction_bucket": None,
             "initial_direction_angle_deg": None,
+            "projection_candidate_geometry": None,
             "base_projection_bridge": None,
             "path_eligible_probe_count": 0,
             "selected_pixel_goal": None,
@@ -5972,8 +5973,27 @@ class SparseOccSemanticMemory:
             }
         )
 
+        # Stage27 candidates intentionally store map/path geometry rather than
+        # a pose-relative direction. Recompute the projection-only fields from
+        # the current re-audited path so a reorientation never reuses a stale
+        # bearing and the frozen candidate record remains unchanged.
+        projection_candidate = dict(candidate)
+        projection_candidate.update(
+            {
+                "direction_bucket": initial_direction.get("bucket"),
+                "direction_angle_deg": initial_direction.get("angle_deg"),
+                "distance_m": float(path_m),
+            }
+        )
+        result["projection_candidate_geometry"] = {
+            "source": "current_sparseocc_path_reaudit",
+            "direction_bucket": projection_candidate.get("direction_bucket"),
+            "direction_angle_deg": projection_candidate.get("direction_angle_deg"),
+            "distance_m": projection_candidate.get("distance_m"),
+            "candidate_mutated": False,
+        }
         base_bridge = self.plan_recovery_projection_bridge(
-            candidate,
+            projection_candidate,
             obs,
             depth,
             context=context,
