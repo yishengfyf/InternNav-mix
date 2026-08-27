@@ -40,10 +40,12 @@ def analyze(root: Path, manifest: Path) -> dict[str, Any]:
         "depth_readable_count": sum(bool(row.get("depth_readable")) for row in reports),
         "sensor_hfov_values": sorted({row.get("sensor_hfov_deg") for row in reports}),
         "first_edge_depth_checked_count": sum(bool(row.get("first_edge_depth_checked")) for row in reports),
+        "first_edge_depth_clear_count": sum(bool(row.get("first_edge_depth_clear")) for row in reports),
         "all_edges_sparseocc_reaudited_count": sum(bool(row.get("all_edges_sparseocc_reaudited")) for row in reports),
         "unsafe_edge_count": sum(not bool(edge.get("sparseocc_safe")) for edge in edge_audits),
         "unknown_edge_count": sum(bool(edge.get("unknown")) for edge in edge_audits),
         "occupied_edge_count": sum(bool(edge.get("occupied")) for edge in edge_audits),
+        "action_emitted_count": sum(bool(row.get("action_emitted")) for row in reports),
         "action_applied_count": sum(bool(row.get("action_applied")) for row in rows),
         "unknown_is_free": False,
         "gt_fields_used": [],
@@ -53,7 +55,9 @@ def analyze(root: Path, manifest: Path) -> dict[str, Any]:
         and all(row.get("unknown_is_free") is False for row in rows)
         and all(float(row.get("sensor_hfov_deg")) == 79.0 for row in reports)
         and all(bool(row.get("depth_readable")) for row in reports)
+        and all(bool(row.get("first_edge_depth_checked")) for row in reports)
         and all(bool(row.get("all_edges_sparseocc_reaudited")) for row in reports)
+        and not any(bool(row.get("action_emitted")) for row in reports)
         and not any(not bool(edge.get("sparseocc_safe")) for edge in edge_audits),
     }
 

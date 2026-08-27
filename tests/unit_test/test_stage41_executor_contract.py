@@ -28,6 +28,8 @@ def test_contract_uses_sensor_hfov_and_readable_depth():
         candidate_safety=_candidate(),
     )
     assert report["executor_eligible"] is True
+    assert report["first_edge_depth_checked"] is True
+    assert report["first_edge_depth_clear"] is True
     assert _module.executor_contract_ok(report)
 
 
@@ -40,3 +42,15 @@ def test_contract_abstains_without_depth_or_on_unknown_edge():
     assert report["executor_eligible"] is False
     assert report["action_emitted"] is False
     assert _module.executor_contract_ok(report)
+
+
+def test_contract_records_checked_but_blocked_first_edge_separately():
+    report = _module.validate_executor_contract(
+        sensor={"hfov_deg": 79, "hfov_source": "depth_sensor", "depth_readable": True},
+        edge_audits=[_edge(depth_clear=False)],
+        candidate_safety=_candidate(),
+    )
+    assert report["first_edge_depth_checked"] is True
+    assert report["first_edge_depth_clear"] is False
+    assert report["executor_eligible"] is False
+    assert report["action_emitted"] is False

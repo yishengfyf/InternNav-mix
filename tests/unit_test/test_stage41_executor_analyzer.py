@@ -15,7 +15,7 @@ def test_stage41_analyzer_requires_exact_safe_depth_contract(tmp_path):
         "scene_id": "s", "episode_id": 1, "step_id": 2,
         "shadow_only": True, "action_applied": False, "unknown_is_free": False, "gt_fields_used": [],
         "contracts": [{
-            "contract": {"executor_eligible": False, "depth_readable": True, "sensor_hfov_deg": 79.0, "first_edge_depth_checked": True, "all_edges_sparseocc_reaudited": True},
+            "contract": {"executor_eligible": False, "depth_readable": True, "sensor_hfov_deg": 79.0, "first_edge_depth_checked": True, "first_edge_depth_clear": False, "all_edges_sparseocc_reaudited": True, "action_emitted": False},
             "edge_audits": [{"sparseocc_safe": True, "unknown": False, "occupied": False}],
         }],
     }
@@ -26,3 +26,20 @@ def test_stage41_analyzer_requires_exact_safe_depth_contract(tmp_path):
     report = _module.analyze(tmp_path, manifest)
     assert report["integrity_passed"] is True
     assert report["abstain_count"] == 1
+    assert report["first_edge_depth_checked_count"] == 1
+    assert report["first_edge_depth_clear_count"] == 0
+
+
+def test_stage41_analyzer_rejects_unchecked_first_edge(tmp_path):
+    row = {
+        "scene_id": "s", "episode_id": 1, "step_id": 2,
+        "shadow_only": True, "action_applied": False, "unknown_is_free": False, "gt_fields_used": [],
+        "contracts": [{
+            "contract": {"executor_eligible": False, "depth_readable": True, "sensor_hfov_deg": 79.0, "first_edge_depth_checked": False, "first_edge_depth_clear": False, "all_edges_sparseocc_reaudited": True, "action_emitted": False},
+            "edge_audits": [{"sparseocc_safe": True, "unknown": False, "occupied": False}],
+        }],
+    }
+    (tmp_path / "stage41_executor_contract_events.jsonl").write_text(json.dumps(row) + "\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"scene_id": "s", "episode_id": 1, "step_id": 2}]))
+    assert _module.analyze(tmp_path, manifest)["integrity_passed"] is False

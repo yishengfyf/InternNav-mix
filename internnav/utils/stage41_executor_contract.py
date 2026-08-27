@@ -30,9 +30,10 @@ def validate_executor_contract(
         and not bool(edge.get("occupied"))
         for edge in edges
     )
-    first_edge_depth_ok = bool(edges) and bool(edges[0].get("depth_occlusion_checked")) and bool(
+    first_edge_depth_checked = bool(edges) and bool(edges[0].get("depth_occlusion_checked")) and bool(
         edges[0].get("depth_readable")
-    ) and bool(edges[0].get("depth_clear"))
+    )
+    first_edge_depth_clear = first_edge_depth_checked and bool(edges[0].get("depth_clear"))
     hfov_ok = hfov is not None and 0.5 <= float(hfov) <= 180.0
     return {
         "schema_version": SCHEMA_VERSION,
@@ -41,10 +42,11 @@ def validate_executor_contract(
         "depth_readable": depth_readable,
         "edge_count": len(edges),
         "candidate_safety_reaudited": safety_ok,
-        "first_edge_depth_checked": first_edge_depth_ok,
+        "first_edge_depth_checked": first_edge_depth_checked,
+        "first_edge_depth_clear": first_edge_depth_clear,
         "all_edges_sparseocc_reaudited": edge_ok,
-        "executor_eligible": bool(hfov_ok and depth_readable and safety_ok and edge_ok and first_edge_depth_ok),
-        "abstain_reason": None if (hfov_ok and depth_readable and safety_ok and edge_ok and first_edge_depth_ok) else "contract_not_satisfied",
+        "executor_eligible": bool(hfov_ok and depth_readable and safety_ok and edge_ok and first_edge_depth_clear),
+        "abstain_reason": None if (hfov_ok and depth_readable and safety_ok and edge_ok and first_edge_depth_clear) else "contract_not_satisfied",
         "action_emitted": False,
         "action_applied": False,
         "shadow_only": True,
