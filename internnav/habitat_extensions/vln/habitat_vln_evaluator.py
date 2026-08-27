@@ -62,6 +62,10 @@ from internnav.utils.vlmap_semantic import VLMapSemanticShadow
 from internnav.utils.stage27_candidate_generation import generate_from_sparse_memory
 from internnav.utils.stage38_recovery_context import build_recovery_bev_spatial_snapshot
 from internnav.utils.stage41_executor_contract import validate_executor_contract
+from internnav.utils.stage45_candidate_rejection_truth import (
+    audit_candidate_rejection_truth,
+    summarize_event_audits,
+)
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -390,6 +394,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         )
         self._stage27_candidate_audit_cfg = dict(
             vlmap_safety_cfg.get("stage27_candidate_audit_config", {}) or {}
+        )
+        self._stage45_candidate_rejection_truth_enable = bool(
+            vlmap_safety_cfg.get(
+                "stage45_candidate_rejection_truth_enable", False
+            )
+        )
+        self._stage45_candidate_rejection_truth_cfg = dict(
+            vlmap_safety_cfg.get(
+                "stage45_candidate_rejection_truth_config", {}
+            )
+            or {}
         )
         self._stage27_candidate_audit_entries = {
             (
@@ -3305,6 +3320,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "candidate_feature_gt_fields_used": [],
             **event,
         }
+        if self._stage45_candidate_rejection_truth_enable:
+            record["offline_rejection_truth_audit"] = (
+                self._stage45_candidate_rejection_truth_audit(
+                    record, scene_id=scene_id, episode_id=int(episode_id)
+                )
+            )
         if bool(self._stage27_candidate_audit_cfg.get("recovery_bev_snapshot_enable", False)):
             semantic_cells = []
             final_pool = record.get("ablation", {}).get(
@@ -3329,6 +3350,212 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._stage43_counterfactual_reobserve_shadow(
             record, observations=observations, depth_m=depth_m
         )
+
+    def _stage45_candidate_rejection_truth_audit(
+        self, record: dict, *, scene_id: str, episode_id: int
+    ) -> dict:
+        """Run a read-only navmesh audit for frozen route-only candidates."""
+        result = {
+            "event_schema_version": "stage45_candidate_rejection_truth_event_v1",
+            "enabled": True,
+            "scene_id": str(scene_id),
+            "episode_id": int(episode_id),
+            "shadow_only": True,
+            "action_applied": False,
+            "gt_used_for_navigation": False,
+            "unknown_is_free": False,
+            "candidate_pool": "route_only",
+            "audits": [],
+            "summary": summarize_event_audits([]),
+        }
+        route_pool = (
+            record.get("ablation", {})
+            .get("route_only", {})
+            .get("candidates", [])
+            or []
+        )
+        if not route_pool:
+            result["reason"] = "no_route_only_candidates"
+            return result
+        pathfinder = getattr(self.env._env.sim, "pathfinder", None)
+        memory = self.occ_memory
+        if pathfinder is None or not bool(getattr(pathfinder, "is_loaded", True)):
+            result["reason"] = "pathfinder_unavailable"
+            return result
+        reference_memory = self.occ_memory_oracle_sensor_pose or memory
+        pose_trace = list(getattr(reference_memory, "pose_trace", []) or [])
+        trace_xy = []
+        trace_z = []
+        for node in pose_trace:
+            try:
+                trace_xy.append((float(node["x"]), float(node["y"])))
+                trace_z.append(float(node.get("z", 0.0) or 0.0))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if self._stage23a_initial_agent_matrix is None:
+            result["reason"] = "missing_initial_agent_matrix"
+            return result
+        habitat_to_map = np.array(
+            [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        )
+        map_to_habitat_tf = np.eye(4, dtype=np.float32)
+        map_to_habitat_tf[:3, :3] = habitat_to_map.T
+        map_to_world_tf = (
+            np.asarray(self._stage23a_initial_agent_matrix, dtype=np.float32)
+            @ map_to_habitat_tf
+        )
+        cell_size = float(getattr(memory, "cs", 0.05))
+        footprint_radius = float(
+            self._stage45_candidate_rejection_truth_cfg.get(
+                "footprint_radius_m", 0.18
+            )
+        )
+        radius_cells = max(0, int(math.ceil(footprint_radius / cell_size)))
+        max_edge_geodesic_ratio = float(
+            self._stage45_candidate_rejection_truth_cfg.get(
+                "max_edge_geodesic_ratio", 2.0
+            )
+        )
+        world_cache = {}
+        footprint_cache = {}
+
+        def floor_z_for_cell(cell):
+            if not trace_xy:
+                return 0.0
+            x, y = memory._grid_to_xy(cell)
+            index = int(
+                np.argmin(
+                    np.sum(
+                        (np.asarray(trace_xy, dtype=np.float32)
+                         - np.asarray([[x, y]], dtype=np.float32)) ** 2,
+                        axis=1,
+                    )
+                )
+            )
+            return float(trace_z[index])
+
+        def world_for_cell(cell):
+            cell = (int(cell[0]), int(cell[1]))
+            if cell not in world_cache:
+                xy = memory._grid_to_xy(cell)
+                point = np.array(
+                    [float(xy[0]), float(xy[1]), floor_z_for_cell(cell), 1.0],
+                    dtype=np.float32,
+                )
+                world_cache[cell] = (map_to_world_tf @ point)[:3]
+            return world_cache[cell]
+
+        def navmesh_cell(cell):
+            cell = (int(cell[0]), int(cell[1]))
+            if cell not in footprint_cache:
+                point = world_for_cell(cell)
+                try:
+                    navigable = bool(pathfinder.is_navigable(point, 0.5))
+                except TypeError:
+                    navigable = bool(pathfinder.is_navigable(point))
+                try:
+                    snapped = np.asarray(
+                        pathfinder.snap_point(point), dtype=np.float32
+                    ).reshape(3)
+                    snap_distance = float(np.linalg.norm(snapped - point))
+                except Exception:
+                    snapped, snap_distance = None, None
+                clearance = None
+                if snapped is not None and hasattr(
+                    pathfinder, "distance_to_closest_obstacle"
+                ):
+                    try:
+                        clearance = float(
+                            pathfinder.distance_to_closest_obstacle(
+                                snapped, max(2.0, footprint_radius * 2.0)
+                            )
+                        )
+                    except TypeError:
+                        try:
+                            clearance = float(
+                                pathfinder.distance_to_closest_obstacle(snapped)
+                            )
+                        except Exception:
+                            clearance = None
+                    except Exception:
+                        clearance = None
+                footprint_cache[cell] = {
+                    "navigable": navigable,
+                    "footprint_safe": (
+                        bool(clearance + 1e-6 >= footprint_radius)
+                        if clearance is not None
+                        else None
+                    ),
+                    "clearance_m": clearance,
+                    "snap_distance_m": snap_distance,
+                    "footprint_check_method": (
+                        "navmesh_distance_to_closest_obstacle"
+                    ),
+                }
+            return footprint_cache[cell]
+
+        def navmesh_edge(first, second):
+            start = world_for_cell(first)
+            end = world_for_cell(second)
+            direct = float(np.linalg.norm(np.asarray(end) - np.asarray(start)))
+            shortest = habitat_sim.ShortestPath()
+            shortest.requested_start = start
+            shortest.requested_end = end
+            try:
+                connected = bool(pathfinder.find_path(shortest))
+                geodesic = (
+                    float(shortest.geodesic_distance) if connected else None
+                )
+            except Exception:
+                connected, geodesic = False, None
+            ratio = (
+                float(geodesic / direct)
+                if geodesic is not None and direct > 1e-6
+                else None
+            )
+            return {
+                "connected": bool(
+                    connected
+                    and ratio is not None
+                    and ratio <= max_edge_geodesic_ratio
+                ),
+                "direct_m": direct,
+                "geodesic_m": geodesic,
+                "geodesic_ratio": ratio,
+            }
+
+        def sparse_floor_footprint_state(row, col, floor):
+            all_free = True
+            for dr in range(-radius_cells, radius_cells + 1):
+                for dc in range(-radius_cells, radius_cells + 1):
+                    if math.hypot(dr, dc) > radius_cells:
+                        continue
+                    state = memory.validation_floor_aligned_cell_evidence(
+                        int(row) + dr,
+                        int(col) + dc,
+                        float(floor),
+                        height_max_m=1.5,
+                    )["state"]
+                    if state == "blocked":
+                        return "occupied"
+                    all_free = all_free and state == "free"
+            return "free" if all_free else "unknown"
+
+        for candidate in route_pool:
+            result["audits"].append(
+                audit_candidate_rejection_truth(
+                    candidate,
+                    sparse_2d_state=memory._cell_state,
+                    sparse_floor_footprint_state=sparse_floor_footprint_state,
+                    navmesh_cell=navmesh_cell,
+                    navmesh_edge=navmesh_edge,
+                    footprint_radius_m=footprint_radius,
+                )
+            )
+        result["summary"] = summarize_event_audits(result["audits"])
+        result["reason"] = "ok"
+        return result
 
     def _write_s2_loop_fixed_route_occ_audit_event(self, event: dict) -> None:
         run_dir = self._get_vlmap_run_dir()
@@ -9216,6 +9443,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     rgb=rgb,
                     context=occ_memory_context,
                 )
+                # Stage45 needs the current oracle floor pose before it writes
+                # the offline rejection audit. This isolated branch is never
+                # read by navigation and is updated exactly once per frame.
+                if (
+                    self._stage45_candidate_rejection_truth_enable
+                    and self.occ_memory_oracle_sensor_pose is not None
+                ):
+                    self.occ_memory_oracle_sensor_pose.update_observation(
+                        occ_memory_obs,
+                        current_depth_m,
+                        rgb=rgb,
+                        context={
+                            **occ_memory_context,
+                            "stage23a_map_branch": "oracle_sensor_pose",
+                            "gt_fields_used": [
+                                "habitat_sensor_state_position",
+                                "habitat_sensor_state_rotation",
+                            ],
+                        },
+                    )
                 # Stage27 is invoked only for the pre-registered detector
                 # event steps. It serializes shadow evidence and cannot affect
                 # the frozen action path.
@@ -9334,7 +9581,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             "gt_fields_used": ["habitat_sim_agent_position_y"],
                         },
                     )
-                if self.occ_memory_oracle_sensor_pose is not None:
+                if (
+                    self.occ_memory_oracle_sensor_pose is not None
+                    and not self._stage45_candidate_rejection_truth_enable
+                ):
                     self.occ_memory_oracle_sensor_pose.update_observation(
                         occ_memory_obs,
                         current_depth_m,
