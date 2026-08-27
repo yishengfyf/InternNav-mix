@@ -7,14 +7,15 @@ from internnav.utils.sparse_occ_memory import SparseOccSemanticMemory
 
 def _memory():
     return SparseOccSemanticMemory(
-        None,
-        enable=True,
-        frontier_enable=False,
-        grid_size=64,
-        cell_size=0.25,
-        semantic_resilience_anchor_feature_radius_cells=4,
-        semantic_resilience_cycle_radius_cells=1,
-        semantic_resilience_cycle_window_steps=16,
+        {
+            "enable": True,
+            "frontier_enable": False,
+            "grid_size": 64,
+            "cell_size": 0.25,
+            "semantic_resilience_anchor_feature_radius_cells": 4,
+            "semantic_resilience_cycle_radius_cells": 1,
+            "semantic_resilience_cycle_window_steps": 16,
+        }
     )
 
 
