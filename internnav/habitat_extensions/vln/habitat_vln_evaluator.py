@@ -66,6 +66,7 @@ from internnav.utils.stage45_candidate_rejection_truth import (
     audit_candidate_rejection_truth,
     summarize_event_audits,
 )
+from internnav.utils.stage46_active_recovery import bind_candidate_to_loop_event
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -417,6 +418,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
             if isinstance(item, dict)
         }
+        self._stage27_candidate_audit_records = {}
         self.occ_memory_oracle_pose = None
         if self._stage23a_oracle_pose_enabled:
             oracle_cfg = copy.deepcopy(vlmap_safety_cfg)
@@ -792,6 +794,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ),
             "path_reobserve_active_enable": bool(
                 vlmap_safety_cfg.get("s2_loop_path_reobserve_active_enable", False)
+            ),
+            "path_reobserve_candidate_source": str(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_candidate_source", "legacy_semantic"
+                )
+            ),
+            "path_reobserve_one_primitive_per_reaudit": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_one_primitive_per_reaudit", False
+                )
             ),
             "path_reobserve_max_interventions_per_episode": max(
                 0,
@@ -2599,6 +2611,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         result = {
             "event_type": "s2_loop_path_reobserve_active",
             "event_schema_version": "stage21c_path_reobserve_active_v1",
+            "candidate_source": (event or {}).get(
+                "candidate_source", "legacy_semantic"
+            ),
+            "one_primitive_per_reaudit": bool(
+                cfg.get("path_reobserve_one_primitive_per_reaudit")
+            ),
             "scene_id": (event or {}).get("scene_id"),
             "episode_id": (event or {}).get("episode_id"),
             "episode_index": (event or {}).get("episode_index"),
@@ -2719,6 +2737,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result["reason"] = "empty_reorient_plan"
             return result
         actions = [int(turn_action)] * int(turn_steps)
+        if cfg.get("path_reobserve_one_primitive_per_reaudit"):
+            actions = actions[:1]
         result.update(
             {
                 "execution_mode": "bounded_reorient_reobserve",
@@ -3276,17 +3296,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         observations: Optional[dict] = None,
         depth_m: Optional[np.ndarray] = None,
         allow_unscheduled: bool = False,
-    ) -> None:
+    ) -> Optional[dict]:
         if not self._stage27_candidate_audit_enabled:
-            return
+            return None
         key = (str(scene_id), int(episode_id), int(step_id))
         entry = self._stage27_candidate_audit_entries.get(key)
         if entry is None and not allow_unscheduled:
-            return
+            return None
         entry = entry or {"selection": "all_detector_shadow_starts"}
         trigger_grid = getattr(self.occ_memory, "last_pose_grid", None)
         if trigger_grid is None:
-            return
+            return None
         semantic_candidate_enabled = bool(
             self._stage27_candidate_audit_cfg.get("semantic_candidate_enable", False)
         )
@@ -3350,6 +3370,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._stage43_counterfactual_reobserve_shadow(
             record, observations=observations, depth_m=depth_m
         )
+        self._stage27_candidate_audit_records[key] = record
+        return record
 
     def _stage45_candidate_rejection_truth_audit(
         self, record: dict, *, scene_id: str, episode_id: int
@@ -3656,6 +3678,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         state: dict,
         output: str,
         observations: dict,
+        depth_m: Optional[np.ndarray],
         step_id: int,
         scene_id: str,
         episode_id: int,
@@ -3697,14 +3720,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         )
         # An empty audit manifest is a smoke-only mode: record only actual D0
         # loop starts, never every environment step.
+        stage27_key = (str(scene_id), int(episode_id), int(step_id))
+        stage27_record = self._stage27_candidate_audit_records.get(stage27_key)
         if not self._stage27_candidate_audit_entries:
-            self._maybe_write_stage27_candidate_audit(
+            stage27_record = self._maybe_write_stage27_candidate_audit(
                 scene_id=scene_id,
                 episode_id=int(episode_id),
                 episode_index=int(episode_index),
                 episode_count=int(episode_count),
                 episode_eval_seed=episode_eval_seed,
                 step_id=int(step_id),
+                observations=observations,
+                depth_m=depth_m,
                 allow_unscheduled=True,
             )
         candidate = self._best_semantic_resilience_backtrack_candidate(candidate_event)
@@ -3763,6 +3790,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "triage_reason": triage.get("reason"),
             "gt_fields_used": [],
         }
+        if cfg.get("path_reobserve_candidate_source") == "stage27_frozen_m3":
+            if stage27_record is None:
+                event.update(
+                    {
+                        "candidate": None,
+                        "candidate_source": "stage27_frozen_m3",
+                        "triage_tier": "hold",
+                        "triage_reason": "missing_same_step_stage27_event",
+                    }
+                )
+            else:
+                event = bind_candidate_to_loop_event(event, stage27_record)
         if (
             bool(cfg.get("executed_route_occ_audit_enable"))
             and str(event.get("triage_tier") or "") == "strict_intervention"
@@ -9933,6 +9972,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         state=s2_action_loop_state,
                         output=loop_observer_output,
                         observations=observations,
+                        depth_m=current_depth_m,
                         step_id=step_id,
                         scene_id=scene_id,
                         episode_id=episode_id,
@@ -11945,6 +11985,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         local_actions = action_list
                         if len(local_actions) >= MAX_LOCAL_STEPS:
                             local_actions = local_actions[:MAX_LOCAL_STEPS]
+                        if (
+                            pending_s2_loop_path_execution is not None
+                            and self._get_s2_action_loop_cfg().get(
+                                "path_reobserve_one_primitive_per_reaudit"
+                            )
+                        ):
+                            local_actions = local_actions[:1]
                         (
                             traj_reject_required,
                             vlmap_traj_decision,
@@ -12300,6 +12347,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         local_actions = action_list
                         if len(local_actions) >= MAX_LOCAL_STEPS:
                             local_actions = local_actions[:MAX_LOCAL_STEPS]
+                        if (
+                            pending_s2_loop_path_execution is not None
+                            and self._get_s2_action_loop_cfg().get(
+                                "path_reobserve_one_primitive_per_reaudit"
+                            )
+                        ):
+                            local_actions = local_actions[:1]
                         (
                             traj_reject_required,
                             vlmap_traj_decision,
