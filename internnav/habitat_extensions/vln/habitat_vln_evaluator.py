@@ -2902,6 +2902,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     result["attempt_count"] += 1
                     if not counterfactual or counterfactual.get("depth") is None:
                         continue
+                    # get_observations_at covers simulator RGB-D sensors only.
+                    # Read episodic GPS/compass from the task sensors at the
+                    # same temporary pose, then restore in the outer finally.
+                    sim.set_agent_state(
+                        np.asarray(before_state.position, dtype=np.float64).tolist(),
+                        rotation_xyzw,
+                        reset_sensors=False,
+                    )
+                    task_sensors = self.env._env.task.sensor_suite.sensors
+                    current_episode = self.env._env.current_episode
+                    counterfactual["gps"] = task_sensors["gps"].get_observation(
+                        counterfactual, current_episode
+                    )
+                    counterfactual["compass"] = task_sensors["compass"].get_observation(
+                        counterfactual, current_episode
+                    )
                     after_compass = math.degrees(
                         float(np.asarray(counterfactual.get("compass")).reshape(-1)[0])
                     )
