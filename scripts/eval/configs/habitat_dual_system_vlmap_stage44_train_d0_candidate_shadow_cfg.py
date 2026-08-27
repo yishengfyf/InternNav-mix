@@ -26,6 +26,7 @@ vlmap_cfg["stage27_candidate_audit_config"] = {
     "frontier_sample_limit": 512, "frontier_path_max_visited_cells": 30000,
     "frontier_standoff_m": 0.25, "frontier_min_route_separation_m": 0.25,
     "frontier_trigger_min_route_candidates": 1,
+    "recovery_bev_snapshot_enable": True, "recovery_bev_radius_cells": 24,
 }
 
 # No recovery, reobserve, ranker, or action path is enabled.

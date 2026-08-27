@@ -11,6 +11,7 @@ _spec.loader.exec_module(_module)
 attach_current_reaudit = _module.attach_current_reaudit
 build_recovery_anchor = _module.build_recovery_anchor
 build_recovery_bev_digest = _module.build_recovery_bev_digest
+build_recovery_bev_spatial_snapshot = _module.build_recovery_bev_spatial_snapshot
 recovery_contract_ok = _module.recovery_contract_ok
 
 
@@ -57,3 +58,17 @@ def test_missing_current_candidate_abstains():
     digest = build_recovery_bev_digest(current)
     assert current["current_safety"]["status"] == "no_current_candidate"
     assert recovery_contract_ok(current, digest)
+
+
+def test_spatial_snapshot_keeps_unknown_explicit_and_occupied_precedence():
+    snapshot = build_recovery_bev_spatial_snapshot(
+        center_grid=[10, 10], free_cells=[[10, 10], [10, 11]],
+        occupied_cells=[[10, 11]],
+        pose_trace=[{"row": 10, "col": 9}, {"row": 10, "col": 10}],
+        semantic_cells=[[9, 10]], radius_cells=1,
+    )
+    assert [10, 11] in snapshot["channels"]["occupied"]
+    assert [10, 11] not in snapshot["channels"]["known_free"]
+    assert len(snapshot["channels"]["unknown"]) == 7
+    assert snapshot["unknown_is_free"] is False
+    assert snapshot["semantic_can_override_safety"] is False

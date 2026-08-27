@@ -6,7 +6,7 @@ an old route node into a currently safe node and never emit an action.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = "stage38_recovery_anchor_v1"
@@ -123,6 +123,50 @@ def build_recovery_bev_digest(
         "action_applied": False,
         "shadow_only": True,
         "gt_fields_used": [],
+    }
+
+
+def build_recovery_bev_spatial_snapshot(
+    *, center_grid: Sequence[int], free_cells: Iterable[Sequence[int]],
+    occupied_cells: Iterable[Sequence[int]],
+    pose_trace: Iterable[Mapping[str, Any] | Sequence[int]] = (),
+    semantic_cells: Iterable[Sequence[int]] = (), radius_cells: int = 24,
+) -> dict[str, Any]:
+    """Create a bounded read-only local grid with explicit unknown cells."""
+    center = (int(center_grid[0]), int(center_grid[1]))
+    radius = max(1, int(radius_cells))
+    free_set = {(int(cell[0]), int(cell[1])) for cell in free_cells}
+    occupied_set = {(int(cell[0]), int(cell[1])) for cell in occupied_cells}
+    channels = {"known_free": [], "occupied": [], "unknown": [], "semantic": []}
+    for row in range(center[0] - radius, center[0] + radius + 1):
+        for col in range(center[1] - radius, center[1] + radius + 1):
+            cell = [row, col]
+            if (row, col) in occupied_set:
+                channels["occupied"].append(cell)
+            elif (row, col) in free_set:
+                channels["known_free"].append(cell)
+            else:
+                channels["unknown"].append(cell)
+    for cell in semantic_cells:
+        row, col = int(cell[0]), int(cell[1])
+        if abs(row - center[0]) <= radius and abs(col - center[1]) <= radius:
+            channels["semantic"].append([row, col])
+    route = []
+    for item in pose_trace:
+        row, col = ((item.get("row"), item.get("col")) if isinstance(item, Mapping)
+                    else (item[0], item[1]))
+        if row is None or col is None:
+            continue
+        row, col = int(row), int(col)
+        if abs(row - center[0]) <= radius and abs(col - center[1]) <= radius:
+            route.append([row, col])
+    return {
+        "schema_version": "stage38_recovery_bev_spatial_v1",
+        "center_grid": list(center), "radius_cells": radius,
+        "channels": channels, "executed_route": route,
+        "unknown_is_free": False, "semantic_can_override_safety": False,
+        "safety_authority": "SparseOcc_current_reaudit",
+        "shadow_only": True, "action_applied": False, "gt_fields_used": [],
     }
 
 

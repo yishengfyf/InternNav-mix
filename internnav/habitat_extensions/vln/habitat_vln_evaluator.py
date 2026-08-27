@@ -60,6 +60,7 @@ from internnav.utils.replay_ledger import ReplayLedger
 from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
 from internnav.utils.stage27_candidate_generation import generate_from_sparse_memory
+from internnav.utils.stage38_recovery_context import build_recovery_bev_spatial_snapshot
 from internnav.utils.stage41_executor_contract import validate_executor_contract
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
@@ -3304,6 +3305,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "candidate_feature_gt_fields_used": [],
             **event,
         }
+        if bool(self._stage27_candidate_audit_cfg.get("recovery_bev_snapshot_enable", False)):
+            semantic_cells = []
+            final_pool = record.get("ablation", {}).get(
+                "route_occ_clearance_frontier_semantic_filtered", {}
+            ).get("candidates", []) or []
+            for candidate in final_pool:
+                grid = (candidate.get("semantic_evidence") or {}).get("grid") or []
+                if len(grid) >= 2:
+                    semantic_cells.append(grid)
+            record["recovery_bev_spatial"] = build_recovery_bev_spatial_snapshot(
+                center_grid=trigger_grid,
+                free_cells=getattr(self.occ_memory, "free2d_counts", {}).keys(),
+                occupied_cells=getattr(self.occ_memory, "occ2d_counts", {}).keys(),
+                pose_trace=getattr(self.occ_memory, "pose_trace", []),
+                semantic_cells=semantic_cells,
+                radius_cells=int(self._stage27_candidate_audit_cfg.get("recovery_bev_radius_cells", 24)),
+            )
         self._write_stage27_candidate_event(record)
         self._stage41_executor_contract_shadow(
             record, observations=observations, depth_m=depth_m

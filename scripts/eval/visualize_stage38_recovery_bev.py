@@ -68,6 +68,9 @@ def render_recovery_bev(
     """Render one anchor/digest pair and return auditable rendering metadata."""
     capture = dict(anchor.get("capture") or {})
     channels = dict(digest.get("channels") or {})
+    required = ("known_free", "occupied", "unknown")
+    if not all(isinstance(channels.get(name), list) for name in required):
+        raise ValueError("RecoveryBEV requires explicit known_free/occupied/unknown cell lists")
     free = _channel_points(channels, ("known_free", "free", "known_free_cells"))
     occupied = _channel_points(channels, ("occupied", "occ", "occupied_cells"))
     unknown = _channel_points(channels, ("unknown", "unknown_cells", "unobserved"))
@@ -139,24 +142,61 @@ def render_recovery_bev(
     }
 
 
+def render_stage27_event(event: Mapping[str, Any], output: Path, *, scale: int = 6) -> dict[str, Any]:
+    spatial = dict(event.get("recovery_bev_spatial") or {})
+    channels = dict(spatial.get("channels") or {})
+    if not all(isinstance(channels.get(name), list) for name in ("known_free", "occupied", "unknown")):
+        raise ValueError("Stage27 event lacks explicit RecoveryBEV spatial channels")
+    final_pool = list(event.get("ablation", {}).get(
+        "route_occ_clearance_frontier_semantic_filtered", {}
+    ).get("candidates") or [])
+    candidate = final_pool[0] if final_pool else {}
+    event_id = "_".join(str(event.get(key)) for key in ("scene_id", "episode_id", "step_id"))
+    anchor = {
+        "anchor_id": event_id,
+        "capture": {
+            "path_cells": candidate.get("path_cells") or spatial.get("executed_route") or [],
+            "pose": spatial.get("center_grid"),
+            "candidate_grid": candidate.get("grid"),
+        },
+    }
+    meta = render_recovery_bev(anchor, {"channels": channels}, output, scale=scale)
+    meta["event_key"] = {key: event.get(key) for key in ("scene_id", "episode_id", "step_id")}
+    meta["candidate_count"] = len(final_pool)
+    return meta
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--report", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--report", type=Path)
+    source.add_argument("--events-root", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    report = json.loads(args.report.read_text(encoding="utf-8"))
-    anchors = {str(row.get("anchor_id")): row for row in report.get("anchors", [])}
     rendered = []
-    for digest in report.get("digests", []):
-        anchor = anchors.get(str(digest.get("anchor_id")))
-        if anchor is None:
-            continue
-        safe_name = str(digest.get("anchor_id") or "anchor").replace("/", "_").replace(":", "_")
-        rendered.append(render_recovery_bev(anchor, digest, args.output_dir / f"{safe_name}.png"))
+    if args.report is not None:
+        report = json.loads(args.report.read_text(encoding="utf-8"))
+        anchors = {str(row.get("anchor_id")): row for row in report.get("anchors", [])}
+        for digest in report.get("digests", []):
+            anchor = anchors.get(str(digest.get("anchor_id")))
+            if anchor is None:
+                continue
+            safe_name = str(digest.get("anchor_id") or "anchor").replace("/", "_").replace(":", "_")
+            rendered.append(render_recovery_bev(anchor, digest, args.output_dir / f"{safe_name}.png"))
+        source_report = str(args.report)
+    else:
+        for path in sorted(args.events_root.glob("**/stage27_m3_candidate_events.jsonl")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                name = "_".join(str(event.get(key)) for key in ("scene_id", "episode_id", "step_id"))
+                rendered.append(render_stage27_event(event, args.output_dir / f"{name}.png"))
+        source_report = str(args.events_root)
     metadata = {
         "task": "stage38_recovery_bev_visualization",
         "schema_version": "stage38_recovery_bev_visualization_v1",
-        "source_report": str(args.report),
+        "source_report": source_report,
         "rendered_count": len(rendered),
         "rendered": rendered,
         "unknown_is_free": False,

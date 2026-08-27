@@ -16,6 +16,7 @@ def test_unknown_is_explicit_and_semantic_is_outline(tmp_path):
     digest = {
         "channels": {
             "known_free": [[0, 0]],
+            "occupied": [],
             "unknown": [[0, 1]],
             "semantic": [[0, 1]],
         },
@@ -32,3 +33,17 @@ def test_unknown_is_explicit_and_semantic_is_outline(tmp_path):
     assert _module.COLORS["unknown"] in colors
     assert _module.COLORS["free"] in colors
 
+
+def test_stage27_event_requires_and_renders_spatial_channels(tmp_path):
+    event = {
+        "scene_id": "s", "episode_id": 1, "step_id": 2,
+        "recovery_bev_spatial": {
+            "center_grid": [1, 1], "executed_route": [[1, 0], [1, 1]],
+            "channels": {"known_free": [[1, 1]], "occupied": [[0, 1]],
+                         "unknown": [[0, 0]], "semantic": [[0, 0]]},
+        },
+        "ablation": {"route_occ_clearance_frontier_semantic_filtered": {"candidates": []}},
+    }
+    meta = _module.render_stage27_event(event, tmp_path / "event.png")
+    assert meta["unknown_cells_drawn"] == 1
+    assert meta["candidate_count"] == 0
