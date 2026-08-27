@@ -814,6 +814,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "s2_loop_path_reobserve_iterative_reorient_enable", False
                 )
             ),
+            "path_reobserve_pixel_execution_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_pixel_execution_enable", True
+                )
+            ),
             "path_reobserve_max_interventions_per_episode": max(
                 0,
                 int(
@@ -2723,6 +2728,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
             return result
         if bridge.get("valid"):
+            if not cfg.get("path_reobserve_pixel_execution_enable"):
+                result["reason"] = "path_pixel_execution_not_released"
+                return result
             result.update(
                 {
                     "execution_mode": "path_pixel",
@@ -2839,6 +2847,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         )
         result["post_path_bridge"] = bridge
         if bridge.get("valid"):
+            if not cfg.get("path_reobserve_pixel_execution_enable"):
+                result["reason"] = "path_pixel_execution_not_released"
+                return result
             result.update(
                 {
                     "execution_mode": "post_reobserve_path_pixel",
