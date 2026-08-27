@@ -45,10 +45,22 @@ exec > >(tee -a "${WORK_DIR}/pipeline.log") 2>&1
 
 FAILED_STAGE=targeted_tests
 python3 -m pytest -q tests/unit_test/test_stage27_candidate_generation.py
+if [[ "${STAGE27_STAGE43_ANALYZE:-0}" == 1 ]]; then
+  python3 -m pytest -q \
+    tests/unit_test/test_stage43_counterfactual_reobserve.py \
+    tests/unit_test/test_stage43_counterfactual_analyzer.py \
+    tests/unit_test/test_stage41_executor_contract.py
+fi
 python3 -m py_compile \
   internnav/utils/stage27_candidate_generation.py \
   scripts/eval/analyze_stage27_m3_candidate_shadow.py \
   scripts/eval/configs/habitat_dual_system_vlmap_stage27_m3_candidate_shadow_cfg.py
+if [[ "${STAGE27_STAGE43_ANALYZE:-0}" == 1 ]]; then
+  python3 -m py_compile \
+    internnav/utils/stage43_counterfactual_reobserve.py \
+    scripts/eval/analyze_stage43_counterfactual_reobserve.py \
+    scripts/eval/configs/habitat_dual_system_vlmap_stage43_counterfactual_reobserve_shadow_cfg.py
+fi
 
 FAILED_STAGE=frozen_s2_candidate_shadow
 CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8} \
@@ -69,6 +81,13 @@ if [[ -n "${EVENT_MANIFEST}" ]]; then
   AUDIT_ARGS+=(--gt-manifest "${EVENT_MANIFEST}")
 fi
 python3 scripts/eval/analyze_stage27_m3_candidate_shadow.py "${AUDIT_ARGS[@]}"
+if [[ "${STAGE27_STAGE43_ANALYZE:-0}" == 1 ]]; then
+  test -n "${EVENT_MANIFEST}"
+  python3 scripts/eval/analyze_stage43_counterfactual_reobserve.py \
+    --run-root "${RUN_ROOT}" \
+    --manifest "${EVENT_MANIFEST}" \
+    --output "${RUN_ROOT}/stage43_counterfactual_reobserve_audit.json"
+fi
 
 FAILED_STAGE=return_packaging
 mv "${RUN_ROOT}" "${WORK_DIR}/run"

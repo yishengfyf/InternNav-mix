@@ -61,6 +61,11 @@ from internnav.utils.vlmap_safety import VLMapActionSafety
 from internnav.utils.vlmap_semantic import VLMapSemanticShadow
 from internnav.utils.stage27_candidate_generation import generate_from_sparse_memory
 from internnav.utils.stage41_executor_contract import validate_executor_contract
+from internnav.utils.stage43_counterfactual_reobserve import (
+    SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
+    normalize_angle_deg,
+    plan_bounded_reorientation,
+)
 
 # Import for Habitat registry side effects — do not remove
 import internnav.habitat_extensions.vln.measures  # noqa: F401 # isort: skip
@@ -2810,6 +2815,358 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
+    def _write_stage43_counterfactual_reobserve_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "stage43_counterfactual_reobserve_events.jsonl")
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _stage43_memory_fingerprint(memory) -> tuple:
+        free_counts = getattr(memory, "free_counts", {}) or {}
+        occ_counts = getattr(memory, "occ_counts", {}) or {}
+        free2d_counts = getattr(memory, "free2d_counts", {}) or {}
+        occ2d_counts = getattr(memory, "occ2d_counts", {}) or {}
+        return (
+            int(getattr(memory, "observation_count", -1)),
+            len(getattr(memory, "pose_trace", []) or []),
+            len(free_counts), int(sum(free_counts.values())),
+            len(occ_counts), int(sum(occ_counts.values())),
+            len(free2d_counts), int(sum(free2d_counts.values())),
+            len(occ2d_counts), int(sum(occ2d_counts.values())),
+            tuple(getattr(memory, "last_pose_grid", ()) or ()),
+        )
+
+    @staticmethod
+    def _stage43_pose_equal(first, second) -> bool:
+        try:
+            positions_equal = bool(np.allclose(
+                np.asarray(first.position, dtype=np.float64),
+                np.asarray(second.position, dtype=np.float64),
+                atol=1e-7,
+            ))
+            first_q = quaternion.as_float_array(first.rotation)
+            second_q = quaternion.as_float_array(second.rotation)
+            rotations_equal = abs(float(np.dot(first_q, second_q))) >= 1.0 - 1e-7
+            return positions_equal and rotations_equal
+        except Exception:
+            return False
+
+    def _stage43_counterfactual_observation(
+        self, observations: dict, *, relative_bearing_deg: float, plan: dict
+    ) -> dict:
+        """Read a rotated sensor view and restore all official simulator state."""
+        result = {
+            "observation": None,
+            "depth_m": None,
+            "observation_readable": False,
+            "sim_pose_restored": False,
+            "selected_yaw_delta_deg": None,
+            "observed_compass_delta_deg": None,
+            "post_relative_bearing_deg": None,
+            "attempt_count": 0,
+            "reason": None,
+        }
+        if not plan.get("valid"):
+            result["reason"] = str(plan.get("reason") or "invalid_reorientation_plan")
+            return result
+        try:
+            sim = self.env._env.sim
+            before_state = sim.get_agent_state()
+            previous_sim_obs = getattr(sim, "_prev_sim_obs", None)
+            before_compass = math.degrees(float(np.asarray(observations.get("compass")).reshape(-1)[0]))
+            planned_delta = float(plan.get("planned_yaw_delta_deg", 0.0) or 0.0)
+            deltas = [planned_delta]
+            if abs(planned_delta) > 1e-9:
+                deltas.append(-planned_delta)
+            attempts = []
+            try:
+                for delta_deg in deltas:
+                    delta_q = quaternion.from_rotation_vector(
+                        np.asarray([0.0, math.radians(delta_deg), 0.0], dtype=np.float64)
+                    )
+                    target_q = delta_q * before_state.rotation
+                    rotation_xyzw = [
+                        float(target_q.x), float(target_q.y),
+                        float(target_q.z), float(target_q.w),
+                    ]
+                    counterfactual = sim.get_observations_at(
+                        position=np.asarray(before_state.position, dtype=np.float64).tolist(),
+                        rotation=rotation_xyzw,
+                        keep_agent_at_new_pose=False,
+                    )
+                    result["attempt_count"] += 1
+                    if not counterfactual or counterfactual.get("depth") is None:
+                        continue
+                    after_compass = math.degrees(
+                        float(np.asarray(counterfactual.get("compass")).reshape(-1)[0])
+                    )
+                    compass_delta = normalize_angle_deg(after_compass - before_compass)
+                    residual = normalize_angle_deg(float(relative_bearing_deg) - compass_delta)
+                    attempts.append((abs(residual), delta_deg, compass_delta, residual, counterfactual))
+            finally:
+                before_q = before_state.rotation
+                sim.set_agent_state(
+                    np.asarray(before_state.position, dtype=np.float64).tolist(),
+                    [float(before_q.x), float(before_q.y), float(before_q.z), float(before_q.w)],
+                    reset_sensors=False,
+                )
+                if hasattr(sim, "_prev_sim_obs"):
+                    sim._prev_sim_obs = previous_sim_obs
+            after_state = sim.get_agent_state()
+            result["sim_pose_restored"] = self._stage43_pose_equal(before_state, after_state)
+            if not attempts:
+                result["reason"] = "counterfactual_observation_unavailable"
+                return result
+            _, selected_delta, compass_delta, residual, selected = min(
+                attempts, key=lambda item: (item[0], abs(item[1]))
+            )
+            raw_depth = np.asarray(selected["depth"])
+            depth_m = filter_depth(raw_depth.reshape(raw_depth.shape[:2]), blur_type=None)
+            depth_m = depth_m * (self._max_depth - self._min_depth) + self._min_depth
+            result.update({
+                "observation": selected,
+                "depth_m": depth_m,
+                "observation_readable": bool(depth_m.size and np.isfinite(depth_m).any()),
+                "selected_yaw_delta_deg": float(selected_delta),
+                "observed_compass_delta_deg": float(compass_delta),
+                "post_relative_bearing_deg": float(residual),
+                "reason": "ok" if result["sim_pose_restored"] else "sim_pose_restore_failed",
+            })
+        except Exception as exc:
+            result["reason"] = f"counterfactual_probe_error:{type(exc).__name__}:{exc}"
+        return result
+
+    def _stage43_contract_for_candidate(
+        self, candidate: dict, *, observations: dict, depth_m: np.ndarray
+    ) -> dict:
+        bridge = self._recovery_path_bridge(
+            {"candidate": candidate},
+            observations=observations,
+            depth_m=depth_m,
+            probe_source="stage43_counterfactual_reobserve",
+        )
+        edge_audits = []
+        for index, cell in enumerate(list(bridge.get("path") or [])[1:], start=1):
+            state = self.occ_memory._cell_state(int(cell[0]), int(cell[1]))
+            edge_audits.append({
+                "edge_index": int(index),
+                "grid": list(cell),
+                "state": str(state),
+                "sparseocc_safe": state == "free",
+                "unknown": state == "unknown",
+                "occupied": state == "occupied",
+                "depth_occlusion_checked": bool(index == 1 and bridge.get("base_projection_bridge") is not None),
+                "depth_readable": True,
+                "depth_clear": bool(index == 1 and bridge.get("valid")),
+            })
+        contract = validate_executor_contract(
+            sensor={
+                "hfov_deg": float(self.sim_sensors_config.depth_sensor.hfov),
+                "hfov_source": "habitat_counterfactual_depth_sensor_config",
+                "depth_readable": True,
+            },
+            edge_audits=edge_audits,
+            candidate_safety=candidate,
+        )
+        return {
+            "candidate_id": candidate.get("candidate_id"),
+            "bridge": bridge,
+            "edge_audits": edge_audits,
+            "contract": contract,
+        }
+
+    def _stage43_zero_history_bearing(self) -> dict:
+        trace = list(getattr(self.occ_memory, "pose_trace", []) or [])
+        if len(trace) < 2:
+            return {"valid": False, "reason": "insufficient_pose_trace"}
+        current = trace[-1]
+        min_distance_m = float(
+            self._stage27_candidate_audit_cfg.get("stage43_zero_history_distance_m", 0.50)
+        )
+        target = next((
+            item for item in reversed(trace[:-1])
+            if math.hypot(
+                float(item.get("x", 0.0)) - float(current.get("x", 0.0)),
+                float(item.get("y", 0.0)) - float(current.get("y", 0.0)),
+            ) >= min_distance_m
+        ), None)
+        if target is None:
+            return {"valid": False, "reason": "no_translated_history_target"}
+        direction = self.occ_memory._direction_to_cell(
+            (int(current["row"]), int(current["col"])),
+            (int(target["row"]), int(target["col"])),
+            float(current.get("yaw", 0.0) or 0.0),
+        )
+        return {
+            "valid": direction.get("angle_deg") is not None,
+            "reason": "history_bearing_only",
+            "relative_bearing_deg": direction.get("angle_deg"),
+            "target_step": target.get("step_id"),
+            "target_grid": [int(target["row"]), int(target["col"])],
+            "history_grants_safety": False,
+        }
+
+    def _stage43_counterfactual_reobserve_shadow(
+        self, event: dict, *, observations: Optional[dict], depth_m: Optional[np.ndarray]
+    ) -> None:
+        cfg = self._stage27_candidate_audit_cfg
+        if not bool(cfg.get("stage43_counterfactual_reobserve_enable", False)):
+            return
+        pre_pool = list(event.get("ablation", {}).get(
+            "route_occ_clearance_frontier", {}
+        ).get("candidates") or [])
+        record = {
+            "schema_version": STAGE43_SCHEMA_VERSION,
+            "event_type": "stage43_counterfactual_reobserve_shadow",
+            "scene_id": event.get("scene_id"),
+            "episode_id": event.get("episode_id"),
+            "step_id": event.get("step_id"),
+            "pre_candidate_count": len(pre_pool),
+            "post_candidate_count_max": 0,
+            "probes": [],
+            "shadow_only": True,
+            "action_applied": False,
+            "unknown_is_free": False,
+            "gt_fields_used": [],
+        }
+        if observations is None or depth_m is None:
+            record["reason"] = "missing_current_observation"
+            self._write_stage43_counterfactual_reobserve_event(record)
+            return
+
+        targets = []
+        for candidate in pre_pool[: max(1, int(cfg.get("stage43_max_candidate_probes", 3)))]:
+            bridge = self._recovery_path_bridge(
+                {**event, "candidate": candidate},
+                observations=observations,
+                depth_m=depth_m,
+                probe_source="stage43_pre_counterfactual",
+            )
+            angle = bridge.get("initial_direction_angle_deg")
+            if bridge.get("path_reachable") and angle is not None:
+                targets.append({
+                    "source": "safe_candidate_first_edge",
+                    "candidate": candidate,
+                    "relative_bearing_deg": float(angle),
+                    "pre_bridge": bridge,
+                })
+        if not targets and not pre_pool:
+            history = self._stage43_zero_history_bearing()
+            if history.get("valid"):
+                targets.append({
+                    "source": "history_bearing_only",
+                    "candidate": None,
+                    "relative_bearing_deg": float(history["relative_bearing_deg"]),
+                    "history_target": history,
+                })
+            else:
+                record["reason"] = history.get("reason")
+
+        for target in targets:
+            plan = plan_bounded_reorientation(
+                target["relative_bearing_deg"],
+                hfov_deg=float(self.sim_sensors_config.depth_sensor.hfov),
+                turn_angle_deg=float(getattr(self.config.habitat.simulator, "turn_angle", 15.0)),
+                center_margin_deg=float(cfg.get("stage43_center_margin_deg", 10.0)),
+                max_turn_steps=int(cfg.get("stage43_max_turn_steps", 12)),
+            )
+            official_before = self._stage43_memory_fingerprint(self.occ_memory)
+            counterfactual = self._stage43_counterfactual_observation(
+                observations,
+                relative_bearing_deg=float(target["relative_bearing_deg"]),
+                plan=plan,
+            )
+            probe = {
+                "source": target["source"],
+                "candidate_id": (target.get("candidate") or {}).get("candidate_id"),
+                "history_target": target.get("history_target"),
+                "plan": plan,
+                "observation_readable": bool(counterfactual.get("observation_readable")),
+                "sim_pose_restored": bool(counterfactual.get("sim_pose_restored")),
+                "selected_yaw_delta_deg": counterfactual.get("selected_yaw_delta_deg"),
+                "observed_compass_delta_deg": counterfactual.get("observed_compass_delta_deg"),
+                "post_relative_bearing_deg": counterfactual.get("post_relative_bearing_deg"),
+                "attempt_count": counterfactual.get("attempt_count"),
+                "reason": counterfactual.get("reason"),
+                "post_candidate_count": 0,
+                "post_contracts": [],
+                "official_memory_mutated": False,
+                "safety_authority": "temporary_current_sparseocc_reaudit",
+                "action_emitted": False,
+                "action_applied": False,
+                "shadow_only": True,
+                "unknown_is_free": False,
+                "gt_fields_used": [],
+            }
+            try:
+                if counterfactual.get("observation_readable") and counterfactual.get("sim_pose_restored"):
+                    candidate = target.get("candidate")
+                    if candidate is not None:
+                        probe["post_candidate_count"] = 1
+                        probe["post_contracts"] = [self._stage43_contract_for_candidate(
+                            candidate,
+                            observations=counterfactual["observation"],
+                            depth_m=counterfactual["depth_m"],
+                        )]
+                    else:
+                        temporary_memory = copy.deepcopy(self.occ_memory)
+                        cf_observation = counterfactual["observation"]
+                        temporary_memory.update_observation(
+                            {
+                                "rgb": cf_observation.get("rgb"),
+                                "depth": counterfactual["depth_m"],
+                                "gps": cf_observation.get("gps"),
+                                "compass": cf_observation.get("compass"),
+                            },
+                            counterfactual["depth_m"],
+                            rgb=cf_observation.get("rgb"),
+                            context={
+                                "step_id": int(event.get("step_id", -1)),
+                                "scene_id": event.get("scene_id"),
+                                "episode_id": event.get("episode_id"),
+                                "camera_pitch_deg": 0.0,
+                            },
+                        )
+                        post_event = generate_from_sparse_memory(
+                            temporary_memory,
+                            trigger_grid=temporary_memory.last_pose_grid,
+                            config=cfg,
+                            semantic_raw_nodes=[],
+                            semantic_filtered_nodes=[],
+                            instruction="",
+                        )
+                        post_pool = list(post_event.get("ablation", {}).get(
+                            "route_occ_clearance_frontier", {}
+                        ).get("candidates") or [])
+                        probe["post_candidate_count"] = len(post_pool)
+                        official_memory = self.occ_memory
+                        try:
+                            self.occ_memory = temporary_memory
+                            probe["post_contracts"] = [
+                                self._stage43_contract_for_candidate(
+                                    candidate,
+                                    observations=cf_observation,
+                                    depth_m=counterfactual["depth_m"],
+                                )
+                                for candidate in post_pool[: max(1, int(cfg.get("stage43_max_candidate_probes", 3)))]
+                            ]
+                        finally:
+                            self.occ_memory = official_memory
+            except Exception as exc:
+                probe["reason"] = f"temporary_reaudit_error:{type(exc).__name__}:{exc}"
+            official_after = self._stage43_memory_fingerprint(self.occ_memory)
+            probe["official_memory_mutated"] = official_after != official_before
+            record["post_candidate_count_max"] = max(
+                int(record["post_candidate_count_max"]), int(probe["post_candidate_count"])
+            )
+            record["probes"].append(probe)
+        self._write_stage43_counterfactual_reobserve_event(record)
+
     def _stage41_executor_contract_shadow(
         self, event: dict, *, observations: Optional[dict], depth_m: Optional[np.ndarray]
     ) -> None:
@@ -2930,6 +3287,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         }
         self._write_stage27_candidate_event(record)
         self._stage41_executor_contract_shadow(
+            record, observations=observations, depth_m=depth_m
+        )
+        self._stage43_counterfactual_reobserve_shadow(
             record, observations=observations, depth_m=depth_m
         )
 
