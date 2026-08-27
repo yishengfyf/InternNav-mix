@@ -94,3 +94,47 @@ def test_active_path_bound_is_local_and_zero_disables_it():
     assert _module.active_path_within_bound(0.95, 1.0)
     assert not _module.active_path_within_bound(1.65, 1.0)
     assert _module.active_path_within_bound(1.65, 0.0)
+
+
+def test_iterative_reorientation_requires_monotonic_bearing_improvement():
+    decision = _module.iterative_reorientation_decision(
+        -100.0,
+        -85.0,
+        primitive_count=1,
+        max_primitives=4,
+        deadband_deg=7.5,
+    )
+    assert decision["continue_reorientation"] is True
+    assert decision["turn_direction"] == "right"
+
+    stalled = _module.iterative_reorientation_decision(
+        -85.0,
+        -86.0,
+        primitive_count=2,
+        max_primitives=4,
+        deadband_deg=7.5,
+    )
+    assert stalled["continue_reorientation"] is False
+    assert stalled["reason"] == "iterative_reorient_not_converging"
+
+
+def test_iterative_reorientation_stops_at_alignment_or_budget():
+    aligned = _module.iterative_reorientation_decision(
+        16.0,
+        1.0,
+        primitive_count=1,
+        max_primitives=4,
+        deadband_deg=7.5,
+    )
+    assert aligned["continue_reorientation"] is False
+    assert aligned["reason"] == "path_aligned_no_visible_proxy"
+
+    exhausted = _module.iterative_reorientation_decision(
+        -55.0,
+        -40.0,
+        primitive_count=4,
+        max_primitives=4,
+        deadband_deg=7.5,
+    )
+    assert exhausted["continue_reorientation"] is False
+    assert exhausted["reason"] == "iterative_reorient_budget_exhausted"

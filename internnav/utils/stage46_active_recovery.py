@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping, Optional, Tuple
 
 
@@ -117,3 +118,55 @@ def active_path_within_bound(path_m: Any, max_active_path_m: float) -> bool:
     except (TypeError, ValueError):
         return True
     return bool(bound <= 0.0 or distance <= bound + 1e-9)
+
+
+def iterative_reorientation_decision(
+    previous_bearing_deg: Any,
+    current_bearing_deg: Any,
+    *,
+    primitive_count: int,
+    max_primitives: int,
+    deadband_deg: float,
+) -> dict[str, Any]:
+    """Decide whether one more turn is justified after a fresh path re-audit."""
+    result = {
+        "continue_reorientation": False,
+        "turn_direction": None,
+        "reason": None,
+        "previous_abs_bearing_deg": None,
+        "current_abs_bearing_deg": None,
+    }
+    try:
+        previous = float(previous_bearing_deg)
+        current = float(current_bearing_deg)
+    except (TypeError, ValueError):
+        result["reason"] = "missing_reaudited_bearing"
+        return result
+    if not math.isfinite(previous) or not math.isfinite(current):
+        result["reason"] = "nonfinite_reaudited_bearing"
+        return result
+    previous_abs = abs(previous)
+    current_abs = abs(current)
+    result.update(
+        {
+            "previous_abs_bearing_deg": previous_abs,
+            "current_abs_bearing_deg": current_abs,
+        }
+    )
+    if int(primitive_count) >= max(0, int(max_primitives)):
+        result["reason"] = "iterative_reorient_budget_exhausted"
+        return result
+    if current_abs <= max(0.0, float(deadband_deg)):
+        result["reason"] = "path_aligned_no_visible_proxy"
+        return result
+    if current_abs >= previous_abs - 1e-6:
+        result["reason"] = "iterative_reorient_not_converging"
+        return result
+    result.update(
+        {
+            "continue_reorientation": True,
+            "turn_direction": "left" if current > 0.0 else "right",
+            "reason": "iterative_reorient_queued",
+        }
+    )
+    return result

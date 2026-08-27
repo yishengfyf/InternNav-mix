@@ -6,6 +6,7 @@ cd "${REPO_ROOT}"
 
 CHECKPOINT=${STAGE21C_SCORER_CHECKPOINT:?Set STAGE21C_SCORER_CHECKPOINT}
 MANIFEST=${STAGE46_MANIFEST:-scripts/eval/manifests/stage25_gt_detector_fresh500_smoke4.json}
+ACTIVE_CONFIG=${STAGE46_ACTIVE_CONFIG:-scripts/eval/configs/habitat_dual_system_vlmap_stage46_m3_active_cfg.py}
 TAG=${STAGE46_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
 RETURN_ROOT=${STAGE46_RETURN_ROOT:-results/stage_17}
 CONTROL_NAME="compare_vlmap_stage46_control_${TAG}"
@@ -45,6 +46,7 @@ trap package_failure EXIT
 
 test -f "${CHECKPOINT}"
 test -f "${MANIFEST}"
+test -f "${ACTIVE_CONFIG}"
 test ! -e "${WORK_DIR}"; test ! -e "${DEST}"; test ! -e "${FAILURE_DEST}"
 test ! -e "${CONTROL_ROOT}"; test ! -e "${ACTIVE_ROOT}"
 mkdir -p "${WORK_DIR}/episode_manifests"
@@ -58,7 +60,8 @@ python3 -m pytest -q \
 python3 -m py_compile \
   internnav/utils/stage46_active_recovery.py \
   scripts/eval/analyze_stage46_m3_active_paired.py \
-  scripts/eval/configs/habitat_dual_system_vlmap_stage46_m3_active_cfg.py
+  scripts/eval/configs/habitat_dual_system_vlmap_stage46_m3_active_cfg.py \
+  "${ACTIVE_CONFIG}"
 
 FAILED_STAGE=frozen_control
 CUDA_VISIBLE_DEVICES="${STAGE46_CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
@@ -78,7 +81,7 @@ STAGE21C_SCORER_CHECKPOINT="${CHECKPOINT}" STAGE21C_SCORER_DEVICE=cpu \
 STAGE27_EVENT_MANIFEST="" STAGE46_EVAL_PORT=${STAGE46_ACTIVE_EVAL_PORT:-3463} \
 NPROC_PER_NODE=4 MASTER_PORT=${STAGE46_ACTIVE_MASTER_PORT:-3464} \
 bash scripts/eval/bash/stage21_torchrun_eval.sh \
-  --config scripts/eval/configs/habitat_dual_system_vlmap_stage46_m3_active_cfg.py
+  --config "${ACTIVE_CONFIG}"
 
 FAILED_STAGE=paired_audit
 python3 scripts/eval/analyze_stage27_m3_candidate_shadow.py \

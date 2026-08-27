@@ -75,6 +75,9 @@ def analyze(control_root: Path, active_root: Path, manifest_path: Path) -> dict[
         "unsafe_applied_candidate": [],
         "multi_primitive_reorient": [],
         "multi_primitive_nextdit": [],
+        "missing_per_primitive_reaudit": [],
+        "cumulative_reorient_limit": [],
+        "nonconvergent_reorientation": [],
         "pixel_contract_failure": [],
         "gt_leakage": [],
     }
@@ -93,6 +96,22 @@ def analyze(control_root: Path, active_root: Path, manifest_path: Path) -> dict[
         executed = list(row.get("reorient_actions_applied") or [])
         if len(planned) != 1 or executed != planned or planned[0] not in (2, 3):
             violations["multi_primitive_reorient"].append(row)
+        if not isinstance(row.get("post_path_bridge"), Mapping):
+            violations["missing_per_primitive_reaudit"].append(row)
+        if row.get("iterative_reorient_enable"):
+            count = int(row.get("reorient_primitive_count", 0) or 0)
+            limit = int(row.get("max_reorient_primitives", 0) or 0)
+            if count < 1 or limit < 1 or count > limit:
+                violations["cumulative_reorient_limit"].append(row)
+            bearings = [
+                abs(float(value))
+                for value in list(row.get("reorient_bearing_history_deg") or [])
+            ]
+            if (
+                len(bearings) != count + 1
+                or any(second >= first - 1e-6 for first, second in zip(bearings, bearings[1:]))
+            ):
+                violations["nonconvergent_reorientation"].append(row)
     for row in pixel:
         trajectory = dict(row.get("trajectory_preflight") or {})
         actions = list(trajectory.get("local_actions") or [])
@@ -143,6 +162,10 @@ def analyze(control_root: Path, active_root: Path, manifest_path: Path) -> dict[
         ),
         "applied_episode_count": len(intervention_episodes),
         "reorient_applied_event_count": len(reorient),
+        "max_reorient_primitive_count": max(
+            (int(row.get("reorient_primitive_count", 0) or 0) for row in reorient),
+            default=0,
+        ),
         "pixel_primitive_applied_event_count": len(pixel),
         "failed_to_success_count": sum(
             item["intervened"] and item["control_success"] == 0 and item["active_success"] > 0

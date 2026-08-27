@@ -69,6 +69,7 @@ from internnav.utils.stage45_candidate_rejection_truth import (
 from internnav.utils.stage46_active_recovery import (
     active_path_within_bound,
     bind_candidate_to_loop_event,
+    iterative_reorientation_decision,
 )
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
@@ -806,6 +807,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "path_reobserve_one_primitive_per_reaudit": bool(
                 vlmap_safety_cfg.get(
                     "s2_loop_path_reobserve_one_primitive_per_reaudit", False
+                )
+            ),
+            "path_reobserve_iterative_reorient_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_iterative_reorient_enable", False
                 )
             ),
             "path_reobserve_max_interventions_per_episode": max(
@@ -2650,6 +2656,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "execution_pending": False,
             "reobserve_pending": False,
             "reorient_actions": [],
+            "reorient_primitive_count": 0,
+            "max_reorient_primitives": int(
+                cfg.get("path_reobserve_max_turn_steps", 4)
+            ),
+            "reorient_bearing_history_deg": [],
+            "iterative_reorient_enable": bool(
+                cfg.get("path_reobserve_iterative_reorient_enable")
+            ),
             "selected_pixel_goal": None,
             "action_applied": False,
             "output_rewritten": False,
@@ -2731,6 +2745,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             path_angle -= 360.0
         while path_angle <= -180.0:
             path_angle += 360.0
+        result["reorient_bearing_history_deg"] = [float(path_angle)]
         turn_angle = max(
             1e-6,
             abs(float(getattr(self.config.habitat.simulator, "turn_angle", 15.0))),
@@ -2831,10 +2846,61 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "reason": "post_reobserve_path_pixel_preflight_pass",
                 }
             )
-        else:
+            return result
+
+        primitive_count = int(result.get("reorient_primitive_count", 0) or 0) + len(
+            applied_actions
+        )
+        result["reorient_primitive_count"] = int(primitive_count)
+        bearing_history = [
+            float(value)
+            for value in list(result.get("reorient_bearing_history_deg") or [])
+        ]
+        current_bearing = bridge.get("initial_direction_angle_deg")
+        if current_bearing is not None:
+            bearing_history.append(float(current_bearing))
+        result["reorient_bearing_history_deg"] = bearing_history
+        if not cfg.get("path_reobserve_iterative_reorient_enable"):
             result["reason"] = str(
                 bridge.get("reason") or "post_reobserve_no_path_pixel_handoff_s2"
             )
+            return result
+        if not bridge.get("path_reachable"):
+            result["reason"] = str(bridge.get("reason") or "path_not_reachable")
+            return result
+        max_active_path_m = float(
+            cfg.get("path_reobserve_max_active_path_m", 0.0) or 0.0
+        )
+        if not active_path_within_bound(bridge.get("path_m"), max_active_path_m):
+            result["reason"] = "candidate_path_beyond_active_bound_after_reaudit"
+            return result
+        previous_bearing = bearing_history[-2] if len(bearing_history) >= 2 else None
+        decision = iterative_reorientation_decision(
+            previous_bearing,
+            current_bearing,
+            primitive_count=primitive_count,
+            max_primitives=int(cfg.get("path_reobserve_max_turn_steps", 4)),
+            deadband_deg=float(cfg.get("path_reobserve_turn_deadband_deg", 7.5)),
+        )
+        result["iterative_reorient_decision"] = decision
+        if not decision.get("continue_reorientation"):
+            result["reason"] = str(decision.get("reason"))
+            return result
+        turn_action = (
+            action_code.LEFT
+            if decision.get("turn_direction") == "left"
+            else action_code.RIGHT
+        )
+        result.update(
+            {
+                "execution_mode": "bounded_iterative_reorient_reobserve",
+                "reobserve_pending": True,
+                "reorient_actions": [int(turn_action)],
+                "reorient_angle_deg": float(current_bearing),
+                "scan_reason": "continue_turn_to_path_lookahead",
+                "reason": "iterative_reorient_queued",
+            }
+        )
         return result
 
     def _write_s2_action_loop_event(self, event: dict) -> None:
@@ -9941,6 +10007,63 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 s2_loop_path_reobserve_first_step = int(
                                     path_post_event.get("trigger_step", step_id)
                                 )
+                        if path_post_event.get("reobserve_pending"):
+                            reorient_actions = [
+                                int(item)
+                                for item in list(
+                                    path_post_event.get("reorient_actions") or []
+                                )
+                                if int(item) in (
+                                    int(action_code.LEFT),
+                                    int(action_code.RIGHT),
+                                )
+                            ]
+                            if len(reorient_actions) == 1:
+                                path_post_event["reorient_actions"] = list(
+                                    reorient_actions
+                                )
+                                path_post_event["rgb_file"] = (
+                                    self._save_s2_loop_path_reobserve_snapshot(
+                                        path_post_event, observations
+                                    )
+                                )
+                                self._write_s2_loop_path_reobserve_event(
+                                    path_post_event
+                                )
+                                next_pending = dict(path_post_event)
+                                next_pending["reorient_actions_applied"] = []
+                                pending_s2_loop_path_reobserve = next_pending
+                                s2_loop_path_reobserve_reorient_count += 1
+                                vlmap_recovery_actions = list(reorient_actions)
+                                pixel_goal = None
+                                output_ids = None
+                                traj_latents = None
+                                pix_goal_image = None
+                                pix_goal_depth = None
+                                messages = []
+                                input_images = []
+                                llm_outputs = ""
+                                local_actions = []
+                                action_seq = []
+                                action = None
+                                forward_action = 0
+                                draw_pixel_goal = False
+                                flag = False
+                                print(
+                                    "[S2LoopPathReobserve] "
+                                    f"episode={scene_id}/{episode_id} step={step_id} "
+                                    f"iterative_queue={reorient_actions} "
+                                    f"primitive_count={path_post_event.get('reorient_primitive_count')} "
+                                    f"path_angle={path_post_event.get('reorient_angle_deg')}",
+                                    flush=True,
+                                )
+                                continue
+                            path_post_event.update(
+                                {
+                                    "reason": "invalid_iterative_reorient_queue_hold",
+                                    "reobserve_pending": False,
+                                }
+                            )
                         if path_post_event.get("execution_pending"):
                             planned_goal = list(
                                 path_post_event.get("selected_pixel_goal") or []

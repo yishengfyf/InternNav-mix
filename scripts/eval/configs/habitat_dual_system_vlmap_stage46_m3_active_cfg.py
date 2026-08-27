@@ -23,6 +23,7 @@ vlmap_cfg["s2_loop_strict_active_enable"] = False
 vlmap_cfg["s2_loop_path_reobserve_active_enable"] = True
 vlmap_cfg["s2_loop_path_reobserve_candidate_source"] = "stage27_frozen_m3"
 vlmap_cfg["s2_loop_path_reobserve_one_primitive_per_reaudit"] = True
+vlmap_cfg["s2_loop_path_reobserve_iterative_reorient_enable"] = False
 vlmap_cfg["s2_loop_path_reobserve_max_interventions_per_episode"] = 1
 vlmap_cfg["s2_loop_path_reobserve_max_turn_steps"] = 1
 vlmap_cfg["s2_loop_strict_active_allowed_directions"] = ["path"]
