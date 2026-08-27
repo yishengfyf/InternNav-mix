@@ -1,0 +1,27 @@
+{
+  "task": "stage47_scene_disjoint_active_expansion_selection",
+  "online_manifest": "scripts/eval/manifests/stage47_active_scene_disjoint8_episode_seed_replay.json",
+  "frozen_source": "stage27_m3_e1_gtlite_all119_full500_v1_retry1_20260824",
+  "selection_contract": {
+    "candidate_stage": "route_occ_clearance_frontier",
+    "candidate_ranking": "stage40_composite_fixed_heuristic",
+    "max_selected_path_m": 1.0,
+    "exclude_stage46_smoke_scenes": true,
+    "one_episode_per_scene": true,
+    "stable_order": "scene_id_ascending_first_8",
+    "future_outcome_fields_used": [],
+    "gt_fields_used": [],
+    "frozen_event_step_used_online": false
+  },
+  "excluded_scenes": ["17DRP5sb8fy", "1LXtFkjw3qL", "1pXnuDYAj8r", "29hnd4uzFmX"],
+  "rows": [
+    {"scene_id": "5q7pvUzZiYa", "episode_id": 9357, "episode_eval_seed": 440006, "frozen_event_step_shadow_only": 403, "selected_candidate_id": "F-local-known-safe-frontier:frontier_316", "source_type": "F-local-known-safe-frontier", "path_length_m": 0.8071067811865476, "route_support_edge_count": 0.0, "local_free_fraction": 0.8706624605678234, "floor_aligned_known_free": true, "unknown_fraction": 0.0, "occupied_fraction": 0.0, "route_occ_conflict": false, "gt_fields_used": []},
+    {"scene_id": "PX4nDJXEHrG", "episode_id": 9891, "episode_eval_seed": 440264, "frozen_event_step_shadow_only": 58, "selected_candidate_id": "route_node:55", "source_type": "R-route-near+R-route-open", "path_length_m": 0.7499990994741944, "route_support_edge_count": 3.0, "local_free_fraction": 1.0, "floor_aligned_known_free": true, "unknown_fraction": 0.0, "occupied_fraction": 0.0, "route_occ_conflict": false, "gt_fields_used": []},
+    {"scene_id": "PuKPg4mmafe", "episode_id": 6965, "episode_eval_seed": 440266, "frozen_event_step_shadow_only": 263, "selected_candidate_id": "route_node:257", "source_type": "R-route-open", "path_length_m": 0.9999991793767454, "route_support_edge_count": 4.0, "local_free_fraction": 1.0, "floor_aligned_known_free": true, "unknown_fraction": 0.0, "occupied_fraction": 0.0, "route_occ_conflict": false, "gt_fields_used": []},
+    {"scene_id": "Uxmj2M2itWa", "episode_id": 306, "episode_eval_seed": 440330, "frozen_event_step_shadow_only": 47, "selected_candidate_id": "F-local-known-safe-frontier:frontier_151", "source_type": "F-local-known-safe-frontier", "path_length_m": 0.5914213562373094, "route_support_edge_count": 0.0, "local_free_fraction": 0.9968454258675079, "floor_aligned_known_free": true, "unknown_fraction": 0.0, "occupied_fraction": 0.0, "route_occ_conflict": false, "gt_fields_used": []},
+    {"scene_id": "VVfe2KiqLaN", "episode_id": 4976, "episode_eval_seed": 440334, "frozen_event_step_shadow_only": 64, "selected_candidate_id": "route_node:60", "source_type": "R-route-near+R-route-open", "path_length_m": 0.7500005735500306, "route_support_edge_count": 3.0, "local_free_fraction": 1.0, "floor_aligned_known_free": true, "unknown_fraction": 0.0, "occupied_fraction": 0.0, "route_occ_conflict": false, "gt_fields_used": []},
+    {"scene_id": "ZMojNkEp431", "episode_id": 3204, "episode_eval_seed": 440339, "frozen_event_step_shadow_only": 82, "selected_candidate_id": "route_node:76", "source_type": "R-route-near", "path_length_m": 0.749999924404793, "route_support_edge_count": 3.0, "local_free_fraction": 0.9842271293375394, "floor_aligned_known_free": true, "unknown_fraction": 0.0, "occupied_fraction": 0.0, "route_occ_conflict": false, "gt_fields_used": []},
+    {"scene_id": "dhjEzFoUFzH", "episode_id": 6763, "episode_eval_seed": 440284, "frozen_event_step_shadow_only": 35, "selected_candidate_id": "route_node:30", "source_type": "R-route-open", "path_length_m": 1.0, "route_support_edge_count": 4.0, "local_free_fraction": 0.9936908517350158, "floor_aligned_known_free": true, "unknown_fraction": 0.0, "occupied_fraction": 0.0, "route_occ_conflict": false, "gt_fields_used": []},
+    {"scene_id": "gZ6f7yhEvPG", "episode_id": 2023, "episode_eval_seed": 440044, "frozen_event_step_shadow_only": 43, "selected_candidate_id": "F-local-known-safe-frontier:frontier_241", "source_type": "F-local-known-safe-frontier", "path_length_m": 0.65, "route_support_edge_count": 0.0, "local_free_fraction": 0.9242902208201893, "floor_aligned_known_free": true, "unknown_fraction": 0.0, "occupied_fraction": 0.0, "route_occ_conflict": false, "gt_fields_used": []}
+  ]
+}
