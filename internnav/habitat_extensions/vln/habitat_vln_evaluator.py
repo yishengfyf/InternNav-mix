@@ -2799,6 +2799,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         depth_m: Optional[np.ndarray],
         step_id: int,
     ) -> dict:
+        cfg = self._get_s2_action_loop_cfg()
         result = dict(pending or {})
         planned_actions = [int(item) for item in pending.get("reorient_actions") or []]
         applied_actions = [
