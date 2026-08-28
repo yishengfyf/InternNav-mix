@@ -2966,6 +2966,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
+    def _write_stage50_depth_short_lookahead_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "stage50_depth_short_lookahead_events.jsonl")
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
     @staticmethod
     def _stage43_memory_fingerprint(memory) -> tuple:
         free_counts = getattr(memory, "free_counts", {}) or {}
@@ -3457,12 +3467,64 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 grid = (candidate.get("semantic_evidence") or {}).get("grid") or []
                 if len(grid) >= 2:
                     semantic_cells.append(grid)
+            semantic_nodes = []
+            if bool(self._stage27_candidate_audit_cfg.get("stage51_semantic_bev_enable", False)):
+                for node in semantic_filtered_nodes:
+                    item = dict(node)
+                    centroid = item.get("centroid")
+                    if isinstance(centroid, (list, tuple)) and len(centroid) >= 2:
+                        try:
+                            item["grid"] = list(self.occ_memory._xy_to_grid_cell(
+                                float(centroid[0]), float(centroid[1])
+                            ))
+                        except (TypeError, ValueError, IndexError):
+                            pass
+                    semantic_nodes.append(item)
+            pose = dict((getattr(self.occ_memory, "pose_trace", []) or [])[-1:] or [{}])[0]
+            depth_shadow = None
+            if bool(self._stage27_candidate_audit_cfg.get("stage50_depth_short_lookahead_enable", False)):
+                depth_shadow = self.occ_memory.plan_depth_short_lookahead_shadow(
+                    {"gps": (observations or {}).get("gps"), "compass": (observations or {}).get("compass")},
+                    depth_m,
+                    context={
+                        "step_id": int(step_id), "scene_id": scene_id, "episode_id": int(episode_id),
+                        "image_width": int(getattr(self.model_args, "resize_w", 384)),
+                        "image_height": int(getattr(self.model_args, "resize_h", 384)),
+                    },
+                    footprint_radius_m=float(self._stage27_candidate_audit_cfg.get("footprint_radius_m", 0.18)),
+                    floor_height_max_m=float(self._stage27_candidate_audit_cfg.get("floor_aligned_height_max_m", 1.5)),
+                )
+                depth_shadow.update({
+                    "event_type": "stage50_depth_short_lookahead_shadow",
+                    "scene_id": scene_id, "episode_id": int(episode_id), "step_id": int(step_id),
+                })
+                self._write_stage50_depth_short_lookahead_event(depth_shadow)
+            depth_endpoints = list((depth_shadow or {}).get("surface_endpoints", []))
+            depth_endpoints.extend((depth_shadow or {}).get("lookahead_records", []))
+            candidate_path = (final_pool[0].get("path_cells") if final_pool else []) or []
+            footprint_corridor = []
+            radius_cells = max(0, int(math.ceil(float(self._stage27_candidate_audit_cfg.get("footprint_radius_m", 0.18)) / max(float(getattr(self.occ_memory, "cs", 0.05)), 1e-6))))
+            for cell in candidate_path:
+                try:
+                    row, col = int(cell[0]), int(cell[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                for dr in range(-radius_cells, radius_cells + 1):
+                    for dc in range(-radius_cells, radius_cells + 1):
+                        if math.hypot(dr, dc) <= radius_cells:
+                            footprint_corridor.append([row + dr, col + dc])
             record["recovery_bev_spatial"] = build_recovery_bev_spatial_snapshot(
                 center_grid=trigger_grid,
                 free_cells=getattr(self.occ_memory, "free2d_counts", {}).keys(),
                 occupied_cells=getattr(self.occ_memory, "occ2d_counts", {}).keys(),
                 pose_trace=getattr(self.occ_memory, "pose_trace", []),
                 semantic_cells=semantic_cells,
+                semantic_nodes=semantic_nodes,
+                current_pose=pose,
+                hfov_deg=float(self.sim_sensors_config.depth_sensor.hfov),
+                depth_endpoints=depth_endpoints,
+                candidate_path=candidate_path,
+                footprint_corridor=footprint_corridor,
                 radius_cells=int(self._stage27_candidate_audit_cfg.get("recovery_bev_radius_cells", 24)),
             )
         self._write_stage27_candidate_event(record)

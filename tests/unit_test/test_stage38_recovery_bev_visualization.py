@@ -47,3 +47,26 @@ def test_stage27_event_requires_and_renders_spatial_channels(tmp_path):
     meta = _module.render_stage27_event(event, tmp_path / "event.png")
     assert meta["unknown_cells_drawn"] == 1
     assert meta["candidate_count"] == 0
+
+
+def test_robot_forward_up_bev_includes_pose_hfov_depth_and_semantic_metadata(tmp_path):
+    anchor = {"anchor_id": "rich", "capture": {"pose": [2, 2]}}
+    digest = {
+        "center_grid": [2, 2],
+        "current_pose": {"grid": [2, 2], "yaw": 0.0},
+        "hfov_deg": 79.0,
+        "channels": {
+            "known_free": [[2, 2], [1, 2]], "occupied": [[0, 2]],
+            "unknown": [[2, 1]], "semantic": [],
+            "semantic_nodes": [{"grid": [1, 2], "label": "chair"}],
+        },
+        "depth_endpoints": [
+            {"surface_grid": [0, 2], "lookahead_grid": [1, 2]},
+        ],
+    }
+    meta = _module.render_recovery_bev(anchor, digest, tmp_path / "rich.png", scale=8)
+    assert meta["coordinate_frame"] == "robot_forward_up"
+    assert meta["hfov_deg"] == 79.0
+    assert meta["depth_endpoint_count"] == 1
+    assert meta["semantic_node_count"] == 1
+    assert (tmp_path / "rich.png").is_file()

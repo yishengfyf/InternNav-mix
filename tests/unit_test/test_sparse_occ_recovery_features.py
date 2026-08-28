@@ -157,3 +157,44 @@ def test_path_bridge_reports_counterfactual_observation_pose(monkeypatch):
 
     assert report["path_pose_source"] == "current_observation"
     assert report["path_pose_yaw_rad"] == 1.25
+
+
+def test_depth_short_lookahead_rejects_unknown_prefix_and_accepts_free_prefix(monkeypatch):
+    memory = _memory()
+    memory.init_base_tf = np.eye(4, dtype=np.float32)
+    memory.camera_intrinsic = np.eye(3, dtype=np.float32)
+    monkeypatch.setattr(memory, "_pose_from_obs", lambda _obs: np.eye(4, dtype=np.float32))
+    monkeypatch.setattr(memory, "_pixel_goal_to_grid", lambda *_args, **_kwargs: {
+        "goal_grid": [32, 36], "start_grid": [32, 32], "start_yaw": 0.0,
+        "depth_m": 2.0, "goal_world_z": 0.0,
+    })
+    monkeypatch.setattr(memory, "validation_floor_aligned_cell_evidence", lambda *_args, **_kwargs: {"state": "free"})
+    for col in (32, 33, 34, 35, 36):
+        memory.free2d_counts[(32, col)] = 1
+    memory.free2d_counts.pop((32, 33))
+    rejected = memory.plan_depth_short_lookahead_shadow({}, np.ones((8, 8), dtype=np.float32))
+    assert rejected["eligible_count"] == 0
+    assert rejected["reason"] == "no_current_depth_short_safe_path"
+    memory.free2d_counts[(32, 33)] = 1
+    accepted = memory.plan_depth_short_lookahead_shadow({}, np.ones((8, 8), dtype=np.float32))
+    assert accepted["eligible_count"] > 0
+    assert all(item["path_state"] == "free" for item in accepted["eligible_records"])
+    assert accepted["unknown_is_free"] is False
+
+
+def test_depth_short_lookahead_never_uses_surface_z_for_floor_gate(monkeypatch):
+    memory = _memory()
+    memory.init_base_tf = np.eye(4, dtype=np.float32)
+    memory.camera_intrinsic = np.eye(3, dtype=np.float32)
+    monkeypatch.setattr(memory, "_pose_from_obs", lambda _obs: np.eye(4, dtype=np.float32))
+    monkeypatch.setattr(memory, "_pixel_goal_to_grid", lambda *_args, **_kwargs: {
+        "goal_grid": [32, 34], "start_grid": [32, 32], "start_yaw": 0.0,
+        "depth_m": 2.0, "goal_world_z": 9.0,
+    })
+    floor_z_seen = []
+    monkeypatch.setattr(memory, "validation_floor_aligned_cell_evidence", lambda _r, _c, z, **_kwargs: floor_z_seen.append(z) or {"state": "free"})
+    for col in (32, 33, 34):
+        memory.free2d_counts[(32, col)] = 1
+    report = memory.plan_depth_short_lookahead_shadow({}, np.ones((8, 8), dtype=np.float32))
+    assert report["eligible_count"] > 0
+    assert floor_z_seen and all(abs(value) < 1e-6 for value in floor_z_seen)

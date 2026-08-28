@@ -6151,6 +6151,148 @@ class SparseOccSemanticMemory:
         )
         return result
 
+    def plan_depth_short_lookahead_shadow(
+        self,
+        obs: Dict[str, Any],
+        depth: np.ndarray,
+        *,
+        context: Optional[Dict[str, Any]] = None,
+        sample_x_ratios: Iterable[float] = (0.25, 0.40, 0.50, 0.60, 0.75),
+        sample_y_ratios: Iterable[float] = (0.65, 0.75, 0.85, 0.92),
+        lookahead_distances_m: Iterable[float] = (0.25, 0.50, 0.75, 1.00),
+        footprint_radius_m: float = 0.18,
+        floor_height_max_m: float = 1.5,
+    ) -> Dict[str, Any]:
+        """Find short current-depth free prefixes without changing memory.
+
+        A depth surface is only an endpoint observation.  For each projected
+        ray we report that endpoint separately, then test prefixes before it
+        against the current 2-D map and the unchanged floor/footprint gate.
+        No prefix is accepted when any traversed cell is unknown or occupied.
+        """
+        result: Dict[str, Any] = {
+            "schema_version": "stage50_depth_short_lookahead_shadow_v1",
+            "valid": False,
+            "reason": None,
+            "start_grid": None,
+            "surface_endpoints": [],
+            "lookahead_records": [],
+            "eligible_records": [],
+            "eligible_count": 0,
+            "unknown_is_free": False,
+            "semantic_can_override_safety": False,
+            "shadow_only": True,
+            "action_applied": False,
+            "gt_fields_used": [],
+        }
+        if not self.enabled or not self.config.waypoint_probe_enable:
+            result["reason"] = "disabled"
+            return result
+        pose_tf = self._pose_from_obs(obs or {})
+        if pose_tf is None or self.init_base_tf is None or self.camera_intrinsic is None:
+            result["reason"] = "missing_pose_intrinsic_or_memory"
+            return result
+        depth_arr = np.asarray(depth)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        if depth_arr.ndim != 2 or not depth_arr.size:
+            result["reason"] = "invalid_depth"
+            return result
+        ctx = dict(context or {})
+        h, w = depth_arr.shape
+        image_w = int(ctx.get("image_width") or self.config.waypoint_source_image_width or w)
+        image_h = int(ctx.get("image_height") or self.config.waypoint_source_image_height or h)
+        try:
+            start_state = self._pose_to_grid(self._relative_base_tf(pose_tf))
+            start = (int(start_state[0]), int(start_state[1]))
+        except (TypeError, ValueError, IndexError):
+            result["reason"] = "missing_start_grid"
+            return result
+        result["start_grid"] = [int(start[0]), int(start[1])]
+        radius_cells = max(0, int(math.ceil(float(footprint_radius_m) / max(self.cs, 1e-6))))
+        rel_base_tf = self._relative_base_tf(pose_tf)
+        current_floor_z = float(rel_base_tf[2, 3])
+
+        def line_cells(target: Tuple[int, int]) -> List[Tuple[int, int]]:
+            dr, dc = target[0] - start[0], target[1] - start[1]
+            count = max(abs(dr), abs(dc), 1)
+            return [
+                (int(round(start[0] + dr * i / count)), int(round(start[1] + dc * i / count)))
+                for i in range(count + 1)
+            ]
+
+        def footprint_path_state(path: Iterable[Tuple[int, int]], floor_z: float) -> str:
+            unknown_seen = False
+            for cell in path:
+                for dr in range(-radius_cells, radius_cells + 1):
+                    for dc in range(-radius_cells, radius_cells + 1):
+                        if math.hypot(dr, dc) > radius_cells:
+                            continue
+                        evidence = self.validation_floor_aligned_cell_evidence(
+                            cell[0] + dr, cell[1] + dc, floor_z,
+                            height_max_m=float(floor_height_max_m),
+                        )
+                        if evidence.get("state") == "blocked":
+                            return "occupied"
+                        if evidence.get("state") != "free":
+                            unknown_seen = True
+            if unknown_seen:
+                return "unknown"
+            return "free"
+
+        seen = set()
+        for y_ratio in sample_y_ratios:
+            for x_ratio in sample_x_ratios:
+                px = int(round(min(1.0, max(0.0, float(x_ratio))) * (image_w - 1)))
+                py = int(round(min(1.0, max(0.0, float(y_ratio))) * (image_h - 1)))
+                key = (px, py)
+                if key in seen:
+                    continue
+                seen.add(key)
+                target = self._pixel_goal_to_grid([px, py], depth_arr, pose_tf, ctx)
+                endpoint = {"pixel": [px, py], "projection_valid": bool(target is not None)}
+                if target is None:
+                    endpoint["reason"] = "invalid_projection"
+                    result["surface_endpoints"].append(endpoint)
+                    continue
+                goal = (int(target["goal_grid"][0]), int(target["goal_grid"][1]))
+                endpoint.update({"surface_grid": [goal[0], goal[1]], "surface_state": self._cell_state(*goal),
+                                 "surface_depth_m": float(target["depth_m"]),
+                                 "goal_world_z": float(target.get("goal_world_z", 0.0))})
+                result["surface_endpoints"].append(endpoint)
+                cells = line_cells(goal)
+                for distance_m in lookahead_distances_m:
+                    requested = max(float(self.cs), float(distance_m))
+                    index = min(len(cells) - 1, max(1, int(round(requested / max(self.cs, 1e-6)))))
+                    prefix = cells[: index + 1]
+                    states = [self._cell_state(*cell) for cell in prefix]
+                    path_state = "occupied" if "occupied" in states else ("unknown" if "unknown" in states else "free")
+                    floor_state = footprint_path_state(prefix, current_floor_z) if path_state == "free" else path_state
+                    record = {
+                        "pixel": [px, py],
+                        "surface_grid": [goal[0], goal[1]],
+                        "surface_state": endpoint["surface_state"],
+                        "surface_depth_m": endpoint["surface_depth_m"],
+                        "lookahead_grid": [prefix[-1][0], prefix[-1][1]],
+                        "lookahead_pixel_goal": self._grid_to_pixel_goal(
+                            prefix[-1], current_floor_z, pose_tf, ctx, depth_arr
+                        ),
+                        "lookahead_distance_m": float(len(prefix) - 1) * self.cs,
+                        "path_cells": [[int(r), int(c)] for r, c in prefix],
+                        "path_state": path_state,
+                        "floor_footprint_state": floor_state,
+                        "eligible": bool(path_state == "free" and floor_state == "free" and len(prefix) > 1),
+                        "safety_authority": "current_sparseocc_reaudit",
+                        "unknown_is_free": False,
+                    }
+                    result["lookahead_records"].append(record)
+                    if record["eligible"]:
+                        result["eligible_records"].append(record)
+        result["eligible_count"] = len(result["eligible_records"])
+        result["valid"] = bool(result["eligible_records"])
+        result["reason"] = "eligible_current_depth_lookahead" if result["valid"] else "no_current_depth_short_safe_path"
+        return result
+
     def _stage15_repair_shadow_info(
         self,
         *,

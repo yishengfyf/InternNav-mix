@@ -131,13 +131,19 @@ def build_recovery_bev_spatial_snapshot(
     occupied_cells: Iterable[Sequence[int]],
     pose_trace: Iterable[Mapping[str, Any] | Sequence[int]] = (),
     semantic_cells: Iterable[Sequence[int]] = (), radius_cells: int = 24,
+    semantic_nodes: Iterable[Mapping[str, Any]] = (),
+    current_pose: Mapping[str, Any] | None = None,
+    hfov_deg: float | None = None,
+    depth_endpoints: Iterable[Mapping[str, Any]] = (),
+    candidate_path: Iterable[Sequence[int]] = (),
+    footprint_corridor: Iterable[Sequence[int]] = (),
 ) -> dict[str, Any]:
     """Create a bounded read-only local grid with explicit unknown cells."""
     center = (int(center_grid[0]), int(center_grid[1]))
     radius = max(1, int(radius_cells))
     free_set = {(int(cell[0]), int(cell[1])) for cell in free_cells}
     occupied_set = {(int(cell[0]), int(cell[1])) for cell in occupied_cells}
-    channels = {"known_free": [], "occupied": [], "unknown": [], "semantic": []}
+    channels = {"known_free": [], "occupied": [], "unknown": [], "semantic": [], "semantic_nodes": []}
     for row in range(center[0] - radius, center[0] + radius + 1):
         for col in range(center[1] - radius, center[1] + radius + 1):
             cell = [row, col]
@@ -151,6 +157,21 @@ def build_recovery_bev_spatial_snapshot(
         row, col = int(cell[0]), int(cell[1])
         if abs(row - center[0]) <= radius and abs(col - center[1]) <= radius:
             channels["semantic"].append([row, col])
+    for node in semantic_nodes:
+        if not isinstance(node, Mapping):
+            continue
+        centroid = node.get("centroid")
+        if isinstance(centroid, Sequence) and len(centroid) >= 2:
+            # LSeg centroids are metric map XYZ; callers may provide grid in
+            # the node when available, otherwise retain the metric point for
+            # an offline renderer to transform.
+            item = {"label": str(node.get("label") or "other"),
+                    "confidence": node.get("mean_confidence"),
+                    "evidence_tier": node.get("evidence_tier"),
+                    "centroid": [float(v) for v in centroid[:3]]}
+            if isinstance(node.get("grid"), Sequence):
+                item["grid"] = [int(v) for v in node["grid"][:2]]
+            channels["semantic_nodes"].append(item)
     route = []
     for item in pose_trace:
         row, col = ((item.get("row"), item.get("col")) if isinstance(item, Mapping)
@@ -160,10 +181,16 @@ def build_recovery_bev_spatial_snapshot(
         row, col = int(row), int(col)
         if abs(row - center[0]) <= radius and abs(col - center[1]) <= radius:
             route.append([row, col])
+    pose = dict(current_pose or {})
     return {
         "schema_version": "stage38_recovery_bev_spatial_v1",
         "center_grid": list(center), "radius_cells": radius,
         "channels": channels, "executed_route": route,
+        "current_pose": pose,
+        "hfov_deg": None if hfov_deg is None else float(hfov_deg),
+        "depth_endpoints": [dict(item) for item in depth_endpoints if isinstance(item, Mapping)],
+        "candidate_path": [[int(v[0]), int(v[1])] for v in candidate_path if isinstance(v, Sequence) and len(v) >= 2],
+        "footprint_corridor": [[int(v[0]), int(v[1])] for v in footprint_corridor if isinstance(v, Sequence) and len(v) >= 2],
         "unknown_is_free": False, "semantic_can_override_safety": False,
         "safety_authority": "SparseOcc_current_reaudit",
         "shadow_only": True, "action_applied": False, "gt_fields_used": [],
