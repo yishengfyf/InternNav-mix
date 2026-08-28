@@ -32,7 +32,7 @@ def _arm(variant):
 def _write_run(tmp_path, event):
     run_root = tmp_path / "run"
     event_dir = run_root / "vlmap_safety_debug" / "rank0_run_001"
-    event_dir.mkdir(parents=True)
+    event_dir.mkdir(parents=True, exist_ok=True)
     (run_root / "progress.json").write_text(
         json.dumps({"scene_id": "scene", "episode_id": 7}) + "\n",
         encoding="utf-8",
