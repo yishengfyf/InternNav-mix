@@ -6216,7 +6216,8 @@ class SparseOccSemanticMemory:
             result["reason"] = "missing_start_grid"
             return result
         result["start_grid"] = [int(start[0]), int(start[1])]
-        radius_cells = max(0, int(math.ceil(float(footprint_radius_m) / max(self.cs, 1e-6))))
+        footprint_radius_m = max(0.0, float(footprint_radius_m))
+        radius_cells = max(0, int(math.ceil(footprint_radius_m / max(self.cs, 1e-6))))
         rel_base_tf = self._relative_base_tf(pose_tf)
         current_floor_z = float(rel_base_tf[2, 3])
 
@@ -6259,6 +6260,7 @@ class SparseOccSemanticMemory:
             occupied_hits = 0
             occupied_voxels = 0
             checked_count = 0
+            initial_exempted_count = 0
             first_blocker = None
             for path_index, cell in enumerate(path):
                 # The current pose is already occupied by the robot body and
@@ -6269,9 +6271,20 @@ class SparseOccSemanticMemory:
                     continue
                 for dr in range(-radius_cells, radius_cells + 1):
                     for dc in range(-radius_cells, radius_cells + 1):
-                        if math.hypot(dr, dc) > radius_cells:
+                        offset_m = math.hypot(dr, dc) * float(self.cs)
+                        if offset_m > footprint_radius_m + 1e-6:
                             continue
                         row, col = int(cell[0] + dr), int(cell[1] + dc)
+                        # The robot already occupies this footprint at the
+                        # current pose. Self/sensor returns there are not
+                        # evidence against entering a future cell, while any
+                        # cell outside this initial footprint remains audited.
+                        start_offset_m = math.hypot(
+                            row - start[0], col - start[1]
+                        ) * float(self.cs)
+                        if start_offset_m <= footprint_radius_m + 1e-6:
+                            initial_exempted_count += 1
+                            continue
                         evidence = cell_evidence(row, col, floor_z)
                         checked_count += 1
                         occupied_hits += int(evidence.get("occupied_hits", 0) or 0)
@@ -6309,6 +6322,7 @@ class SparseOccSemanticMemory:
                 "occupied_voxel_count": int(occupied_voxels),
                 "first_blocker": first_blocker,
                 "start_cell_exempted": True,
+                "initial_footprint_exempted_cell_count": int(initial_exempted_count),
             }
 
         def reconstruct_path(parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]], end: Tuple[int, int]) -> List[Tuple[int, int]]:

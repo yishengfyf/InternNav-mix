@@ -267,3 +267,42 @@ def test_depth_short_origin_occupancy_does_not_block_future_free_cells(monkeypat
     assert report["eligible_count"] > 0
     assert all(row["start_cell_state"] == "occupied" for row in report["eligible_records"])
     assert all(row["start_cell_exempted"] is True for row in report["eligible_records"])
+
+
+def test_depth_short_footprint_uses_physical_radius_and_preserves_future_blocker(monkeypatch):
+    memory = _memory()
+    memory.cell_size = 0.05
+    memory.cs = 0.05
+    memory.init_base_tf = np.eye(4, dtype=np.float32)
+    memory.camera_intrinsic = np.eye(3, dtype=np.float32)
+    monkeypatch.setattr(memory, "_pose_from_obs", lambda _obs: np.eye(4, dtype=np.float32))
+    monkeypatch.setattr(memory, "_pixel_goal_to_grid", lambda *_args, **_kwargs: {
+        "goal_grid": [31, 32], "start_grid": [32, 32], "start_yaw": 0.0,
+        "depth_m": 2.0, "goal_world_z": 0.0,
+    })
+    evidence_calls = []
+    def evidence(row, col, _z, **_kwargs):
+        evidence_calls.append((row, col))
+        # Outside the physical 0.18m radius of the current pose, but within
+        # the old ceil-to-four-cell stencil for the first future pose.
+        if (row, col) == (27, 33):
+            return {"state": "blocked", "occupied_hits": 1, "occupied_voxel_count": 1}
+        # A genuine future footprint conflict: inside the footprint of the
+        # next pose, despite being outside the initial pose footprint.
+        if (row, col) == (28, 33):
+            return {"state": "blocked", "occupied_hits": 1, "occupied_voxel_count": 1}
+        return {"state": "free", "occupied_hits": 0, "occupied_voxel_count": 0}
+    monkeypatch.setattr(memory, "validation_floor_aligned_cell_evidence", evidence)
+    monkeypatch.setattr(memory, "_grid_to_pixel_goal", lambda *_args, **_kwargs: [4, 4])
+    for row in range(27, 33):
+        memory.free2d_counts[(row, 32)] = 1
+    report = memory.plan_depth_short_lookahead_shadow(
+        {}, np.ones((8, 8), dtype=np.float32), lookahead_distances_m=(0.25,)
+    )
+    record = report["lookahead_records"][0]
+    blocker = (record["floor_footprint_audit"] or {}).get("first_blocker")
+    assert blocker is not None
+    assert blocker["footprint_cell"] == [28, 33]
+    assert record["floor_footprint_audit"]["initial_footprint_exempted_cell_count"] > 0
+    # A cell exactly 0.20m from the next pose is outside the 0.18m gate.
+    assert (27, 33) not in evidence_calls
