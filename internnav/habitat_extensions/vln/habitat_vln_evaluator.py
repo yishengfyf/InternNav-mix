@@ -3480,7 +3480,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         except (TypeError, ValueError, IndexError):
                             pass
                     semantic_nodes.append(item)
-            pose = dict((getattr(self.occ_memory, "pose_trace", []) or [])[-1:] or [{}])[0]
+            pose_trace = list(getattr(self.occ_memory, "pose_trace", []) or [])
+            pose = dict(pose_trace[-1]) if pose_trace and isinstance(pose_trace[-1], dict) else {}
             depth_shadow = None
             if bool(self._stage27_candidate_audit_cfg.get("stage50_depth_short_lookahead_enable", False)):
                 depth_shadow = self.occ_memory.plan_depth_short_lookahead_shadow(
