@@ -588,6 +588,9 @@ class OnlineLSegSemanticShadow:
         if self.disabled_after_error:
             event["reason"] = "disabled_after_error"
             return event
+        if camera_pose_map is None:
+            event["reason"] = "missing_camera_pose_map"
+            return event
         rng = self._capture_rng()
         try:
             self._load_model()

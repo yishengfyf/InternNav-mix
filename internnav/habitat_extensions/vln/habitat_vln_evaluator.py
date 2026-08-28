@@ -9667,6 +9667,30 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             ],
                         },
                     )
+                # Run the observation-only LSeg shadow before the Stage27
+                # snapshot so this event can carry same-frame filtered nodes.
+                if self.online_lseg_shadow.enabled:
+                    lseg_pose_map = None
+                    try:
+                        lseg_base_tf = self.occ_memory._pose_from_obs({
+                            "gps": observations.get("gps"),
+                            "compass": observations.get("compass"),
+                        })
+                        if lseg_base_tf is not None:
+                            lseg_pose_map = self.occ_memory._relative_base_tf(
+                                lseg_base_tf
+                            ) @ self.occ_memory.cam_to_base_tf
+                    except (AttributeError, TypeError, ValueError, np.linalg.LinAlgError):
+                        lseg_pose_map = None
+                    self.online_lseg_shadow.process_query_frame(
+                        rgb=rgb,
+                        depth_m=current_depth_m,
+                        camera_pose_map=lseg_pose_map,
+                        step_id=int(step_id),
+                        query_id=int(replay_query_index),
+                        observation_index=int(replay_observation_index - 1),
+                        occ_memory=self.occ_memory,
+                    )
                 # Stage27 is invoked only for the pre-registered detector
                 # event steps. It serializes shadow evidence and cannot affect
                 # the frozen action path.
@@ -10050,17 +10074,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     # Stage24D runs only after Frozen S2 has produced this query's
                     # output. Its result is intentionally discarded by every
                     # prompt, gate, candidate, and action-selection branch.
-                    self.online_lseg_shadow.process_query_frame(
-                        rgb=rgb,
-                        depth_m=current_depth_m,
-                        camera_pose_map=occ_memory_context.get(
-                            "stage23_gt_camera_pose_map"
-                        ),
-                        step_id=int(step_id),
-                        query_id=int(replay_query_index),
-                        observation_index=int(replay_observation_index - 1),
-                        occ_memory=self.occ_memory,
-                    )
                     replay_query_index += 1
                     print('step_id:', step_id, 'output text:', llm_outputs)
                     loop_observer_output = llm_outputs

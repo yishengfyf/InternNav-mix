@@ -170,7 +170,12 @@ def build_recovery_bev_spatial_snapshot(
                     "evidence_tier": node.get("evidence_tier"),
                     "centroid": [float(v) for v in centroid[:3]]}
             if isinstance(node.get("grid"), Sequence):
-                item["grid"] = [int(v) for v in node["grid"][:2]]
+                grid = [int(v) for v in node["grid"][:2]]
+                if abs(grid[0] - center[0]) > radius or abs(grid[1] - center[1]) > radius:
+                    continue
+                item["grid"] = grid
+            else:
+                continue
             channels["semantic_nodes"].append(item)
     route = []
     for item in pose_trace:
