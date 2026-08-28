@@ -23,6 +23,10 @@ def analyze(root: Path) -> dict:
     events = rows(root)
     eligible = [row for row in events if int(row.get("eligible_count", 0) or 0) > 0]
     records = [item for row in events for item in row.get("lookahead_records", [])]
+    blockers = [
+        ((item.get("floor_footprint_audit") or {}).get("first_blocker") or {}).get("reason")
+        for item in records
+    ]
     return {
         "task": "stage50_depth_short_lookahead_shadow",
         "event_count": len(events),
@@ -32,6 +36,18 @@ def analyze(root: Path) -> dict:
         "reason_counts": dict(Counter(str(row.get("reason")) for row in events)),
         "path_state_counts": dict(Counter(str(row.get("path_state")) for row in records)),
         "floor_footprint_state_counts": dict(Counter(str(row.get("floor_footprint_state")) for row in records)),
+        "path_source_counts": dict(Counter(str(row.get("path_source")) for row in records)),
+        "first_blocker_reason_counts": dict(Counter(str(value) for value in blockers if value)),
+        "out_of_bounds_projection_count": sum(row.get("lookahead_pixel_in_bounds") is False for row in records),
+        "local_search_attempt_count": sum(int(row.get("local_search_attempt_count", 0) or 0) for row in records),
+        "local_search_eligible_count": sum(
+            row.get("eligible") is True and row.get("path_source") == "local_8n_depth_supported"
+            for row in records
+        ),
+        "occupied_hit_count": sum(
+            int((row.get("floor_footprint_audit") or {}).get("occupied_hit_count", 0) or 0)
+            for row in records
+        ),
         "unknown_is_free": False,
         "semantic_can_override_safety": False,
         "shadow_only": all(row.get("shadow_only") is True for row in events),

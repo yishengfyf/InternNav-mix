@@ -3494,6 +3494,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     },
                     footprint_radius_m=float(self._stage27_candidate_audit_cfg.get("footprint_radius_m", 0.18)),
                     floor_height_max_m=float(self._stage27_candidate_audit_cfg.get("floor_aligned_height_max_m", 1.5)),
+                    local_search_enable=bool(self._stage27_candidate_audit_cfg.get("stage52_local_search_enable", False)),
+                    local_search_lateral_m=float(self._stage27_candidate_audit_cfg.get("stage52_local_search_lateral_m", 0.20)),
+                    local_search_detour_m=float(self._stage27_candidate_audit_cfg.get("stage52_local_search_detour_m", 0.25)),
+                    local_search_max_paths=int(self._stage27_candidate_audit_cfg.get("stage52_local_search_max_paths", 16)),
                 )
                 depth_shadow.update({
                     "event_type": "stage50_depth_short_lookahead_shadow",

@@ -5478,6 +5478,8 @@ class SparseOccSemanticMemory:
         py = sy * float(image_h) / float(h)
         if not np.isfinite(px) or not np.isfinite(py):
             return None
+        if px < 0.0 or px > float(image_w - 1) or py < 0.0 or py > float(image_h - 1):
+            return None
         return [int(round(px)), int(round(py))]
 
     def project_grid_to_pixel_goal(
@@ -6162,6 +6164,10 @@ class SparseOccSemanticMemory:
         lookahead_distances_m: Iterable[float] = (0.25, 0.50, 0.75, 1.00),
         footprint_radius_m: float = 0.18,
         floor_height_max_m: float = 1.5,
+        local_search_enable: bool = False,
+        local_search_lateral_m: float = 0.20,
+        local_search_detour_m: float = 0.25,
+        local_search_max_paths: int = 16,
     ) -> Dict[str, Any]:
         """Find short current-depth free prefixes without changing memory.
 
@@ -6184,6 +6190,7 @@ class SparseOccSemanticMemory:
             "shadow_only": True,
             "action_applied": False,
             "gt_fields_used": [],
+            "local_search_enabled": bool(local_search_enable),
         }
         if not self.enabled or not self.config.waypoint_probe_enable:
             result["reason"] = "disabled"
@@ -6221,24 +6228,139 @@ class SparseOccSemanticMemory:
                 for i in range(count + 1)
             ]
 
-        def footprint_path_state(path: Iterable[Tuple[int, int]], floor_z: float) -> str:
-            unknown_seen = False
-            for cell in path:
+        evidence_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+        def cell_evidence(row: int, col: int, floor_z: float) -> Dict[str, Any]:
+            key = (int(row), int(col))
+            if key not in evidence_cache:
+                evidence_cache[key] = self.validation_floor_aligned_cell_evidence(
+                    key[0], key[1], floor_z,
+                    height_max_m=float(floor_height_max_m),
+                )
+            return evidence_cache[key]
+
+        def first_occupied_height(evidence: Dict[str, Any], row: int, col: int) -> Optional[Dict[str, Any]]:
+            for height in range(
+                int(evidence.get("height_index_min", 0)),
+                int(evidence.get("height_index_max", -1)) + 1,
+            ):
+                hits = int(self.occ_counts.get((int(row), int(col), int(height)), 0) or 0)
+                if hits > 0:
+                    return {
+                        "height_index": int(height),
+                        "height_m": float(height) * float(self.cs),
+                        "occupied_hits": hits,
+                    }
+            return None
+
+        def footprint_path_audit(path: Iterable[Tuple[int, int]], floor_z: float) -> Dict[str, Any]:
+            unknown_count = 0
+            blocked_count = 0
+            occupied_hits = 0
+            occupied_voxels = 0
+            checked_count = 0
+            first_blocker = None
+            for path_index, cell in enumerate(path):
                 for dr in range(-radius_cells, radius_cells + 1):
                     for dc in range(-radius_cells, radius_cells + 1):
                         if math.hypot(dr, dc) > radius_cells:
                             continue
-                        evidence = self.validation_floor_aligned_cell_evidence(
-                            cell[0] + dr, cell[1] + dc, floor_z,
-                            height_max_m=float(floor_height_max_m),
-                        )
+                        row, col = int(cell[0] + dr), int(cell[1] + dc)
+                        evidence = cell_evidence(row, col, floor_z)
+                        checked_count += 1
+                        occupied_hits += int(evidence.get("occupied_hits", 0) or 0)
+                        occupied_voxels += int(evidence.get("occupied_voxel_count", 0) or 0)
                         if evidence.get("state") == "blocked":
-                            return "occupied"
-                        if evidence.get("state") != "free":
-                            unknown_seen = True
-            if unknown_seen:
-                return "unknown"
-            return "free"
+                            blocked_count += 1
+                            if first_blocker is None:
+                                first_blocker = {
+                                    "reason": "floor_footprint_occupied",
+                                    "path_index": int(path_index),
+                                    "path_cell": [int(cell[0]), int(cell[1])],
+                                    "footprint_cell": [row, col],
+                                    "footprint_offset": [int(dr), int(dc)],
+                                    "evidence": dict(evidence),
+                                    "first_occupied_height": first_occupied_height(evidence, row, col),
+                                }
+                        elif evidence.get("state") != "free":
+                            unknown_count += 1
+                            if first_blocker is None:
+                                first_blocker = {
+                                    "reason": "floor_footprint_unknown",
+                                    "path_index": int(path_index),
+                                    "path_cell": [int(cell[0]), int(cell[1])],
+                                    "footprint_cell": [row, col],
+                                    "footprint_offset": [int(dr), int(dc)],
+                                    "evidence": dict(evidence),
+                                }
+            state = "occupied" if blocked_count else ("unknown" if unknown_count else "free")
+            return {
+                "state": state,
+                "checked_cell_count": int(checked_count),
+                "blocked_cell_count": int(blocked_count),
+                "unknown_cell_count": int(unknown_count),
+                "occupied_hit_count": int(occupied_hits),
+                "occupied_voxel_count": int(occupied_voxels),
+                "first_blocker": first_blocker,
+            }
+
+        def reconstruct_path(parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]], end: Tuple[int, int]) -> List[Tuple[int, int]]:
+            path = []
+            cursor = end
+            while cursor is not None:
+                path.append(cursor)
+                cursor = parent.get(cursor)
+            return list(reversed(path))
+
+        def local_paths(target: Tuple[int, int], requested_cells: int) -> List[List[Tuple[int, int]]]:
+            if not local_search_enable or self._cell_state(*start) != "free":
+                return []
+            lateral_cells = max(1, int(math.ceil(float(local_search_lateral_m) / max(self.cs, 1e-6))))
+            detour_cells = max(0, int(math.ceil(float(local_search_detour_m) / max(self.cs, 1e-6))))
+            max_steps = max(1, int(requested_cells) + detour_cells)
+            target_vector = np.asarray(
+                [target[0] - start[0], target[1] - start[1]], dtype=np.float32
+            )
+            target_norm = float(np.linalg.norm(target_vector))
+            if target_norm <= 1e-6:
+                return []
+            forward = target_vector / target_norm
+            queue = deque([start])
+            parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
+            distance = {start: 0}
+            endpoints = []
+            neighbors = ((-1, -1), (-1, 0), (-1, 1), (0, -1),
+                         (0, 1), (1, -1), (1, 0), (1, 1))
+            while queue:
+                cell = queue.popleft()
+                steps = distance[cell]
+                if steps > 0:
+                    offset = np.asarray(
+                        [cell[0] - start[0], cell[1] - start[1]], dtype=np.float32
+                    )
+                    longitudinal = float(np.dot(offset, forward))
+                    lateral = float(np.linalg.norm(offset - longitudinal * forward))
+                    if longitudinal >= float(requested_cells) and lateral <= float(lateral_cells):
+                        endpoints.append(cell)
+                if steps >= max_steps:
+                    continue
+                for dr, dc in neighbors:
+                    nxt = (cell[0] + dr, cell[1] + dc)
+                    if nxt in parent or self._cell_state(*nxt) != "free":
+                        continue
+                    if dr and dc and (
+                        self._cell_state(cell[0] + dr, cell[1]) != "free"
+                        or self._cell_state(cell[0], cell[1] + dc) != "free"
+                    ):
+                        continue
+                    parent[nxt] = cell
+                    distance[nxt] = steps + 1
+                    queue.append(nxt)
+            endpoints.sort(key=lambda cell: (
+                math.hypot(cell[0] - target[0], cell[1] - target[1]),
+                distance[cell], cell[0], cell[1],
+            ))
+            return [reconstruct_path(parent, cell) for cell in endpoints[:max(1, int(local_search_max_paths))]]
 
         seen = set()
         for y_ratio in sample_y_ratios:
@@ -6267,21 +6389,58 @@ class SparseOccSemanticMemory:
                     prefix = cells[: index + 1]
                     states = [self._cell_state(*cell) for cell in prefix]
                     path_state = "occupied" if "occupied" in states else ("unknown" if "unknown" in states else "free")
-                    floor_state = footprint_path_state(prefix, current_floor_z) if path_state == "free" else path_state
+                    direct_audit = footprint_path_audit(prefix, current_floor_z) if path_state == "free" else {
+                        "state": path_state,
+                        "first_blocker": next(({
+                            "reason": "path_2d_" + state,
+                            "path_index": int(i),
+                            "path_cell": [int(prefix[i][0]), int(prefix[i][1])],
+                        } for i, state in enumerate(states) if state != "free"), None),
+                        "checked_cell_count": 0, "blocked_cell_count": 0,
+                        "unknown_cell_count": 0, "occupied_hit_count": 0,
+                        "occupied_voxel_count": 0,
+                    }
+                    selected_path = prefix
+                    selected_audit = direct_audit
+                    path_source = "direct_depth_ray"
+                    pixel = self._grid_to_pixel_goal(prefix[-1], current_floor_z, pose_tf, ctx, depth_arr)
+                    local_attempt_count = 0
+                    if path_state != "free" or direct_audit["state"] != "free" or pixel is None:
+                        for alternative in local_paths(prefix[-1], index):
+                            local_attempt_count += 1
+                            audit = footprint_path_audit(alternative, current_floor_z)
+                            alternative_pixel = self._grid_to_pixel_goal(
+                                alternative[-1], current_floor_z, pose_tf, ctx, depth_arr
+                            )
+                            if audit["state"] == "free" and alternative_pixel is not None:
+                                selected_path = alternative
+                                selected_audit = audit
+                                path_state = "free"
+                                pixel = alternative_pixel
+                                path_source = "local_8n_depth_supported"
+                                break
+                    floor_state = selected_audit["state"] if path_state == "free" else path_state
                     record = {
                         "pixel": [px, py],
                         "surface_grid": [goal[0], goal[1]],
                         "surface_state": endpoint["surface_state"],
                         "surface_depth_m": endpoint["surface_depth_m"],
-                        "lookahead_grid": [prefix[-1][0], prefix[-1][1]],
-                        "lookahead_pixel_goal": self._grid_to_pixel_goal(
-                            prefix[-1], current_floor_z, pose_tf, ctx, depth_arr
-                        ),
-                        "lookahead_distance_m": float(len(prefix) - 1) * self.cs,
-                        "path_cells": [[int(r), int(c)] for r, c in prefix],
+                        "lookahead_grid": [selected_path[-1][0], selected_path[-1][1]],
+                        "lookahead_pixel_goal": pixel,
+                        "lookahead_pixel_in_bounds": pixel is not None,
+                        "lookahead_distance_m": float(len(selected_path) - 1) * self.cs,
+                        "path_cells": [[int(r), int(c)] for r, c in selected_path],
+                        "direct_path_cells": [[int(r), int(c)] for r, c in prefix],
+                        "path_source": path_source,
+                        "local_search_attempt_count": int(local_attempt_count),
                         "path_state": path_state,
                         "floor_footprint_state": floor_state,
-                        "eligible": bool(path_state == "free" and floor_state == "free" and len(prefix) > 1),
+                        "floor_footprint_audit": selected_audit,
+                        "direct_floor_footprint_audit": direct_audit,
+                        "eligible": bool(
+                            path_state == "free" and floor_state == "free"
+                            and len(selected_path) > 1 and pixel is not None
+                        ),
                         "safety_authority": "current_sparseocc_reaudit",
                         "unknown_is_free": False,
                     }

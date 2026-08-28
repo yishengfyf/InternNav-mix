@@ -169,6 +169,7 @@ def test_depth_short_lookahead_rejects_unknown_prefix_and_accepts_free_prefix(mo
         "depth_m": 2.0, "goal_world_z": 0.0,
     })
     monkeypatch.setattr(memory, "validation_floor_aligned_cell_evidence", lambda *_args, **_kwargs: {"state": "free"})
+    monkeypatch.setattr(memory, "_grid_to_pixel_goal", lambda *_args, **_kwargs: [4, 4])
     for col in (32, 33, 34, 35, 36):
         memory.free2d_counts[(32, col)] = 1
     memory.free2d_counts.pop((32, 33))
@@ -193,8 +194,53 @@ def test_depth_short_lookahead_never_uses_surface_z_for_floor_gate(monkeypatch):
     })
     floor_z_seen = []
     monkeypatch.setattr(memory, "validation_floor_aligned_cell_evidence", lambda _r, _c, z, **_kwargs: floor_z_seen.append(z) or {"state": "free"})
+    monkeypatch.setattr(memory, "_grid_to_pixel_goal", lambda *_args, **_kwargs: [4, 4])
     for col in (32, 33, 34):
         memory.free2d_counts[(32, col)] = 1
     report = memory.plan_depth_short_lookahead_shadow({}, np.ones((8, 8), dtype=np.float32))
     assert report["eligible_count"] > 0
     assert floor_z_seen and all(abs(value) < 1e-6 for value in floor_z_seen)
+
+
+def test_grid_to_pixel_goal_rejects_out_of_image_projection(monkeypatch):
+    memory = _memory()
+    memory.init_base_tf = np.eye(4, dtype=np.float32)
+    memory.cam_to_base_tf = np.eye(4, dtype=np.float32)
+    memory.camera_intrinsic = np.array(
+        [[1.0, 0.0, 1000.0], [0.0, 1.0, 1000.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    monkeypatch.setattr(memory, "_grid_to_xy", lambda _grid: (0.0, 0.0))
+    assert memory._grid_to_pixel_goal(
+        [32, 32], 1.0, np.eye(4, dtype=np.float32),
+        {"image_width": 8, "image_height": 8}, np.ones((8, 8), dtype=np.float32),
+    ) is None
+
+
+def test_depth_short_local_search_can_route_around_blocked_direct_cell(monkeypatch):
+    memory = _memory()
+    memory.init_base_tf = np.eye(4, dtype=np.float32)
+    memory.camera_intrinsic = np.eye(3, dtype=np.float32)
+    monkeypatch.setattr(memory, "_pose_from_obs", lambda _obs: np.eye(4, dtype=np.float32))
+    monkeypatch.setattr(memory, "_pixel_goal_to_grid", lambda *_args, **_kwargs: {
+        "goal_grid": [32, 36], "start_grid": [32, 32], "start_yaw": 0.0,
+        "depth_m": 2.0, "goal_world_z": 0.0,
+    })
+    monkeypatch.setattr(memory, "validation_floor_aligned_cell_evidence", lambda *_args, **_kwargs: {
+        "state": "free", "occupied_hits": 0, "occupied_voxel_count": 0,
+        "height_index_min": 0, "height_index_max": 6,
+    })
+    monkeypatch.setattr(memory, "_grid_to_pixel_goal", lambda *_args, **_kwargs: [4, 4])
+    for row, col in (
+        (32, 32), (31, 32), (30, 32), (30, 33), (30, 34),
+        (30, 35), (30, 36), (31, 36), (32, 36),
+    ):
+        memory.free2d_counts[(row, col)] = 1
+    memory.occ2d_counts[(32, 33)] = 1
+    report = memory.plan_depth_short_lookahead_shadow(
+        {}, np.ones((8, 8), dtype=np.float32), local_search_enable=True,
+        local_search_lateral_m=0.5, local_search_detour_m=1.0,
+    )
+    assert report["eligible_count"] > 0
+    assert any(row["path_source"] == "local_8n_depth_supported" for row in report["eligible_records"])
+    assert all(row["lookahead_pixel_in_bounds"] for row in report["eligible_records"])
