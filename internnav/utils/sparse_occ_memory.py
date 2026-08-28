@@ -6261,6 +6261,12 @@ class SparseOccSemanticMemory:
             checked_count = 0
             first_blocker = None
             for path_index, cell in enumerate(path):
+                # The current pose is already occupied by the robot body and
+                # may contain self/sensor returns.  It is an origin, not a
+                # cell the proposed primitive must enter.  All future cells
+                # retain the complete footprint/floor safety audit.
+                if path_index == 0:
+                    continue
                 for dr in range(-radius_cells, radius_cells + 1):
                     for dc in range(-radius_cells, radius_cells + 1):
                         if math.hypot(dr, dc) > radius_cells:
@@ -6302,6 +6308,7 @@ class SparseOccSemanticMemory:
                 "occupied_hit_count": int(occupied_hits),
                 "occupied_voxel_count": int(occupied_voxels),
                 "first_blocker": first_blocker,
+                "start_cell_exempted": True,
             }
 
         def reconstruct_path(parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]], end: Tuple[int, int]) -> List[Tuple[int, int]]:
@@ -6313,7 +6320,7 @@ class SparseOccSemanticMemory:
             return list(reversed(path))
 
         def local_paths(target: Tuple[int, int], requested_cells: int) -> List[List[Tuple[int, int]]]:
-            if not local_search_enable or self._cell_state(*start) != "free":
+            if not local_search_enable:
                 return []
             lateral_cells = max(1, int(math.ceil(float(local_search_lateral_m) / max(self.cs, 1e-6))))
             detour_cells = max(0, int(math.ceil(float(local_search_detour_m) / max(self.cs, 1e-6))))
