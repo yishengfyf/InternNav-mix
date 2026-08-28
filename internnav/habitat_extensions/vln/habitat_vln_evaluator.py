@@ -71,6 +71,10 @@ from internnav.utils.stage46_active_recovery import (
     bind_candidate_to_loop_event,
     iterative_reorientation_decision,
 )
+from internnav.utils.stage55_occ_2p5d_audit import (
+    audit_candidate_occ_2p5d,
+    should_post_turn_collision_guard,
+)
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -851,6 +855,35 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 vlmap_safety_cfg.get(
                     "s2_loop_path_reobserve_pixel_execution_enable", True
                 )
+            ),
+            "path_reobserve_occ_2p5d_audit_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_occ_2p5d_audit_enable", False
+                )
+            ),
+            "path_reobserve_post_turn_collision_guard_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_post_turn_collision_guard_enable",
+                    False,
+                )
+            ),
+            "path_reobserve_post_turn_collision_guard_max_requeries": max(
+                0,
+                int(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_post_turn_collision_guard_max_requeries",
+                        8,
+                    )
+                ),
+            ),
+            "path_reobserve_post_turn_collision_guard_horizon_steps": max(
+                0,
+                int(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_path_reobserve_post_turn_collision_guard_horizon_steps",
+                        400,
+                    )
+                ),
             ),
             "path_reobserve_max_interventions_per_episode": max(
                 0,
@@ -3072,6 +3105,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             },
             "gt_fields_used": [],
         }
+        if cfg.get("path_reobserve_occ_2p5d_audit_enable") and candidate:
+            result["stage55_occ_2p5d_audit"] = audit_candidate_occ_2p5d(
+                self.occ_memory,
+                candidate,
+            )
         if not result["enabled"]:
             result["reason"] = "disabled"
             return result
@@ -3348,6 +3386,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             log_dir, "s2_loop_executed_route_occ_audit_events.jsonl"
         )
         with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _write_stage55_post_turn_collision_guard_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(
+            log_dir, "stage55_post_turn_collision_guard_events.jsonl"
+        )
+        with open(path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
     def _write_stage27_candidate_event(self, event: dict) -> None:
@@ -9912,6 +9962,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             s2_loop_path_reobserve_first_step = None
             pending_s2_loop_path_reobserve = None
             pending_s2_loop_path_execution = None
+            stage55_post_turn_guard_armed = False
+            stage55_post_turn_guard_intervention_step = None
+            stage55_post_turn_guard_event_count = 0
+            stage55_post_turn_guard_requery_count = 0
+            stage55_post_turn_guard_collision_delta_sum = 0.0
             semantic_hint_set_count = 0
             semantic_hint_injected_count = 0
             semantic_hint_detection_step = None
@@ -10219,6 +10274,95 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     ),
                 }
                 replay_previous_collision_count = replay_collision_count
+                stage55_cfg = self._get_s2_action_loop_cfg()
+                stage55_guard_age = (
+                    None
+                    if stage55_post_turn_guard_intervention_step is None
+                    else int(step_id - stage55_post_turn_guard_intervention_step)
+                )
+                stage55_guard_horizon = int(
+                    stage55_cfg.get(
+                        "path_reobserve_post_turn_collision_guard_horizon_steps",
+                        400,
+                    )
+                )
+                stage55_guard_budget = int(
+                    stage55_cfg.get(
+                        "path_reobserve_post_turn_collision_guard_max_requeries",
+                        8,
+                    )
+                )
+                if should_post_turn_collision_guard(
+                    enabled=bool(
+                        stage55_cfg.get(
+                            "path_reobserve_post_turn_collision_guard_enable"
+                        )
+                    ),
+                    armed=stage55_post_turn_guard_armed,
+                    previous_action=int(action if action is not None else -1),
+                    forward_action=int(action_code.FORWARD),
+                    previous_action_source=str(action_source),
+                    collision_delta=float(replay_audit_metrics["collision_delta"]),
+                    guard_age_steps=stage55_guard_age,
+                    horizon_steps=stage55_guard_horizon,
+                    requery_count=stage55_post_turn_guard_requery_count,
+                    requery_budget=stage55_guard_budget,
+                ):
+                    discarded_actions = list(action_seq)
+                    stage55_post_turn_guard_event_count += 1
+                    stage55_post_turn_guard_requery_count += 1
+                    stage55_post_turn_guard_collision_delta_sum += float(
+                        replay_audit_metrics["collision_delta"]
+                    )
+                    action_seq = []
+                    local_actions = []
+                    pixel_goal = None
+                    output_ids = None
+                    messages = []
+                    input_images = []
+                    llm_outputs = ""
+                    forward_action = 0
+                    draw_pixel_goal = False
+                    flag = False
+                    guard_event = {
+                        "event_type": "stage55_post_turn_collision_guard",
+                        "event_schema_version": "stage55_post_turn_collision_guard_v1",
+                        "scene_id": scene_id,
+                        "episode_id": int(episode_id),
+                        "episode_index": int(episode_index),
+                        "episode_count": int(episode_count),
+                        "episode_eval_seed": int(episode_eval_seed),
+                        "step_id": int(step_id),
+                        "intervention_step": int(
+                            stage55_post_turn_guard_intervention_step
+                        ),
+                        "guard_age_steps": stage55_guard_age,
+                        "previous_action": int(action),
+                        "previous_action_source": str(action_source),
+                        "collision_delta": float(
+                            replay_audit_metrics["collision_delta"]
+                        ),
+                        "discarded_action_count": len(discarded_actions),
+                        "discarded_actions": discarded_actions,
+                        "requery_index": int(
+                            stage55_post_turn_guard_requery_count
+                        ),
+                        "requery_budget": int(stage55_guard_budget),
+                        "queue_cleared": True,
+                        "environment_action_applied": False,
+                        "pixel_translation_applied": False,
+                        "gt_fields_used": [],
+                    }
+                    self._write_stage55_post_turn_collision_guard_event(
+                        guard_event
+                    )
+                    print(
+                        "[Stage55PostTurnGuard] "
+                        f"episode={scene_id}/{episode_id} step={step_id} "
+                        f"discarded={len(discarded_actions)} requery="
+                        f"{stage55_post_turn_guard_requery_count}/{stage55_guard_budget}",
+                        flush=True,
+                    )
                 self.replay_ledger.record_observation(
                     step_id=step_id,
                     observation_index=replay_observation_index,
@@ -13370,6 +13514,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         pending_s2_loop_path_reobserve[
                             "last_reorient_environment_step"
                         ] = int(step_id)
+                        if self._get_s2_action_loop_cfg().get(
+                            "path_reobserve_post_turn_collision_guard_enable"
+                        ):
+                            stage55_post_turn_guard_armed = True
+                            stage55_post_turn_guard_intervention_step = int(step_id)
                     else:
                         pending_s2_loop_path_reobserve.update(
                             {
@@ -13839,6 +13988,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result["s2_loop_path_reobserve_first_step"] = (
                 s2_loop_path_reobserve_first_step
             )
+            result["stage55_post_turn_collision_guard_enabled"] = bool(
+                self._get_s2_action_loop_cfg().get(
+                    "path_reobserve_post_turn_collision_guard_enable"
+                )
+            )
+            result["stage55_post_turn_collision_guard_armed"] = bool(
+                stage55_post_turn_guard_armed
+            )
+            result["stage55_post_turn_collision_guard_event_count"] = int(
+                stage55_post_turn_guard_event_count
+            )
+            result["stage55_post_turn_collision_guard_requery_count"] = int(
+                stage55_post_turn_guard_requery_count
+            )
+            result[
+                "stage55_post_turn_collision_guard_collision_delta_sum"
+            ] = float(stage55_post_turn_guard_collision_delta_sum)
             if self._get_occ_memory_recovery_cfg().get("enable"):
                 result["occ_memory_recovery_event_count"] = occ_memory_recovery_summary.get("event_count")
                 result["occ_memory_recovery_logged_event_count"] = occ_memory_recovery_summary.get(
