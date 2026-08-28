@@ -90,6 +90,46 @@ def test_selector_report_keeps_pool_accounting_for_post_selection_gates():
     assert report["unsafe_record_count"] == 1
 
 
+def test_route_occ_turn_only_keeps_clearance_failure_auditable():
+    candidate = _candidate(
+        "clearance-failed",
+        support=3,
+        openness=0.8,
+        path=0.6,
+        floor_aligned_known_free=False,
+    )
+    event = {"ablation": {"route_occ": {"candidates": [candidate]}}}
+    selected, report = _module.select_frozen_m3_candidate(
+        event,
+        candidate_stage="route_occ",
+        safety_mode="route_occ_turn_only",
+    )
+    assert selected["candidate_id"] == "clearance-failed"
+    assert report["turn_only_relaxation"] is True
+    assert report["translation_allowed"] is False
+
+
+def test_route_only_turn_binding_marks_relaxation_without_granting_translation():
+    candidate = _candidate(
+        "route-conflict",
+        support=3,
+        openness=0.8,
+        path=0.5,
+        route_occ_conflict=True,
+        occupied_fraction=0.2,
+    )
+    event = {"ablation": {"route_only": {"candidates": [candidate]}}}
+    result = _module.bind_candidate_to_loop_event(
+        {"scene_id": "scene", "episode_id": 1},
+        event,
+        candidate_stage="route_only",
+        safety_mode="route_only_turn_only",
+    )
+    assert result["candidate"]["stage54_turn_only_relaxation"] is True
+    assert result["candidate"]["stage54_translation_allowed"] is False
+    assert result["candidate"]["stage46_safety_derivation"] == "route_only"
+
+
 def test_active_path_bound_is_local_and_zero_disables_it():
     assert _module.active_path_within_bound(0.95, 1.0)
     assert not _module.active_path_within_bound(1.65, 1.0)

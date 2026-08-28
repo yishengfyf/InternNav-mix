@@ -7,6 +7,11 @@ from typing import Any, Mapping, Optional, Tuple
 
 
 SAFE_STAGE = "route_occ_clearance_frontier"
+ALLOWED_CANDIDATE_STAGES = {
+    SAFE_STAGE,
+    "route_occ",
+    "route_only",
+}
 SCHEMA_VERSION = "stage46_m3_one_primitive_active_v1"
 
 
@@ -40,20 +45,56 @@ def _safe(candidate: Mapping[str, Any]) -> bool:
     )
 
 
+def _frozen_record(candidate: Mapping[str, Any]) -> bool:
+    return bool(
+        not candidate.get("gt_fields_used")
+        and not candidate.get("action_applied")
+        and candidate.get("shadow_only")
+    )
+
+
+def _eligible(candidate: Mapping[str, Any], stage: str, safety_mode: str) -> bool:
+    if safety_mode == "strict":
+        return _safe(candidate)
+    if safety_mode == "route_occ_turn_only":
+        return bool(
+            stage == "route_occ"
+            and _frozen_record(candidate)
+            and not candidate.get("route_occ_conflict")
+            and _number(candidate, "unknown_fraction", 1.0) == 0.0
+            and _number(candidate, "occupied_fraction", 1.0) == 0.0
+        )
+    if safety_mode == "route_only_turn_only":
+        return bool(stage == "route_only" and _frozen_record(candidate))
+    return False
+
+
 def select_frozen_m3_candidate(
     event: Mapping[str, Any],
+    *,
+    candidate_stage: str = SAFE_STAGE,
+    safety_mode: str = "strict",
 ) -> Tuple[Optional[dict[str, Any]], dict[str, Any]]:
     """Select one already-safe M3 candidate without changing its pool."""
+    candidate_stage = str(candidate_stage or SAFE_STAGE)
+    if candidate_stage not in ALLOWED_CANDIDATE_STAGES:
+        candidate_stage = SAFE_STAGE
+        safety_mode = "strict"
     pool = list(
         (event.get("ablation") or {})
-        .get(SAFE_STAGE, {})
+        .get(candidate_stage, {})
         .get("candidates", [])
         or []
     )
-    safe = [dict(candidate) for candidate in pool if _safe(candidate)]
+    safe = [
+        dict(candidate)
+        for candidate in pool
+        if _eligible(candidate, candidate_stage, safety_mode)
+    ]
     report = {
         "schema_version": SCHEMA_VERSION,
-        "candidate_stage": SAFE_STAGE,
+        "candidate_stage": candidate_stage,
+        "safety_mode": safety_mode,
         "ranking_rule": "stage40_composite_fixed_heuristic",
         "pool_count": int(len(pool)),
         "safe_count": int(len(safe)),
@@ -62,6 +103,8 @@ def select_frozen_m3_candidate(
         "unknown_is_free": False,
         "gt_fields_used": [],
         "ranker_trained": False,
+        "turn_only_relaxation": bool(safety_mode != "strict"),
+        "translation_allowed": bool(safety_mode == "strict"),
     }
     if not safe:
         report["reason"] = "zero_safe_m3_candidate"
@@ -77,11 +120,19 @@ def select_frozen_m3_candidate(
 
 
 def bind_candidate_to_loop_event(
-    loop_event: Mapping[str, Any], stage27_event: Mapping[str, Any]
+    loop_event: Mapping[str, Any],
+    stage27_event: Mapping[str, Any],
+    *,
+    candidate_stage: str = SAFE_STAGE,
+    safety_mode: str = "strict",
 ) -> dict[str, Any]:
     """Return an executor-facing copy; never mutates the frozen M3 record."""
     result = dict(loop_event)
-    candidate, selection = select_frozen_m3_candidate(stage27_event)
+    candidate, selection = select_frozen_m3_candidate(
+        stage27_event,
+        candidate_stage=candidate_stage,
+        safety_mode=safety_mode,
+    )
     result["stage46_candidate_selection"] = selection
     result["candidate_source"] = "stage27_frozen_m3"
     result["event_schema_version"] = SCHEMA_VERSION
@@ -97,7 +148,10 @@ def bind_candidate_to_loop_event(
             "geometry_safe": True,
             "active_gate_safe": True,
             "direction_bucket": "path",
-            "stage46_safety_derivation": SAFE_STAGE,
+            "stage46_safety_derivation": selection["candidate_stage"],
+            "stage54_safety_mode": selection["safety_mode"],
+            "stage54_turn_only_relaxation": bool(selection["turn_only_relaxation"]),
+            "stage54_translation_allowed": bool(selection["translation_allowed"]),
         }
     )
     result.update(

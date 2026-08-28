@@ -820,6 +820,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "s2_loop_path_reobserve_candidate_source", "legacy_semantic"
                 )
             ),
+            "path_reobserve_m3_candidate_stage": str(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_m3_candidate_stage",
+                    "route_occ_clearance_frontier",
+                )
+            ),
+            "path_reobserve_m3_safety_mode": str(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_m3_safety_mode", "strict"
+                )
+            ),
+            "path_reobserve_frozen_path_bearing_relaxation": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_frozen_path_bearing_relaxation",
+                    False,
+                )
+            ),
             "path_reobserve_one_primitive_per_reaudit": bool(
                 vlmap_safety_cfg.get(
                     "s2_loop_path_reobserve_one_primitive_per_reaudit", False
@@ -2947,6 +2964,52 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result["visualization_path"] = image_path
         return result
 
+    def _stage54_frozen_candidate_path_bearing(self, candidate: dict) -> dict:
+        """Read a frozen M3 path as a turn-only bearing; never grants free space."""
+        result = {
+            "valid": False,
+            "frozen_candidate_path_bearing_relaxation": True,
+            "translation_allowed": False,
+            "reason": None,
+        }
+        pose_trace = list(getattr(self.occ_memory, "pose_trace", []) or [])
+        path = list(candidate.get("path_cells") or [])
+        if not pose_trace or len(path) < 2:
+            result["reason"] = "missing_pose_or_frozen_path"
+            return result
+        pose = pose_trace[-1]
+        try:
+            start = (int(pose["row"]), int(pose["col"]))
+            cells = [(int(item[0]), int(item[1])) for item in path]
+            yaw = float(pose.get("yaw", 0.0) or 0.0)
+        except (KeyError, TypeError, ValueError, IndexError):
+            result["reason"] = "invalid_pose_or_frozen_path"
+            return result
+        distance_first = math.hypot(cells[0][0] - start[0], cells[0][1] - start[1])
+        distance_last = math.hypot(cells[-1][0] - start[0], cells[-1][1] - start[1])
+        if distance_last < distance_first:
+            cells.reverse()
+        cell_size = max(float(getattr(self.occ_memory, "cs", 0.05)), 1e-6)
+        lookahead_cells = max(1, int(round(0.75 / cell_size)))
+        target = cells[min(len(cells) - 1, lookahead_cells)]
+        direction = self.occ_memory._direction_to_cell(start, target, yaw)
+        result.update(
+            {
+                "valid": True,
+                "reason": "frozen_candidate_path_bearing_only",
+                "start_grid": [start[0], start[1]],
+                "target_grid": [target[0], target[1]],
+                "initial_direction_angle_deg": direction.get("angle_deg"),
+                "initial_direction_bucket": direction.get("bucket"),
+                "path_m": float(
+                    candidate.get("path_length_m", (len(cells) - 1) * cell_size)
+                ),
+                "candidate_stage": candidate.get("stage46_safety_derivation"),
+                "safety_mode": candidate.get("stage54_safety_mode"),
+            }
+        )
+        return result
+
     def _plan_s2_loop_path_reobserve_active(
         self,
         event: Optional[dict],
@@ -3042,10 +3105,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             probe_source="s2_loop_path_reobserve_initial",
         )
         result["path_bridge"] = bridge
+        frozen_bearing = None
+        if (
+            not bridge.get("path_reachable")
+            and cfg.get("path_reobserve_frozen_path_bearing_relaxation")
+            and candidate.get("stage54_turn_only_relaxation")
+            and not candidate.get("stage54_translation_allowed")
+        ):
+            frozen_bearing = self._stage54_frozen_candidate_path_bearing(candidate)
+            bridge["frozen_candidate_path_bearing"] = frozen_bearing
+            result["frozen_candidate_path_bearing_relaxation"] = bool(
+                frozen_bearing.get("valid")
+            )
         max_active_path_m = float(
             cfg.get("path_reobserve_max_active_path_m", 0.0) or 0.0
         )
-        path_m = bridge.get("path_m")
+        path_m = (
+            bridge.get("path_m")
+            if bridge.get("path_m") is not None
+            else (frozen_bearing or {}).get("path_m")
+        )
         if not active_path_within_bound(path_m, max_active_path_m):
             result.update(
                 {
@@ -3057,23 +3136,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return result
         if bridge.get("valid"):
             if not cfg.get("path_reobserve_pixel_execution_enable"):
-                result["reason"] = "path_pixel_execution_not_released"
+                if not candidate.get("stage54_turn_only_relaxation"):
+                    result["reason"] = "path_pixel_execution_not_released"
+                    return result
+            else:
+                result.update(
+                    {
+                        "execution_mode": "path_pixel",
+                        "execution_pending": True,
+                        "selected_pixel_goal": bridge.get("selected_pixel_goal"),
+                        "reason": "path_pixel_preflight_pass",
+                    }
+                )
                 return result
-            result.update(
-                {
-                    "execution_mode": "path_pixel",
-                    "execution_pending": True,
-                    "selected_pixel_goal": bridge.get("selected_pixel_goal"),
-                    "reason": "path_pixel_preflight_pass",
-                }
-            )
-            return result
-        if not bridge.get("path_reachable"):
+        if not bridge.get("path_reachable") and not (frozen_bearing or {}).get("valid"):
             result["reason"] = str(bridge.get("reason") or "path_not_reachable")
             return result
 
         try:
-            path_angle = float(bridge.get("initial_direction_angle_deg"))
+            path_angle = float(
+                bridge.get("initial_direction_angle_deg")
+                if bridge.get("initial_direction_angle_deg") is not None
+                else (frozen_bearing or {}).get("initial_direction_angle_deg")
+            )
         except (TypeError, ValueError):
             result["reason"] = "missing_path_reorient_angle"
             return result
@@ -4308,7 +4393,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     }
                 )
             else:
-                event = bind_candidate_to_loop_event(event, stage27_record)
+                event = bind_candidate_to_loop_event(
+                    event,
+                    stage27_record,
+                    candidate_stage=cfg.get("path_reobserve_m3_candidate_stage"),
+                    safety_mode=cfg.get("path_reobserve_m3_safety_mode"),
+                )
         if (
             bool(cfg.get("executed_route_occ_audit_enable"))
             and str(event.get("triage_tier") or "") == "strict_intervention"

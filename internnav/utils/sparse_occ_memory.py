@@ -7,7 +7,7 @@ import re
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from statistics import mean
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -537,6 +537,12 @@ class SparseOccSemanticMemory:
         self.free_counts: Dict[Tuple[int, int, int], int] = defaultdict(int)
         self.occ2d_counts: Dict[Tuple[int, int], int] = defaultdict(int)
         self.free2d_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+        self.occ3d_frame_counts: Dict[Tuple[int, int, int], int] = defaultdict(int)
+        self.free3d_frame_counts: Dict[Tuple[int, int, int], int] = defaultdict(int)
+        self.occ2d_frame_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+        self.free2d_frame_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+        self.occ2d_last_observation: Dict[Tuple[int, int], int] = {}
+        self.free2d_last_observation: Dict[Tuple[int, int], int] = {}
         self.visited2d_counts: Dict[Tuple[int, int], int] = defaultdict(int)
         self.pose_trace: List[Dict[str, Any]] = []
         self.keyframes: List[Dict[str, Any]] = []
@@ -756,6 +762,8 @@ class SparseOccSemanticMemory:
             )
             self._append_validation_surface(world_points, surface_colors)
         cam_origin = cam_pose_tf[:3, 3]
+        frame_occ_keys: Set[Tuple[int, int, int]] = set()
+        frame_free_keys: Set[Tuple[int, int, int]] = set()
         occupied_added = 0
         free_added = 0
         validation_endpoint_mapped = 0
@@ -779,6 +787,7 @@ class SparseOccSemanticMemory:
                     validation_endpoint_negative_z_mapped += 1
             row, col, height = endpoint
             key3 = (row, col, height)
+            frame_occ_keys.add(key3)
             before = self.occ_counts.get(key3, 0)
             self.occ_counts[key3] = before + 1
             if before == 0:
@@ -786,7 +795,29 @@ class SparseOccSemanticMemory:
             if self._is_obstacle_height(height):
                 self.occ2d_counts[(row, col)] += 1
             if self.config.raycast_enable:
-                free_added += self._raycast_free(cam_origin, point, endpoint)
+                free_added += self._raycast_free(
+                    cam_origin,
+                    point,
+                    endpoint,
+                    frame_free_keys=frame_free_keys,
+                )
+
+        frame_occ_cells = {
+            (row, col)
+            for row, col, height in frame_occ_keys
+            if self._is_obstacle_height(height)
+        }
+        frame_free_cells = {(row, col) for row, col, _ in frame_free_keys}
+        for key in frame_occ_keys:
+            self.occ3d_frame_counts[key] += 1
+        for key in frame_free_keys:
+            self.free3d_frame_counts[key] += 1
+        for cell in frame_occ_cells:
+            self.occ2d_frame_counts[cell] += 1
+            self.occ2d_last_observation[cell] = int(self.observation_count)
+        for cell in frame_free_cells:
+            self.free2d_frame_counts[cell] += 1
+            self.free2d_last_observation[cell] = int(self.observation_count)
 
         if self.config.validation_enable:
             self.validation_endpoint_mapped_count += int(validation_endpoint_mapped)
@@ -823,6 +854,10 @@ class SparseOccSemanticMemory:
                 "sampled_point_count": int(cam_points.shape[0]),
                 "occupied_added": int(occupied_added),
                 "free_added": int(free_added),
+                "frame_unique_occupied_voxel_count": int(len(frame_occ_keys)),
+                "frame_unique_free_voxel_count": int(len(frame_free_keys)),
+                "frame_unique_occupied_cell_count": int(len(frame_occ_cells)),
+                "frame_unique_free_cell_count": int(len(frame_free_cells)),
                 "occupied_voxel_count": int(len(self.occ_counts)),
                 "free_voxel_count": int(len(self.free_counts)),
                 "occupied_cell_count": int(len(self.occ2d_counts)),
@@ -5254,7 +5289,14 @@ class SparseOccSemanticMemory:
         z = float(height) * self.cs
         return float(self.config.obstacle_height_min) < z < float(self.config.obstacle_height_max)
 
-    def _raycast_free(self, origin: np.ndarray, endpoint: np.ndarray, endpoint_grid: Tuple[int, int, int]) -> int:
+    def _raycast_free(
+        self,
+        origin: np.ndarray,
+        endpoint: np.ndarray,
+        endpoint_grid: Tuple[int, int, int],
+        *,
+        frame_free_keys: Optional[Set[Tuple[int, int, int]]] = None,
+    ) -> int:
         delta = np.asarray(endpoint, dtype=np.float32) - np.asarray(origin, dtype=np.float32)
         distance = float(np.linalg.norm(delta))
         if distance <= self.cs:
@@ -5268,6 +5310,8 @@ class SparseOccSemanticMemory:
             grid = self._xyz_to_grid(point)
             if grid is None or grid == endpoint_grid:
                 continue
+            if frame_free_keys is not None:
+                frame_free_keys.add(grid)
             before = self.free_counts.get(grid, 0)
             self.free_counts[grid] = before + 1
             if before == 0:
@@ -6616,6 +6660,41 @@ class SparseOccSemanticMemory:
             return "free"
         return "unknown"
 
+    def frame_aware_cell_evidence(self, row: int, col: int) -> Dict[str, Any]:
+        """Expose independent-frame support without changing legacy decisions."""
+        key = (int(row), int(col))
+        occupied_frames = int(self.occ2d_frame_counts.get(key, 0) or 0)
+        free_frames = int(self.free2d_frame_counts.get(key, 0) or 0)
+        last_occupied = self.occ2d_last_observation.get(key)
+        last_free = self.free2d_last_observation.get(key)
+        current = int(self.observation_count)
+        current_occupied = last_occupied == current
+        if current_occupied or occupied_frames >= 2:
+            consensus_state = "blocked"
+        elif free_frames >= 2 and (
+            last_occupied is None
+            or (last_free is not None and int(last_free) > int(last_occupied))
+        ):
+            consensus_state = "free"
+        else:
+            consensus_state = "unknown"
+        return {
+            "legacy_state": self._cell_state(*key),
+            "frame_consensus_state": consensus_state,
+            "occupied_frame_count": occupied_frames,
+            "free_frame_count": free_frames,
+            "last_occupied_observation": last_occupied,
+            "last_free_observation": last_free,
+            "occupied_age_observations": (
+                None if last_occupied is None else int(current - last_occupied)
+            ),
+            "free_age_observations": (
+                None if last_free is None else int(current - last_free)
+            ),
+            "current_frame_occupied": bool(current_occupied),
+            "decision_applied": False,
+        }
+
     def validation_floor_aligned_cell_evidence(
         self,
         row: int,
@@ -6675,6 +6754,7 @@ class SparseOccSemanticMemory:
             "free_hits": int(free_hits),
             "occupied_voxel_count": int(occupied_voxels),
             "free_voxel_count": int(free_voxels),
+            "frame_aware_cell_evidence": self.frame_aware_cell_evidence(row, col),
         }
 
     def audit_route_cell_evidence(
