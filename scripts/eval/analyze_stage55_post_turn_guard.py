@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from internnav.utils.stage55_occ_2p5d_audit import POST_TURN_FORWARD_SOURCES
+
 
 METRICS = ("success", "spl", "ne", "steps", "collision_count")
 
@@ -117,7 +119,7 @@ def analyze(baseline_root: Path, guard_root: Path, manifest: Path) -> dict[str, 
     for row in guard_events:
         if (
             row.get("previous_action") != 1
-            or row.get("previous_action_source") != "system2_action_queue"
+            or row.get("previous_action_source") not in POST_TURN_FORWARD_SOURCES
             or float(row.get("collision_delta", 0.0) or 0.0) <= 0.0
             or row.get("environment_action_applied") is not False
             or row.get("pixel_translation_applied") is not False

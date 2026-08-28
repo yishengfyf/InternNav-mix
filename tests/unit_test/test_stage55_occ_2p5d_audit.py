@@ -116,6 +116,12 @@ def test_post_turn_guard_requires_real_collided_s2_forward_and_budget():
     assert not _module.should_post_turn_collision_guard(
         **{**base, "previous_action_source": "vlmap_recovery_queue"}
     )
+    assert _module.should_post_turn_collision_guard(
+        **{**base, "previous_action_source": "nextdit_local_queue"}
+    )
+    assert _module.should_post_turn_collision_guard(
+        **{**base, "previous_action_source": "nextdit_regenerated_local_queue"}
+    )
     assert not _module.should_post_turn_collision_guard(
         **{**base, "requery_count": 8}
     )

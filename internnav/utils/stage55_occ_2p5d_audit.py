@@ -7,6 +7,15 @@ from collections import Counter, defaultdict
 from typing import Any, Mapping, Optional, Sequence
 
 
+POST_TURN_FORWARD_SOURCES = frozenset(
+    {
+        "system2_action_queue",
+        "nextdit_local_queue",
+        "nextdit_regenerated_local_queue",
+    }
+)
+
+
 def should_post_turn_collision_guard(
     *,
     enabled: bool,
@@ -25,7 +34,7 @@ def should_post_turn_collision_guard(
         enabled
         and armed
         and int(previous_action) == int(forward_action)
-        and str(previous_action_source) == "system2_action_queue"
+        and str(previous_action_source) in POST_TURN_FORWARD_SOURCES
         and float(collision_delta) > 0.0
         and (
             int(horizon_steps) <= 0
