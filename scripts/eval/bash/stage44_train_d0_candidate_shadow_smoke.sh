@@ -43,7 +43,8 @@ python3 -m py_compile \
   scripts/eval/configs/habitat_dual_system_vlmap_stage44_train_d0_candidate_shadow_cfg.py \
   scripts/eval/analyze_stage27_m3_candidate_shadow.py \
   scripts/eval/analyze_stage53_recovery_ab.py \
-  scripts/eval/configs/habitat_dual_system_vlmap_stage53_recovery_ab_shadow_cfg.py
+  scripts/eval/configs/habitat_dual_system_vlmap_stage53_recovery_ab_shadow_cfg.py \
+  scripts/eval/configs/habitat_dual_system_vlmap_stage53_recovery_ab_v2_shadow_cfg.py
 
 FAILED_STAGE=frozen_s2_train_d0_shadow
 CUDA_VISIBLE_DEVICES="${STAGE44_CUDA_VISIBLE_DEVICES:-0,1,2,3}" \

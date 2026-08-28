@@ -749,6 +749,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                 ),
             ),
+            "stage53_lookdown_view_prompt_enable": bool(
+                vlmap_safety_cfg.get(
+                    "stage53_lookdown_view_prompt_enable", False
+                )
+            ),
             "strict_active_enable": bool(
                 vlmap_safety_cfg.get("s2_loop_strict_active_enable", False)
             ),
@@ -1262,6 +1267,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         context: dict,
         image_width: int,
         lookdown_image: Optional[Image.Image],
+        lookdown_view_prompt_enable: bool,
     ) -> dict:
         """Run one no-action Stage53 S2 arm from the same natural query."""
         variant = str(variant).strip().lower()
@@ -1289,9 +1295,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if include_context
             else ""
         )
+        lookdown_view_prompt = (
+            "Current observation note: the final current-view image is already a "
+            "fresh 30-degree downward RGB observation captured at the same robot "
+            "pose. Use this view directly instead of requesting the identical "
+            "look-down observation again. This view does not certify that any "
+            "location is traversable."
+            if include_lookdown and lookdown_view_prompt_enable
+            else ""
+        )
         prompt = " ".join(
             value
-            for value in (base_prompt_body, context_prompt, f"{final_prompt}.")
+            for value in (
+                base_prompt_body,
+                context_prompt,
+                lookdown_view_prompt,
+                f"{final_prompt}.",
+            )
             if str(value or "").strip()
         )
         prompt_image_token_count = sum(
@@ -1341,6 +1361,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 prompt_image_token_count == len(images) == len(prompt_image_roles)
             ),
             "recovery_context_prompt": context_prompt,
+            "lookdown_view_prompt": lookdown_view_prompt,
+            "lookdown_view_prompt_included": bool(lookdown_view_prompt),
             "forbidden_context_terms": forbidden_context_terms,
             "base_output": str(base_output),
         }
@@ -1478,7 +1500,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return
         record = {
             "event_type": "stage53_recovery_ab_shadow",
-            "event_schema_version": "stage53_recovery_ab_v1",
+            "event_schema_version": (
+                "stage53_recovery_ab_v2"
+                if cfg.get("stage53_lookdown_view_prompt_enable")
+                else "stage53_recovery_ab_v1"
+            ),
             "scene_id": event.get("scene_id"),
             "episode_id": event.get("episode_id"),
             "episode_index": event.get("episode_index"),
@@ -1517,6 +1543,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     context=context,
                     image_width=int(self.model_args.resize_w),
                     lookdown_image=resized_lookdown,
+                    lookdown_view_prompt_enable=bool(
+                        cfg.get("stage53_lookdown_view_prompt_enable")
+                    ),
                 )
             )
         try:

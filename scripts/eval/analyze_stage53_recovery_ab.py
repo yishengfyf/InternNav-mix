@@ -64,6 +64,14 @@ def analyze(run_root: Path, expected_episodes: int):
     context_claim_violations = [
         arm for arm in arms if list(arm.get("forbidden_context_terms") or [])
     ]
+    view_prompt_violations = []
+    for event in events:
+        if event.get("event_schema_version") != "stage53_recovery_ab_v2":
+            continue
+        for arm in list(event.get("arms") or []):
+            expected = arm.get("variant") in {"lookdown_only", "lookdown_context"}
+            if bool(arm.get("lookdown_view_prompt_included")) != expected:
+                view_prompt_violations.append(arm)
     state_mutations = [event for event in events if event.get("official_memory_mutated")]
     action_violations = [event for event in events if event.get("action_applied")]
     gt_leakage = [event for event in events if list(event.get("gt_fields_used") or [])]
@@ -75,6 +83,7 @@ def analyze(run_root: Path, expected_episodes: int):
         and not errors
         and not binding_violations
         and not context_claim_violations
+        and not view_prompt_violations
         and not state_mutations
         and not action_violations
         and not gt_leakage
@@ -109,6 +118,7 @@ def analyze(run_root: Path, expected_episodes: int):
         "counterfactual_error_count": len(errors),
         "prompt_image_binding_violation_count": len(binding_violations),
         "recovery_context_claim_violation_count": len(context_claim_violations),
+        "lookdown_view_prompt_violation_count": len(view_prompt_violations),
         "official_memory_mutation_count": len(state_mutations),
         "action_applied_violation_count": len(action_violations),
         "gt_leakage_count": len(gt_leakage),

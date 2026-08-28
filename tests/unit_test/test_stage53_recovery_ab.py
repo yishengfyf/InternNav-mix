@@ -84,3 +84,19 @@ def test_stage53_integrity_rejects_failed_temporary_map_update(tmp_path):
     event["lookdown_geometry"]["temporary_update_valid"] = False
     report = stage53.analyze(_write_run(tmp_path, event), expected_episodes=1)
     assert report["integrity_passed"] is False
+
+
+def test_stage53_v2_requires_view_note_only_on_lookdown_arms(tmp_path):
+    event = _event()
+    event["event_schema_version"] = "stage53_recovery_ab_v2"
+    for arm in event["arms"]:
+        arm["lookdown_view_prompt_included"] = arm["variant"] in {
+            "lookdown_only",
+            "lookdown_context",
+        }
+    report = stage53.analyze(_write_run(tmp_path, event), expected_episodes=1)
+    assert report["integrity_passed"] is True
+    event["arms"][0]["lookdown_view_prompt_included"] = True
+    report = stage53.analyze(_write_run(tmp_path, event), expected_episodes=1)
+    assert report["integrity_passed"] is False
+    assert report["lookdown_view_prompt_violation_count"] == 1
