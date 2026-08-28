@@ -217,6 +217,26 @@ def test_grid_to_pixel_goal_rejects_out_of_image_projection(monkeypatch):
     ) is None
 
 
+def test_grid_pixel_roundtrip_respects_lookdown_pitch(monkeypatch):
+    memory = _memory()
+    memory.init_base_tf = np.eye(4, dtype=np.float32)
+    memory.cam_to_base_tf = np.eye(4, dtype=np.float32)
+    memory.camera_intrinsic = np.array(
+        [[4.0, 0.0, 3.5], [0.0, 4.0, 3.5], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    memory.config.camera_height = 1.5
+    monkeypatch.setattr(memory, "_relative_base_tf", lambda _tf: np.eye(4, dtype=np.float32))
+    monkeypatch.setattr(memory, "_grid_to_xy", lambda _grid: np.array([2.0, 0.0], dtype=np.float32))
+    pixel = memory._grid_to_pixel_goal(
+        [32, 32], 0.0, np.eye(4, dtype=np.float32),
+        {"image_width": 8, "image_height": 8, "camera_pitch_deg": 30.0},
+        np.ones((8, 8), dtype=np.float32),
+    )
+    assert pixel is not None
+    assert 0 <= pixel[0] < 8 and 0 <= pixel[1] < 8
+
+
 def test_depth_short_local_search_can_route_around_blocked_direct_cell(monkeypatch):
     memory = _memory()
     memory.init_base_tf = np.eye(4, dtype=np.float32)

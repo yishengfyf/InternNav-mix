@@ -5380,7 +5380,13 @@ class SparseOccSemanticMemory:
         cam = inv_intrinsic @ np.array([sx + 0.5, sy + 0.5, 1.0], dtype=np.float32)
         cam = cam * depth_m
         rel_base_tf = self._relative_base_tf(pose_tf)
-        cam_pose_tf = rel_base_tf @ self.cam_to_base_tf
+        camera_pitch_deg = float(context.get("camera_pitch_deg", 0.0) or 0.0)
+        cam_to_base_tf = (
+            _cam_to_base_for_pitch(float(self.config.camera_height), camera_pitch_deg)
+            if abs(camera_pitch_deg) > 1e-6
+            else self.cam_to_base_tf
+        )
+        cam_pose_tf = rel_base_tf @ cam_to_base_tf
         point = cam_pose_tf @ np.array([cam[0], cam[1], cam[2], 1.0], dtype=np.float32)
         goal = self._xyz_to_grid(point[:3])
         if goal is None:
@@ -5460,7 +5466,13 @@ class SparseOccSemanticMemory:
         if image_w <= 0 or image_h <= 0 or w <= 0 or h <= 0:
             return None
         rel_base_tf = self._relative_base_tf(pose_tf)
-        cam_pose_tf = rel_base_tf @ self.cam_to_base_tf
+        camera_pitch_deg = float(context.get("camera_pitch_deg", 0.0) or 0.0)
+        cam_to_base_tf = (
+            _cam_to_base_for_pitch(float(self.config.camera_height), camera_pitch_deg)
+            if abs(camera_pitch_deg) > 1e-6
+            else self.cam_to_base_tf
+        )
+        cam_pose_tf = rel_base_tf @ cam_to_base_tf
         world_point = np.array([world_xy[0], world_xy[1], world_z, 1.0], dtype=np.float32)
         try:
             cam_point = np.linalg.inv(cam_pose_tf) @ world_point

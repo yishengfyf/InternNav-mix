@@ -738,6 +738,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 vlmap_safety_cfg.get("s2_recovery_context_save_images", False)
             ),
             "recovery_context_shadow_variants": shadow_variants,
+            "stage53_recovery_ab_enable": bool(
+                vlmap_safety_cfg.get("stage53_recovery_ab_enable", False)
+            ),
+            "stage53_lookdown_pitch_deg": max(
+                0.0,
+                float(
+                    vlmap_safety_cfg.get(
+                        "stage53_lookdown_pitch_deg", 2.0 * self._tilt_angle_deg
+                    )
+                ),
+            ),
             "strict_active_enable": bool(
                 vlmap_safety_cfg.get("s2_loop_strict_active_enable", False)
             ),
@@ -914,31 +925,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         translation = event.get("translation_m")
         candidate = dict(event.get("candidate") or {})
         candidate_direction = str(candidate.get("direction_bucket") or "unknown")
+        candidate_bearing = candidate.get("direction_angle_deg")
         candidate_distance = candidate.get("distance_m")
-        candidate_open = candidate.get("semantic_resilience_open_score")
-        candidate_safe = candidate.get("geometry_safe")
-        semantic_term = (
-            (candidate.get("semantic_evidence") or {}).get("semantic_top_match")
-            or (candidate.get("semantic_evidence") or {}).get("matched_landmark")
-            or candidate.get("semantic_top_match")
-            or candidate.get("matched_landmark")
-            or candidate.get("anchor_semantic_top_match")
-            or "unknown"
-        )
         return (
             "Temporary recovery context (observed local evidence, not ground truth): "
             f"failure={failure_type}; repeated_turn={direction}; "
             f"query_streak={streak}; cumulative_turn_actions={turn_actions}; "
             f"translation_m={translation}; "
-            f"recovery_anchor_direction={candidate_direction}; "
-            f"anchor_distance_m={candidate_distance}; "
-            f"anchor_geometry_safe={candidate_safe}; "
-            f"anchor_open_score={candidate_open}; "
-            f"anchor_semantic={semantic_term}. "
+            f"map_observation_direction={candidate_direction}; "
+            f"map_observation_bearing_deg={candidate_bearing}; "
+            f"map_observation_distance_m={candidate_distance}. "
             "The repeated direction has failed to produce new local progress in "
             "this recent state. Re-observe the current view, respect the instruction, "
-            "and choose a visible, executable, non-redundant waypoint; do not treat "
-            "this card as a forced left/right command."
+            "and choose a visible, executable, non-redundant waypoint. The map-derived "
+            "bearing is an observation target only: it does not assert traversability "
+            "and is not a forced left/right command."
         )
 
     @staticmethod
@@ -1002,7 +1003,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
         if anchor_step not in {start_step, current_step}:
             add(
-                "recent safe recovery anchor frame",
+                "recent recovery anchor frame",
                 self._nearest_recovery_frame_record(frame_records, anchor_step),
             )
         # The current loop frame is already the current image in the base S2
@@ -1248,6 +1249,304 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             event["latency_ms"] = float((time.perf_counter() - started) * 1000.0)
             self._restore_torch_rng_state(rng_state)
         return event
+
+    def _run_stage53_s2_arm(
+        self,
+        *,
+        variant: str,
+        base_prompt_body: str,
+        final_prompt: str,
+        input_images: list,
+        messages_prefix: Optional[list],
+        base_output: str,
+        context: dict,
+        image_width: int,
+        lookdown_image: Optional[Image.Image],
+    ) -> dict:
+        """Run one no-action Stage53 S2 arm from the same natural query."""
+        variant = str(variant).strip().lower()
+        include_context = variant in {"context_only", "lookdown_context"}
+        include_lookdown = variant in {"lookdown_only", "lookdown_context"}
+        base_images = list(input_images)
+        if include_lookdown:
+            if not base_images or not isinstance(lookdown_image, Image.Image):
+                return {
+                    "variant": variant,
+                    "status": "error",
+                    "error": "missing_current_lookdown_image",
+                    "shadow_only": True,
+                    "action_applied": False,
+                    "gt_fields_used": [],
+                }
+            base_images[-1] = lookdown_image
+        extra_images = list(context.get("images") or []) if include_context else []
+        if extra_images and base_images:
+            images = base_images[:-1] + extra_images + base_images[-1:]
+        else:
+            images = base_images
+        context_prompt = (
+            self._recovery_context_prompt(context, "text_images")
+            if include_context
+            else ""
+        )
+        prompt = " ".join(
+            value
+            for value in (base_prompt_body, context_prompt, f"{final_prompt}.")
+            if str(value or "").strip()
+        )
+        prompt_image_token_count = sum(
+            part == DEFAULT_IMAGE_TOKEN for part in split_and_clean(prompt)
+        )
+        prompt_image_roles = (
+            [
+                f"base historical frame {index}"
+                for index in range(max(0, len(base_images) - 1))
+            ]
+            + (list(context.get("image_roles") or []) if extra_images else [])
+            + (
+                [
+                    "current look-down frame"
+                    if include_lookdown
+                    else "current horizon frame"
+                ]
+                if base_images
+                else []
+            )
+        )
+        forbidden_context_terms = [
+            term
+            for term in (
+                "geometry_safe",
+                "geometry safe",
+                "completed_landmark",
+                "completed landmark",
+                "landmark_completed",
+                "landmark completed",
+            )
+            if term in context_prompt.lower()
+        ]
+        event = {
+            "variant": variant,
+            "status": "ok",
+            "shadow_only": True,
+            "action_applied": False,
+            "gt_fields_used": [],
+            "current_view": "lookdown_30deg" if include_lookdown else "horizon",
+            "context_included": bool(include_context),
+            "extra_context_image_count": int(len(extra_images)),
+            "input_image_count": int(len(images)),
+            "prompt_image_token_count": int(prompt_image_token_count),
+            "prompt_image_roles": prompt_image_roles,
+            "prompt_image_binding_valid": bool(
+                prompt_image_token_count == len(images) == len(prompt_image_roles)
+            ),
+            "recovery_context_prompt": context_prompt,
+            "forbidden_context_terms": forbidden_context_terms,
+            "base_output": str(base_output),
+        }
+        if not event["prompt_image_binding_valid"]:
+            event.update(
+                {
+                    "status": "error",
+                    "error": "prompt_image_binding_mismatch",
+                    "output": "",
+                    "latency_ms": 0.0,
+                }
+            )
+            return event
+        if forbidden_context_terms:
+            event.update(
+                {
+                    "status": "error",
+                    "error": "forbidden_recovery_context_claim",
+                    "output": "",
+                    "latency_ms": 0.0,
+                }
+            )
+            return event
+        if variant == "control":
+            output = str(base_output)
+            latency_ms = 0.0
+        else:
+            rng_state = self._capture_torch_rng_state()
+            started = time.perf_counter()
+            try:
+                output = self._generate_s2_text_from_prompt_instruction(
+                    prompt,
+                    images,
+                    messages_prefix=messages_prefix,
+                    max_new_tokens=128,
+                )
+            except Exception as exc:
+                event.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
+                output = ""
+            finally:
+                latency_ms = float((time.perf_counter() - started) * 1000.0)
+                self._restore_torch_rng_state(rng_state)
+        event["output"] = output
+        event["latency_ms"] = latency_ms
+        if event["status"] == "ok":
+            base_parse = self._parse_s2_candidate_output(
+                base_output, image_width=image_width
+            )
+            arm_parse = self._parse_s2_candidate_output(
+                output, image_width=image_width
+            )
+            event.update(self._s2_recovery_change_metrics(base_parse, arm_parse, context))
+        return event
+
+    def _stage53_lookdown_geometry_shadow(
+        self,
+        *,
+        event: dict,
+        observations: dict,
+        depth_m: np.ndarray,
+        pitch_deg: float,
+    ) -> dict:
+        """Update a private memory with the same-step look-down RGB-D and audit it."""
+        temporary_memory = copy.deepcopy(self.occ_memory)
+        temporary_memory.debug_dir = None
+        temporary_memory.config.camera_pitch_aware_update = True
+        update_event = temporary_memory.update_observation(
+            {
+                "rgb": observations.get("rgb"),
+                "depth": depth_m,
+                "gps": observations.get("gps"),
+                "compass": observations.get("compass"),
+            },
+            depth_m,
+            rgb=observations.get("rgb"),
+            context={
+                "step_id": int(event.get("step_id", -1)),
+                "scene_id": event.get("scene_id"),
+                "episode_id": event.get("episode_id"),
+                "camera_pitch_deg": float(pitch_deg),
+            },
+        )
+        cfg = self._stage27_candidate_audit_cfg
+        h, w = np.asarray(depth_m).shape[:2]
+        report = temporary_memory.plan_depth_short_lookahead_shadow(
+            {
+                "gps": observations.get("gps"),
+                "compass": observations.get("compass"),
+            },
+            depth_m,
+            context={
+                "image_width": int(w),
+                "image_height": int(h),
+                "camera_pitch_deg": float(pitch_deg),
+            },
+            footprint_radius_m=float(cfg.get("footprint_radius_m", 0.18)),
+            floor_height_max_m=float(cfg.get("floor_aligned_height_max_m", 1.5)),
+            local_search_enable=bool(cfg.get("stage52_local_search_enable", False)),
+            local_search_lateral_m=float(cfg.get("stage52_local_search_lateral_m", 0.20)),
+            local_search_detour_m=float(cfg.get("stage52_local_search_detour_m", 0.25)),
+            local_search_max_paths=int(cfg.get("stage52_local_search_max_paths", 16)),
+        )
+        return {
+            "camera_pitch_deg": float(pitch_deg),
+            "observation_readable": bool(
+                np.asarray(depth_m).size
+                and np.any(
+                    np.isfinite(np.asarray(depth_m))
+                    & (np.asarray(depth_m) > float(temporary_memory.config.min_depth))
+                    & (np.asarray(depth_m) < float(temporary_memory.config.max_depth))
+                )
+            ),
+            "temporary_memory_only": True,
+            "temporary_update_valid": bool(update_event.get("valid")),
+            "temporary_update_reason": update_event.get("reason"),
+            "report": report,
+        }
+
+    def _run_stage53_recovery_ab_shadow(
+        self,
+        *,
+        event: dict,
+        context: Optional[dict],
+        base_prompt_body: str,
+        final_prompt: str,
+        input_images: list,
+        messages_prefix: Optional[list],
+        base_output: str,
+        lookdown_image: Optional[Image.Image],
+        lookdown_observations: Optional[dict],
+        lookdown_depth_m: Optional[np.ndarray],
+    ) -> None:
+        cfg = self._get_s2_action_loop_cfg()
+        if not cfg.get("stage53_recovery_ab_enable"):
+            return
+        record = {
+            "event_type": "stage53_recovery_ab_shadow",
+            "event_schema_version": "stage53_recovery_ab_v1",
+            "scene_id": event.get("scene_id"),
+            "episode_id": event.get("episode_id"),
+            "episode_index": event.get("episode_index"),
+            "episode_count": event.get("episode_count"),
+            "episode_eval_seed": event.get("episode_eval_seed"),
+            "step_id": event.get("step_id"),
+            "failure_type": event.get("failure_type"),
+            "turn_direction": event.get("turn_direction"),
+            "shadow_only": True,
+            "action_applied": False,
+            "official_memory_mutated": False,
+            "gt_fields_used": [],
+            "arms": [],
+            "lookdown_geometry": None,
+        }
+        if context is None:
+            record["reason"] = "missing_online_recovery_context"
+            self._write_stage53_recovery_ab_event(record)
+            return
+        pitch_deg = float(cfg.get("stage53_lookdown_pitch_deg", 30.0))
+        resized_lookdown = (
+            lookdown_image.resize((self.model_args.resize_w, self.model_args.resize_h))
+            if isinstance(lookdown_image, Image.Image)
+            else None
+        )
+        official_before = self._stage43_memory_fingerprint(self.occ_memory)
+        for variant in ("control", "lookdown_only", "context_only", "lookdown_context"):
+            record["arms"].append(
+                self._run_stage53_s2_arm(
+                    variant=variant,
+                    base_prompt_body=base_prompt_body,
+                    final_prompt=final_prompt,
+                    input_images=input_images,
+                    messages_prefix=messages_prefix,
+                    base_output=base_output,
+                    context=context,
+                    image_width=int(self.model_args.resize_w),
+                    lookdown_image=resized_lookdown,
+                )
+            )
+        try:
+            if lookdown_observations is None or lookdown_depth_m is None:
+                record["reason"] = "missing_same_step_lookdown_rgbd"
+            else:
+                record["lookdown_geometry"] = self._stage53_lookdown_geometry_shadow(
+                    event=event,
+                    observations=lookdown_observations,
+                    depth_m=lookdown_depth_m,
+                    pitch_deg=pitch_deg,
+                )
+                record["reason"] = "ok"
+        except Exception as exc:
+            record["reason"] = f"lookdown_geometry_error:{type(exc).__name__}:{exc}"
+        official_after = self._stage43_memory_fingerprint(self.occ_memory)
+        record["official_memory_mutated"] = official_after != official_before
+        if isinstance(lookdown_image, Image.Image):
+            log_dir = self._get_vlmap_run_dir() or self.output_path
+            if log_dir:
+                snapshot_dir = os.path.join(log_dir, "stage53_recovery_ab_snapshots")
+                os.makedirs(snapshot_dir, exist_ok=True)
+                snapshot_path = os.path.join(
+                    snapshot_dir,
+                    f"{event.get('scene_id')}_{int(event.get('episode_id'))}_"
+                    f"step{int(event.get('step_id', -1))}_lookdown.jpg",
+                )
+                lookdown_image.save(snapshot_path, quality=90)
+                record["lookdown_snapshot_path"] = snapshot_path
+        self._write_stage53_recovery_ab_event(record)
 
     def _plan_s2_loop_projection_bridge_shadow(
         self,
@@ -3770,6 +4069,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         with open(log_path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
+    def _write_stage53_recovery_ab_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "stage53_recovery_ab_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
     def _write_s2_loop_strict_active_event(self, event: dict) -> None:
         run_dir = self._get_vlmap_run_dir()
         log_dir = run_dir or self.output_path
@@ -5246,6 +5555,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 input_img_id += 1
             else:
                 content.append({"type": "text", "text": part})
+
+        if input_img_id != len(input_images):
+            raise ValueError(
+                "S2 prompt contains fewer image tokens than provided images: "
+                f"{input_img_id} tokens for {len(input_images)} images"
+            )
 
         messages = list(messages_prefix or [])
         messages.append({"role": "user", "content": content})
@@ -9881,9 +10196,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                 image = Image.fromarray(rgb).convert('RGB')
                 save_raw_image = image.copy()
+                look_down_shadow_observations = None
+                look_down_shadow_depth_m = None
 
                 if action == action_code.LOOKDOWN:
                     look_down_image = image
+                    look_down_shadow_observations = observations
+                    look_down_shadow_depth_m = current_depth_m
                     save_raw_image = look_down_image.copy()
                     look_down_depth, resize_shape = preprocess_depth_image_v2(
                         Image.fromarray(depth.astype(np.uint16), mode='I;16'),
@@ -9908,6 +10227,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     depth = down_observations["depth"]
                     depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
                     depth = depth * (self._max_depth - self._min_depth) + self._min_depth
+                    look_down_shadow_observations = down_observations
+                    look_down_shadow_depth_m = depth.copy()
                     depth = depth * 1000
                     look_down_depth, resize_shape = preprocess_depth_image_v2(
                         Image.fromarray(depth.astype(np.uint16), mode='I;16'),
@@ -10471,6 +10792,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                     "gt_fields_used": [],
                                 }
                             )
+
+                        self._run_stage53_recovery_ab_shadow(
+                            event=s2_loop_event,
+                            context=recovery_context,
+                            base_prompt_body=s2_prompt_body_before_final_prompt,
+                            final_prompt=prompt,
+                            input_images=input_images,
+                            messages_prefix=s2_counterfactual_messages_prefix,
+                            base_output=llm_outputs,
+                            lookdown_image=look_down_image,
+                            lookdown_observations=look_down_shadow_observations,
+                            lookdown_depth_m=look_down_shadow_depth_m,
+                        )
 
                     recovery_cfg = self._get_s2_action_loop_cfg()
                     if (

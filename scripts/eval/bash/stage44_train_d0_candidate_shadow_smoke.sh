@@ -34,7 +34,16 @@ exec > >(tee -a "${WORK_DIR}/pipeline.log") 2>&1
 
 FAILED_STAGE=targeted_tests
 python3 -m pytest -q tests/unit_test/test_stage27_candidate_generation.py
-python3 -m py_compile scripts/eval/configs/habitat_dual_system_vlmap_stage44_train_d0_candidate_shadow_cfg.py scripts/eval/analyze_stage27_m3_candidate_shadow.py
+if [[ "${STAGE44_RUN_STAGE53_ANALYSIS:-0}" == 1 ]]; then
+  python3 -m pytest -q \
+    tests/unit_test/test_stage53_recovery_ab.py \
+    tests/unit_test/test_sparse_occ_recovery_features.py
+fi
+python3 -m py_compile \
+  scripts/eval/configs/habitat_dual_system_vlmap_stage44_train_d0_candidate_shadow_cfg.py \
+  scripts/eval/analyze_stage27_m3_candidate_shadow.py \
+  scripts/eval/analyze_stage53_recovery_ab.py \
+  scripts/eval/configs/habitat_dual_system_vlmap_stage53_recovery_ab_shadow_cfg.py
 
 FAILED_STAGE=frozen_s2_train_d0_shadow
 CUDA_VISIBLE_DEVICES="${STAGE44_CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
@@ -51,6 +60,14 @@ if [[ "${STAGE44_RUN_STAGE50_ANALYSIS:-0}" == 1 ]]; then
   python3 scripts/eval/analyze_stage50_depth_short_lookahead.py \
     --run-root "${RUN_ROOT}" \
     --output "${RUN_ROOT}/stage50_depth_short_lookahead_audit.json"
+fi
+
+if [[ "${STAGE44_RUN_STAGE53_ANALYSIS:-0}" == 1 ]]; then
+  python3 scripts/eval/analyze_stage53_recovery_ab.py \
+    --run-root "${RUN_ROOT}" \
+    --expected-episodes "${STAGE44_STAGE53_EXPECTED_EPISODES:-4}" \
+    --output "${RUN_ROOT}/stage53_recovery_ab_audit.json" \
+    --require-all
 fi
 
 FAILED_STAGE=return_packaging
