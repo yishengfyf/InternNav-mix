@@ -10308,7 +10308,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     requery_count=stage55_post_turn_guard_requery_count,
                     requery_budget=stage55_guard_budget,
                 ):
-                    discarded_actions = list(action_seq)
+                    discarded_s2_actions = list(action_seq)
+                    discarded_local_actions = list(local_actions)
+                    discarded_actions = (
+                        discarded_s2_actions + discarded_local_actions
+                    )
                     stage55_post_turn_guard_event_count += 1
                     stage55_post_turn_guard_requery_count += 1
                     stage55_post_turn_guard_collision_delta_sum += float(
@@ -10343,6 +10347,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             replay_audit_metrics["collision_delta"]
                         ),
                         "discarded_action_count": len(discarded_actions),
+                        "discarded_s2_action_count": len(discarded_s2_actions),
+                        "discarded_local_action_count": len(discarded_local_actions),
                         "discarded_actions": discarded_actions,
                         "requery_index": int(
                             stage55_post_turn_guard_requery_count

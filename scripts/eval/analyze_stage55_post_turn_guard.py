@@ -9,7 +9,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from internnav.utils.stage55_occ_2p5d_audit import POST_TURN_FORWARD_SOURCES
+
+
+# Keep the offline analyzer independent from the full internnav package.
+POST_TURN_FORWARD_SOURCES = frozenset(
+    {
+        "system2_action_queue",
+        "nextdit_local_queue",
+        "nextdit_regenerated_local_queue",
+    }
+)
 
 
 METRICS = ("success", "spl", "ne", "steps", "collision_count")
@@ -126,6 +135,11 @@ def analyze(baseline_root: Path, guard_root: Path, manifest: Path) -> dict[str, 
             or row.get("gt_fields_used")
         ):
             violations.append("invalid_guard_event")
+        if int(row.get("discarded_action_count", 0) or 0) != (
+            int(row.get("discarded_s2_action_count", 0) or 0)
+            + int(row.get("discarded_local_action_count", 0) or 0)
+        ):
+            violations.append("guard_discard_count_mismatch")
     seed_mismatch = [
         key
         for key, seed in expected.items()
