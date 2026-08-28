@@ -6394,7 +6394,8 @@ class SparseOccSemanticMemory:
                     requested = max(float(self.cs), float(distance_m))
                     index = min(len(cells) - 1, max(1, int(round(requested / max(self.cs, 1e-6)))))
                     prefix = cells[: index + 1]
-                    states = [self._cell_state(*cell) for cell in prefix]
+                    start_cell_state = self._cell_state(*prefix[0])
+                    states = ["free"] + [self._cell_state(*cell) for cell in prefix[1:]]
                     path_state = "occupied" if "occupied" in states else ("unknown" if "unknown" in states else "free")
                     direct_audit = footprint_path_audit(prefix, current_floor_z) if path_state == "free" else {
                         "state": path_state,
@@ -6439,6 +6440,8 @@ class SparseOccSemanticMemory:
                         "path_cells": [[int(r), int(c)] for r, c in selected_path],
                         "direct_path_cells": [[int(r), int(c)] for r, c in prefix],
                         "path_source": path_source,
+                        "start_cell_state": start_cell_state,
+                        "start_cell_exempted": True,
                         "local_search_attempt_count": int(local_attempt_count),
                         "path_state": path_state,
                         "floor_footprint_state": floor_state,
