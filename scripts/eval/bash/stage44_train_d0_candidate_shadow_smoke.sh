@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 MANIFEST=${STAGE44_MANIFEST:?Set STAGE44_MANIFEST to a train episode JSON list}
+EVAL_CONFIG=${STAGE44_EVAL_CONFIG:-scripts/eval/configs/habitat_dual_system_vlmap_stage44_train_d0_candidate_shadow_cfg.py}
 TAG=${STAGE44_PIPELINE_TAG:-$(date +%Y%m%d_%H%M%S)}
 RUN_NAME="compare_vlmap_stage44_train_d0_candidate_shadow_${TAG}"
 RUN_ROOT="logs/habitat/${RUN_NAME}"
@@ -41,10 +42,16 @@ STAGE21_EPISODE_IDS="${MANIFEST}" STAGE21_RUN_NAME="${RUN_NAME}" \
 STAGE21_EPISODE_SEED_REPLAY_MANIFEST="${MANIFEST}" STAGE27_EVENT_MANIFEST="" \
 STAGE21_EVAL_PORT="${STAGE44_EVAL_PORT:-3441}" NPROC_PER_NODE="${STAGE44_NPROC_PER_NODE:-4}" \
 MASTER_PORT="${STAGE44_MASTER_PORT:-3442}" \
-bash scripts/eval/bash/stage21_torchrun_eval.sh --config scripts/eval/configs/habitat_dual_system_vlmap_stage44_train_d0_candidate_shadow_cfg.py
+bash scripts/eval/bash/stage21_torchrun_eval.sh --config "${EVAL_CONFIG}"
 
 FAILED_STAGE=stage44_candidate_audit
 python3 scripts/eval/analyze_stage27_m3_candidate_shadow.py --run-root "${RUN_ROOT}" --output "${RUN_ROOT}/stage44_candidate_shadow_audit.json"
+
+if [[ "${STAGE44_RUN_STAGE50_ANALYSIS:-0}" == 1 ]]; then
+  python3 scripts/eval/analyze_stage50_depth_short_lookahead.py \
+    --run-root "${RUN_ROOT}" \
+    --output "${RUN_ROOT}/stage50_depth_short_lookahead_audit.json"
+fi
 
 FAILED_STAGE=return_packaging
 mv "${RUN_ROOT}" "${WORK_DIR}/run"
