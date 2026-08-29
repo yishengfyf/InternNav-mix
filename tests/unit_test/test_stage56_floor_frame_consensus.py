@@ -83,7 +83,7 @@ def test_candidate_audit_is_read_only_and_uses_same_height_scope():
         "trigger_grid": [10, 10],
         "floor_z_m": 0.0,
         "floor_aligned_height_max_m": 1.5,
-        "footprint_radius_m": 0.05,
+        "footprint_radius_m": 0.01,
     }
     report = audit_module.audit_candidate_floor_relative_frames(memory, candidate)
     assert report["decision_applied"] is False
@@ -91,6 +91,27 @@ def test_candidate_audit_is_read_only_and_uses_same_height_scope():
     assert report["frame_consensus_scope"] == "same_floor_relative_height_band"
     assert report["corridor_summary_is_complete"] is True
     assert report["complete_corridor_frame_consensus_free"] is True
+
+
+def test_candidate_audit_keeps_unobserved_side_footprint_unknown():
+    memory = _memory()
+    for col in (10, 11, 12):
+        key = (10, col, 4)
+        memory.free_counts[key] = 4
+        memory.free3d_frame_masks[key] = (1 << 2) | (1 << 3)
+    report = audit_module.audit_candidate_floor_relative_frames(
+        memory,
+        {
+            "candidate_id": "route:side-unknown",
+            "path_cells": [[10, 10], [10, 11], [10, 12]],
+            "trigger_grid": [10, 10],
+            "floor_z_m": 0.0,
+            "floor_aligned_height_max_m": 1.5,
+            "footprint_radius_m": 0.05,
+        },
+    )
+    assert report["complete_corridor_frame_consensus_free"] is False
+    assert report["frame_consensus_state_counts"]["unknown"] > 0
 
 
 def test_analyzer_requires_same_seed_and_reports_vertical_gain(tmp_path):
