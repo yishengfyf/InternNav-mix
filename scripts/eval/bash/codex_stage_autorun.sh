@@ -24,7 +24,12 @@ case "${PHASE}" in
     export STAGE56_MANIFEST=/home/yifeifeng/workspace/InternNav/scripts/eval/manifests/stage23a_sensor_layer12_mix5_episode_seed_replay.json
     export STAGE56_PIPELINE_TAG="${TAG}"
     export STAGE56_RETURN_ROOT=results/stage_17
-    exec bash scripts/eval/bash/stage56_floor_frame_consensus_mix5.sh
+    bash scripts/eval/bash/stage56_floor_frame_consensus_mix5.sh
+    result_dir="${REPO_ROOT}/results/stage_17/stage56_floor_frame_consensus_return_${TAG}"
+    latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
+    test -d "${result_dir}"
+    ln -sfn "$(basename "${result_dir}")" "${latest_link}"
+    echo "CODEX_LATEST_RETURN=${latest_link}"
     ;;
   *)
     echo "unsupported codex experiment phase: ${PHASE}" >&2
