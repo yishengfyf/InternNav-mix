@@ -314,6 +314,7 @@ class SparseOccMemoryConfig:
     raycast_enable: bool = True
     raycast_stride_cells: int = 2
     raycast_max_points_per_update: int = 2500
+    frame_observation_mask_audit_enable: bool = False
     keyframe_every_steps: int = 10
     keyframe_min_distance: float = 0.50
     frontier_enable: bool = True
@@ -539,6 +540,9 @@ class SparseOccSemanticMemory:
         self.free2d_counts: Dict[Tuple[int, int], int] = defaultdict(int)
         self.occ3d_frame_counts: Dict[Tuple[int, int, int], int] = defaultdict(int)
         self.free3d_frame_counts: Dict[Tuple[int, int, int], int] = defaultdict(int)
+        self.occ3d_frame_masks: Dict[Tuple[int, int, int], int] = defaultdict(int)
+        self.free3d_frame_masks: Dict[Tuple[int, int, int], int] = defaultdict(int)
+        self.frame_observation_metadata: Dict[int, Dict[str, Any]] = {}
         self.occ2d_frame_counts: Dict[Tuple[int, int], int] = defaultdict(int)
         self.free2d_frame_counts: Dict[Tuple[int, int], int] = defaultdict(int)
         self.occ2d_last_observation: Dict[Tuple[int, int], int] = {}
@@ -678,6 +682,20 @@ class SparseOccSemanticMemory:
             if bool(self.config.camera_pitch_aware_update)
             else 0.0
         )
+        if bool(self.config.frame_observation_mask_audit_enable):
+            self.frame_observation_metadata[int(self.observation_count)] = {
+                "step_id": context.get("step_id"),
+                "requested_camera_pitch_deg": float(requested_camera_pitch_deg),
+                "applied_camera_pitch_deg": float(applied_camera_pitch_deg),
+                "view_source": (
+                    "lookdown" if abs(requested_camera_pitch_deg) > 1e-6 else "forward"
+                ),
+                "pose_height_source": (
+                    "context_oracle_height"
+                    if bool(self.config.validation_pose_from_context)
+                    else "gps_compass_2d"
+                ),
+            }
         if bool(self.config.validation_camera_pose_from_context):
             cam_pose_tf = direct_cam_tf
         else:
@@ -812,6 +830,12 @@ class SparseOccSemanticMemory:
             self.occ3d_frame_counts[key] += 1
         for key in frame_free_keys:
             self.free3d_frame_counts[key] += 1
+        if bool(self.config.frame_observation_mask_audit_enable):
+            frame_bit = 1 << int(self.observation_count)
+            for key in frame_occ_keys:
+                self.occ3d_frame_masks[key] |= frame_bit
+            for key in frame_free_keys:
+                self.free3d_frame_masks[key] |= frame_bit
         for cell in frame_occ_cells:
             self.occ2d_frame_counts[cell] += 1
             self.occ2d_last_observation[cell] = int(self.observation_count)
@@ -6692,6 +6716,112 @@ class SparseOccSemanticMemory:
                 None if last_free is None else int(current - last_free)
             ),
             "current_frame_occupied": bool(current_occupied),
+            "decision_applied": False,
+        }
+
+    @staticmethod
+    def _frame_mask_ids(mask: int) -> List[int]:
+        ids = []
+        value = int(mask or 0)
+        while value:
+            least = value & -value
+            ids.append(int(least.bit_length() - 1))
+            value ^= least
+        return ids
+
+    def floor_relative_frame_cell_evidence(
+        self,
+        row: int,
+        col: int,
+        floor_z_m: float,
+        *,
+        height_max_m: Optional[float] = None,
+        min_occupied_frames: int = 2,
+        min_free_frames: int = 2,
+    ) -> Dict[str, Any]:
+        """Aggregate independent-frame evidence inside one floor-relative band."""
+        min_height = int(
+            math.floor(
+                (float(floor_z_m) + float(self.config.obstacle_height_min))
+                / self.cs
+            )
+        )
+        height_max = float(
+            self.config.obstacle_height_max
+            if height_max_m is None
+            else height_max_m
+        )
+        max_height = int(
+            math.ceil((float(floor_z_m) + height_max) / self.cs)
+        )
+        occupied_mask = 0
+        free_mask = 0
+        occupied_height_records = []
+        for height in range(min_height, max_height + 1):
+            key = (int(row), int(col), int(height))
+            occ_mask = int(self.occ3d_frame_masks.get(key, 0) or 0)
+            free_mask_height = int(self.free3d_frame_masks.get(key, 0) or 0)
+            occupied_mask |= occ_mask
+            free_mask |= free_mask_height
+            if occ_mask:
+                occupied_height_records.append(
+                    {
+                        "height_index": int(height),
+                        "z_m": float(height * self.cs),
+                        "occupied_frame_count": int(
+                            len(self._frame_mask_ids(occ_mask))
+                        ),
+                        "occupied_hits": int(self.occ_counts.get(key, 0) or 0),
+                    }
+                )
+
+        occupied_ids = self._frame_mask_ids(occupied_mask)
+        free_ids = self._frame_mask_ids(free_mask)
+        last_occupied = occupied_ids[-1] if occupied_ids else None
+        last_free = free_ids[-1] if free_ids else None
+        current = int(self.observation_count)
+        current_occupied = bool(occupied_mask & (1 << current))
+        if current_occupied or len(occupied_ids) >= max(1, int(min_occupied_frames)):
+            state = "blocked"
+        elif len(free_ids) >= max(1, int(min_free_frames)) and (
+            last_occupied is None
+            or (last_free is not None and int(last_free) > int(last_occupied))
+        ):
+            state = "free"
+        else:
+            state = "unknown"
+
+        def observation_metadata(observation_id: Optional[int]) -> Optional[Dict[str, Any]]:
+            if observation_id is None:
+                return None
+            metadata = self.frame_observation_metadata.get(int(observation_id))
+            return None if metadata is None else dict(metadata)
+
+        return {
+            "schema_version": "stage56_floor_relative_frame_cell_v1",
+            "state": state,
+            "floor_z_m": float(floor_z_m),
+            "height_index_min": int(min_height),
+            "height_index_max": int(max_height),
+            "height_max_m": height_max,
+            "occupied_frame_count": int(len(occupied_ids)),
+            "free_frame_count": int(len(free_ids)),
+            "last_occupied_observation": last_occupied,
+            "last_free_observation": last_free,
+            "occupied_age_observations": (
+                None if last_occupied is None else int(current - last_occupied)
+            ),
+            "free_age_observations": (
+                None if last_free is None else int(current - last_free)
+            ),
+            "current_frame_occupied": current_occupied,
+            "last_occupied_metadata": observation_metadata(last_occupied),
+            "last_free_metadata": observation_metadata(last_free),
+            "occupied_height_records": occupied_height_records,
+            "frame_masks_available": bool(
+                self.config.frame_observation_mask_audit_enable
+            ),
+            "unknown_is_free": False,
             "decision_applied": False,
         }
 

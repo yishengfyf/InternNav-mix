@@ -75,6 +75,9 @@ from internnav.utils.stage55_occ_2p5d_audit import (
     audit_candidate_occ_2p5d,
     should_post_turn_collision_guard,
 )
+from internnav.utils.stage56_floor_relative_occ_audit import (
+    audit_candidate_floor_relative_frames,
+)
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -382,6 +385,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._stage23b_route_support_audit_enabled = bool(
             vlmap_safety_cfg.get(
                 "occ_memory_validation_route_support_audit_enable", False
+            )
+        )
+        self._stage56_floor_frame_consensus_audit_enabled = bool(
+            vlmap_safety_cfg.get(
+                "occ_memory_validation_floor_frame_consensus_enable", False
             )
         )
         self._stage23c_semantic_scene_audit_enabled = bool(
@@ -859,6 +867,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "path_reobserve_occ_2p5d_audit_enable": bool(
                 vlmap_safety_cfg.get(
                     "s2_loop_path_reobserve_occ_2p5d_audit_enable", False
+                )
+            ),
+            "path_reobserve_floor_frame_consensus_audit_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_floor_frame_consensus_audit_enable",
+                    False,
                 )
             ),
             "path_reobserve_post_turn_collision_guard_enable": bool(
@@ -2422,6 +2436,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         scene_id: str,
         episode_id: int,
         readout_height_max_m: Optional[float] = None,
+        readout_mode: str = "legacy_any_hit",
     ) -> dict:
         """Compare a floor-aligned SparseOcc readout with Habitat navmesh."""
         result = {
@@ -2444,6 +2459,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 memory.config.obstacle_height_max
                 if readout_height_max_m is None
                 else readout_height_max_m
+            ),
+            "readout_mode": str(readout_mode),
+            "decision_applied": False,
+            "frame_masks_available": bool(
+                getattr(
+                    memory.config,
+                    "frame_observation_mask_audit_enable",
+                    False,
+                )
             ),
         }
         if not self._stage23b_navmesh_audit_enabled:
@@ -2543,12 +2567,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if cell in evidence_cache:
                 return evidence_cache[cell]
             floor_z, _ = nearest_trace(cell)
-            center = memory.validation_floor_aligned_cell_evidence(
-                cell[0],
-                cell[1],
-                floor_z,
-                height_max_m=readout_height_max_m,
-            )
+            def read_evidence(target):
+                if str(readout_mode) == "floor_frame_consensus":
+                    return memory.floor_relative_frame_cell_evidence(
+                        target[0],
+                        target[1],
+                        floor_z,
+                        height_max_m=readout_height_max_m,
+                    )
+                return memory.validation_floor_aligned_cell_evidence(
+                    target[0],
+                    target[1],
+                    floor_z,
+                    height_max_m=readout_height_max_m,
+                )
+
+            center = read_evidence(cell)
             blocked = False
             if radius_cells > 0:
                 for dr in range(-radius_cells, radius_cells + 1):
@@ -2557,12 +2591,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             self._stage23b_agent_radius_m
                         ):
                             continue
-                        neighbor = memory.validation_floor_aligned_cell_evidence(
-                            cell[0] + dr,
-                            cell[1] + dc,
-                            floor_z,
-                            height_max_m=readout_height_max_m,
-                        )
+                        neighbor = read_evidence((cell[0] + dr, cell[1] + dc))
                         if neighbor["state"] == "blocked":
                             blocked = True
                             break
@@ -3109,6 +3138,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result["stage55_occ_2p5d_audit"] = audit_candidate_occ_2p5d(
                 self.occ_memory,
                 candidate,
+            )
+        if cfg.get("path_reobserve_floor_frame_consensus_audit_enable") and candidate:
+            result["stage56_floor_relative_occ_audit"] = (
+                audit_candidate_floor_relative_frames(
+                    self.occ_memory,
+                    candidate,
+                )
             )
         if not result["enabled"]:
             result["reason"] = "disabled"
@@ -13724,6 +13760,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             stage23b_navmesh_oracle_sensor = {}
             stage23b_navmesh_current_clearance = {}
             stage23b_navmesh_oracle_sensor_clearance = {}
+            stage56_navmesh_current_floor_frame_consensus = {}
+            stage56_navmesh_oracle_sensor_floor_frame_consensus = {}
             if (
                 self._stage23b_navmesh_audit_enabled
                 and self.occ_memory_oracle_sensor_pose is not None
@@ -13771,6 +13809,35 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             ),
                         )
                     )
+                    if self._stage56_floor_frame_consensus_audit_enabled:
+                        stage56_navmesh_current_floor_frame_consensus = (
+                            self._stage23b_navmesh_traversability_audit(
+                                self.occ_memory,
+                                self.occ_memory_oracle_sensor_pose,
+                                branch_name="current_clearance_floor_frame_consensus",
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                readout_height_max_m=(
+                                    self._stage23b_clearance_height_max_m
+                                ),
+                                readout_mode="floor_frame_consensus",
+                            )
+                        )
+                        stage56_navmesh_oracle_sensor_floor_frame_consensus = (
+                            self._stage23b_navmesh_traversability_audit(
+                                self.occ_memory_oracle_sensor_pose,
+                                self.occ_memory_oracle_sensor_pose,
+                                branch_name=(
+                                    "oracle_sensor_clearance_floor_frame_consensus"
+                                ),
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                readout_height_max_m=(
+                                    self._stage23b_clearance_height_max_m
+                                ),
+                                readout_mode="floor_frame_consensus",
+                            )
+                        )
             stage23a_sensor_comparison = {}
             stage23a_sensor_comparison_path = None
             if self.occ_memory_oracle_sensor_pose is not None:
@@ -13873,6 +13940,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 ),
                 "stage23b_navmesh_traversability_oracle_sensor_clearance": (
                     stage23b_navmesh_oracle_sensor_clearance
+                ),
+                "stage56_navmesh_current_floor_frame_consensus": (
+                    stage56_navmesh_current_floor_frame_consensus
+                ),
+                "stage56_navmesh_oracle_sensor_floor_frame_consensus": (
+                    stage56_navmesh_oracle_sensor_floor_frame_consensus
                 ),
                 "stage23c_semantic_scene_audit": stage23c_semantic_scene_audit,
                 "replay_ledger_enabled": bool(self.replay_ledger.enabled),
