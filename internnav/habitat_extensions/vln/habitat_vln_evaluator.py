@@ -392,6 +392,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "occ_memory_validation_floor_frame_consensus_enable", False
             )
         )
+        self._stage56_height_bin_consensus_audit_enabled = bool(
+            vlmap_safety_cfg.get(
+                "occ_memory_validation_floor_height_bin_consensus_enable", False
+            )
+        )
         self._stage23c_semantic_scene_audit_enabled = bool(
             vlmap_safety_cfg.get(
                 "occ_memory_validation_semantic_scene_audit_enable", False
@@ -2570,6 +2575,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             def read_evidence(target):
                 if str(readout_mode) == "floor_frame_consensus":
                     return memory.floor_relative_frame_cell_evidence(
+                        target[0],
+                        target[1],
+                        floor_z,
+                        height_max_m=readout_height_max_m,
+                    )
+                if str(readout_mode) == "floor_height_bin_consensus":
+                    return memory.floor_relative_height_bin_frame_cell_evidence(
                         target[0],
                         target[1],
                         floor_z,
@@ -13762,6 +13774,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             stage23b_navmesh_oracle_sensor_clearance = {}
             stage56_navmesh_current_floor_frame_consensus = {}
             stage56_navmesh_oracle_sensor_floor_frame_consensus = {}
+            stage56b_navmesh_current_floor_height_bin_consensus = {}
+            stage56b_navmesh_oracle_sensor_floor_height_bin_consensus = {}
             if (
                 self._stage23b_navmesh_audit_enabled
                 and self.occ_memory_oracle_sensor_pose is not None
@@ -13836,6 +13850,35 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                     self._stage23b_clearance_height_max_m
                                 ),
                                 readout_mode="floor_frame_consensus",
+                            )
+                        )
+                    if self._stage56_height_bin_consensus_audit_enabled:
+                        stage56b_navmesh_current_floor_height_bin_consensus = (
+                            self._stage23b_navmesh_traversability_audit(
+                                self.occ_memory,
+                                self.occ_memory_oracle_sensor_pose,
+                                branch_name="current_clearance_floor_height_bin_consensus",
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                readout_height_max_m=(
+                                    self._stage23b_clearance_height_max_m
+                                ),
+                                readout_mode="floor_height_bin_consensus",
+                            )
+                        )
+                        stage56b_navmesh_oracle_sensor_floor_height_bin_consensus = (
+                            self._stage23b_navmesh_traversability_audit(
+                                self.occ_memory_oracle_sensor_pose,
+                                self.occ_memory_oracle_sensor_pose,
+                                branch_name=(
+                                    "oracle_sensor_clearance_floor_height_bin_consensus"
+                                ),
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                readout_height_max_m=(
+                                    self._stage23b_clearance_height_max_m
+                                ),
+                                readout_mode="floor_height_bin_consensus",
                             )
                         )
             stage23a_sensor_comparison = {}
@@ -13946,6 +13989,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 ),
                 "stage56_navmesh_oracle_sensor_floor_frame_consensus": (
                     stage56_navmesh_oracle_sensor_floor_frame_consensus
+                ),
+                "stage56b_navmesh_current_floor_height_bin_consensus": (
+                    stage56b_navmesh_current_floor_height_bin_consensus
+                ),
+                "stage56b_navmesh_oracle_sensor_floor_height_bin_consensus": (
+                    stage56b_navmesh_oracle_sensor_floor_height_bin_consensus
                 ),
                 "stage23c_semantic_scene_audit": stage23c_semantic_scene_audit,
                 "replay_ledger_enabled": bool(self.replay_ledger.enabled),

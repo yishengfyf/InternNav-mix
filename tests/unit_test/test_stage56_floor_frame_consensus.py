@@ -71,6 +71,18 @@ def test_floor_relative_frame_consensus_requires_recent_multiframe_free():
     assert evidence["last_free_metadata"]["view_source"] == "lookdown"
 
 
+def test_height_bin_consensus_does_not_merge_single_frames_from_different_heights():
+    memory = _memory()
+    memory.occ3d_frame_masks[(10, 10, 4)] = 1 << 1
+    memory.occ3d_frame_masks[(10, 10, 5)] = 1 << 2
+    evidence = memory.floor_relative_height_bin_frame_cell_evidence(
+        10, 10, 0.0, height_max_m=1.5
+    )
+    assert evidence["occupied_frame_count"] == 2
+    assert evidence["blocked_height_bin_count"] == 0
+    assert evidence["state"] == "unknown"
+
+
 def test_candidate_audit_is_read_only_and_uses_same_height_scope():
     memory = _memory()
     for col in (10, 11, 12):

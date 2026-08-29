@@ -70,7 +70,16 @@ def _delta(new: dict[str, Any], legacy: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def analyze(run_root: Path, manifest_path: Path) -> dict[str, Any]:
+def analyze(
+    run_root: Path,
+    manifest_path: Path,
+    consensus_field: str = "stage56_navmesh_current_floor_frame_consensus",
+) -> dict[str, Any]:
+    expected_readout_mode = (
+        "floor_height_bin_consensus"
+        if "height_bin" in consensus_field
+        else "floor_frame_consensus"
+    )
     manifest = {_key(row): row for row in json.loads(manifest_path.read_text())}
     progress = {}
     for path in run_root.glob("vlmap_safety_debug/*run_*/progress.json"):
@@ -86,12 +95,12 @@ def analyze(run_root: Path, manifest_path: Path) -> dict[str, Any]:
         if int(row.get("episode_eval_seed", -1)) != int(expected["episode_eval_seed"]):
             errors.append(f"seed_mismatch:{key}")
         legacy = row.get("stage23b_navmesh_traversability_current_clearance") or {}
-        consensus = row.get("stage56_navmesh_current_floor_frame_consensus") or {}
+        consensus = row.get(consensus_field) or {}
         if not legacy.get("valid"):
             errors.append(f"legacy_invalid:{key}")
         if not consensus.get("valid"):
             errors.append(f"consensus_invalid:{key}")
-        if consensus.get("readout_mode") != "floor_frame_consensus":
+        if consensus.get("readout_mode") != expected_readout_mode:
             errors.append(f"consensus_mode_mismatch:{key}")
         if consensus.get("decision_applied") is not False:
             errors.append(f"decision_applied:{key}")
@@ -164,9 +173,13 @@ def main() -> None:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--consensus-field",
+        default="stage56_navmesh_current_floor_frame_consensus",
+    )
     parser.add_argument("--require-all", action="store_true")
     args = parser.parse_args()
-    report = analyze(args.run_root, args.manifest)
+    report = analyze(args.run_root, args.manifest, args.consensus_field)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n",

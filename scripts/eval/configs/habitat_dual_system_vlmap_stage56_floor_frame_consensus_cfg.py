@@ -18,6 +18,7 @@ vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
 
 vlmap_cfg["occ_memory_frame_observation_mask_audit_enable"] = True
 vlmap_cfg["occ_memory_validation_floor_frame_consensus_enable"] = True
+vlmap_cfg["occ_memory_validation_floor_height_bin_consensus_enable"] = True
 vlmap_cfg["s2_loop_path_reobserve_floor_frame_consensus_audit_enable"] = True
 vlmap_cfg["s2_loop_path_reobserve_active_enable"] = False
 vlmap_cfg["s2_loop_path_reobserve_pixel_execution_enable"] = False

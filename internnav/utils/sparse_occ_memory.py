@@ -6825,6 +6825,103 @@ class SparseOccSemanticMemory:
             "decision_applied": False,
         }
 
+    def floor_relative_height_bin_frame_cell_evidence(
+        self,
+        row: int,
+        col: int,
+        floor_z_m: float,
+        *,
+        height_max_m: Optional[float] = None,
+        min_occupied_frames: int = 2,
+        min_free_frames: int = 2,
+    ) -> Dict[str, Any]:
+        """Keep frame consensus separate for each height bin before reducing to 2D."""
+        min_height = int(
+            math.floor(
+                (float(floor_z_m) + float(self.config.obstacle_height_min))
+                / self.cs
+            )
+        )
+        height_max = float(
+            self.config.obstacle_height_max
+            if height_max_m is None
+            else height_max_m
+        )
+        max_height = int(math.ceil((float(floor_z_m) + height_max) / self.cs))
+        bins = []
+        blocked_bins = 0
+        free_bins = 0
+        unresolved_occupied_bins = 0
+        occupied_union = 0
+        free_union = 0
+        for height in range(min_height, max_height + 1):
+            key = (int(row), int(col), int(height))
+            occupied_mask = int(self.occ3d_frame_masks.get(key, 0) or 0)
+            free_mask = int(self.free3d_frame_masks.get(key, 0) or 0)
+            occupied_ids = self._frame_mask_ids(occupied_mask)
+            free_ids = self._frame_mask_ids(free_mask)
+            occupied_union |= occupied_mask
+            free_union |= free_mask
+            last_occupied = occupied_ids[-1] if occupied_ids else None
+            last_free = free_ids[-1] if free_ids else None
+            current_occupied = bool(occupied_mask & (1 << int(self.observation_count)))
+            if current_occupied or len(occupied_ids) >= max(1, int(min_occupied_frames)):
+                state = "blocked"
+                blocked_bins += 1
+            elif free_ids and len(free_ids) >= max(1, int(min_free_frames)) and (
+                last_occupied is None
+                or (last_free is not None and int(last_free) > int(last_occupied))
+            ):
+                state = "free"
+                free_bins += 1
+            else:
+                state = "unknown"
+                if occupied_ids:
+                    unresolved_occupied_bins += 1
+            if occupied_ids or free_ids:
+                bins.append(
+                    {
+                        "height_index": int(height),
+                        "z_m": float(height * self.cs),
+                        "state": state,
+                        "occupied_frame_count": len(occupied_ids),
+                        "free_frame_count": len(free_ids),
+                        "last_occupied_observation": last_occupied,
+                        "last_free_observation": last_free,
+                        "current_frame_occupied": current_occupied,
+                    }
+                )
+        if blocked_bins:
+            state = "blocked"
+        elif free_bins and not unresolved_occupied_bins:
+            state = "free"
+        else:
+            state = "unknown"
+        occupied_ids = self._frame_mask_ids(occupied_union)
+        free_ids = self._frame_mask_ids(free_union)
+        return {
+            "schema_version": "stage56_floor_height_bin_frame_cell_v1",
+            "state": state,
+            "floor_z_m": float(floor_z_m),
+            "height_index_min": int(min_height),
+            "height_index_max": int(max_height),
+            "height_max_m": height_max,
+            "occupied_frame_count": len(occupied_ids),
+            "free_frame_count": len(free_ids),
+            "height_bin_records": bins,
+            "blocked_height_bin_count": int(blocked_bins),
+            "free_height_bin_count": int(free_bins),
+            "unresolved_occupied_height_bin_count": int(unresolved_occupied_bins),
+            "cross_height_frame_conflict": bool(
+                occupied_ids and free_ids and not blocked_bins
+            ),
+            "frame_masks_available": bool(
+                self.config.frame_observation_mask_audit_enable
+            ),
+            "unknown_is_free": False,
+            "decision_applied": False,
+        }
+
     def validation_floor_aligned_cell_evidence(
         self,
         row: int,
