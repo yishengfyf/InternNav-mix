@@ -78,6 +78,9 @@ from internnav.utils.stage55_occ_2p5d_audit import (
 from internnav.utils.stage56_floor_relative_occ_audit import (
     audit_candidate_floor_relative_frames,
 )
+from internnav.utils.stage57_local_elevation_support import (
+    audit_local_elevation_support,
+)
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -386,6 +389,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             vlmap_safety_cfg.get(
                 "occ_memory_validation_route_support_audit_enable", False
             )
+        )
+        self._stage57_local_elevation_support_audit_enabled = bool(
+            vlmap_safety_cfg.get(
+                "occ_memory_validation_local_elevation_support_enable", False
+            )
+        )
+        self._stage57_local_elevation_support_min_frames = max(
+            1,
+            int(
+                vlmap_safety_cfg.get(
+                    "occ_memory_validation_local_elevation_support_min_frames", 2
+                )
+            ),
+        )
+        self._stage57_local_elevation_support_max_step_m = max(
+            0.01,
+            float(
+                vlmap_safety_cfg.get(
+                    "occ_memory_validation_local_elevation_support_max_step_m", 0.20
+                )
+            ),
         )
         self._stage56_floor_frame_consensus_audit_enabled = bool(
             vlmap_safety_cfg.get(
@@ -2723,6 +2747,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 node["y"] - movement_nodes[-1]["y"],
             ) > 1e-4:
                 movement_nodes.append(node)
+        stage57_local_elevation_support = {}
+        if self._stage57_local_elevation_support_audit_enabled:
+            stage57_local_elevation_support = audit_local_elevation_support(
+                memory,
+                [(node["row"], node["col"]) for node in movement_nodes],
+                initial_floor_z_m=float(trace[0]["z"]),
+                footprint_radius_m=float(self._stage23b_agent_radius_m),
+                min_support_frames=int(self._stage57_local_elevation_support_min_frames),
+                max_step_up_m=float(self._stage57_local_elevation_support_max_step_m),
+                max_step_down_m=float(self._stage57_local_elevation_support_max_step_m),
+                headroom_m=float(
+                    self._stage23b_clearance_height_max_m
+                    if readout_height_max_m is None
+                    else readout_height_max_m
+                ),
+            )
         edge_records = []
         strict_edge_count = 0
         nonblocked_edge_count = 0
@@ -2984,6 +3024,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                     if route_heights_by_cell else None
                 ),
+                "stage57_local_elevation_support": stage57_local_elevation_support,
                 "pair_records": pair_records,
                 "cached_cell_state_count": int(len(state_cache)),
             }
