@@ -97,7 +97,7 @@ def test_local_support_graph_distinguishes_leading_from_later_safe_segment():
     del memory.occ_counts[(10, 10, 0)]
     del memory.occ3d_frame_counts[(10, 10, 0)]
     for col in range(14, 21):
-        key = (10, col, 0)
+        key = (10, col, 3)
         memory.occ_counts[key] = 4
         memory.occ3d_frame_counts[key] = 2
     report = _module.audit_local_elevation_support(
