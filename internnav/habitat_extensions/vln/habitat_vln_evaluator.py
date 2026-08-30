@@ -3233,15 +3233,40 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
             )
         if cfg.get("path_reobserve_local_elevation_support_audit_enable") and candidate:
+            audit_candidate = dict(candidate)
+            if not audit_candidate.get("path_cells") and audit_candidate.get("grid"):
+                pose_grid = getattr(self.occ_memory, "last_pose_grid", None)
+                try:
+                    target_grid = tuple(int(value) for value in audit_candidate["grid"][:2])
+                except (TypeError, ValueError, IndexError):
+                    target_grid = None
+                if pose_grid is not None and target_grid is not None:
+                    distance_m = math.hypot(
+                        target_grid[0] - int(pose_grid[0]),
+                        target_grid[1] - int(pose_grid[1]),
+                    ) * float(getattr(self.occ_memory, "cs", 0.05))
+                    audit_candidate["path_cells"] = [
+                        list(cell)
+                        for cell in self.occ_memory._rasterize_executed_route_edge(
+                            (int(pose_grid[0]), int(pose_grid[1])),
+                            target_grid,
+                            edge_length_m=distance_m,
+                            sample_spacing_m=float(getattr(self.occ_memory, "cs", 0.05)),
+                        )
+                    ]
+                    audit_candidate["synthetic_audit_path"] = True
             result["stage57_local_elevation_support"] = audit_local_elevation_support(
                 self.occ_memory,
-                candidate.get("path_cells") or [],
-                initial_floor_z_m=float(candidate.get("floor_z_m", 0.0) or 0.0),
-                footprint_radius_m=float(candidate.get("footprint_radius_m", 0.18) or 0.18),
+                audit_candidate.get("path_cells") or [],
+                initial_floor_z_m=float(audit_candidate.get("floor_z_m", 0.0) or 0.0),
+                footprint_radius_m=float(audit_candidate.get("footprint_radius_m", 0.18) or 0.18),
                 min_support_frames=int(cfg.get("local_elevation_support_min_frames", 2)),
                 max_step_up_m=float(cfg.get("local_elevation_support_max_step_m", 0.20)),
                 max_step_down_m=float(cfg.get("local_elevation_support_max_step_m", 0.20)),
                 headroom_m=float(cfg.get("local_elevation_support_headroom_m", 1.50)),
+            )
+            result["stage57_local_elevation_support"]["synthetic_audit_path"] = bool(
+                audit_candidate.get("synthetic_audit_path")
             )
         if not result["enabled"]:
             result["reason"] = "disabled"
