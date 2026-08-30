@@ -15,6 +15,7 @@ vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
 vlmap_cfg["occ_memory_validation_local_elevation_support_enable"] = True
 vlmap_cfg["occ_memory_validation_local_elevation_support_min_frames"] = 2
 vlmap_cfg["occ_memory_validation_local_elevation_support_max_step_m"] = 0.20
+vlmap_cfg["s2_loop_path_reobserve_local_elevation_support_audit_enable"] = True
 vlmap_cfg["s2_loop_path_reobserve_active_enable"] = False
 vlmap_cfg["s2_loop_path_reobserve_pixel_execution_enable"] = False
 eval_cfg.eval_settings["port"] = os.environ.get("STAGE57_EVAL_PORT", "3561")

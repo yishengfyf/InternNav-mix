@@ -904,6 +904,39 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     False,
                 )
             ),
+            "path_reobserve_local_elevation_support_audit_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_local_elevation_support_audit_enable",
+                    False,
+                )
+            ),
+            "local_elevation_support_min_frames": max(
+                1,
+                int(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_validation_local_elevation_support_min_frames",
+                        2,
+                    )
+                ),
+            ),
+            "local_elevation_support_max_step_m": max(
+                0.01,
+                float(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_validation_local_elevation_support_max_step_m",
+                        0.20,
+                    )
+                ),
+            ),
+            "local_elevation_support_headroom_m": max(
+                0.1,
+                float(
+                    vlmap_safety_cfg.get(
+                        "occ_memory_validation_navmesh_clearance_height_max_m",
+                        1.50,
+                    )
+                ),
+            ),
             "path_reobserve_post_turn_collision_guard_enable": bool(
                 vlmap_safety_cfg.get(
                     "s2_loop_path_reobserve_post_turn_collision_guard_enable",
@@ -3198,6 +3231,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     self.occ_memory,
                     candidate,
                 )
+            )
+        if cfg.get("path_reobserve_local_elevation_support_audit_enable") and candidate:
+            result["stage57_local_elevation_support"] = audit_local_elevation_support(
+                self.occ_memory,
+                candidate.get("path_cells") or [],
+                initial_floor_z_m=float(candidate.get("floor_z_m", 0.0) or 0.0),
+                footprint_radius_m=float(candidate.get("footprint_radius_m", 0.18) or 0.18),
+                min_support_frames=int(cfg.get("local_elevation_support_min_frames", 2)),
+                max_step_up_m=float(cfg.get("local_elevation_support_max_step_m", 0.20)),
+                max_step_down_m=float(cfg.get("local_elevation_support_max_step_m", 0.20)),
+                headroom_m=float(cfg.get("local_elevation_support_headroom_m", 1.50)),
             )
         if not result["enabled"]:
             result["reason"] = "disabled"
@@ -10929,9 +10973,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 depth_m=current_depth_m,
                             )
                         )
-                        if path_reobserve_event.get("enabled"):
+                        path_reobserve_audit_only = bool(
+                            path_reobserve_event.get(
+                                "stage57_local_elevation_support"
+                            )
+                            and not path_reobserve_event.get("enabled")
+                        )
+                        if path_reobserve_event.get("enabled") or path_reobserve_audit_only:
                             s2_loop_path_reobserve_event_count += 1
                             path_reobserve_event["base_s2_output"] = llm_outputs
+                            path_reobserve_event["audit_only"] = bool(
+                                path_reobserve_audit_only
+                            )
                             if path_reobserve_event.get("reobserve_pending"):
                                 reorient_actions = [
                                     int(item)

@@ -24,6 +24,19 @@ def analyze(run_root: Path, manifest_path: Path) -> dict[str, Any]:
             progress[_key(row)] = row
     errors = []
     records = []
+    candidate_audits = []
+    for path in run_root.glob("vlmap_safety_debug/*run_*/s2_loop_path_reobserve_active_events.jsonl"):
+        for event in _jsonl(path):
+            graph = event.get("stage57_local_elevation_support") or {}
+            if graph:
+                candidate_audits.append({
+                    "scene_id": event.get("scene_id"),
+                    "episode_id": event.get("episode_id"),
+                    "trigger_step": event.get("trigger_step"),
+                    "candidate_id": (event.get("candidate") or {}).get("candidate_id"),
+                    "audit_only": bool(event.get("audit_only")),
+                    "graph": graph,
+                })
     for key, expected in manifest.items():
         row = progress.get(key)
         if row is None:
@@ -54,7 +67,9 @@ def analyze(run_root: Path, manifest_path: Path) -> dict[str, Any]:
     groups = {label: {"current": summary(items, "current"), "oracle_sensor": summary(items, "oracle_sensor")} for label, items in (("all", records), ("flat", flat), ("vertical", vertical))}
     integrity = len(records) == len(manifest) and not errors
     safe_count = groups["vertical"]["oracle_sensor"]["full_footprint_safe_corridor_count"]
-    return {"task": "stage57_local_elevation_support", "schema_version": "stage57_local_elevation_support_audit_v2", "expected_episode_count": len(manifest), "completed_episode_count": len(records), "integrity_passed": integrity, "shadow_only": True, "decision_applied": False, "unknown_is_free": False, "pixel_translation_allowed": False, "groups": groups, "gate": {"integrity_passed": integrity, "vertical_full_footprint_safe_corridor_count": int(safe_count), "representation_calibration_ready": bool(integrity and safe_count > 0), "natural_candidate_audit_required": True, "stage58_pixel_active_ready": False}, "errors": errors, "records": records}
+    candidate_safe = sum(bool(item["graph"].get("full_footprint_safe_corridor")) for item in candidate_audits)
+    candidate_violations = [item for item in candidate_audits if not item.get("audit_only")]
+    return {"task": "stage57_local_elevation_support", "schema_version": "stage57_local_elevation_support_audit_v3", "expected_episode_count": len(manifest), "completed_episode_count": len(records), "integrity_passed": integrity, "shadow_only": True, "decision_applied": False, "unknown_is_free": False, "pixel_translation_allowed": False, "groups": groups, "candidate_audit_count": len(candidate_audits), "candidate_full_footprint_safe_corridor_count": candidate_safe, "candidate_audits": candidate_audits, "gate": {"integrity_passed": integrity, "representation_calibration_ready": bool(integrity and safe_count > 0), "natural_candidate_audit_count": len(candidate_audits), "natural_candidate_safe_corridor_count": candidate_safe, "active_mutation_violations": len(candidate_violations), "stage58_pixel_active_ready": False}, "errors": errors, "records": records}
 
 def main() -> None:
     parser = argparse.ArgumentParser()
