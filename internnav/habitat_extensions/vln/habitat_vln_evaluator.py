@@ -910,6 +910,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     False,
                 )
             ),
+            "path_reobserve_stage57_planned_prefix_audit_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_stage57_planned_prefix_audit_enable",
+                    False,
+                )
+            ),
+            "stage57_planned_prefix_max_m": max(
+                0.05,
+                float(
+                    vlmap_safety_cfg.get(
+                        "s2_loop_stage57_planned_prefix_max_m", 1.0
+                    )
+                ),
+            ),
             "local_elevation_support_min_frames": max(
                 1,
                 int(
@@ -3268,6 +3282,70 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result["stage57_local_elevation_support"]["synthetic_audit_path"] = bool(
                 audit_candidate.get("synthetic_audit_path")
             )
+        if cfg.get("path_reobserve_stage57_planned_prefix_audit_enable") and candidate:
+            bridge = self._recovery_path_bridge(
+                event or {},
+                observations=observations,
+                depth_m=depth_m,
+                probe_source="stage57_planned_prefix_audit",
+            )
+            cell_size_m = max(float(getattr(self.occ_memory, "cs", 0.05)), 1e-6)
+            max_prefix_m = max(
+                cell_size_m,
+                float(cfg.get("stage57_planned_prefix_max_m", 1.0)),
+            )
+            max_prefix_cells = max(2, int(math.floor(max_prefix_m / cell_size_m)) + 1)
+            planned_path = list(bridge.get("path") or [])
+            prefix_path = planned_path[:max_prefix_cells]
+            prefix_graph = audit_local_elevation_support(
+                self.occ_memory,
+                prefix_path,
+                initial_floor_z_m=float(candidate.get("floor_z_m", 0.0) or 0.0),
+                footprint_radius_m=float(candidate.get("footprint_radius_m", 0.18) or 0.18),
+                min_support_frames=int(cfg.get("local_elevation_support_min_frames", 2)),
+                max_step_up_m=float(cfg.get("local_elevation_support_max_step_m", 0.20)),
+                max_step_down_m=float(cfg.get("local_elevation_support_max_step_m", 0.20)),
+                headroom_m=float(cfg.get("local_elevation_support_headroom_m", 1.50)),
+            )
+            selected_probe = dict(bridge.get("selected_probe") or {})
+            selected_progress_m = selected_probe.get("path_progress_m")
+            selected_within_prefix = bool(
+                selected_progress_m is not None
+                and float(selected_progress_m) <= max_prefix_m + 1e-9
+            )
+            leading_safe_m = float(
+                prefix_graph.get("leading_full_footprint_safe_segment_m", 0.0) or 0.0
+            )
+            image_visible_safe_prefix = bool(
+                bridge.get("valid")
+                and selected_within_prefix
+                and float(selected_progress_m) >= float(
+                    cfg.get("path_reobserve_min_path_progress_m", 0.25)
+                )
+                and leading_safe_m + 1e-9 >= float(selected_progress_m)
+            )
+            result["stage57_planned_prefix_audit"] = {
+                "schema_version": "stage57_planned_prefix_audit_v1",
+                "audit_only": True,
+                "decision_applied": False,
+                "unknown_is_free": False,
+                "pixel_translation_allowed": False,
+                "planner_reason": bridge.get("reason"),
+                "path_reachable": bool(bridge.get("path_reachable")),
+                "path_m": bridge.get("path_m"),
+                "path_cell_count": int(bridge.get("path_cell_count", 0) or 0),
+                "prefix_max_m": float(max_prefix_m),
+                "prefix_path_m": float(max(0, len(prefix_path) - 1) * cell_size_m),
+                "prefix_path_cells": prefix_path,
+                "image_bridge_valid": bool(bridge.get("valid")),
+                "image_bridge_reason": bridge.get("reason"),
+                "selected_pixel_goal": bridge.get("selected_pixel_goal"),
+                "selected_path_progress_m": selected_progress_m,
+                "selected_proxy_from_current_m": selected_probe.get("proxy_from_current_m"),
+                "selected_within_prefix": selected_within_prefix,
+                "image_visible_safe_prefix": image_visible_safe_prefix,
+                "elevation_support": prefix_graph,
+            }
         if not result["enabled"]:
             result["reason"] = "disabled"
             return result

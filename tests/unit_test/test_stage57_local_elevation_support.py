@@ -90,3 +90,25 @@ def test_local_support_graph_requires_minimum_safe_segment_length():
     )
     assert abs(report["longest_full_footprint_safe_segment_m"] - 0.3) < 1e-9
     assert report["full_footprint_safe_corridor"] is True
+
+
+def test_local_support_graph_distinguishes_leading_from_later_safe_segment():
+    memory = _Memory()
+    del memory.occ_counts[(10, 10, 0)]
+    del memory.occ3d_frame_counts[(10, 10, 0)]
+    for col in range(14, 18):
+        key = (10, col, 0)
+        memory.occ_counts[key] = 4
+        memory.occ3d_frame_counts[key] = 2
+    report = _module.audit_local_elevation_support(
+        memory,
+        [[10, 10], [10, 17]],
+        footprint_radius_m=0.0,
+        max_step_up_m=0.06,
+        max_step_down_m=0.06,
+        support_search_radius_m=0.0,
+    )
+    assert report["full_footprint_safe_corridor"] is True
+    assert report["leading_full_footprint_safe_step_count"] == 0
+    assert report["leading_full_footprint_safe_segment_m"] == 0.0
+    assert report["leading_full_footprint_safe_corridor"] is False

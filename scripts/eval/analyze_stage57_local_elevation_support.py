@@ -36,6 +36,7 @@ def analyze(run_root: Path, manifest_path: Path) -> dict[str, Any]:
                     "candidate_id": (event.get("candidate") or {}).get("candidate_id"),
                     "audit_only": bool(event.get("audit_only")),
                     "graph": graph,
+                    "planned_prefix": event.get("stage57_planned_prefix_audit") or {},
                 })
     for key, expected in manifest.items():
         row = progress.get(key)
@@ -68,8 +69,12 @@ def analyze(run_root: Path, manifest_path: Path) -> dict[str, Any]:
     integrity = len(records) == len(manifest) and not errors
     safe_count = groups["vertical"]["oracle_sensor"]["full_footprint_safe_corridor_count"]
     candidate_safe = sum(bool(item["graph"].get("full_footprint_safe_corridor")) for item in candidate_audits)
+    planned_prefix_count = sum(bool(item.get("planned_prefix")) for item in candidate_audits)
+    planned_prefix_reachable = sum(bool(item.get("planned_prefix", {}).get("path_reachable")) for item in candidate_audits)
+    planned_prefix_safe = sum(bool(item.get("planned_prefix", {}).get("elevation_support", {}).get("leading_full_footprint_safe_corridor")) for item in candidate_audits)
+    planned_prefix_image_safe = sum(bool(item.get("planned_prefix", {}).get("image_visible_safe_prefix")) for item in candidate_audits)
     candidate_violations = [item for item in candidate_audits if not item.get("audit_only")]
-    return {"task": "stage57_local_elevation_support", "schema_version": "stage57_local_elevation_support_audit_v3", "expected_episode_count": len(manifest), "completed_episode_count": len(records), "integrity_passed": integrity, "shadow_only": True, "decision_applied": False, "unknown_is_free": False, "pixel_translation_allowed": False, "groups": groups, "candidate_audit_count": len(candidate_audits), "candidate_full_footprint_safe_corridor_count": candidate_safe, "candidate_audits": candidate_audits, "gate": {"integrity_passed": integrity, "representation_calibration_ready": bool(integrity and safe_count > 0), "natural_candidate_audit_count": len(candidate_audits), "natural_candidate_safe_corridor_count": candidate_safe, "active_mutation_violations": len(candidate_violations), "stage58_pixel_active_ready": False}, "errors": errors, "records": records}
+    return {"task": "stage57_local_elevation_support", "schema_version": "stage57_local_elevation_support_audit_v4", "expected_episode_count": len(manifest), "completed_episode_count": len(records), "integrity_passed": integrity, "shadow_only": True, "decision_applied": False, "unknown_is_free": False, "pixel_translation_allowed": False, "groups": groups, "candidate_audit_count": len(candidate_audits), "candidate_full_footprint_safe_corridor_count": candidate_safe, "planned_prefix_audit_count": planned_prefix_count, "planned_prefix_reachable_count": planned_prefix_reachable, "planned_prefix_leading_safe_count": planned_prefix_safe, "planned_prefix_image_visible_safe_count": planned_prefix_image_safe, "candidate_audits": candidate_audits, "gate": {"integrity_passed": integrity, "representation_calibration_ready": bool(integrity and safe_count > 0), "natural_candidate_audit_count": len(candidate_audits), "natural_candidate_safe_corridor_count": candidate_safe, "planned_prefix_image_visible_safe_count": planned_prefix_image_safe, "active_mutation_violations": len(candidate_violations), "stage58_pixel_active_ready": bool(integrity and planned_prefix_image_safe > 0 and not candidate_violations)}, "errors": errors, "records": records}
 
 def main() -> None:
     parser = argparse.ArgumentParser()

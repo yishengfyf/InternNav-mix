@@ -231,6 +231,8 @@ def audit_local_elevation_support(
     safe_step_count = 0
     longest_safe_steps = 0
     current_safe_steps = 0
+    leading_safe_steps = 0
+    leading_safe_open = True
     step_records = []
     for center, center_record in zip(path, center_records):
         center_z = center_record.get("support_z_m")
@@ -278,6 +280,10 @@ def audit_local_elevation_support(
         safe_step_count += int(step_safe)
         current_safe_steps = current_safe_steps + 1 if step_safe else 0
         longest_safe_steps = max(longest_safe_steps, current_safe_steps)
+        if leading_safe_open and step_safe:
+            leading_safe_steps += 1
+        else:
+            leading_safe_open = False
         step_records.append(
             {
                 "center_cell": list(center),
@@ -294,6 +300,7 @@ def audit_local_elevation_support(
     corridor_coverage = support_known / max(1, corridor_sample_count)
     center_coverage = center_known / max(1, len(path))
     longest_safe_segment_m = float(max(0, longest_safe_steps - 1) * cs)
+    leading_safe_segment_m = float(max(0, leading_safe_steps - 1) * cs)
     result.update(
         {
             "reason": "ok",
@@ -311,6 +318,12 @@ def audit_local_elevation_support(
             "full_footprint_safe_step_count": int(safe_step_count),
             "longest_full_footprint_safe_step_count": int(longest_safe_steps),
             "longest_full_footprint_safe_segment_m": longest_safe_segment_m,
+            "leading_full_footprint_safe_step_count": int(leading_safe_steps),
+            "leading_full_footprint_safe_segment_m": leading_safe_segment_m,
+            "leading_full_footprint_safe_corridor": bool(
+                leading_safe_segment_m + 1e-9 >= float(minimum_safe_segment_m)
+                and discontinuities == 0
+            ),
             "full_footprint_support": bool(path and safe_step_count == len(path)),
             "full_footprint_safe_corridor": bool(
                 longest_safe_segment_m + 1e-9 >= float(minimum_safe_segment_m)
