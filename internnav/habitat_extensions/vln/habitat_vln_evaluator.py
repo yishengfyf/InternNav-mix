@@ -3370,6 +3370,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "start_grid": start_raw,
                 "candidate_count": 0,
                 "reachable_count": 0,
+                "target_samples": [],
+                "start_neighbor_states": [],
                 "selected_target_grid": None,
                 "selected_path_m": None,
                 "selected_path_cell_count": 0,
@@ -3394,6 +3396,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 free_cells = set(getattr(memory, "free2d_counts", {}) or {}) - set(
                     getattr(memory, "occ2d_counts", {}) or {}
                 )
+                for nbr_raw in memory._neighbors2d(start[0], start[1]):
+                    nbr = (int(nbr_raw[0]), int(nbr_raw[1]))
+                    local_report["start_neighbor_states"].append(
+                        {
+                            "grid": [int(nbr[0]), int(nbr[1])],
+                            "state": str(memory._cell_state(nbr[0], nbr[1])),
+                            "in_known_free_set": bool(nbr in free_cells),
+                        }
+                    )
                 max_local_m = max(
                     cs,
                     float(cfg.get("stage57_local_frontier_max_m", 1.0)),
@@ -3428,6 +3439,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         depth_m=depth_m,
                         probe_source="stage57_local_frontier_audit",
                     )
+                    if len(local_report["target_samples"]) < 8:
+                        local_report["target_samples"].append(
+                            {
+                                "grid": [int(cell[0]), int(cell[1])],
+                                "progress_m": float(progress),
+                                "euclidean_distance_m": float(distance),
+                                "cell_state": str(memory._cell_state(cell[0], cell[1])),
+                                "bridge_reason": bridge.get("reason"),
+                                "path_reachable": bool(bridge.get("path_reachable")),
+                            }
+                        )
                     if not bridge.get("path_reachable"):
                         continue
                     local_report["reachable_count"] += 1
