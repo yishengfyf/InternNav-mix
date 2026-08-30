@@ -924,6 +924,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                 ),
             ),
+            "path_reobserve_stage57_local_frontier_audit_enable": bool(
+                vlmap_safety_cfg.get(
+                    "s2_loop_path_reobserve_stage57_local_frontier_audit_enable",
+                    False,
+                )
+            ),
+            "stage57_local_frontier_max_m": max(
+                0.20,
+                float(vlmap_safety_cfg.get("s2_loop_stage57_local_frontier_max_m", 1.0)),
+            ),
             "local_elevation_support_min_frames": max(
                 1,
                 int(
@@ -3346,6 +3356,134 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "image_visible_safe_prefix": image_visible_safe_prefix,
                 "elevation_support": prefix_graph,
             }
+        if cfg.get("path_reobserve_stage57_local_frontier_audit_enable") and candidate:
+            memory = self.occ_memory
+            start_raw = getattr(memory, "last_pose_grid", None)
+            target_raw = candidate.get("grid")
+            local_report = {
+                "schema_version": "stage57_local_frontier_audit_v1",
+                "audit_only": True,
+                "decision_applied": False,
+                "unknown_is_free": False,
+                "pixel_translation_allowed": False,
+                "candidate_target_grid": target_raw,
+                "start_grid": start_raw,
+                "candidate_count": 0,
+                "reachable_count": 0,
+                "selected_target_grid": None,
+                "selected_path_m": None,
+                "selected_path_cell_count": 0,
+                "selected_path": [],
+                "selected_bridge_reason": None,
+                "selected_image_bridge_valid": False,
+                "selected_image_bridge_reason": None,
+                "selected_elevation_support": None,
+                "local_frontier_safe": False,
+            }
+            try:
+                start = (int(start_raw[0]), int(start_raw[1]))
+                target = (int(target_raw[0]), int(target_raw[1]))
+                cs = max(float(getattr(memory, "cs", 0.05)), 1e-6)
+                direction = np.asarray(
+                    [float(target[0] - start[0]), float(target[1] - start[1])],
+                    dtype=np.float32,
+                )
+                norm = float(np.linalg.norm(direction))
+                if norm > 1e-6:
+                    direction /= norm
+                free_cells = set(getattr(memory, "free2d_counts", {}) or {}) - set(
+                    getattr(memory, "occ2d_counts", {}) or {}
+                )
+                max_local_m = max(
+                    cs,
+                    float(cfg.get("stage57_local_frontier_max_m", 1.0)),
+                )
+                targets = []
+                for raw_cell in free_cells:
+                    try:
+                        cell = (int(raw_cell[0]), int(raw_cell[1]))
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    delta = np.asarray(
+                        [float(cell[0] - start[0]), float(cell[1] - start[1])],
+                        dtype=np.float32,
+                    )
+                    distance = float(np.linalg.norm(delta) * cs)
+                    if distance < max(cs, 0.20) or distance > max_local_m + 1e-9:
+                        continue
+                    progress = float(np.dot(delta, direction) * cs)
+                    if progress < 0.20:
+                        continue
+                    targets.append((progress, distance, cell))
+                targets.sort(key=lambda item: (-item[0], item[1], item[2]))
+                targets = targets[:32]
+                local_report["candidate_count"] = len(targets)
+                best = None
+                for progress, distance, cell in targets:
+                    local_candidate = dict(candidate)
+                    local_candidate["grid"] = [int(cell[0]), int(cell[1])]
+                    bridge = self._recovery_path_bridge(
+                        {"candidate": local_candidate},
+                        observations=observations,
+                        depth_m=depth_m,
+                        probe_source="stage57_local_frontier_audit",
+                    )
+                    if not bridge.get("path_reachable"):
+                        continue
+                    local_report["reachable_count"] += 1
+                    path = list(bridge.get("path") or [])
+                    prefix_cells = max(2, int(math.floor(max_local_m / cs)) + 1)
+                    path_prefix = path[:prefix_cells]
+                    graph = audit_local_elevation_support(
+                        memory,
+                        path_prefix,
+                        initial_floor_z_m=float(candidate.get("floor_z_m", 0.0) or 0.0),
+                        footprint_radius_m=float(candidate.get("footprint_radius_m", 0.18) or 0.18),
+                        min_support_frames=int(cfg.get("local_elevation_support_min_frames", 2)),
+                        max_step_up_m=float(cfg.get("local_elevation_support_max_step_m", 0.20)),
+                        max_step_down_m=float(cfg.get("local_elevation_support_max_step_m", 0.20)),
+                        headroom_m=float(cfg.get("local_elevation_support_headroom_m", 1.50)),
+                    )
+                    selected_progress_m = (bridge.get("selected_probe") or {}).get(
+                        "path_progress_m"
+                    )
+                    leading_safe_m = float(
+                        graph.get("leading_full_footprint_safe_segment_m", 0.0) or 0.0
+                    )
+                    image_safe = bool(
+                        bridge.get("valid")
+                        and graph.get("leading_full_footprint_safe_corridor")
+                        and selected_progress_m is not None
+                        and leading_safe_m + 1e-9 >= float(selected_progress_m)
+                    )
+                    score = (
+                        int(image_safe),
+                        float(graph.get("leading_full_footprint_safe_segment_m", 0.0) or 0.0),
+                        float(progress),
+                        -float(bridge.get("path_m") or distance),
+                    )
+                    if best is None or score > best[0]:
+                        best = (score, cell, bridge, graph, image_safe, path_prefix)
+                if best is not None:
+                    _, cell, bridge, graph, image_safe, path_prefix = best
+                    local_report.update(
+                        {
+                            "selected_target_grid": [int(cell[0]), int(cell[1])],
+                            "selected_path_m": bridge.get("path_m"),
+                            "selected_path_cell_count": int(bridge.get("path_cell_count", 0) or 0),
+                            "selected_path": path_prefix,
+                            "selected_bridge_reason": bridge.get("reason"),
+                            "selected_image_bridge_valid": bool(bridge.get("valid")),
+                            "selected_image_bridge_reason": bridge.get("reason"),
+                            "selected_pixel_goal": bridge.get("selected_pixel_goal"),
+                            "selected_path_progress_m": selected_progress_m,
+                            "selected_elevation_support": graph,
+                            "local_frontier_safe": bool(image_safe),
+                        }
+                    )
+            except (TypeError, ValueError, IndexError, AttributeError):
+                local_report["selected_bridge_reason"] = "invalid_local_frontier_inputs"
+            result["stage57_local_frontier_audit"] = local_report
         if not result["enabled"]:
             result["reason"] = "disabled"
             return result
