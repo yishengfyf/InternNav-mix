@@ -3369,6 +3369,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "candidate_target_grid": target_raw,
                 "start_grid": start_raw,
                 "candidate_count": 0,
+                "reachable_component_cell_count": 0,
                 "reachable_count": 0,
                 "target_samples": [],
                 "start_neighbor_states": [],
@@ -3409,8 +3410,33 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     cs,
                     float(cfg.get("stage57_local_frontier_max_m", 1.0)),
                 )
+                max_local_cells = max(1, int(math.floor(max_local_m / cs)))
+                queue = deque([start])
+                local_parent = {start: None}
+                local_depth = {start: 0}
+                while queue:
+                    cell = queue.popleft()
+                    if int(local_depth[cell]) >= max_local_cells:
+                        continue
+                    for nbr_raw in memory._neighbors2d(cell[0], cell[1]):
+                        nbr = (int(nbr_raw[0]), int(nbr_raw[1]))
+                        if nbr in local_parent or nbr not in free_cells:
+                            continue
+                        dr = int(nbr[0] - cell[0])
+                        dc = int(nbr[1] - cell[1])
+                        if dr and dc:
+                            side_a = (cell[0] + dr, cell[1])
+                            side_b = (cell[0], cell[1] + dc)
+                            if side_a not in free_cells or side_b not in free_cells:
+                                continue
+                        local_parent[nbr] = cell
+                        local_depth[nbr] = int(local_depth[cell]) + 1
+                        queue.append(nbr)
+                local_report["reachable_component_cell_count"] = max(
+                    0, len(local_parent) - 1
+                )
                 targets = []
-                for raw_cell in free_cells:
+                for raw_cell in local_parent:
                     try:
                         cell = (int(raw_cell[0]), int(raw_cell[1]))
                     except (TypeError, ValueError, IndexError):
