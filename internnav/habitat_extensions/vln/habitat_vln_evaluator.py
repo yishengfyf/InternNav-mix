@@ -431,6 +431,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._stage59_productive_onset_enabled = bool(
             vlmap_safety_cfg.get("stage59_productive_onset_enable", False)
         )
+        self._stage59_post_turn_counterfactual_enabled = bool(
+            vlmap_safety_cfg.get(
+                "stage59_post_turn_counterfactual_enable", False
+            )
+        )
         self._stage56_floor_frame_consensus_audit_enabled = bool(
             vlmap_safety_cfg.get(
                 "occ_memory_validation_floor_frame_consensus_enable", False
@@ -2108,6 +2113,93 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "offline_primitive_truth": truth,
                 }
             )
+            if self._stage59_post_turn_counterfactual_enabled:
+                bearing = bridge.get("initial_direction_angle_deg")
+                post_turn = {
+                    "enabled": True,
+                    "shadow_only": True,
+                    "decision_applied": False,
+                    "action_applied": False,
+                    "memory_mutated": False,
+                    "observation_readable": False,
+                    "sim_pose_restored": False,
+                    "first_edge_visible_projection": False,
+                    "reason": None,
+                }
+                if bearing is None:
+                    post_turn["reason"] = "missing_retreat_bearing"
+                else:
+                    plan = plan_bounded_reorientation(
+                        float(bearing),
+                        hfov_deg=float(self.sim_sensors_config.depth_sensor.hfov),
+                        turn_angle_deg=float(
+                            getattr(self.config.habitat.simulator, "turn_angle", 15.0)
+                        ),
+                        center_margin_deg=10.0,
+                        max_turn_steps=12,
+                    )
+                    official_before = self._stage43_memory_fingerprint(self.occ_memory)
+                    counterfactual = self._stage43_counterfactual_observation(
+                        observations or {},
+                        relative_bearing_deg=float(bearing),
+                        plan=plan,
+                    )
+                    post_turn.update(
+                        {
+                            "initial_bearing_deg": float(bearing),
+                            "plan": plan,
+                            "observation_readable": bool(
+                                counterfactual.get("observation_readable")
+                            ),
+                            "sim_pose_restored": bool(
+                                counterfactual.get("sim_pose_restored")
+                            ),
+                            "selected_yaw_delta_deg": counterfactual.get(
+                                "selected_yaw_delta_deg"
+                            ),
+                            "post_relative_bearing_deg": counterfactual.get(
+                                "post_relative_bearing_deg"
+                            ),
+                            "reason": counterfactual.get("reason"),
+                        }
+                    )
+                    if (
+                        counterfactual.get("observation_readable")
+                        and counterfactual.get("sim_pose_restored")
+                    ):
+                        post_bridge = self._recovery_path_bridge(
+                            {
+                                **event,
+                                "candidate": {
+                                    "candidate_id": f"stage60:{anchor.get('anchor')}",
+                                    "grid": anchor.get("grid"),
+                                    "path_cells": candidate_path,
+                                    "path_length_m": anchor.get("route_length_m"),
+                                    "floor_z_m": anchor.get("z_m", 0.0),
+                                },
+                            },
+                            observations=counterfactual.get("observation"),
+                            depth_m=counterfactual.get("depth_m"),
+                            probe_source="stage43_counterfactual_stage60_productive",
+                        )
+                        post_selected_progress = (
+                            post_bridge.get("selected_probe") or {}
+                        ).get("path_progress_m")
+                        post_turn.update(
+                            {
+                                "bridge": post_bridge,
+                                "bridge_reason": post_bridge.get("reason"),
+                                "selected_path_progress_m": post_selected_progress,
+                                "first_edge_visible_projection": bool(
+                                    post_bridge.get("valid")
+                                    and post_selected_progress is not None
+                                    and float(post_selected_progress) <= 0.25 + 1e-9
+                                ),
+                            }
+                        )
+                    official_after = self._stage43_memory_fingerprint(self.occ_memory)
+                    post_turn["memory_mutated"] = official_before != official_after
+                anchor["post_turn_counterfactual"] = post_turn
         report["runtime_contract"] = contract
         report["gt_fields_used"] = ["Habitat pathfinder.try_step offline label only"]
         report["gt_used_for_navigation"] = False

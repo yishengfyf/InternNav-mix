@@ -88,6 +88,8 @@ def analyze(run_root: Path, manifest_path: Path) -> dict[str, Any]:
             retreat = int(anchor.get("route_edge_count", 0) or 0) > 0
             predicted_safe = bool(policy.get("predicted_first_primitive_safe"))
             visible = bool(anchor.get("first_edge_visible_projection"))
+            post_turn = anchor.get("post_turn_counterfactual") or {}
+            post_visible = bool(post_turn.get("first_edge_visible_projection"))
             counter["event_count"] += 1
             counter["valid_anchor"] += int(bool(anchor.get("valid")))
             counter["retreat_edge_nonzero"] += int(retreat)
@@ -95,6 +97,20 @@ def analyze(run_root: Path, manifest_path: Path) -> dict[str, Any]:
             counter["first_edge_visible"] += int(visible)
             counter["first_0p25m_support_safe"] += int(predicted_safe)
             counter["shadow_joint_eligible"] += int(retreat and visible and predicted_safe)
+            counter["post_turn_attempted"] += int(bool(post_turn.get("enabled")))
+            counter["post_turn_observation_readable"] += int(
+                bool(post_turn.get("observation_readable"))
+            )
+            counter["post_turn_pose_restored"] += int(
+                bool(post_turn.get("sim_pose_restored"))
+            )
+            counter["post_turn_memory_mutated"] += int(
+                bool(post_turn.get("memory_mutated"))
+            )
+            counter["post_turn_first_edge_visible"] += int(post_visible)
+            counter["post_turn_joint_eligible"] += int(
+                retreat and post_visible and predicted_safe
+            )
             counter["offline_truth_valid"] += int(bool(truth.get("valid")))
             counter["offline_truth_safe"] += int(bool(truth.get("valid") and truth.get("primitive_safe")))
             counter["false_safe"] += int(bool(truth.get("valid") and predicted_safe and not truth.get("primitive_safe")))
@@ -130,6 +146,26 @@ def analyze(run_root: Path, manifest_path: Path) -> dict[str, Any]:
                 int(productive.get("shadow_joint_eligible", 0) or 0) >= 12
                 and int(productive.get("scene_count", 0) or 0) >= 4
                 and int(productive.get("false_safe", 0) or 0) == 0
+            ),
+        },
+        "stage60_post_turn_gate": {
+            "required_joint_eligible": 12,
+            "required_scenes": 4,
+            "required_false_safe": 0,
+            "required_memory_mutations": 0,
+            "observed_joint_eligible": int(
+                productive.get("post_turn_joint_eligible", 0) or 0
+            ),
+            "observed_scenes": int(productive.get("scene_count", 0) or 0),
+            "observed_false_safe": int(productive.get("false_safe", 0) or 0),
+            "observed_memory_mutations": int(
+                productive.get("post_turn_memory_mutated", 0) or 0
+            ),
+            "passed": bool(
+                int(productive.get("post_turn_joint_eligible", 0) or 0) >= 12
+                and int(productive.get("scene_count", 0) or 0) >= 4
+                and int(productive.get("false_safe", 0) or 0) == 0
+                and int(productive.get("post_turn_memory_mutated", 0) or 0) == 0
             ),
         },
         "integrity_passed": integrity,

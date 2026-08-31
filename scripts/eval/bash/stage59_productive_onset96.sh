@@ -13,7 +13,7 @@ RUN_DIR="${RUN_ROOT}/${RUN_NAME}"
 WORK_DIR="${RETURN_ROOT}/stage59_productive_onset_running_${TAG}"
 DEST="${RETURN_ROOT}/stage59_productive_onset_return_${TAG}"
 FAILURE_DEST="${RETURN_ROOT}/stage59_productive_onset_failure_return_${TAG}"
-CONFIG=scripts/eval/configs/habitat_dual_system_vlmap_stage59_productive_onset_cfg.py
+CONFIG=${STAGE59_CONFIG:-scripts/eval/configs/habitat_dual_system_vlmap_stage59_productive_onset_cfg.py}
 COMPLETE=0
 
 package_failure() {
