@@ -85,6 +85,7 @@ from internnav.utils.stage58_geometry_contract import (
     audit_geometry_radius_sweep,
 )
 from internnav.utils.stage58_support_policy import audit_support_policy_sweep
+from internnav.utils.stage59_productive_onset import audit_productive_onset_anchors
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -426,6 +427,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         )
         self._stage58_support_policy_enabled = bool(
             vlmap_safety_cfg.get("stage58_support_policy_enable", False)
+        )
+        self._stage59_productive_onset_enabled = bool(
+            vlmap_safety_cfg.get("stage59_productive_onset_enable", False)
         )
         self._stage56_floor_frame_consensus_audit_enabled = bool(
             vlmap_safety_cfg.get(
@@ -2014,6 +2018,101 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "map_cell_size_m": float(getattr(self.occ_memory, "cs", 0.05)),
         }
 
+    def _stage59_productive_onset_shadow(
+        self,
+        event: dict,
+        *,
+        observations: Optional[dict],
+        depth_m: Optional[np.ndarray],
+    ) -> dict:
+        """Attach image, support and offline truth audits to causal anchors."""
+        report = audit_productive_onset_anchors(
+            list(getattr(self.occ_memory, "pose_trace", []) or []),
+            trigger_step=event.get("step_id"),
+            onset_step=event.get("start_step"),
+            state_fn=self.occ_memory._cell_state,
+            rasterize_edge=self.occ_memory._rasterize_executed_route_edge,
+            cell_size_m=float(getattr(self.occ_memory, "cs", 0.05)),
+        )
+        contract = self._stage58_runtime_geometry_contract()
+        for anchor in report.get("anchors") or []:
+            path = list(anchor.get("current_to_anchor_path_cells") or [])
+            if len(path) < 2:
+                anchor.update(
+                    {
+                        "current_sparseocc_connectivity": False,
+                        "first_edge_visible_projection": False,
+                        "image_bridge_reason": "anchor_has_no_retreat_edge",
+                        "stage58_support_policy": None,
+                        "offline_primitive_truth": {
+                            "valid": False,
+                            "reason": "anchor_has_no_retreat_edge",
+                            "gt_used_for_navigation": False,
+                        },
+                    }
+                )
+                continue
+            truth = self._stage58_offline_primitive_truth(path)
+            support = audit_support_policy_sweep(
+                self.occ_memory,
+                path,
+                runtime_contract=contract,
+                offline_primitive_truth=truth,
+                footprint_radius_m=float(getattr(self.agent_config, "radius", 0.10)),
+                initial_floor_z_m=float(anchor.get("z_m", 0.0) or 0.0),
+                max_step_m=0.20,
+                headroom_m=float(getattr(self.agent_config, "height", 1.50)),
+                minimum_safe_segment_m=float(
+                    getattr(self.config.habitat.simulator, "forward_step_size", 0.25)
+                ),
+            )
+            candidate_path = list(reversed(path))
+            bridge = self._recovery_path_bridge(
+                {
+                    **event,
+                    "candidate": {
+                        "candidate_id": f"stage59:{anchor.get('anchor')}",
+                        "grid": anchor.get("grid"),
+                        "path_cells": candidate_path,
+                        "path_length_m": anchor.get("route_length_m"),
+                        "floor_z_m": anchor.get("z_m", 0.0),
+                    },
+                },
+                observations=observations,
+                depth_m=depth_m,
+                probe_source="stage59_productive_onset_shadow",
+            )
+            selected_progress = (bridge.get("selected_probe") or {}).get(
+                "path_progress_m"
+            )
+            first_edge_visible = bool(
+                bridge.get("valid")
+                and selected_progress is not None
+                and float(selected_progress) <= 0.25 + 1e-9
+            )
+            state_counts = anchor.get("route_state_counts") or {}
+            anchor.update(
+                {
+                    "current_sparseocc_connectivity": bool(
+                        int(state_counts.get("occupied", 0) or 0) == 0
+                        and int(state_counts.get("unknown", 0) or 0) == 0
+                    ),
+                    "first_edge_visible_projection": first_edge_visible,
+                    "image_bridge_reason": bridge.get("reason"),
+                    "image_bridge_path_reachable": bool(
+                        bridge.get("path_reachable")
+                    ),
+                    "selected_pixel_goal": bridge.get("selected_pixel_goal"),
+                    "selected_path_progress_m": selected_progress,
+                    "stage58_support_policy": support,
+                    "offline_primitive_truth": truth,
+                }
+            )
+        report["runtime_contract"] = contract
+        report["gt_fields_used"] = ["Habitat pathfinder.try_step offline label only"]
+        report["gt_used_for_navigation"] = False
+        return report
+
     def _stage58_offline_primitive_truth(self, path: list) -> dict:
         """Evaluate the first planned 0.25m against Habitat without moving."""
         result = {
@@ -3390,6 +3489,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             },
             "gt_fields_used": [],
         }
+        if self._stage59_productive_onset_enabled and event:
+            result["stage59_productive_onset"] = (
+                self._stage59_productive_onset_shadow(
+                    event,
+                    observations=observations,
+                    depth_m=depth_m,
+                )
+            )
         if cfg.get("path_reobserve_occ_2p5d_audit_enable") and candidate:
             result["stage55_occ_2p5d_audit"] = audit_candidate_occ_2p5d(
                 self.occ_memory,
@@ -11535,8 +11642,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             )
                         )
                         path_reobserve_audit_only = bool(
-                            path_reobserve_event.get(
-                                "stage57_local_elevation_support"
+                            (
+                                path_reobserve_event.get(
+                                    "stage57_local_elevation_support"
+                                )
+                                or path_reobserve_event.get(
+                                    "stage59_productive_onset"
+                                )
                             )
                             and not path_reobserve_event.get("enabled")
                         )
