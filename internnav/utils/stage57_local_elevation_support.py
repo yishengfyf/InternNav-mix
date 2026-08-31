@@ -21,7 +21,15 @@ def _ordered_path(values: Sequence[Sequence[int]]) -> list[tuple[int, int]]:
     return result
 
 
-def _profiles(memory: Any, cells: set[tuple[int, int]]) -> dict[tuple[int, int], list[dict]]:
+def _profiles(
+    memory: Any,
+    cells: set[tuple[int, int]],
+    *,
+    floor_support_cells: set[tuple[int, int]] | None = None,
+    floor_support_z_m: float = 0.0,
+    floor_support_frame_count: int = 0,
+    floor_support_source: str | None = None,
+) -> dict[tuple[int, int], list[dict]]:
     occ_counts = getattr(memory, "occ_counts", {}) or {}
     frame_counts = getattr(memory, "occ3d_frame_counts", {}) or {}
     cell_profiles: dict[tuple[int, int], list[dict]] = defaultdict(list)
@@ -40,6 +48,19 @@ def _profiles(memory: Any, cells: set[tuple[int, int]]) -> dict[tuple[int, int],
                 "z_m": float(height * cs),
                 "occupied_hits": int(hits),
                 "support_frame_count": int(frame_counts.get(key, 0) or 0),
+                "support_source": "occupied_endpoint",
+            }
+        )
+    floor_height = int(round(float(floor_support_z_m) / cs))
+    for cell in set(floor_support_cells or ()) & cells:
+        existing = cell_profiles[cell]
+        existing.append(
+            {
+                "height_index": floor_height,
+                "z_m": float(floor_height * cs),
+                "occupied_hits": 0,
+                "support_frame_count": int(floor_support_frame_count),
+                "support_source": str(floor_support_source or "floor_support_fallback"),
             }
         )
     for values in cell_profiles.values():
@@ -99,6 +120,10 @@ def _choose_support(
         for item in values
         if int(item.get("support_frame_count", 0) or 0) >= int(min_support_frames)
         and (
+            item.get("support_source") != "known_free_2d_without_occupied_2d"
+            or float(item.get("source_distance_m", 0.0) or 0.0) <= 1e-9
+        )
+        and (
             initial
             or previous_z - float(max_step_down_m) - 1e-9
             <= float(item["z_m"])
@@ -132,6 +157,8 @@ def audit_local_elevation_support(
     support_search_radius_m: float = 0.10,
     minimum_safe_segment_m: float = 0.25,
     max_records: int = 256,
+    floor_support_cells: set[tuple[int, int]] | None = None,
+    floor_support_source: str | None = None,
 ) -> dict[str, Any]:
     """Build a conservative support graph without changing navigation state."""
     sparse_path = _ordered_path(path_cells)
@@ -154,6 +181,8 @@ def audit_local_elevation_support(
         "headroom_m": float(headroom_m),
         "support_search_radius_m": float(support_search_radius_m),
         "minimum_safe_segment_m": float(minimum_safe_segment_m),
+        "floor_support_fallback_enabled": bool(floor_support_cells),
+        "floor_support_source": floor_support_source,
     }
     if not path:
         result["reason"] = "missing_path"
@@ -188,7 +217,14 @@ def audit_local_elevation_support(
         for row, col in corridor
         for dr, dc in search_offsets
     }
-    profiles = _profiles(memory, profile_cells)
+    profiles = _profiles(
+        memory,
+        profile_cells,
+        floor_support_cells=set(floor_support_cells or ()),
+        floor_support_z_m=float(initial_floor_z_m),
+        floor_support_frame_count=int(min_support_frames),
+        floor_support_source=floor_support_source,
+    )
 
     previous_z = float(initial_floor_z_m)
     center_records = []
@@ -222,6 +258,7 @@ def audit_local_elevation_support(
                 "support_frame_count": int(support.get("support_frame_count", 0) or 0),
                 "support_source_cell": support.get("source_cell"),
                 "support_source_distance_m": support.get("source_distance_m"),
+                "support_source": support.get("support_source"),
             }
         )
 
@@ -268,6 +305,7 @@ def audit_local_elevation_support(
                     "support_z_m": support_z,
                     "support_frame_count": int(support.get("support_frame_count", 0) or 0),
                     "support_source_distance_m": support.get("source_distance_m"),
+                    "support_source": support.get("support_source"),
                     "headroom_blocked": bool(overhead),
                     "height_record_count": len(values),
                 }

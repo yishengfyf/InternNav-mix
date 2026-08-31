@@ -84,6 +84,7 @@ from internnav.utils.stage57_local_elevation_support import (
 from internnav.utils.stage58_geometry_contract import (
     audit_geometry_radius_sweep,
 )
+from internnav.utils.stage58_support_policy import audit_support_policy_sweep
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -422,6 +423,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             for value in vlmap_safety_cfg.get(
                 "stage58_geometry_contract_radii_m", (0.10, 0.13, 0.15, 0.18)
             )
+        )
+        self._stage58_support_policy_enabled = bool(
+            vlmap_safety_cfg.get("stage58_support_policy_enable", False)
         )
         self._stage56_floor_frame_consensus_audit_enabled = bool(
             vlmap_safety_cfg.get(
@@ -3499,14 +3503,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "elevation_support": prefix_graph,
             }
             if self._stage58_geometry_contract_enabled:
+                primitive_truth = self._stage58_offline_primitive_truth(prefix_path)
                 result["stage58_geometry_contract"] = audit_geometry_radius_sweep(
                     self.occ_memory,
                     prefix_path,
                     footprint_radii_m=self._stage58_geometry_contract_radii_m,
                     runtime_contract=self._stage58_runtime_geometry_contract(),
-                    offline_primitive_truth=self._stage58_offline_primitive_truth(
-                        prefix_path
-                    ),
+                    offline_primitive_truth=primitive_truth,
                     initial_floor_z_m=float(candidate.get("floor_z_m", 0.0) or 0.0),
                     min_support_frames=int(
                         cfg.get("local_elevation_support_min_frames", 2)
@@ -3525,6 +3528,106 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         )
                     ),
                 )
+            if self._stage58_support_policy_enabled:
+                primitive_truth = self._stage58_offline_primitive_truth(prefix_path)
+                support_policy = audit_support_policy_sweep(
+                    self.occ_memory,
+                    prefix_path,
+                    runtime_contract=self._stage58_runtime_geometry_contract(),
+                    offline_primitive_truth=primitive_truth,
+                    footprint_radius_m=float(
+                        getattr(self.agent_config, "radius", 0.10)
+                    ),
+                    initial_floor_z_m=float(
+                        candidate.get("floor_z_m", 0.0) or 0.0
+                    ),
+                    max_step_m=float(
+                        cfg.get("local_elevation_support_max_step_m", 0.20)
+                    ),
+                    headroom_m=float(
+                        cfg.get("local_elevation_support_headroom_m", 1.50)
+                    ),
+                    minimum_safe_segment_m=float(
+                        getattr(
+                            self.config.habitat.simulator,
+                            "forward_step_size",
+                            0.25,
+                        )
+                    ),
+                )
+                start_grid = getattr(self.occ_memory, "last_pose_grid", None)
+                directional_controls = []
+                if start_grid is not None:
+                    for label, dr, dc in (
+                        ("north", -5, 0),
+                        ("north_east", -4, 4),
+                        ("east", 0, 5),
+                        ("south_east", 4, 4),
+                        ("south", 5, 0),
+                        ("south_west", 4, -4),
+                        ("west", 0, -5),
+                        ("north_west", -4, -4),
+                    ):
+                        start = (int(start_grid[0]), int(start_grid[1]))
+                        target = (start[0] + int(dr), start[1] + int(dc))
+                        distance_m = math.hypot(dr, dc) * float(
+                            getattr(self.occ_memory, "cs", 0.05)
+                        )
+                        control_path = list(
+                            self.occ_memory._rasterize_executed_route_edge(
+                                start,
+                                target,
+                                edge_length_m=distance_m,
+                                sample_spacing_m=float(
+                                    getattr(self.occ_memory, "cs", 0.05)
+                                ),
+                            )
+                        )
+                        control_truth = self._stage58_offline_primitive_truth(
+                            control_path
+                        )
+                        directional_controls.append(
+                            {
+                                "direction": label,
+                                "target_grid": [int(target[0]), int(target[1])],
+                                "audit": audit_support_policy_sweep(
+                                    self.occ_memory,
+                                    control_path,
+                                    runtime_contract=(
+                                        self._stage58_runtime_geometry_contract()
+                                    ),
+                                    offline_primitive_truth=control_truth,
+                                    footprint_radius_m=float(
+                                        getattr(self.agent_config, "radius", 0.10)
+                                    ),
+                                    initial_floor_z_m=float(
+                                        candidate.get("floor_z_m", 0.0) or 0.0
+                                    ),
+                                    max_step_m=float(
+                                        cfg.get(
+                                            "local_elevation_support_max_step_m",
+                                            0.20,
+                                        )
+                                    ),
+                                    headroom_m=float(
+                                        cfg.get(
+                                            "local_elevation_support_headroom_m",
+                                            1.50,
+                                        )
+                                    ),
+                                    minimum_safe_segment_m=float(
+                                        getattr(
+                                            self.config.habitat.simulator,
+                                            "forward_step_size",
+                                            0.25,
+                                        )
+                                    ),
+                                ),
+                            }
+                        )
+                support_policy["directional_controls"] = directional_controls
+                support_policy["directional_controls_used_for_navigation"] = False
+                result["stage58_support_policy"] = support_policy
         if cfg.get("path_reobserve_stage57_local_frontier_audit_enable") and candidate:
             memory = self.occ_memory
             start_raw = getattr(memory, "last_pose_grid", None)
