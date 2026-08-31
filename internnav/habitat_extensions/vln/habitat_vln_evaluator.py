@@ -81,6 +81,9 @@ from internnav.utils.stage56_floor_relative_occ_audit import (
 from internnav.utils.stage57_local_elevation_support import (
     audit_local_elevation_support,
 )
+from internnav.utils.stage58_geometry_contract import (
+    audit_geometry_radius_sweep,
+)
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -410,6 +413,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "occ_memory_validation_local_elevation_support_max_step_m", 0.20
                 )
             ),
+        )
+        self._stage58_geometry_contract_enabled = bool(
+            vlmap_safety_cfg.get("stage58_geometry_contract_enable", False)
+        )
+        self._stage58_geometry_contract_radii_m = tuple(
+            float(value)
+            for value in vlmap_safety_cfg.get(
+                "stage58_geometry_contract_radii_m", (0.10, 0.13, 0.15, 0.18)
+            )
         )
         self._stage56_floor_frame_consensus_audit_enabled = bool(
             vlmap_safety_cfg.get(
@@ -1978,6 +1990,136 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ),
         )
 
+    def _stage58_runtime_geometry_contract(self) -> dict:
+        sensor_position = list(
+            getattr(self.sim_sensors_config.depth_sensor, "position", []) or []
+        )
+        return {
+            "source": "runtime_habitat_config",
+            "agent_radius_m": float(getattr(self.agent_config, "radius", 0.0)),
+            "agent_height_m": float(getattr(self.agent_config, "height", 0.0)),
+            "sensor_position_m": [float(value) for value in sensor_position],
+            "sensor_height_m": float(self._camera_height),
+            "forward_step_m": float(
+                getattr(self.config.habitat.simulator, "forward_step_size", 0.25)
+            ),
+            "turn_angle_deg": float(
+                getattr(self.config.habitat.simulator, "turn_angle", 15.0)
+            ),
+            "tilt_angle_deg": float(self._tilt_angle_deg),
+            "map_cell_size_m": float(getattr(self.occ_memory, "cs", 0.05)),
+        }
+
+    def _stage58_offline_primitive_truth(self, path: list) -> dict:
+        """Evaluate the first planned 0.25m against Habitat without moving."""
+        result = {
+            "valid": False,
+            "reason": None,
+            "gt_reference": "Habitat pathfinder.try_step",
+            "gt_used_for_navigation": False,
+            "action_applied": False,
+            "primitive_safe": False,
+        }
+        if self._stage23a_initial_agent_matrix is None:
+            result["reason"] = "missing_initial_agent_matrix"
+            return result
+        if len(path or []) < 2:
+            result["reason"] = "path_too_short"
+            return result
+        sim = self.env._env.sim
+        pathfinder = getattr(sim, "pathfinder", None)
+        if pathfinder is None or not bool(getattr(pathfinder, "is_loaded", True)):
+            result["reason"] = "pathfinder_unavailable"
+            return result
+        try:
+            state = sim.get_agent_state()
+            start = np.asarray(state.position, dtype=np.float32).reshape(3)
+            cell_size_m = max(float(getattr(self.occ_memory, "cs", 0.05)), 1e-6)
+            forward_step_m = float(
+                getattr(self.config.habitat.simulator, "forward_step_size", 0.25)
+            )
+            target_index = min(
+                len(path) - 1,
+                max(1, int(round(forward_step_m / cell_size_m))),
+            )
+            target_cell = (int(path[target_index][0]), int(path[target_index][1]))
+            target_xy = self.occ_memory._grid_to_xy(target_cell)
+            current_floor_z_m = float(
+                start[1]
+                - np.asarray(
+                    self._stage23a_initial_agent_matrix, dtype=np.float32
+                )[1, 3]
+            )
+            habitat_to_map = np.array(
+                [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float32,
+            )
+            map_to_habitat = np.eye(4, dtype=np.float32)
+            map_to_habitat[:3, :3] = habitat_to_map.T
+            map_to_world = (
+                np.asarray(self._stage23a_initial_agent_matrix, dtype=np.float32)
+                @ map_to_habitat
+            )
+            requested = (
+                map_to_world
+                @ np.asarray(
+                    [target_xy[0], target_xy[1], current_floor_z_m, 1.0],
+                    dtype=np.float32,
+                )
+            )[:3]
+            try:
+                snapped = np.asarray(pathfinder.snap_point(requested), dtype=np.float32).reshape(3)
+                if np.all(np.isfinite(snapped)):
+                    requested[1] = snapped[1]
+            except Exception:
+                snapped = None
+            filtered = np.asarray(
+                pathfinder.try_step(start.copy(), requested.copy()), dtype=np.float32
+            ).reshape(3)
+            request_horizontal = requested[[0, 2]] - start[[0, 2]]
+            actual_horizontal = filtered[[0, 2]] - start[[0, 2]]
+            request_distance = float(np.linalg.norm(request_horizontal))
+            direction = request_horizontal / max(request_distance, 1e-6)
+            progress_m = float(np.dot(actual_horizontal, direction))
+            lateral_m = float(
+                np.linalg.norm(actual_horizontal - progress_m * direction)
+            )
+            endpoint_error_m = float(np.linalg.norm(filtered - requested))
+            vertical_delta_m = float(filtered[1] - start[1])
+            minimum_progress_m = min(0.20, 0.80 * request_distance)
+            primitive_safe = bool(
+                request_distance >= 0.20
+                and progress_m + 1e-6 >= minimum_progress_m
+                and lateral_m <= 0.075 + 1e-6
+                and endpoint_error_m <= 0.10 + 1e-6
+                and abs(vertical_delta_m) <= 0.25 + 1e-6
+            )
+            result.update(
+                {
+                    "valid": True,
+                    "reason": "ok",
+                    "primitive_safe": primitive_safe,
+                    "path_target_index": int(target_index),
+                    "path_target_cell": [int(target_cell[0]), int(target_cell[1])],
+                    "start_world": start.tolist(),
+                    "requested_world": requested.tolist(),
+                    "filtered_world": filtered.tolist(),
+                    "requested_horizontal_m": request_distance,
+                    "actual_progress_m": progress_m,
+                    "lateral_slide_m": lateral_m,
+                    "endpoint_error_m": endpoint_error_m,
+                    "vertical_delta_m": vertical_delta_m,
+                    "minimum_progress_m": minimum_progress_m,
+                    "max_lateral_slide_m": 0.075,
+                    "max_endpoint_error_m": 0.10,
+                    "max_vertical_delta_m": 0.25,
+                    "snap_world": snapped.tolist() if snapped is not None else None,
+                }
+            )
+        except Exception as exc:
+            result["reason"] = f"primitive_truth_error:{type(exc).__name__}:{exc}"
+        return result
+
     def _stage23c_semantic_scene_audit(self, memory) -> dict:
         """Audit semantic anchors against Habitat scene annotations.
 
@@ -3356,6 +3498,33 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "image_visible_safe_prefix": image_visible_safe_prefix,
                 "elevation_support": prefix_graph,
             }
+            if self._stage58_geometry_contract_enabled:
+                result["stage58_geometry_contract"] = audit_geometry_radius_sweep(
+                    self.occ_memory,
+                    prefix_path,
+                    footprint_radii_m=self._stage58_geometry_contract_radii_m,
+                    runtime_contract=self._stage58_runtime_geometry_contract(),
+                    offline_primitive_truth=self._stage58_offline_primitive_truth(
+                        prefix_path
+                    ),
+                    initial_floor_z_m=float(candidate.get("floor_z_m", 0.0) or 0.0),
+                    min_support_frames=int(
+                        cfg.get("local_elevation_support_min_frames", 2)
+                    ),
+                    max_step_m=float(
+                        cfg.get("local_elevation_support_max_step_m", 0.20)
+                    ),
+                    headroom_m=float(
+                        cfg.get("local_elevation_support_headroom_m", 1.50)
+                    ),
+                    minimum_safe_segment_m=float(
+                        getattr(
+                            self.config.habitat.simulator,
+                            "forward_step_size",
+                            0.25,
+                        )
+                    ),
+                )
         if cfg.get("path_reobserve_stage57_local_frontier_audit_enable") and candidate:
             memory = self.occ_memory
             start_raw = getattr(memory, "last_pose_grid", None)
