@@ -87,6 +87,15 @@ from internnav.utils.stage58_geometry_contract import (
 from internnav.utils.stage58_support_policy import audit_support_policy_sweep
 from internnav.utils.stage59_productive_onset import audit_productive_onset_anchors
 from internnav.utils.stage63_adaptive_reobserve import plan_adaptive_view_sweep
+from internnav.utils.stage64_recovery_subtask import (
+    SCHEMA_VERSION as STAGE64_SCHEMA_VERSION,
+    build_programmatic_recovery_prompt,
+    build_self_authored_execution_prompt,
+    build_self_authoring_prompt,
+    is_valid_self_authored_instruction,
+    plan_recovery_state_reset,
+    sanitize_self_authored_instruction,
+)
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -837,6 +846,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 vlmap_safety_cfg.get(
                     "stage53_lookdown_view_prompt_enable", False
                 )
+            ),
+            "stage64_recovery_subtask_enable": bool(
+                vlmap_safety_cfg.get("stage64_recovery_subtask_enable", False)
+            ),
+            "stage64_self_authored_max_chars": max(
+                64,
+                int(vlmap_safety_cfg.get("stage64_self_authored_max_chars", 480)),
             ),
             "strict_active_enable": bool(
                 vlmap_safety_cfg.get("s2_loop_strict_active_enable", False)
@@ -1769,6 +1785,392 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 lookdown_image.save(snapshot_path, quality=90)
                 record["lookdown_snapshot_path"] = snapshot_path
         self._write_stage53_recovery_ab_event(record)
+
+    @staticmethod
+    def _stage64_known_free_support_safe(anchor: dict) -> bool:
+        support = dict(anchor.get("stage58_support_policy") or {})
+        arm = next(
+            (
+                item
+                for item in list(support.get("arms") or [])
+                if item.get("policy") == "known_free_floor_frames2"
+            ),
+            {},
+        )
+        return bool(arm.get("predicted_first_primitive_safe"))
+
+    def _stage64_audit_s2_output(
+        self,
+        *,
+        variant: str,
+        output: str,
+        prompt: Optional[str],
+        input_images: list,
+        observations: Optional[dict],
+        depth_m: Optional[np.ndarray],
+        path_bridge: dict,
+        support_safe: bool,
+    ) -> dict:
+        parsed = self._parse_s2_candidate_output(
+            output,
+            image_width=int(self.model_args.resize_w),
+        )
+        direct_actions = self._s2_direct_action_codes(output)
+        prompt_image_count = (
+            0
+            if prompt is None
+            else sum(part == DEFAULT_IMAGE_TOKEN for part in split_and_clean(prompt))
+        )
+        arm = {
+            "variant": str(variant),
+            "status": "ok",
+            "output": str(output),
+            "prompt": prompt,
+            "prompt_image_token_count": int(prompt_image_count),
+            "input_image_count": int(len(input_images)),
+            "prompt_image_binding_valid": bool(
+                prompt is None or prompt_image_count == len(input_images)
+            ),
+            "protocol_valid": bool(
+                parsed.get("valid")
+                or parsed.get("is_stop")
+                or direct_actions
+            ),
+            "pixel_valid": bool(parsed.get("valid")),
+            "pixel_goal": parsed.get("pixel_goal"),
+            "is_stop": bool(parsed.get("is_stop")),
+            "direct_action_codes": direct_actions,
+            "direct_turn_direction": (
+                (normalize_direct_turn_output(output) or {}).get("direction")
+            ),
+            "waypoint_preflight": None,
+            "path_consistent": False,
+            "path_progress_m": None,
+            "path_deviation_m": None,
+            "support_safe": bool(support_safe),
+            "joint_eligible": False,
+            "shadow_only": True,
+            "action_applied": False,
+            "pixel_translation_allowed": False,
+            "unknown_is_free": False,
+        }
+        if not parsed.get("valid") or observations is None or depth_m is None:
+            return arm
+        waypoint = self.occ_memory.evaluate_waypoint(
+            parsed.get("pixel_goal"),
+            {
+                "gps": observations.get("gps"),
+                "compass": observations.get("compass"),
+            },
+            depth_m,
+            context={
+                "image_width": int(self.model_args.resize_w),
+                "image_height": int(self.model_args.resize_h),
+                "probe_source": f"stage64_{variant}_shadow",
+            },
+        )
+        arm["waypoint_preflight"] = {
+            "valid": bool(waypoint.get("valid")),
+            "reason": waypoint.get("reason"),
+            "goal_grid": waypoint.get("goal_grid"),
+            "goal_state": waypoint.get("goal_state"),
+            "depth_m": waypoint.get("depth_m"),
+        }
+        path = np.asarray(
+            path_bridge.get("stage64_contract_path") or [],
+            dtype=np.float32,
+        )
+        goal = waypoint.get("goal_grid")
+        if not waypoint.get("valid") or goal is None or path.ndim != 2 or len(path) < 2:
+            return arm
+        goal_arr = np.asarray(list(goal)[:2], dtype=np.float32)
+        distances = np.linalg.norm(path[:, :2] - goal_arr[None, :], axis=1)
+        nearest_index = int(np.argmin(distances))
+        cell_size = float(getattr(self.occ_memory, "cs", 0.05))
+        progress_m = float(nearest_index * cell_size)
+        deviation_m = float(distances[nearest_index] * cell_size)
+        path_consistent = bool(
+            waypoint.get("goal_state") == "free"
+            and deviation_m <= 0.35 + 1e-9
+            and progress_m >= 0.20 - 1e-9
+            and progress_m <= 0.25 + 1e-9
+        )
+        arm.update(
+            {
+                "path_consistent": path_consistent,
+                "path_progress_m": progress_m,
+                "path_deviation_m": deviation_m,
+                "joint_eligible": bool(path_consistent and support_safe),
+            }
+        )
+        return arm
+
+    def _run_stage64_recovery_subtask_shadow(
+        self,
+        *,
+        event: dict,
+        path_reobserve_event: dict,
+        original_instruction: str,
+        input_images: list,
+        messages_prefix: Optional[list],
+        base_output: str,
+        observations: Optional[dict],
+        depth_m: Optional[np.ndarray],
+        queue_state: dict,
+    ) -> None:
+        cfg = self._get_s2_action_loop_cfg()
+        if not cfg.get("stage64_recovery_subtask_enable"):
+            return
+        stage59 = dict(path_reobserve_event.get("stage59_productive_onset") or {})
+        anchor = next(
+            (
+                row
+                for row in list(stage59.get("anchors") or [])
+                if row.get("anchor") == "last_productive_pre_loop"
+            ),
+            None,
+        )
+        record = {
+            "event_type": "stage64_recovery_subtask_shadow",
+            "event_schema_version": STAGE64_SCHEMA_VERSION,
+            "scene_id": event.get("scene_id"),
+            "episode_id": event.get("episode_id"),
+            "episode_index": event.get("episode_index"),
+            "episode_count": event.get("episode_count"),
+            "episode_eval_seed": event.get("episode_eval_seed"),
+            "trigger_step": event.get("step_id"),
+            "failure_type": event.get("failure_type"),
+            "repeated_direction": event.get("turn_direction"),
+            "shadow_only": True,
+            "decision_applied": False,
+            "action_applied": False,
+            "pixel_translation_allowed": False,
+            "unknown_is_free": False,
+            "gt_fields_used": [],
+            "official_memory_mutated": False,
+            "original_instruction_restored": True,
+            "original_instruction_leaked_to_recovery_prompt": False,
+            "recovery_messages_prefix_empty": True,
+            "queue_state_unchanged": True,
+            "queue_reset_plan": plan_recovery_state_reset(queue_state),
+            "arms": [],
+            "reason": None,
+        }
+        if anchor is None or observations is None or depth_m is None or not input_images:
+            record["reason"] = "missing_anchor_or_current_input"
+            self._write_stage64_recovery_subtask_event(record)
+            return
+        candidate = {
+            "candidate_id": "stage64:last_productive_pre_loop",
+            "grid": anchor.get("grid"),
+            "path_cells": list(reversed(anchor.get("current_to_anchor_path_cells") or [])),
+            "path_length_m": anchor.get("route_length_m"),
+            "floor_z_m": anchor.get("z_m", 0.0),
+        }
+        path_bridge = self._recovery_path_bridge(
+            {**event, "candidate": candidate},
+            observations=observations,
+            depth_m=depth_m,
+            probe_source="stage64_recovery_subtask_shadow",
+        )
+        path_bridge["stage64_contract_path"] = list(
+            anchor.get("current_to_anchor_path_cells") or []
+        )
+        bearing = path_bridge.get("initial_direction_angle_deg")
+        distance = path_bridge.get("path_m")
+        if bearing is None or distance is None:
+            record["reason"] = str(path_bridge.get("reason") or "missing_route_hint")
+            record["path_bridge_reason"] = path_bridge.get("reason")
+            self._write_stage64_recovery_subtask_event(record)
+            return
+        support_safe = self._stage64_known_free_support_safe(anchor)
+        record.update(
+            {
+                "reason": "ok",
+                "route_bearing_deg": float(bearing),
+                "route_distance_m": float(distance),
+                "route_path_reachable": bool(path_bridge.get("path_reachable")),
+                "support_safe": bool(support_safe),
+                "offline_primitive_safe": bool(
+                    (anchor.get("offline_primitive_truth") or {}).get("primitive_safe")
+                ),
+            }
+        )
+        queue_before = copy.deepcopy(queue_state)
+        instruction_before = str(original_instruction)
+        memory_before = self._stage43_memory_fingerprint(self.occ_memory)
+        record["arms"].append(
+            self._stage64_audit_s2_output(
+                variant="control",
+                output=base_output,
+                prompt=None,
+                input_images=input_images,
+                observations=observations,
+                depth_m=depth_m,
+                path_bridge=path_bridge,
+                support_safe=support_safe,
+            )
+        )
+
+        programmatic_prompt = build_programmatic_recovery_prompt(
+            image_count=len(input_images),
+            bearing_deg=float(bearing),
+            distance_m=float(distance),
+            failure_type=str(event.get("failure_type") or "unknown"),
+            repeated_direction=str(event.get("turn_direction") or "unknown"),
+        )
+        rng_state = self._capture_torch_rng_state()
+        try:
+            programmatic_output = self._generate_s2_text_from_prompt_instruction(
+                programmatic_prompt,
+                input_images,
+                messages_prefix=None,
+                max_new_tokens=128,
+            )
+        except Exception as exc:
+            programmatic_output = ""
+            record["programmatic_error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._restore_torch_rng_state(rng_state)
+        programmatic_arm = self._stage64_audit_s2_output(
+            variant="programmatic_subtask",
+            output=programmatic_output,
+            prompt=programmatic_prompt,
+            input_images=input_images,
+            observations=observations,
+            depth_m=depth_m,
+            path_bridge=path_bridge,
+            support_safe=support_safe,
+        )
+        if record.get("programmatic_error"):
+            programmatic_arm["status"] = "error"
+            programmatic_arm["error"] = record["programmatic_error"]
+        record["arms"].append(programmatic_arm)
+
+        authoring_prompt = build_self_authoring_prompt(
+            image_count=len(input_images),
+            bearing_deg=float(bearing),
+            distance_m=float(distance),
+            failure_type=str(event.get("failure_type") or "unknown"),
+            repeated_direction=str(event.get("turn_direction") or "unknown"),
+        )
+        rng_state = self._capture_torch_rng_state()
+        try:
+            authored_raw = self._generate_s2_text_from_prompt_instruction(
+                authoring_prompt,
+                input_images,
+                messages_prefix=None,
+                max_new_tokens=96,
+            )
+        except Exception as exc:
+            authored_raw = ""
+            record["authoring_error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._restore_torch_rng_state(rng_state)
+        authored_instruction = sanitize_self_authored_instruction(
+            authored_raw,
+            max_chars=int(cfg.get("stage64_self_authored_max_chars", 480)),
+        )
+        record.update(
+            {
+                "self_authored_instruction_raw": authored_raw,
+                "self_authored_instruction": authored_instruction,
+                "self_authored_instruction_valid": bool(
+                    is_valid_self_authored_instruction(authored_instruction)
+                ),
+                "authoring_prompt_image_token_count": sum(
+                    part == DEFAULT_IMAGE_TOKEN
+                    for part in split_and_clean(authoring_prompt)
+                ),
+                "authoring_input_image_count": len(input_images),
+            }
+        )
+        record["authoring_prompt_image_binding_valid"] = bool(
+            record["authoring_prompt_image_token_count"] == len(input_images)
+        )
+        if not record["self_authored_instruction_valid"]:
+            self_arm = self._stage64_audit_s2_output(
+                variant="self_authored_subtask",
+                output="",
+                prompt=None,
+                input_images=input_images,
+                observations=observations,
+                depth_m=depth_m,
+                path_bridge=path_bridge,
+                support_safe=support_safe,
+            )
+            self_arm.update(
+                {
+                    "status": "invalid_instruction",
+                    "execution_skipped": True,
+                }
+            )
+            record["arms"].append(self_arm)
+            memory_after = self._stage43_memory_fingerprint(self.occ_memory)
+            record["official_memory_mutated"] = memory_before != memory_after
+            record["queue_state_unchanged"] = queue_before == queue_state
+            record["original_instruction_restored"] = (
+                instruction_before == str(original_instruction)
+            )
+            record["original_instruction_leaked_to_recovery_prompt"] = bool(
+                instruction_before
+                and (
+                    instruction_before in programmatic_prompt
+                    or instruction_before in authoring_prompt
+                )
+            )
+            self._write_stage64_recovery_subtask_event(record)
+            return
+        self_prompt = build_self_authored_execution_prompt(
+            instruction=authored_instruction,
+            image_count=len(input_images),
+            bearing_deg=float(bearing),
+            distance_m=float(distance),
+        )
+        rng_state = self._capture_torch_rng_state()
+        try:
+            self_output = self._generate_s2_text_from_prompt_instruction(
+                self_prompt,
+                input_images,
+                messages_prefix=None,
+                max_new_tokens=128,
+            )
+        except Exception as exc:
+            self_output = ""
+            record["self_execution_error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._restore_torch_rng_state(rng_state)
+        self_arm = self._stage64_audit_s2_output(
+            variant="self_authored_subtask",
+            output=self_output,
+            prompt=self_prompt,
+            input_images=input_images,
+            observations=observations,
+            depth_m=depth_m,
+            path_bridge=path_bridge,
+            support_safe=support_safe,
+        )
+        if record.get("authoring_error") or record.get("self_execution_error"):
+            self_arm["status"] = "error"
+            self_arm["error"] = record.get("authoring_error") or record.get(
+                "self_execution_error"
+            )
+        record["arms"].append(self_arm)
+        memory_after = self._stage43_memory_fingerprint(self.occ_memory)
+        record["official_memory_mutated"] = memory_before != memory_after
+        record["queue_state_unchanged"] = queue_before == queue_state
+        record["original_instruction_restored"] = (
+            instruction_before == str(original_instruction)
+        )
+        record["original_instruction_leaked_to_recovery_prompt"] = bool(
+            instruction_before
+            and (
+                instruction_before in programmatic_prompt
+                or instruction_before in authoring_prompt
+                or instruction_before in self_prompt
+            )
+        )
+        self._write_stage64_recovery_subtask_event(record)
 
     def _plan_s2_loop_projection_bridge_shadow(
         self,
@@ -5293,6 +5695,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "stage53_recovery_ab_events.jsonl")
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
+
+    def _write_stage64_recovery_subtask_event(self, event: dict) -> None:
+        run_dir = self._get_vlmap_run_dir()
+        log_dir = run_dir or self.output_path
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "stage64_recovery_subtask_events.jsonl")
         with open(log_path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(self._jsonable(event), ensure_ascii=False) + "\n")
 
@@ -11903,6 +12315,28 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 )
                             )
                             and not path_reobserve_event.get("enabled")
+                        )
+                        self._run_stage64_recovery_subtask_shadow(
+                            event=s2_loop_event,
+                            path_reobserve_event=path_reobserve_event,
+                            original_instruction=episode_instruction,
+                            input_images=input_images,
+                            messages_prefix=s2_counterfactual_messages_prefix,
+                            base_output=llm_outputs,
+                            observations=observations,
+                            depth_m=current_depth_m,
+                            queue_state={
+                                "action_seq": [int(item) for item in list(action_seq or [])],
+                                "local_actions": [int(item) for item in list(local_actions or [])],
+                                "vlmap_recovery_actions": [
+                                    int(item) for item in list(vlmap_recovery_actions or [])
+                                ],
+                                "pixel_goal": copy.deepcopy(pixel_goal),
+                                "traj_latents": (
+                                    None if traj_latents is None else "present"
+                                ),
+                                "output_ids": None if output_ids is None else "present",
+                            },
                         )
                         if path_reobserve_event.get("enabled") or path_reobserve_audit_only:
                             s2_loop_path_reobserve_event_count += 1
