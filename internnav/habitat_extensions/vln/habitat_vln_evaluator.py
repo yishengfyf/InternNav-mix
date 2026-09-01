@@ -12048,9 +12048,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             history_id = np.unique(
                                 np.linspace(0, step_id - 1, self.num_history, dtype=np.int32)
                             ).tolist()
-                            placeholder = (DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
-                            sources[0]["value"] += f' These are your historical observations: {placeholder}.'
-
                         history_id = sorted(history_id)
                         if (
                             pending_s2_recovery_context
@@ -12063,6 +12060,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 item for item in history_id
                                 if int(rgb_frame_records[item].get("step_id", -1)) <= anchor_step
                             ]
+                        if history_id:
+                            placeholder = (DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
+                            sources[0]["value"] += f' These are your historical observations: {placeholder}.'
                         input_images = [rgb_list[i] for i in history_id] + cur_images
                         input_img_id = 0
 
