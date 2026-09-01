@@ -12441,6 +12441,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                         "episode_id": int(episode_id),
                                         "trigger_step": int(step_id),
                                         "anchor_step": native_context.get("stage65_anchor_step"),
+                                        "stage59_productive_onset": path_reobserve_event.get(
+                                            "stage59_productive_onset"
+                                        ),
                                         "image_roles": list(native_context.get("image_roles") or []),
                                         "image_steps": list(native_context.get("image_steps") or []),
                                         "original_instruction_preserved": True,

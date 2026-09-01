@@ -19,6 +19,10 @@ def main():
     queries=rows(root,"replay_ledger/queries.jsonl")
     actions=rows(root,"replay_ledger/actions.jsonl")
     native=[r for r in contexts if r.get("event_type")=="stage65_native_recovery_set"]
+    anchors=[]
+    for r in native:
+        report=r.get("stage59_productive_onset") or {}
+        if report: anchors.append(report)
     recovery_queries=[r for r in queries if r.get("input_steps",{}).get("recovery_context") or r.get("stage65_native")]
     report={
       "task":"stage65_native_recovery_active",
@@ -30,7 +34,10 @@ def main():
       "query_count":len(queries), "recovery_query_count":len(recovery_queries),
       "action_count":len(actions),
       "native_events":native,
-      "integrity_passed":len(progress)==a.expected_episodes and len(native)<=a.expected_episodes,
+      "natural_d0_event_count":len(anchors),
+      "natural_d0_scene_count":len({str(r.get("scene_id")) for r in native}),
+      "productive_anchor_count":sum(1 for r in anchors for x in (r.get("anchors") or []) if x.get("anchor")=="last_productive_pre_loop" and x.get("valid")),
+      "integrity_passed":len(progress)==a.expected_episodes and len(native)==a.expected_episodes,
       "shadow_only":False,"decision_applied":True,"unknown_is_free":False,"gt_used_for_navigation":False,
     }
     a.output.parent.mkdir(parents=True,exist_ok=True); a.output.write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n"); print(json.dumps(report,indent=2,ensure_ascii=False))

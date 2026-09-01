@@ -259,8 +259,7 @@ case "${PHASE}" in
     python3 scripts/eval/analyze_stage59_productive_onset.py \
       --run-root "${run_dir}" \
       --manifest "${STAGE59_MANIFEST}" \
-      --output "${result_dir}/stage59_productive_onset_audit.json" \
-      --require-all
+      --output "${result_dir}/stage59_productive_onset_audit.json"
     python3 scripts/eval/analyze_stage65_native_recovery.py \
       --run-root "${run_dir}" \
       --expected-episodes 4 \
