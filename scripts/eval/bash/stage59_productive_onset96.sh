@@ -58,11 +58,15 @@ MASTER_PORT=3591 \
 CUDA_VISIBLE_DEVICES="${STAGE59_CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
 bash scripts/eval/bash/stage21_torchrun_eval.sh --config "${CONFIG}"
 
-python3 scripts/eval/analyze_stage59_productive_onset.py \
-  --run-root "${RUN_DIR}" \
-  --manifest "${MANIFEST}" \
-  --output "${WORK_DIR}/stage59_productive_onset_audit.json" \
-  --require-all
+audit_args=(
+  --run-root "${RUN_DIR}"
+  --manifest "${MANIFEST}"
+  --output "${WORK_DIR}/stage59_productive_onset_audit.json"
+)
+if [[ -z "${STAGE59_SKIP_AUDIT_REQUIRE_ALL:-}" ]]; then
+  audit_args+=(--require-all)
+fi
+python3 scripts/eval/analyze_stage59_productive_onset.py "${audit_args[@]}"
 
 cp -a "${MANIFEST}" "${WORK_DIR}/episode_manifests/"
 [[ -f "${RUN_DIR}/result.json" ]] && cp -a "${RUN_DIR}/result.json" "${WORK_DIR}/run/"

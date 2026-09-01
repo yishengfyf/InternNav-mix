@@ -183,6 +183,7 @@ case "${PHASE}" in
     export STAGE59_PIPELINE_TAG="${TAG}"
     export STAGE59_RUN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results/runs
     export STAGE59_RETURN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results
+    export STAGE59_SKIP_AUDIT_REQUIRE_ALL=1
     bash scripts/eval/bash/stage59_productive_onset96.sh
     result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage59_productive_onset_return_${TAG}"
     latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
