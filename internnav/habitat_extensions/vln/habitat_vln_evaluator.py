@@ -821,6 +821,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "recovery_context_shadow_only": bool(
                 vlmap_safety_cfg.get("s2_recovery_context_shadow_only", True)
             ),
+            "stage65_native_recovery_enable": bool(
+                vlmap_safety_cfg.get("stage65_native_recovery_enable", False)
+            ),
+            "stage65_native_recovery_max_queries": max(
+                1,
+                int(vlmap_safety_cfg.get("stage65_native_recovery_max_queries", 5)),
+            ),
             "recovery_context_max_images": int(
                 vlmap_safety_cfg.get("s2_recovery_context_max_images", 3)
             ),
@@ -1141,6 +1148,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         candidate_direction = str(candidate.get("direction_bucket") or "unknown")
         candidate_bearing = candidate.get("direction_angle_deg")
         candidate_distance = candidate.get("distance_m")
+        if context.get("stage65_native"):
+            return (
+                "Recovery observation for the current navigation task. The original "
+                "task remains active. The image marked recovery reference observation "
+                "shows a previously visited place on the route; use it together with "
+                "the current view and historical observations to return toward that "
+                "place. First observe if the place is not visible. Output the next "
+                "waypoint coordinates in the current image, or output a short turn "
+                "/ look-down action sequence when another observation is needed. "
+                "Output STOP only when the original task is complete."
+            )
         return (
             "Temporary recovery context (observed local evidence, not ground truth): "
             f"failure={failure_type}; repeated_turn={direction}; "
@@ -1255,6 +1273,37 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "action_applied": False,
             "gt_fields_used": [],
         }
+        if cfg.get("stage65_native_recovery_enable"):
+            stage59 = dict(event.get("stage59_productive_onset") or {})
+            anchor = next(
+                (
+                    row for row in list(stage59.get("anchors") or [])
+                    if row.get("anchor") == "last_productive_pre_loop" and row.get("valid")
+                ),
+                None,
+            )
+            anchor_step = None if anchor is None else anchor.get("step_id")
+            anchor_record = self._nearest_recovery_frame_record(frame_records, anchor_step)
+            if anchor_record is None:
+                return None
+            context.update(
+                {
+                    "stage65_native": True,
+                    "stage65_anchor_step": int(anchor_step),
+                    "stage65_anchor_grid": list(anchor.get("grid") or []),
+                    "stage65_anchor_yaw": anchor.get("yaw"),
+                    "stage65_anchor_path_cells": list(
+                        anchor.get("current_to_anchor_path_cells") or []
+                    ),
+                    "image_roles": ["recovery reference observation"],
+                    "image_steps": [int(anchor_step)],
+                    "images": [anchor_record["image"].copy()],
+                    "remaining_queries": int(
+                        cfg.get("stage65_native_recovery_max_queries", 5)
+                    ),
+                }
+            )
+            context["prompt"] = self._format_s2_recovery_context(context)
         if cfg.get("recovery_context_save_images"):
             run_dir = self._get_vlmap_run_dir()
             if run_dir:
@@ -11405,6 +11454,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             pending_vlmap_semantic_hint = ""
             pending_occ_memory_guidance_hint = ""
             pending_s2_recovery_context = None
+            stage65_recovery_active = False
             s2_recovery_context_set_count = 0
             s2_recovery_context_injected_count = 0
             s2_recovery_context_counterfactual_count = 0
@@ -12002,6 +12052,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             sources[0]["value"] += f' These are your historical observations: {placeholder}.'
 
                         history_id = sorted(history_id)
+                        if (
+                            pending_s2_recovery_context
+                            and pending_s2_recovery_context.get("stage65_native")
+                        ):
+                            anchor_step = int(
+                                pending_s2_recovery_context.get("stage65_anchor_step", step_id)
+                            )
+                            history_id = [
+                                item for item in history_id
+                                if int(rgb_frame_records[item].get("step_id", -1)) <= anchor_step
+                            ]
                         input_images = [rgb_list[i] for i in history_id] + cur_images
                         input_img_id = 0
 
@@ -12338,6 +12399,52 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 "output_ids": None if output_ids is None else "present",
                             },
                         )
+                        native_cfg = self._get_s2_action_loop_cfg()
+                        if (
+                            native_cfg.get("stage65_native_recovery_enable")
+                            and not stage65_recovery_active
+                        ):
+                            native_context = self._build_s2_recovery_context(
+                                s2_loop_event,
+                                frame_records=rgb_frame_records,
+                                current_image=image,
+                            )
+                            if native_context is not None:
+                                stage65_recovery_active = True
+                                pending_s2_recovery_context = native_context
+                                s2_recovery_context_set_count += 1
+                                action_seq = []
+                                local_actions = []
+                                vlmap_recovery_actions = []
+                                pixel_goal = None
+                                output_ids = None
+                                traj_latents = None
+                                pix_goal_image = None
+                                pix_goal_depth = None
+                                messages = []
+                                input_images = []
+                                llm_outputs = ""
+                                action = None
+                                forward_action = 0
+                                draw_pixel_goal = False
+                                flag = False
+                                self._write_s2_recovery_context_event(
+                                    {
+                                        "event_type": "stage65_native_recovery_set",
+                                        "event_schema_version": "stage65_native_recovery_v1",
+                                        "scene_id": scene_id,
+                                        "episode_id": int(episode_id),
+                                        "trigger_step": int(step_id),
+                                        "anchor_step": native_context.get("stage65_anchor_step"),
+                                        "image_roles": list(native_context.get("image_roles") or []),
+                                        "image_steps": list(native_context.get("image_steps") or []),
+                                        "original_instruction_preserved": True,
+                                        "queue_cleared": True,
+                                        "action_applied": False,
+                                        "gt_fields_used": [],
+                                    }
+                                )
+                                continue
                         if path_reobserve_event.get("enabled") or path_reobserve_audit_only:
                             s2_loop_path_reobserve_event_count += 1
                             path_reobserve_event["base_s2_output"] = llm_outputs
@@ -14603,6 +14710,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     else:
                         action_seq = self.parse_actions(llm_outputs)
+                        if (
+                            stage65_recovery_active
+                            and pending_s2_recovery_context
+                            and pending_s2_recovery_context.get("stage65_native")
+                        ):
+                            if "STOP" in str(llm_outputs or "").upper():
+                                pending_s2_recovery_context = None
+                                stage65_recovery_active = False
+                                action_seq = []
+                                pixel_goal = None
+                                output_ids = None
+                                traj_latents = None
+                                local_actions = []
+                                messages = []
+                                input_images = []
+                                llm_outputs = ""
+                                continue
+                            action_seq = action_seq[:1]
                         print('actions', action_seq, flush=True)
 
                 action_source = "fallback_stop"
@@ -14696,6 +14821,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 "path_reobserve_one_primitive_per_reaudit"
                             )
                         ):
+                            local_actions = local_actions[:1]
+                        if stage65_recovery_active:
                             local_actions = local_actions[:1]
                         (
                             traj_reject_required,
@@ -14987,6 +15114,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     next_observation_step_id=next_observation_step_id,
                 )
                 last_action_applied = True
+
+                if (
+                    stage65_recovery_active
+                    and action_source == "nextdit_regenerated_local_queue"
+                ):
+                    pixel_goal = None
+                    output_ids = None
+                    traj_latents = None
+                    pix_goal_image = None
+                    pix_goal_depth = None
+                    local_actions = []
+                    pending_s2_recovery_context = None
+                    stage65_recovery_active = False
 
                 if (
                     pending_s2_loop_path_reobserve is not None

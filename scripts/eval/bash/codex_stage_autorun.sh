@@ -12,7 +12,7 @@ fi
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
-PHASE="stage64_recovery_subtask_support_safe12"
+PHASE="stage65_native_recovery_active4"
 TAG="${PHASE}_$(date +%Y%m%d_%H%M%S)"
 
 source /home/yifeifeng/miniconda3/etc/profile.d/conda.sh
@@ -238,6 +238,28 @@ case "${PHASE}" in
       --run-root "${run_dir}" \
       --expected-episodes 12 \
       --output "${result_dir}/stage64_recovery_subtask_audit.json" \
+      --require-all
+    find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
+    latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
+    test -d "${result_dir}"
+    ln -sfn "${result_dir}" "${latest_link}"
+    echo "CODEX_LATEST_RETURN=${latest_link}"
+    ;;
+  stage65_native_recovery_active4)
+    export STAGE21C_SCORER_CHECKPOINT=/data/usr_data/yifeifeng/internnav/stage_results/shared_checkpoints/stage21b_seed_53/best.pt
+    export STAGE59_MANIFEST=/home/yifeifeng/workspace/InternNav/scripts/eval/manifests/stage65_native_recovery_active4_episode_seed_replay.json
+    export STAGE59_CONFIG=scripts/eval/configs/habitat_dual_system_vlmap_stage65_native_recovery_active_cfg.py
+    export STAGE59_PIPELINE_TAG="${TAG}"
+    export STAGE59_RUN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results/runs
+    export STAGE59_RETURN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results
+    python3 -m pytest -q tests/unit_test/test_stage64_recovery_subtask.py
+    bash scripts/eval/bash/stage59_productive_onset96.sh
+    result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage59_productive_onset_return_${TAG}"
+    run_dir="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_${TAG}"
+    python3 scripts/eval/analyze_stage59_productive_onset.py \
+      --run-root "${run_dir}" \
+      --manifest "${STAGE59_MANIFEST}" \
+      --output "${result_dir}/stage59_productive_onset_audit.json" \
       --require-all
     find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
     latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
