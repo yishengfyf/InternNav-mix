@@ -24,6 +24,7 @@ def analyze(run_root: Path) -> dict[str, Any]:
     arm_readable: Counter[str] = Counter()
     arm_restored: Counter[str] = Counter()
     event_count = 0
+    no_probe_event_count = 0
     scene_ids: set[str] = set()
     violations: list[list[Any]] = []
     records = []
@@ -41,6 +42,15 @@ def analyze(run_root: Path) -> dict[str, Any]:
                 continue
             event_count += 1
             scene_ids.add(str(event.get("scene_id")))
+            probes = adaptive.get("probes") or []
+            no_probe_ok = bool(
+                not probes
+                and adaptive.get("reason") == "missing_retreat_bearing"
+            )
+            no_probe_event_count += int(no_probe_ok)
+            pose_integrity_ok = bool(
+                adaptive.get("sim_pose_all_restored") is True or no_probe_ok
+            )
             if not (
                 adaptive.get("shadow_only") is True
                 and adaptive.get("decision_applied") is False
@@ -48,7 +58,7 @@ def analyze(run_root: Path) -> dict[str, Any]:
                 and adaptive.get("pixel_translation_allowed") is False
                 and adaptive.get("unknown_is_free") is False
                 and adaptive.get("official_memory_mutated") is False
-                and adaptive.get("sim_pose_all_restored") is True
+                and pose_integrity_ok
                 and not adaptive.get("gt_fields_used")
             ):
                 violations.append([event.get("scene_id"), event.get("episode_id"), event.get("trigger_step")])
@@ -58,10 +68,11 @@ def analyze(run_root: Path) -> dict[str, Any]:
                 "trigger_step": event.get("trigger_step"),
                 "relative_bearing_deg": adaptive.get("relative_bearing_deg"),
                 "any_first_edge_visible": bool(adaptive.get("any_first_edge_visible")),
-                "probe_count": len(adaptive.get("probes") or []),
+                "probe_count": len(probes),
+                "no_probe_reason": adaptive.get("reason") if not probes else None,
                 "probes": [],
             }
-            for probe in adaptive.get("probes") or []:
+            for probe in probes:
                 arm_names = list(probe.get("arm_aliases") or [probe.get("arm")])
                 for arm in arm_names:
                     arms[str(arm)] += 1
@@ -91,6 +102,7 @@ def analyze(run_root: Path) -> dict[str, Any]:
         "task": "stage63_adaptive_reobserve",
         "schema_version": "stage63_adaptive_reobserve_v1",
         "event_count": event_count,
+        "no_probe_event_count": no_probe_event_count,
         "scene_count": len(scene_ids),
         "arm_summary": arm_summary,
         "any_view_visible_count": sum(int(row["any_first_edge_visible"]) for row in records),

@@ -217,6 +217,7 @@ case "${PHASE}" in
     python3 scripts/eval/analyze_stage63_adaptive_reobserve.py \
       --run-root "${run_dir}" \
       --output "${result_dir}/stage63_adaptive_reobserve_audit.json"
+    find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
     latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
     test -d "${result_dir}"
     ln -sfn "${result_dir}" "${latest_link}"

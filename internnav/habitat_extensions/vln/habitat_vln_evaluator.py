@@ -2262,7 +2262,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         "pixel_translation_allowed": False,
                         "unknown_is_free": False,
                         "official_memory_mutated": False,
-                        "sim_pose_all_restored": False,
+                        "sim_pose_all_restored": True,
                         "probes": [],
                         "reason": "missing_retreat_bearing",
                         "gt_fields_used": [],

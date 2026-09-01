@@ -1,4 +1,7 @@
+import json
+
 from internnav.utils.stage63_adaptive_reobserve import plan_adaptive_view_sweep
+from scripts.eval.analyze_stage63_adaptive_reobserve import analyze
 
 
 def test_view_sweep_has_budget_entry_center_and_overscan() -> None:
@@ -40,3 +43,58 @@ def test_view_sweep_rejects_invalid_sensor_contract() -> None:
         hfov_deg=0.0,
         turn_angle_deg=15.0,
     ) == []
+
+
+def _write_adaptive_event(tmp_path, adaptive):
+    event_dir = tmp_path / "vlmap_safety_debug" / "rank0_run_001"
+    event_dir.mkdir(parents=True)
+    event = {
+        "scene_id": "scene",
+        "episode_id": 1,
+        "trigger_step": 2,
+        "stage59_productive_onset": {
+            "anchors": [{
+                "anchor": "last_productive_pre_loop",
+                "stage63_adaptive_reobserve": adaptive,
+            }],
+        },
+    }
+    (event_dir / "s2_loop_path_reobserve_active_events.jsonl").write_text(
+        json.dumps(event) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_analyzer_accepts_missing_bearing_noop_from_existing_run(tmp_path) -> None:
+    _write_adaptive_event(tmp_path, {
+        "shadow_only": True,
+        "decision_applied": False,
+        "action_applied": False,
+        "pixel_translation_allowed": False,
+        "unknown_is_free": False,
+        "official_memory_mutated": False,
+        "sim_pose_all_restored": False,
+        "probes": [],
+        "reason": "missing_retreat_bearing",
+        "gt_fields_used": [],
+    })
+    report = analyze(tmp_path)
+    assert report["integrity_passed"] is True
+    assert report["no_probe_event_count"] == 1
+    assert report["records"][0]["no_probe_reason"] == "missing_retreat_bearing"
+
+
+def test_analyzer_rejects_unexplained_no_probe_event(tmp_path) -> None:
+    _write_adaptive_event(tmp_path, {
+        "shadow_only": True,
+        "decision_applied": False,
+        "action_applied": False,
+        "pixel_translation_allowed": False,
+        "unknown_is_free": False,
+        "official_memory_mutated": False,
+        "sim_pose_all_restored": False,
+        "probes": [],
+        "reason": "observation_failed",
+        "gt_fields_used": [],
+    })
+    assert analyze(tmp_path)["integrity_passed"] is False
