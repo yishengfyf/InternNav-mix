@@ -86,6 +86,7 @@ from internnav.utils.stage58_geometry_contract import (
 )
 from internnav.utils.stage58_support_policy import audit_support_policy_sweep
 from internnav.utils.stage59_productive_onset import audit_productive_onset_anchors
+from internnav.utils.stage63_adaptive_reobserve import plan_adaptive_view_sweep
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -435,6 +436,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             vlmap_safety_cfg.get(
                 "stage59_post_turn_counterfactual_enable", False
             )
+        )
+        self._stage63_adaptive_reobserve_enabled = bool(
+            vlmap_safety_cfg.get("stage63_adaptive_reobserve_enable", False)
+        )
+        self._stage63_adaptive_reobserve_budgets = tuple(
+            int(value)
+            for value in vlmap_safety_cfg.get(
+                "stage63_adaptive_reobserve_primitive_budgets", (1, 2, 4)
+            )
+        )
+        self._stage63_adaptive_reobserve_max_turn_steps = max(
+            1,
+            int(
+                vlmap_safety_cfg.get(
+                    "stage63_adaptive_reobserve_max_turn_steps", 12
+                )
+            ),
         )
         self._stage56_floor_frame_consensus_audit_enabled = bool(
             vlmap_safety_cfg.get(
@@ -2023,6 +2041,124 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "map_cell_size_m": float(getattr(self.occ_memory, "cs", 0.05)),
         }
 
+    def _stage63_adaptive_view_sweep(
+        self,
+        event: dict,
+        *,
+        candidate: dict,
+        relative_bearing_deg: float,
+        observations: Optional[dict],
+    ) -> dict:
+        """Audit several cumulative turn views without changing online state."""
+        report = {
+            "schema_version": "stage63_adaptive_reobserve_v1",
+            "enabled": True,
+            "shadow_only": True,
+            "decision_applied": False,
+            "action_applied": False,
+            "pixel_translation_allowed": False,
+            "unknown_is_free": False,
+            "official_memory_mutated": False,
+            "sim_pose_all_restored": True,
+            "relative_bearing_deg": float(relative_bearing_deg),
+            "probes": [],
+            "any_first_edge_visible": False,
+            "gt_fields_used": [],
+        }
+        if observations is None:
+            report["reason"] = "missing_current_observation"
+            return report
+        plans = plan_adaptive_view_sweep(
+            float(relative_bearing_deg),
+            hfov_deg=float(self.sim_sensors_config.depth_sensor.hfov),
+            turn_angle_deg=float(
+                getattr(self.config.habitat.simulator, "turn_angle", 15.0)
+            ),
+            primitive_budgets=self._stage63_adaptive_reobserve_budgets,
+            center_margin_deg=10.0,
+            max_turn_steps=self._stage63_adaptive_reobserve_max_turn_steps,
+            overscan_steps=1,
+        )
+        if not plans:
+            report["reason"] = "no_valid_view_plans"
+            return report
+
+        official_before = self._stage43_memory_fingerprint(self.occ_memory)
+        for plan in plans:
+            counterfactual = self._stage43_counterfactual_observation(
+                observations,
+                relative_bearing_deg=float(relative_bearing_deg),
+                plan=plan,
+            )
+            probe = {
+                "arm": plan.get("arm"),
+                "arm_aliases": list(plan.get("arm_aliases") or []),
+                "plan": plan,
+                "observation_readable": bool(
+                    counterfactual.get("observation_readable")
+                ),
+                "sim_pose_restored": bool(
+                    counterfactual.get("sim_pose_restored")
+                ),
+                "selected_yaw_delta_deg": counterfactual.get(
+                    "selected_yaw_delta_deg"
+                ),
+                "observed_compass_delta_deg": counterfactual.get(
+                    "observed_compass_delta_deg"
+                ),
+                "post_relative_bearing_deg": counterfactual.get(
+                    "post_relative_bearing_deg"
+                ),
+                "reason": counterfactual.get("reason"),
+                "first_edge_visible_projection": False,
+                "action_applied": False,
+                "shadow_only": True,
+                "unknown_is_free": False,
+                "gt_fields_used": [],
+            }
+            if (
+                counterfactual.get("observation_readable")
+                and counterfactual.get("sim_pose_restored")
+            ):
+                bridge = self._recovery_path_bridge(
+                    {**event, "candidate": candidate},
+                    observations=counterfactual.get("observation"),
+                    depth_m=counterfactual.get("depth_m"),
+                    probe_source="stage43_counterfactual_stage63_adaptive",
+                )
+                progress = (bridge.get("selected_probe") or {}).get(
+                    "path_progress_m"
+                )
+                visible = bool(
+                    bridge.get("valid")
+                    and progress is not None
+                    and float(progress) <= 0.25 + 1e-9
+                )
+                probe.update(
+                    {
+                        "bridge": bridge,
+                        "bridge_reason": bridge.get("reason"),
+                        "selected_path_progress_m": progress,
+                        "first_edge_visible_projection": visible,
+                    }
+                )
+                report["any_first_edge_visible"] = bool(
+                    report["any_first_edge_visible"] or visible
+                )
+            report["sim_pose_all_restored"] = bool(
+                report["sim_pose_all_restored"]
+                and probe["sim_pose_restored"]
+            )
+            report["probes"].append(probe)
+        official_after = self._stage43_memory_fingerprint(self.occ_memory)
+        report["official_memory_mutated"] = official_before != official_after
+        report["reason"] = (
+            "visible_view_found"
+            if report["any_first_edge_visible"]
+            else "no_visible_view_found"
+        )
+        return report
+
     def _stage59_productive_onset_shadow(
         self,
         event: dict,
@@ -2072,16 +2208,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 ),
             )
             candidate_path = list(reversed(path))
+            productive_candidate = {
+                "candidate_id": f"stage59:{anchor.get('anchor')}",
+                "grid": anchor.get("grid"),
+                "path_cells": candidate_path,
+                "path_length_m": anchor.get("route_length_m"),
+                "floor_z_m": anchor.get("z_m", 0.0),
+            }
             bridge = self._recovery_path_bridge(
                 {
                     **event,
-                    "candidate": {
-                        "candidate_id": f"stage59:{anchor.get('anchor')}",
-                        "grid": anchor.get("grid"),
-                        "path_cells": candidate_path,
-                        "path_length_m": anchor.get("route_length_m"),
-                        "floor_z_m": anchor.get("z_m", 0.0),
-                    },
+                    "candidate": productive_candidate,
                 },
                 observations=observations,
                 depth_m=depth_m,
@@ -2113,6 +2250,32 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "offline_primitive_truth": truth,
                 }
             )
+            if self._stage63_adaptive_reobserve_enabled:
+                bearing = bridge.get("initial_direction_angle_deg")
+                if bearing is None:
+                    anchor["stage63_adaptive_reobserve"] = {
+                        "schema_version": "stage63_adaptive_reobserve_v1",
+                        "enabled": True,
+                        "shadow_only": True,
+                        "decision_applied": False,
+                        "action_applied": False,
+                        "pixel_translation_allowed": False,
+                        "unknown_is_free": False,
+                        "official_memory_mutated": False,
+                        "sim_pose_all_restored": False,
+                        "probes": [],
+                        "reason": "missing_retreat_bearing",
+                        "gt_fields_used": [],
+                    }
+                else:
+                    anchor["stage63_adaptive_reobserve"] = (
+                        self._stage63_adaptive_view_sweep(
+                            event,
+                            candidate=productive_candidate,
+                            relative_bearing_deg=float(bearing),
+                            observations=observations,
+                        )
+                    )
             if self._stage59_post_turn_counterfactual_enabled:
                 bearing = bridge.get("initial_direction_angle_deg")
                 post_turn = {
@@ -2171,11 +2334,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             {
                                 **event,
                                 "candidate": {
+                                    **productive_candidate,
                                     "candidate_id": f"stage60:{anchor.get('anchor')}",
-                                    "grid": anchor.get("grid"),
-                                    "path_cells": candidate_path,
-                                    "path_length_m": anchor.get("route_length_m"),
-                                    "floor_z_m": anchor.get("z_m", 0.0),
                                 },
                             },
                             observations=counterfactual.get("observation"),

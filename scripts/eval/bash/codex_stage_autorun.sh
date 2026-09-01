@@ -12,7 +12,7 @@ fi
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
-PHASE="stage60_post_turn_productive_targeted36"
+PHASE="stage63_adaptive_reobserve_targeted36"
 TAG="${PHASE}_$(date +%Y%m%d_%H%M%S)"
 
 source /home/yifeifeng/miniconda3/etc/profile.d/conda.sh
@@ -199,6 +199,24 @@ case "${PHASE}" in
     export STAGE59_RETURN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results
     bash scripts/eval/bash/stage59_productive_onset96.sh
     result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage59_productive_onset_return_${TAG}"
+    latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
+    test -d "${result_dir}"
+    ln -sfn "${result_dir}" "${latest_link}"
+    echo "CODEX_LATEST_RETURN=${latest_link}"
+    ;;
+  stage63_adaptive_reobserve_targeted36)
+    export STAGE21C_SCORER_CHECKPOINT=/data/usr_data/yifeifeng/internnav/stage_results/shared_checkpoints/stage21b_seed_53/best.pt
+    export STAGE59_MANIFEST=/home/yifeifeng/workspace/InternNav/scripts/eval/manifests/stage60_productive_d0_targeted36_episode_seed_replay.json
+    export STAGE59_CONFIG=scripts/eval/configs/habitat_dual_system_vlmap_stage63_adaptive_reobserve_cfg.py
+    export STAGE59_PIPELINE_TAG="${TAG}"
+    export STAGE59_RUN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results/runs
+    export STAGE59_RETURN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results
+    bash scripts/eval/bash/stage59_productive_onset96.sh
+    result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage59_productive_onset_return_${TAG}"
+    run_dir="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_${TAG}"
+    python3 scripts/eval/analyze_stage63_adaptive_reobserve.py \
+      --run-root "${run_dir}" \
+      --output "${result_dir}/stage63_adaptive_reobserve_audit.json"
     latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
     test -d "${result_dir}"
     ln -sfn "${result_dir}" "${latest_link}"
