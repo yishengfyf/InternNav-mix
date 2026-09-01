@@ -12405,7 +12405,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             and not stage65_recovery_active
                         ):
                             native_context = self._build_s2_recovery_context(
-                                s2_loop_event,
+                                {
+                                    **s2_loop_event,
+                                    "stage59_productive_onset": path_reobserve_event.get(
+                                        "stage59_productive_onset"
+                                    ),
+                                },
                                 frame_records=rgb_frame_records,
                                 current_image=image,
                             )

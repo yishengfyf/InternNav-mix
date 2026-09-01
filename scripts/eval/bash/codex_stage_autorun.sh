@@ -261,6 +261,10 @@ case "${PHASE}" in
       --manifest "${STAGE59_MANIFEST}" \
       --output "${result_dir}/stage59_productive_onset_audit.json" \
       --require-all
+    python3 scripts/eval/analyze_stage65_native_recovery.py \
+      --run-root "${run_dir}" \
+      --expected-episodes 4 \
+      --output "${result_dir}/stage65_native_recovery_audit.json"
     find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
     latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
     test -d "${result_dir}"
