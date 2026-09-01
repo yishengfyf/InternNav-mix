@@ -12882,6 +12882,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 ),
                             },
                         )
+                        if (
+                            stage65_recovery_active
+                            and pending_s2_recovery_context
+                            and pending_s2_recovery_context.get("stage65_native")
+                            and (
+                                occ_waypoint_decision.get("goal_state") != "free"
+                                or not vlmap_waypoint_decision.get("valid")
+                                or vlmap_waypoint_decision.get("waypoint_recovery_required")
+                                or vlmap_waypoint_decision.get("requery_required")
+                            )
+                        ):
+                            pixel_goal = None
+                            output_ids = None
+                            traj_latents = None
+                            pix_goal_image = None
+                            pix_goal_depth = None
+                            local_actions = []
+                            pending_s2_recovery_context = None
+                            stage65_recovery_active = False
+                            messages = []
+                            input_images = []
+                            llm_outputs = ""
+                            continue
                         if occ_waypoint_decision.get("valid"):
                             stage15_repair_consecutive_count = int(
                                 occ_waypoint_decision.get(
