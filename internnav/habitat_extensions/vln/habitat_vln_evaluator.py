@@ -12899,8 +12899,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         )
                         if (
                             stage65_recovery_active
-                            and pending_s2_recovery_context
-                            and pending_s2_recovery_context.get("stage65_native")
                             and (
                                 not native_pixel_execution_enabled
                                 or
