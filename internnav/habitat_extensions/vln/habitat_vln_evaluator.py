@@ -854,6 +854,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 1,
                 int(vlmap_safety_cfg.get("stage65_native_recovery_max_queries", 5)),
             ),
+            "stage73_continuous_recovery_enable": bool(
+                vlmap_safety_cfg.get("stage73_continuous_recovery_enable", False)
+            ),
             "recovery_context_max_images": int(
                 vlmap_safety_cfg.get("s2_recovery_context_max_images", 3)
             ),
@@ -11503,6 +11506,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             pending_occ_memory_guidance_hint = ""
             pending_s2_recovery_context = None
             stage65_recovery_active = False
+            stage73_continuous_recovery_enable = bool(
+                self._get_s2_action_loop_cfg().get(
+                    "stage73_continuous_recovery_enable", False
+                )
+            )
             s2_recovery_context_set_count = 0
             s2_recovery_context_injected_count = 0
             s2_recovery_context_counterfactual_count = 0
@@ -15256,8 +15264,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     pix_goal_image = None
                     pix_goal_depth = None
                     local_actions = []
-                    pending_s2_recovery_context = None
-                    stage65_recovery_active = False
+                    if not (
+                        stage73_continuous_recovery_enable
+                        and permissive_s2_ablation_enabled
+                    ):
+                        pending_s2_recovery_context = None
+                        stage65_recovery_active = False
 
                 if (
                     pending_s2_loop_path_reobserve is not None
