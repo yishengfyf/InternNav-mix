@@ -46,7 +46,21 @@ class InternVLAN1Agent(Agent):
         self.camera_intrinsic = self.get_intrinsic_matrix(
             self._model_settings.width, self._model_settings.height, self._model_settings.hfov
         )
-        self.vlmap_safety = VLMapActionSafety(vln_sensor_config.get("vlmap_safety", {}), self.camera_intrinsic)
+        raw_vlmap_cfg = dict(vln_sensor_config.get("vlmap_safety", {}) or {})
+        # The agent-level async path follows the same explicit legacy boundary
+        # as the Habitat evaluator.  An inherited ``enable`` flag alone must
+        # never activate the old VLMaps action override.
+        self._legacy_vlmaps_enabled = bool(
+            raw_vlmap_cfg.get("legacy_vlmaps_experiment", False)
+            and raw_vlmap_cfg.get("legacy_vlmaps_enable", False)
+        )
+        vlmap_cfg = dict(raw_vlmap_cfg)
+        vlmap_cfg["enable"] = self._legacy_vlmaps_enabled
+        if "legacy_vlmaps_repo" in vlmap_cfg:
+            vlmap_cfg["vlmaps_repo"] = vlmap_cfg["legacy_vlmaps_repo"]
+        if not self._legacy_vlmaps_enabled:
+            vlmap_cfg["action_safety_enable"] = False
+        self.vlmap_safety = VLMapActionSafety(vlmap_cfg, self.camera_intrinsic)
 
         self.episode_step = 0
         self.episode_idx = 0
@@ -113,7 +127,8 @@ class InternVLAN1Agent(Agent):
         # Reset s2 agent
         with self.s2_agent_lock:
             self.policy.reset()
-        self.vlmap_safety.reset()
+        if self._legacy_vlmaps_enabled:
+            self.vlmap_safety.reset()
 
         if self.vis_debug:
             self.fps_writer = imageio.get_writer(f"{self.debug_path}/fps_{self.episode_idx}.mp4", fps=5)
@@ -375,7 +390,10 @@ class InternVLAN1Agent(Agent):
         print('Output discretized traj:', output['action'], self.dual_forward_step)
 
         if 'action' in output:
-            safe_action, changed = self.vlmap_safety.postprocess(obs, output['action'][0])
+            if self._legacy_vlmaps_enabled:
+                safe_action, changed = self.vlmap_safety.postprocess(obs, output['action'][0])
+            else:
+                safe_action, changed = output['action'][0], False
             if changed:
                 output['action'] = [safe_action]
                 with self.s2_output_lock:

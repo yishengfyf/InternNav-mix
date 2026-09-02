@@ -36,7 +36,9 @@ eval_cfg = EvalCfg(
             'vis_debug_path': './logs/test_n1/vis_debug',
             'vlmap_safety': {
                 'enable': False,
-                'vlmaps_repo': '../vlmaps',
+                'legacy_vlmaps_repo': '../vlmaps',
+                'legacy_vlmaps_experiment': False,
+                'legacy_vlmaps_enable': False,
                 'grid_size': 1000,
                 'cell_size': 0.05,
                 'camera_height': 1.5,

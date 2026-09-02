@@ -18,8 +18,22 @@ eval_cfg = EvalCfg(
             "eval_episode_seed_mode": "episode_index",
             "s2_prompt_conjunction_index": None,
             "vlmap_safety": {
-                "enable": True,
-                "vlmaps_repo": "/home/yifeifeng/workspace/vlmaps",
+                # Mainline recovery uses SparseOcc + LSeg diagnostics.  The
+                # old VLMaps obstacle/waypoint stack is opt-in for historical
+                # replay only and must never be enabled by inheritance.
+                "mainline": {
+                    "sparse_occ_enable": True,
+                    "lseg_attachment_enable": False,
+                    "legacy_vlmaps_enable": False,
+                    "legacy_vlmaps_waypoint_enable": False,
+                    "legacy_vlmaps_semantic_enable": False,
+                },
+                "legacy_vlmaps_experiment": False,
+                "legacy_vlmaps_enable": False,
+                "legacy_vlmaps_waypoint_enable": False,
+                "legacy_vlmaps_semantic_enable": False,
+                "enable": False,
+                "legacy_vlmaps_repo": "/home/yifeifeng/workspace/vlmaps",
                 "grid_size": 1000,
                 "cell_size": 0.05,
                 "depth_scale": 1.0,
@@ -62,7 +76,7 @@ eval_cfg = EvalCfg(
                 "max_safety_changes_per_episode": 18,
                 "replan_on_budget_exhaustion": True,
                 "max_budget_replans_per_episode": 2,
-                "action_safety_enable": True,
+                "action_safety_enable": False,
                 "waypoint_check_enable": False,
                 "waypoint_shadow_only": True,
                 "waypoint_requery_enable": False,

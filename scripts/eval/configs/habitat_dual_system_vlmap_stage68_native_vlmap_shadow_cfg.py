@@ -13,9 +13,16 @@ _spec.loader.exec_module(_module)
 eval_cfg = copy.deepcopy(_module.eval_cfg)
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
 
-# Exercise the existing VLMap waypoint projection as an advisory shadow.  The
-# native recovery gate still requires SparseOcc goal_state=free, complete
-# trajectory validation, footprint/headroom checks and no active intervention.
+# Explicit legacy opt-in: this configuration reproduces the historical
+# VLMaps waypoint shadow and is not part of the mainline recovery pipeline.
+vlmap_cfg["legacy_vlmaps_experiment"] = True
+vlmap_cfg["legacy_vlmaps_enable"] = True
+vlmap_cfg["legacy_vlmaps_waypoint_enable"] = True
+
+# Exercise the existing legacy VLMap waypoint projection as an advisory shadow.
+# The native recovery gate itself is independent of the VLMap valid bit and
+# still requires SparseOcc goal_state=free, trajectory validation,
+# footprint/headroom checks and no active intervention.
 vlmap_cfg["waypoint_check_enable"] = True
 vlmap_cfg["waypoint_shadow_only"] = True
 vlmap_cfg["waypoint_requery_enable"] = False

@@ -19,7 +19,14 @@ _spec.loader.exec_module(_module)
 eval_cfg = copy.deepcopy(_module.eval_cfg)
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
 
-# Strict safety remains authoritative; these are diagnostics only.
+# This is a historical VLMaps trajectory audit, intentionally outside the
+# mainline recovery stack.
+vlmap_cfg["legacy_vlmaps_experiment"] = True
+vlmap_cfg["legacy_vlmaps_enable"] = True
+
+# Strict safety remains authoritative; these are diagnostics only.  The
+# explicit legacy opt-in above is required solely to run this historical
+# trajectory validator and does not redefine the mainline safety authority.
 vlmap_cfg["traj_validation_enable"] = True
 vlmap_cfg["traj_validation_shadow_only"] = True
 vlmap_cfg["nextdit_candidate_probe_enable"] = True

@@ -14,6 +14,8 @@ def _load_base_cfg():
 eval_cfg = copy.deepcopy(_load_base_cfg())
 
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
+vlmap_cfg["legacy_vlmaps_experiment"] = True
+vlmap_cfg["legacy_vlmaps_enable"] = True
 vlmap_cfg["enable"] = True
 vlmap_cfg["action_safety_enable"] = False
 vlmap_cfg["waypoint_check_enable"] = True

@@ -45,7 +45,13 @@ class VLMapActionSafety:
 
     def __init__(self, config: Dict[str, Any], camera_intrinsic: np.ndarray):
         self.config = dict(config)
-        self.enabled = bool(self.config.get("enable", False))
+        self.legacy_vlmaps_enabled = bool(
+            self.config.get("legacy_vlmaps_experiment", False)
+            and self.config.get("legacy_vlmaps_enable", False)
+        )
+        # Hard boundary at the utility itself: callers cannot accidentally
+        # activate VLMaps by passing only the historical ``enable`` flag.
+        self.enabled = bool(self.config.get("enable", False) and self.legacy_vlmaps_enabled)
         self.verbose = bool(self.config.get("verbose", True))
         self.strict = bool(self.config.get("strict_import", False))
         self.forward_action = int(self.config.get("forward_action", 1))
@@ -1054,7 +1060,11 @@ class VLMapActionSafety:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     def _init_builder(self, camera_intrinsic: np.ndarray) -> None:
-        repo_path = self.config.get("vlmaps_repo") or self.config.get("vlmaps_root")
+        repo_path = (
+            self.config.get("legacy_vlmaps_repo")
+            or self.config.get("vlmaps_repo")
+            or self.config.get("vlmaps_root")
+        )
         if repo_path:
             repo_path = os.path.abspath(os.path.expanduser(str(repo_path)))
             if repo_path not in sys.path:

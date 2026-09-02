@@ -14,6 +14,8 @@ def _load_baseline_epseed_cfg():
 eval_cfg = copy.deepcopy(_load_baseline_epseed_cfg())
 
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
+vlmap_cfg["legacy_vlmaps_experiment"] = True
+vlmap_cfg["legacy_vlmaps_enable"] = True
 
 # V8a: shadow-only construction validation for OccMem-VLN.
 # This run keeps InternNav behavior unchanged and logs sparse 3D occupancy

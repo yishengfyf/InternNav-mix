@@ -17,6 +17,8 @@ eval_cfg.agent.model_settings["eval_random_seed"] = 0
 eval_cfg.agent.model_settings["s2_prompt_conjunction_index"] = 0
 
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
+vlmap_cfg["legacy_vlmaps_experiment"] = True
+vlmap_cfg["legacy_vlmaps_enable"] = True
 vlmap_cfg["enable"] = True
 vlmap_cfg["action_safety_enable"] = False
 vlmap_cfg["waypoint_check_enable"] = True

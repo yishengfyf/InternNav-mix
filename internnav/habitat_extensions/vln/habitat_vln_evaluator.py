@@ -293,17 +293,38 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._camera_fov = camera_fov_rad
         self._fx = self._fy = self.sim_sensors_config.depth_sensor.width / (2 * np.tan(camera_fov_rad / 2))
         vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
-        vlmap_safety_cfg.setdefault("camera_height", float(self._camera_height))
-        vlmap_safety_cfg.setdefault("depth_scale", 1.0)
+        # VLMaps is a legacy audit dependency.  It must be explicitly opted in
+        # by a named historical experiment; inherited ``enable`` values alone
+        # are not sufficient to initialize the builder or affect actions.
+        legacy_vlmaps_enabled = bool(
+            vlmap_safety_cfg.get("legacy_vlmaps_experiment", False)
+            and vlmap_safety_cfg.get("legacy_vlmaps_enable", False)
+        )
+        self._legacy_vlmaps_enabled = legacy_vlmaps_enabled
+        vlmap_runtime_cfg = dict(vlmap_safety_cfg)
+        vlmap_runtime_cfg["enable"] = legacy_vlmaps_enabled
+        if "legacy_vlmaps_repo" in vlmap_runtime_cfg:
+            vlmap_runtime_cfg["vlmaps_repo"] = vlmap_runtime_cfg[
+                "legacy_vlmaps_repo"
+            ]
+        if not legacy_vlmaps_enabled:
+            vlmap_runtime_cfg["action_safety_enable"] = False
+            vlmap_runtime_cfg["waypoint_check_enable"] = False
+            vlmap_runtime_cfg["waypoint_requery_enable"] = False
+            vlmap_runtime_cfg["waypoint_recovery_enable"] = False
+            vlmap_runtime_cfg["traj_validation_enable"] = False
+            vlmap_runtime_cfg["semantic_match_enable"] = False
+        vlmap_runtime_cfg.setdefault("camera_height", float(self._camera_height))
+        vlmap_runtime_cfg.setdefault("depth_scale", 1.0)
         habitat_forward_step = float(getattr(self.config.habitat.simulator, "forward_step_size", 0.25))
         habitat_turn_angle = float(getattr(self.config.habitat.simulator, "turn_angle", 15.0))
-        vlmap_safety_cfg["habitat_forward_step_size"] = habitat_forward_step
-        vlmap_safety_cfg["habitat_turn_angle_deg"] = habitat_turn_angle
-        if bool(vlmap_safety_cfg.get("sync_habitat_action_scale", True)):
-            vlmap_safety_cfg["forward_distance"] = habitat_forward_step
-            vlmap_safety_cfg["turn_angle_deg"] = habitat_turn_angle
+        vlmap_runtime_cfg["habitat_forward_step_size"] = habitat_forward_step
+        vlmap_runtime_cfg["habitat_turn_angle_deg"] = habitat_turn_angle
+        if bool(vlmap_runtime_cfg.get("sync_habitat_action_scale", True)):
+            vlmap_runtime_cfg["forward_distance"] = habitat_forward_step
+            vlmap_runtime_cfg["turn_angle_deg"] = habitat_turn_angle
         self.vlmap_safety = VLMapActionSafety(
-            vlmap_safety_cfg,
+            vlmap_runtime_cfg,
             get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
         )
         self._vlmap_last_nav_action = None
@@ -311,8 +332,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._vlmap_log_stderr = None
         self._vlmap_run_dir = None
         self._setup_vlmap_run_logging()
-        self.vlmap_semantic = VLMapSemanticShadow(vlmap_safety_cfg)
-        self.vlmap_semantic.set_debug_dir(self._get_vlmap_run_dir())
+        self.vlmap_semantic = None
+        if bool(
+            vlmap_safety_cfg.get("legacy_vlmaps_experiment", False)
+            and vlmap_safety_cfg.get("legacy_vlmaps_semantic_enable", False)
+        ):
+            self.vlmap_semantic = VLMapSemanticShadow(vlmap_runtime_cfg)
+            self.vlmap_semantic.set_debug_dir(self._get_vlmap_run_dir())
         self.occ_memory = SparseOccSemanticMemory(
             vlmap_safety_cfg,
             get_intrinsic_matrix(self.sim_sensors_config.depth_sensor),
@@ -6504,7 +6530,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         episode_count: Optional[int] = None,
         pixel_goal=None,
     ):
-        if not hasattr(self, "vlmap_safety"):
+        if not getattr(self, "_legacy_vlmaps_enabled", False):
             return action, False, {}
         safety_obs = {
             "depth": depth_m,
@@ -6557,7 +6583,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         episode_count: Optional[int] = None,
         camera_pitch_deg: float = 0.0,
     ) -> dict:
-        if not hasattr(self, "vlmap_safety"):
+        if not getattr(self, "_legacy_vlmaps_enabled", False):
             return {}
         evaluate = getattr(self.vlmap_safety, "evaluate_pixel_goal", None)
         if evaluate is None:
@@ -6634,9 +6660,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         episode_index: Optional[int] = None,
         episode_count: Optional[int] = None,
         pixel_goal=None,
+        recovery_active: bool = False,
     ):
-        if not hasattr(self, "vlmap_safety"):
-            return False, {}
+        if not getattr(self, "_legacy_vlmaps_enabled", False):
+            if not recovery_active:
+                return False, {}
+            # Do not silently treat the absence of the legacy validator as a
+            # pass during recovery.  The mainline SparseOcc trajectory
+            # preflight is a separate contract and must be wired explicitly.
+            return False, {
+                "enabled": False,
+                "valid": False,
+                "safe": False,
+                "would_reject": True,
+                "reject_required": True,
+                "reason": "legacy_vlmaps_disabled_mainline_preflight_required",
+                "shadow_only": True,
+            }
         validate = getattr(self.vlmap_safety, "validate_trajectory", None)
         if validate is None:
             return False, {}
@@ -6686,7 +6726,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         episode_count: Optional[int] = None,
         observation_source: str = "current",
     ) -> dict:
-        if not hasattr(self, "vlmap_semantic"):
+        if not getattr(self, "_legacy_vlmaps_enabled", False) or self.vlmap_semantic is None:
             return {}
         context = {
             "step_id": step_id,
@@ -10647,6 +10687,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         pixel_goal,
         current_occ_memory_score: Optional[dict] = None,
     ) -> dict:
+        if not getattr(self, "_legacy_vlmaps_enabled", False):
+            return {
+                "enabled": False,
+                "valid": False,
+                "reason": "legacy_vlmaps_disabled_mainline_preflight_required",
+                "shadow_only": True,
+            }
         cfg = self._get_nextdit_candidate_probe_cfg()
         if not (cfg["enable"] or cfg["active_enable"]) or dp_actions is None:
             return {}
@@ -11277,13 +11324,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             print("episode start", episode_instruction)
             self.vlmap_safety.reset()
             self._vlmap_last_nav_action = None
-            self.vlmap_semantic.reset_episode(
-                instruction=episode_instruction,
-                scene_id=scene_id,
-                episode_id=episode_id,
-                episode_index=episode_index,
-                episode_count=episode_count,
-            )
+            if self.vlmap_semantic is not None:
+                self.vlmap_semantic.reset_episode(
+                    instruction=episode_instruction,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    episode_index=episode_index,
+                    episode_count=episode_count,
+                )
             self.occ_memory.reset_episode(
                 instruction=episode_instruction,
                 scene_id=scene_id,
@@ -12903,9 +12951,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 not native_pixel_execution_enabled
                                 or
                                 occ_waypoint_decision.get("goal_state") != "free"
-                                or not vlmap_waypoint_decision.get("valid")
-                                or vlmap_waypoint_decision.get("waypoint_recovery_required")
-                                or vlmap_waypoint_decision.get("requery_required")
                             )
                         ):
                             pixel_goal = None
@@ -14508,6 +14553,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_index=episode_index,
                             episode_count=episode_count,
                             pixel_goal=pixel_goal,
+                            recovery_active=bool(stage65_recovery_active),
                         )
                         if pending_s2_loop_strict_active_execution is not None:
                             first_action = local_actions[0] if local_actions else None
@@ -14890,6 +14936,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_index=episode_index,
                             episode_count=episode_count,
                             pixel_goal=pixel_goal,
+                            recovery_active=bool(stage65_recovery_active),
                         )
                         nextdit_probe_cfg = self._get_nextdit_candidate_probe_cfg()
                         nextdit_query_index = (
@@ -15358,7 +15405,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             online_lseg_summary = self.online_lseg_shadow.finish_episode(
                 metrics=metrics, steps=step_id, occ_memory=self.occ_memory
             )
-            semantic_summary = self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
+            semantic_summary = (
+                self.vlmap_semantic.finish_episode(metrics=metrics, steps=step_id)
+                if self.vlmap_semantic is not None
+                else {"enabled": False, "disabled_reason": "legacy_vlmaps_disabled"}
+            )
             occ_memory_summary = self.occ_memory.finish_episode(metrics=metrics, steps=step_id)
             replay_summary = self.replay_ledger.finish_episode(
                 success=metrics.get("success"),

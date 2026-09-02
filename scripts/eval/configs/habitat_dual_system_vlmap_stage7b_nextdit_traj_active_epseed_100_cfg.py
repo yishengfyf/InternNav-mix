@@ -14,6 +14,8 @@ def _load_baseline_epseed_cfg():
 eval_cfg = copy.deepcopy(_load_baseline_epseed_cfg())
 
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
+vlmap_cfg["legacy_vlmaps_experiment"] = True
+vlmap_cfg["legacy_vlmaps_enable"] = True
 
 # V7b-small: conservative active reranking over NextDiT raw trajectory samples.
 # The original averaged trajectory is still used unless VLMap trajectory rollout

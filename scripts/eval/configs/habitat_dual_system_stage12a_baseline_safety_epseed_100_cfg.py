@@ -17,6 +17,8 @@ def _load_baseline_epseed_cfg():
 eval_cfg = copy.deepcopy(_load_baseline_epseed_cfg())
 
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
+vlmap_cfg["legacy_vlmaps_experiment"] = True
+vlmap_cfg["legacy_vlmaps_enable"] = True
 
 # Stage12a baseline safety logging. This keeps InternNav behavior unchanged and
 # only records collision/CF metrics plus OccMem shadow waypoint safety probes.

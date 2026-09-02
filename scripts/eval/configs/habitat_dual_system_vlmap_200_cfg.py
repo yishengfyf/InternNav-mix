@@ -13,7 +13,10 @@ def _load_base_cfg():
 
 eval_cfg = copy.deepcopy(_load_base_cfg())
 
-eval_cfg.agent.model_settings["vlmap_safety"]["enable"] = True
+vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
+vlmap_cfg["legacy_vlmaps_experiment"] = True
+vlmap_cfg["legacy_vlmaps_enable"] = True
+vlmap_cfg["enable"] = True
 eval_cfg.agent.model_settings["vlmap_safety"]["debug_dir"] = (
     "./logs/habitat/compare_vlmap_200_softguard/vlmap_safety_debug"
 )

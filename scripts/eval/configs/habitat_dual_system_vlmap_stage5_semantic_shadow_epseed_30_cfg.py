@@ -14,6 +14,9 @@ def _load_baseline_cfg():
 eval_cfg = copy.deepcopy(_load_baseline_cfg())
 
 vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
+vlmap_cfg["legacy_vlmaps_experiment"] = True
+vlmap_cfg["legacy_vlmaps_enable"] = True
+vlmap_cfg["legacy_vlmaps_semantic_enable"] = True
 
 # V5a is semantic shadow only. Keep all geometry/action interventions disabled
 # so behavior remains identical to the fixed-prompt epseed baseline.
