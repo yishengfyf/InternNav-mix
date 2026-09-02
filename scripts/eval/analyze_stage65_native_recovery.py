@@ -10,7 +10,13 @@ def rows(root: Path, name: str):
     # directories) while lightweight latest returns may flatten it.  Search
     # recursively so a missing top-level match cannot masquerade as zero S2
     # queries/actions.
-    patterns = [str(root / "**" / name), str(root / name)]
+    # Ledger files live below rank/episode directories, e.g.
+    # ``replay_ledger/<scene_episode_rank>/queries.jsonl``.  The previous
+    # ``**/replay_ledger/queries.jsonl`` pattern skipped that component and
+    # silently reported zero queries/actions.  Match by basename while still
+    # accepting flattened lightweight returns.
+    patterns = [str(root / "**" / "replay_ledger" / "*" / Path(name).name),
+                str(root / "**" / Path(name).name), str(root / name)]
     seen = set()
     for pattern in patterns:
       for path in glob.glob(pattern, recursive=True):
@@ -24,11 +30,15 @@ def rows(root: Path, name: str):
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--run-root",type=Path,required=True); ap.add_argument("--output",type=Path,required=True); ap.add_argument("--expected-episodes",type=int,required=True); a=ap.parse_args()
     root=a.run_root
-    progress_path = root / "progress.json"
-    if not progress_path.is_file():
+    # Prefer the run-level progress ledger.  Visual bundles also contain one
+    # progress file per rank (often only two records); selecting the first
+    # rank file understated completion for multi-rank returns.
+    progress_candidates = [root / "progress.json", root / "run" / "progress.json"]
+    progress_path = next((p for p in progress_candidates if p.is_file()), None)
+    if progress_path is None:
         candidates = sorted(root.glob("**/progress.json"))
-        progress_path = candidates[0] if candidates else progress_path
-    progress=[json.loads(x) for x in progress_path.read_text().splitlines() if x.strip()] if progress_path.is_file() else []
+        progress_path = candidates[0] if candidates else None
+    progress=[json.loads(x) for x in progress_path.read_text().splitlines() if x.strip()] if progress_path else []
     contexts=rows(root,"s2_recovery_context_events.jsonl")
     queries=rows(root,"replay_ledger/queries.jsonl")
     actions=rows(root,"replay_ledger/actions.jsonl")
@@ -40,7 +50,9 @@ def main():
     for r in native:
         report=r.get("stage59_productive_onset") or {}
         if report: anchors.append(report)
-    recovery_queries=[r for r in queries if r.get("input_steps",{}).get("recovery_context") or r.get("stage65_native")]
+    recovery_queries=[r for r in queries if (r.get("input_steps") or {}).get("recovery_context_active")
+                      or (r.get("input_steps") or {}).get("stage65_native")
+                      or r.get("stage65_native")]
     report={
       "task":"stage65_native_recovery_active",
       "expected_episode_count":a.expected_episodes,
