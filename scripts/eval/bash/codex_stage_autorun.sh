@@ -12,7 +12,7 @@ fi
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
-PHASE="stage76_temporary_instruction_ablation"
+PHASE="stage77_directional_guard_ablation"
 TAG="${PHASE}_$(date +%Y%m%d_%H%M%S)"
 
 source /home/yifeifeng/miniconda3/etc/profile.d/conda.sh
@@ -538,6 +538,33 @@ case "${PHASE}" in
     cp -a "${base_return}/." "${result_dir}/"
     python3 scripts/eval/analyze_stage59_productive_onset.py --run-root "${run_dir}" --manifest "${STAGE59_MANIFEST}" --output "${result_dir}/stage59_productive_onset_audit.json"
     python3 scripts/eval/analyze_stage65_native_recovery.py --run-root "${run_dir}" --expected-episodes 12 --output "${result_dir}/stage65_native_recovery_audit.json"
+    find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
+    latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
+    test -d "${result_dir}"
+    ln -sfn "${result_dir}" "${latest_link}"
+    echo "CODEX_LATEST_RETURN=${latest_link}"
+    ;;
+  stage77_directional_guard_ablation)
+    export STAGE21C_SCORER_CHECKPOINT=/data/usr_data/yifeifeng/internnav/stage_results/shared_checkpoints/stage21b_seed_53/best.pt
+    export STAGE59_MANIFEST=/home/yifeifeng/workspace/InternNav/scripts/eval/manifests/stage60_productive_d0_targeted36_episode_seed_replay.json
+    export STAGE59_CONFIG=scripts/eval/configs/habitat_dual_system_stage77_directional_guard_ablation_cfg.py
+    export STAGE59_PIPELINE_TAG="${TAG}"
+    export STAGE59_RUN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results/runs
+    export STAGE59_RETURN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results
+    export STAGE59_SKIP_AUDIT_REQUIRE_ALL=1
+    python3 -m pytest -q tests/unit_test/test_stage75_route_prompt.py
+    bash scripts/eval/bash/stage59_productive_onset96.sh
+    base_return="/data/usr_data/yifeifeng/internnav/stage_results/stage59_productive_onset_return_${TAG}"
+    result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage77_directional_guard_ablation_return_${TAG}"
+    run_dir="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_${TAG}"
+    test -d "${base_return}"
+    test ! -e "${result_dir}"
+    mkdir -p "${result_dir}"
+    cp -a "${base_return}/." "${result_dir}/"
+    python3 scripts/eval/analyze_stage59_productive_onset.py --run-root "${run_dir}" --manifest "${STAGE59_MANIFEST}" --output "${result_dir}/stage59_productive_onset_audit.json"
+    python3 scripts/eval/analyze_stage65_native_recovery.py --run-root "${run_dir}" --expected-episodes 36 --output "${result_dir}/stage65_native_recovery_audit.json"
+    # Return action-level videos with this stage so visual review is reproducible.
+    cp -a "${run_dir}/vis_debug" "${result_dir}/vis_debug"
     find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
     latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
     test -d "${result_dir}"

@@ -119,6 +119,24 @@ def test_temporary_instruction_fits_native_task_slot_and_reference_protocol():
     assert "Output STOP when you have reached this temporary destination" in card
 
 
+def test_temporary_instruction_adds_directional_guardrails():
+    ahead = build_dualvln_route_recovery_instruction(
+        route_guidance_from_bridge(
+            {"path_reachable": True, "path_m": 0.5, "initial_direction_angle_deg": 5.0}
+        )
+    )
+    assert "without turning left or right" in ahead
+    assert "Keep the current heading" in ahead
+
+    left = build_dualvln_route_recovery_instruction(
+        route_guidance_from_bridge(
+            {"path_reachable": True, "path_m": 0.5, "initial_direction_angle_deg": 90.0}
+        )
+    )
+    assert "at most one short turn" in left
+    assert "re-observe before turning again" in left
+
+
 def test_arrival_threshold_tolerates_grid_float_roundoff():
     arrived = route_guidance_from_bridge(
         {

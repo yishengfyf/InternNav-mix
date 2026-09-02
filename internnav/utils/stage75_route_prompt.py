@@ -160,7 +160,7 @@ def build_dualvln_route_recovery_instruction(guidance: Dict[str, Any]) -> str:
     bearing = int(guidance.get("quantized_bearing_deg", 0) or 0)
     distance = float(guidance.get("quantized_distance_m", 0.0) or 0.0)
     if direction == "ahead":
-        orientation = "facing the route ahead"
+        orientation = "facing the route ahead without turning left or right"
     elif direction == "behind":
         orientation = "turning around about 180 degrees"
     elif "left" in direction:
@@ -169,10 +169,15 @@ def build_dualvln_route_recovery_instruction(guidance: Dict[str, Any]) -> str:
         orientation = f"turning right about {bearing} degrees"
     else:
         orientation = f"turning toward the route about {bearing} degrees"
-    return (
+    instruction = (
         f"{destination} by first {orientation} and then following the previously "
         f"travelled route for about {distance:.2f} meters"
     )
+    if direction == "ahead":
+        return instruction + ". Keep the current heading; do not turn to search for the reference."
+    if direction in {"left", "right", "behind-left", "behind-right", "behind"}:
+        return instruction + ". Make at most one short turn in this query, then re-observe before turning again."
+    return instruction + ". Make at most one short turn in this query, then re-observe."
 
 
 def build_dualvln_temporary_reference_card() -> str:
