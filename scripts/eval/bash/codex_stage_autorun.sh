@@ -12,7 +12,7 @@ fi
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
-PHASE="stage71_permissive_s2_ablation"
+PHASE="stage72_strict_no_vlmap"
 TAG="${PHASE}_$(date +%Y%m%d_%H%M%S)"
 
 source /home/yifeifeng/miniconda3/etc/profile.d/conda.sh
@@ -428,6 +428,25 @@ case "${PHASE}" in
     export STAGE59_SKIP_AUDIT_REQUIRE_ALL=1
     bash scripts/eval/bash/stage59_productive_onset96.sh
     result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage71_permissive_s2_ablation_return_${TAG}"
+    run_dir="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_${TAG}"
+    python3 scripts/eval/analyze_stage59_productive_onset.py --run-root "${run_dir}" --manifest "${STAGE59_MANIFEST}" --output "${result_dir}/stage59_productive_onset_audit.json"
+    python3 scripts/eval/analyze_stage65_native_recovery.py --run-root "${run_dir}" --expected-episodes 8 --output "${result_dir}/stage65_native_recovery_audit.json"
+    find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
+    latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
+    test -d "${result_dir}"
+    ln -sfn "${result_dir}" "${latest_link}"
+    echo "CODEX_LATEST_RETURN=${latest_link}"
+    ;;
+  stage72_strict_no_vlmap)
+    export STAGE21C_SCORER_CHECKPOINT=/data/usr_data/yifeifeng/internnav/stage_results/shared_checkpoints/stage21b_seed_53/best.pt
+    export STAGE59_MANIFEST=/home/yifeifeng/workspace/InternNav/scripts/eval/manifests/stage66_native_visual_audit8_episode_seed_replay.json
+    export STAGE59_CONFIG=scripts/eval/configs/habitat_dual_system_stage72_strict_no_vlmap_cfg.py
+    export STAGE59_PIPELINE_TAG="${TAG}"
+    export STAGE59_RUN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results/runs
+    export STAGE59_RETURN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results
+    export STAGE59_SKIP_AUDIT_REQUIRE_ALL=1
+    bash scripts/eval/bash/stage59_productive_onset96.sh
+    result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage72_strict_no_vlmap_return_${TAG}"
     run_dir="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_${TAG}"
     python3 scripts/eval/analyze_stage59_productive_onset.py --run-root "${run_dir}" --manifest "${STAGE59_MANIFEST}" --output "${result_dir}/stage59_productive_onset_audit.json"
     python3 scripts/eval/analyze_stage65_native_recovery.py --run-root "${run_dir}" --expected-episodes 8 --output "${result_dir}/stage65_native_recovery_audit.json"
