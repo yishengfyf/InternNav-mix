@@ -12863,6 +12863,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             camera_pitch_deg=waypoint_camera_pitch_deg,
                         )
                         vlmap_safety_cfg = dict(getattr(self.model_args, "vlmap_safety", {}) or {})
+                        native_pixel_execution_enabled = bool(
+                            vlmap_safety_cfg.get("stage65_native_pixel_execution_enable", False)
+                        )
                         depth_h, depth_w = current_depth_m.shape[:2]
                         occ_waypoint_decision = self.occ_memory.evaluate_waypoint(
                             pixel_goal,
@@ -12899,6 +12902,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             and pending_s2_recovery_context
                             and pending_s2_recovery_context.get("stage65_native")
                             and (
+                                not native_pixel_execution_enabled
+                                or
                                 occ_waypoint_decision.get("goal_state") != "free"
                                 or not vlmap_waypoint_decision.get("valid")
                                 or vlmap_waypoint_decision.get("waypoint_recovery_required")

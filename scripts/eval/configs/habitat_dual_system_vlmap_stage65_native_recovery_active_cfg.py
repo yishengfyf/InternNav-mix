@@ -16,6 +16,7 @@ vlmap_cfg = eval_cfg.agent.model_settings["vlmap_safety"]
 vlmap_cfg["s2_action_loop_shadow_only"] = False
 vlmap_cfg["stage65_native_recovery_enable"] = True
 vlmap_cfg["stage65_native_recovery_max_queries"] = 5
+vlmap_cfg["stage65_native_pixel_execution_enable"] = False
 vlmap_cfg["s2_recovery_context_enable"] = True
 vlmap_cfg["s2_recovery_context_shadow_only"] = False
 vlmap_cfg["s2_recovery_context_max_images"] = 1
