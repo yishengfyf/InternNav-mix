@@ -96,6 +96,10 @@ from internnav.utils.stage64_recovery_subtask import (
     plan_recovery_state_reset,
     sanitize_self_authored_instruction,
 )
+from internnav.utils.stage75_route_prompt import (
+    build_dualvln_route_recovery_card,
+    route_guidance_from_bridge,
+)
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -860,6 +864,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "stage74_recovery_prompt_v2_enable": bool(
                 vlmap_safety_cfg.get("stage74_recovery_prompt_v2_enable", False)
             ),
+            "stage75_route_guidance_enable": bool(
+                vlmap_safety_cfg.get("stage75_route_guidance_enable", False)
+            ),
+            "stage75_route_lookahead_m": max(
+                0.05,
+                float(vlmap_safety_cfg.get("stage75_route_lookahead_m", 0.75)),
+            ),
+            "stage75_anchor_arrival_distance_m": max(
+                0.0,
+                float(
+                    vlmap_safety_cfg.get(
+                        "stage75_anchor_arrival_distance_m", 0.15
+                    )
+                ),
+            ),
             "recovery_context_max_images": int(
                 vlmap_safety_cfg.get("s2_recovery_context_max_images", 3)
             ),
@@ -1181,6 +1200,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         candidate_bearing = candidate.get("direction_angle_deg")
         candidate_distance = candidate.get("distance_m")
         if context.get("stage65_native"):
+            if self._get_s2_action_loop_cfg().get("stage75_route_guidance_enable"):
+                return build_dualvln_route_recovery_card(
+                    dict(context.get("stage75_route_guidance") or {})
+                )
             if self._get_s2_action_loop_cfg().get("stage74_recovery_prompt_v2_enable"):
                 return (
                     "Recovery observation for the current navigation task. The original "
@@ -1216,6 +1239,103 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "bearing is an observation target only: it does not assert traversability "
             "and is not a forced left/right command."
         )
+
+    def _refresh_stage75_route_guidance(
+        self,
+        context: dict,
+        *,
+        observations: Optional[dict],
+        depth_m: Optional[np.ndarray],
+        current_query_step: int,
+    ) -> dict:
+        """Recompute a prompt-only route hint from the current SparseOcc pose.
+
+        The selected anchor remains the executed productive-history anchor.
+        The known-free path and egocentric bearing are recomputed for every
+        fresh query; neither the prompt nor this audit mutates SparseOcc.
+        """
+        cfg = self._get_s2_action_loop_cfg()
+        event = {
+            "event_type": "stage75_route_guidance",
+            "event_schema_version": "stage75_route_guidance_v1",
+            "scene_id": context.get("scene_id"),
+            "episode_id": context.get("episode_id"),
+            "trigger_step": context.get("trigger_step"),
+            "current_query_step": int(current_query_step),
+            "anchor_step": context.get("stage65_anchor_step"),
+            "anchor_grid": list(context.get("stage65_anchor_grid") or []),
+            "action_applied": False,
+            "decision_applied": False,
+            "prompt_guidance_only": True,
+            "unknown_is_free": False,
+            "gt_fields_used": [],
+        }
+        if not cfg.get("stage75_route_guidance_enable"):
+            event.update({"valid": False, "arrived": False, "reason": "disabled"})
+        elif observations is None or depth_m is None:
+            event.update(
+                {
+                    "valid": False,
+                    "arrived": False,
+                    "reason": "missing_current_observation_or_depth",
+                }
+            )
+        elif len(event["anchor_grid"]) != 2:
+            event.update(
+                {"valid": False, "arrived": False, "reason": "invalid_anchor_grid"}
+            )
+        else:
+            candidate = {
+                "candidate_id": "stage75:last_productive_pre_loop",
+                "grid": list(event["anchor_grid"]),
+            }
+            bridge = self.occ_memory.plan_recovery_path_bridge(
+                candidate,
+                {
+                    "gps": observations.get("gps"),
+                    "compass": observations.get("compass"),
+                },
+                depth_m,
+                context={
+                    "step_id": int(current_query_step),
+                    "scene_id": context.get("scene_id"),
+                    "episode_id": context.get("episode_id"),
+                    "image_width": int(getattr(self.model_args, "resize_w", 384)),
+                    "image_height": int(getattr(self.model_args, "resize_h", 384)),
+                    "probe_source": "stage75_route_guidance",
+                },
+                # Stage75 only needs the current known-free path.  Do not turn
+                # controller geometry into a programmatic image waypoint.
+                sample_x_ratios=(),
+                sample_y_ratios=(),
+                max_path_cells=int(cfg.get("path_reobserve_max_path_cells", 160)),
+                path_corridor_m=float(
+                    cfg.get("path_reobserve_path_corridor_m", 0.35)
+                ),
+                min_path_progress_m=float(
+                    cfg.get("path_reobserve_min_path_progress_m", 0.25)
+                ),
+                max_local_subgoal_m=float(
+                    cfg.get("path_reobserve_max_local_subgoal_m", 3.0)
+                ),
+                max_initial_heading_error_deg=float(
+                    cfg.get("path_reobserve_max_heading_error_deg", 40.0)
+                ),
+                reorient_lookahead_m=float(cfg["stage75_route_lookahead_m"]),
+            )
+            guidance = route_guidance_from_bridge(
+                bridge,
+                arrival_distance_m=float(
+                    cfg["stage75_anchor_arrival_distance_m"]
+                ),
+            )
+            event.update(guidance)
+            event["bridge_reason"] = bridge.get("reason")
+            event["path_preview"] = list(bridge.get("path_preview") or [])
+        context["current_query_step"] = int(current_query_step)
+        context["stage75_route_guidance"] = dict(event)
+        self._write_s2_recovery_context_event(event)
+        return event
 
     @staticmethod
     def _nearest_recovery_frame_record(frame_records: list, step_id) -> Optional[dict]:
@@ -12138,6 +12258,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     recovery_context = pending_s2_recovery_context
                     recovery_cfg = self._get_s2_action_loop_cfg()
+                    if (
+                        recovery_context
+                        and recovery_context.get("stage65_native")
+                        and recovery_cfg.get("stage75_route_guidance_enable")
+                    ):
+                        route_guidance = self._refresh_stage75_route_guidance(
+                            recovery_context,
+                            observations=observations,
+                            depth_m=current_depth_m,
+                            current_query_step=int(step_id),
+                        )
+                        if route_guidance.get("arrived"):
+                            # The temporary subtask has an explicit map-state
+                            # terminal condition.  Continue this query with the
+                            # untouched original instruction and no anchor card.
+                            pending_s2_recovery_context = None
+                            recovery_context = None
+                            stage65_recovery_active = False
+                            s2_recovery_context_expired_count += 1
                     if recovery_context and not recovery_cfg.get("recovery_context_shadow_only"):
                         sources[0]["value"] += (
                             " "
@@ -12259,16 +12398,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             "current_step": int(step_id),
                             "observation_index": int(replay_observation_index - 1),
                             "recovery_context_active": bool(
-                                pending_s2_recovery_context is not None
+                                recovery_context is not None
                             ),
                             "stage65_native": bool(
-                                pending_s2_recovery_context
-                                and pending_s2_recovery_context.get("stage65_native")
+                                recovery_context
+                                and recovery_context.get("stage65_native")
                             ),
                             "recovery_anchor_step": (
                                 None
-                                if not pending_s2_recovery_context
-                                else pending_s2_recovery_context.get("stage65_anchor_step")
+                                if not recovery_context
+                                else recovery_context.get("stage65_anchor_step")
+                            ),
+                            "stage75_route_guidance": copy.deepcopy(
+                                (recovery_context or {}).get(
+                                    "stage75_route_guidance"
+                                )
                             ),
                         },
                         semantic_state=dict(self.occ_memory.last_semantic_decision or {}),
@@ -14851,8 +14995,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         action_seq = self.parse_actions(llm_outputs)
                         if (
                             stage65_recovery_active
-                            and pending_s2_recovery_context
-                            and pending_s2_recovery_context.get("stage65_native")
+                            and recovery_context
+                            and recovery_context.get("stage65_native")
                         ):
                             if "STOP" in str(llm_outputs or "").upper():
                                 pending_s2_recovery_context = None

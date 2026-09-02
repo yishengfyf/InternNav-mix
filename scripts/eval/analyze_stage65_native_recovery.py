@@ -27,6 +27,16 @@ def rows(root: Path, name: str):
             if line.strip(): out.append(json.loads(line))
     return out
 
+def recovery_output_kind(row):
+    text=str(row.get("output") or "").strip()
+    if row.get("pixel_goal") is not None:
+        return "pixel"
+    if "STOP" in text.upper():
+        return "stop"
+    if text and set(text).issubset(set("←→↓↑ ,.;:!?，。；：！？\t\r\n")):
+        return "observation_action"
+    return "other"
+
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--run-root",type=Path,required=True); ap.add_argument("--output",type=Path,required=True); ap.add_argument("--expected-episodes",type=int,required=True); a=ap.parse_args()
     root=a.run_root
@@ -43,6 +53,7 @@ def main():
     queries=rows(root,"replay_ledger/queries.jsonl")
     actions=rows(root,"replay_ledger/actions.jsonl")
     native=[r for r in contexts if r.get("event_type")=="stage65_native_recovery_set"]
+    route_guidance=[r for r in contexts if r.get("event_type")=="stage75_route_guidance"]
     native_episode_keys = {
         (str(r.get("scene_id")), str(r.get("episode_id"))) for r in native
     }
@@ -53,6 +64,21 @@ def main():
     recovery_queries=[r for r in queries if (r.get("input_steps") or {}).get("recovery_context_active")
                       or (r.get("input_steps") or {}).get("stage65_native")
                       or r.get("stage65_native")]
+    recovery_outputs=[]
+    for row in recovery_queries:
+        input_steps=dict(row.get("input_steps") or {})
+        guidance=dict(input_steps.get("stage75_route_guidance") or {})
+        recovery_outputs.append({
+            "scene_id":row.get("scene_id"),
+            "episode_id":row.get("episode_id"),
+            "step_id":row.get("step_id"),
+            "query_id":row.get("query_id"),
+            "output":row.get("output"),
+            "output_kind":recovery_output_kind(row),
+            "pixel_goal":row.get("pixel_goal"),
+            "recovery_anchor_step":input_steps.get("recovery_anchor_step"),
+            "route_guidance":guidance,
+        })
     report={
       "task":"stage65_native_recovery_active",
       "expected_episode_count":a.expected_episodes,
@@ -62,7 +88,16 @@ def main():
       "native_anchor_steps":[r.get("anchor_step") for r in native],
       "context_event_type_counts":dict(Counter(str(r.get("event_type")) for r in contexts)),
       "query_count":len(queries), "recovery_query_count":len(recovery_queries),
+      "recovery_output_kind_counts":dict(Counter(r["output_kind"] for r in recovery_outputs)),
+      "recovery_outputs":recovery_outputs,
       "action_count":len(actions),
+      "stage75_route_guidance_count":len(route_guidance),
+      "stage75_route_guidance_valid_count":sum(bool(r.get("valid")) for r in route_guidance),
+      "stage75_route_guidance_arrived_count":sum(bool(r.get("arrived")) for r in route_guidance),
+      "stage75_route_guidance_direction_counts":dict(Counter(
+          str(r.get("natural_direction")) for r in route_guidance if r.get("valid") and not r.get("arrived")
+      )),
+      "stage75_route_guidance_events":route_guidance,
       "native_events":native,
       "natural_d0_event_count":len(anchors),
       "natural_d0_scene_count":len({str(r.get("scene_id")) for r in native}),
