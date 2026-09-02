@@ -12914,6 +12914,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         native_pixel_execution_enabled = bool(
                             vlmap_safety_cfg.get("stage65_native_pixel_execution_enable", False)
                         )
+                        permissive_s2_ablation_enabled = bool(
+                            vlmap_safety_cfg.get("stage71_permissive_s2_ablation_enable", False)
+                        ) and bool(stage65_recovery_active)
                         depth_h, depth_w = current_depth_m.shape[:2]
                         occ_waypoint_decision = self.occ_memory.evaluate_waypoint(
                             pixel_goal,
@@ -12949,8 +12952,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             stage65_recovery_active
                             and (
                                 not native_pixel_execution_enabled
-                                or
+                                or (
+                                    not permissive_s2_ablation_enabled
+                                    and
                                 occ_waypoint_decision.get("goal_state") != "free"
+                                )
                             )
                         ):
                             pixel_goal = None
@@ -14539,22 +14545,35 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             )
                         ):
                             local_actions = local_actions[:1]
-                        (
-                            traj_reject_required,
-                            vlmap_traj_decision,
-                        ) = self._validate_local_actions_with_vlmap(
-                            local_actions,
-                            observations,
-                            current_depth_m,
-                            rgb=rgb,
-                            step_id=step_id,
-                            scene_id=scene_id,
-                            episode_id=episode_id,
-                            episode_index=episode_index,
-                            episode_count=episode_count,
-                            pixel_goal=pixel_goal,
-                            recovery_active=bool(stage65_recovery_active),
-                        )
+                        if permissive_s2_ablation_enabled:
+                            traj_reject_required = False
+                            vlmap_traj_decision = {
+                                "enabled": False,
+                                "valid": True,
+                                "safe": None,
+                                "would_reject": False,
+                                "reject_required": False,
+                                "reason": "stage71_permissive_s2_ablation_no_online_audit",
+                                "shadow_only": False,
+                                "ablation_only": True,
+                            }
+                        else:
+                            (
+                                traj_reject_required,
+                                vlmap_traj_decision,
+                            ) = self._validate_local_actions_with_vlmap(
+                                local_actions,
+                                observations,
+                                current_depth_m,
+                                rgb=rgb,
+                                step_id=step_id,
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                episode_index=episode_index,
+                                episode_count=episode_count,
+                                pixel_goal=pixel_goal,
+                                recovery_active=bool(stage65_recovery_active),
+                            )
                         if pending_s2_loop_strict_active_execution is not None:
                             first_action = local_actions[0] if local_actions else None
                             strict_trajectory_pass = bool(
@@ -14922,22 +14941,35 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             local_actions = local_actions[:1]
                         if stage65_recovery_active:
                             local_actions = local_actions[:1]
-                        (
-                            traj_reject_required,
-                            vlmap_traj_decision,
-                        ) = self._validate_local_actions_with_vlmap(
-                            local_actions,
-                            observations,
-                            current_depth_m,
-                            rgb=rgb,
-                            step_id=step_id,
-                            scene_id=scene_id,
-                            episode_id=episode_id,
-                            episode_index=episode_index,
-                            episode_count=episode_count,
-                            pixel_goal=pixel_goal,
-                            recovery_active=bool(stage65_recovery_active),
-                        )
+                        if permissive_s2_ablation_enabled:
+                            traj_reject_required = False
+                            vlmap_traj_decision = {
+                                "enabled": False,
+                                "valid": True,
+                                "safe": None,
+                                "would_reject": False,
+                                "reject_required": False,
+                                "reason": "stage71_permissive_s2_ablation_no_online_audit",
+                                "shadow_only": False,
+                                "ablation_only": True,
+                            }
+                        else:
+                            (
+                                traj_reject_required,
+                                vlmap_traj_decision,
+                            ) = self._validate_local_actions_with_vlmap(
+                                local_actions,
+                                observations,
+                                current_depth_m,
+                                rgb=rgb,
+                                step_id=step_id,
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                episode_index=episode_index,
+                                episode_count=episode_count,
+                                pixel_goal=pixel_goal,
+                                recovery_active=bool(stage65_recovery_active),
+                            )
                         nextdit_probe_cfg = self._get_nextdit_candidate_probe_cfg()
                         nextdit_query_index = (
                             nextdit_candidate_probe_event_count
