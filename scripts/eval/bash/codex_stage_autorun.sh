@@ -12,7 +12,7 @@ fi
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
-PHASE="stage66_native_visual_audit8"
+PHASE="stage66_package_visual_audit8"
 TAG="${PHASE}_$(date +%Y%m%d_%H%M%S)"
 
 source /home/yifeifeng/miniconda3/etc/profile.d/conda.sh
@@ -295,6 +295,36 @@ case "${PHASE}" in
     latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
     test -d "${result_dir}"
     ln -sfn "${result_dir}" "${latest_link}"
+    echo "CODEX_LATEST_RETURN=${latest_link}"
+    ;;
+  stage66_package_visual_audit8)
+    # Package the completed Stage66 run without rerunning Habitat.  Keep the
+    # videos and JSON audit ledgers, but exclude the multi-GB raw RGB/depth
+    # cache; the latter remains on the server for reproducible re-analysis.
+    SOURCE_TAG="stage66_native_visual_audit8_20260902_115447"
+    SOURCE_RUN="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_${SOURCE_TAG}"
+    SOURCE_RETURN="/data/usr_data/yifeifeng/internnav/stage_results/stage59_productive_onset_return_${SOURCE_TAG}"
+    DEST="/data/usr_data/yifeifeng/internnav/stage_results/stage66_native_visual_audit8_return_${SOURCE_TAG}"
+    test -d "${SOURCE_RUN}"
+    test ! -e "${DEST}"
+    mkdir -p "${DEST}/run" "${DEST}/visual/vis_0" "${DEST}/visual/vlmap_safety_debug"
+    cp -a "${SOURCE_RETURN}"/stage59_productive_onset_audit.json "${DEST}/"
+    cp -a "${SOURCE_RETURN}"/stage65_native_recovery_audit.json "${DEST}/"
+    cp -a "${SOURCE_RETURN}"/episode_manifests "${DEST}/"
+    cp -a "${SOURCE_RUN}"/result.json "${SOURCE_RUN}"/progress.json "${DEST}/run/"
+    cp -a "${SOURCE_RUN}"/vis_0/. "${DEST}/visual/vis_0/"
+    while IFS= read -r src; do
+      rel="${src#${SOURCE_RUN}/vlmap_safety_debug/}"
+      dst="${DEST}/visual/vlmap_safety_debug/${rel}"
+      mkdir -p "$(dirname "${dst}")"
+      cp -a "${src}" "${dst}"
+    done < <(find "${SOURCE_RUN}/vlmap_safety_debug" -type f \( -name '*.jsonl' -o -name '*.json' \) ! -path '*/replay_ledger/*')
+    printf '%s\n' 0 > "${DEST}/EXIT_STATUS.txt"
+    git rev-parse HEAD > "${DEST}/git_commit.txt"
+    git status --short > "${DEST}/git_status_short.txt"
+    find "${DEST}" -type f | sort > "${DEST}/RETURN_MANIFEST.txt"
+    latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
+    ln -sfn "${DEST}" "${latest_link}"
     echo "CODEX_LATEST_RETURN=${latest_link}"
     ;;
   *)

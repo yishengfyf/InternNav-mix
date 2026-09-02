@@ -29,6 +29,9 @@ def main():
     queries=rows(root,"replay_ledger/queries.jsonl")
     actions=rows(root,"replay_ledger/actions.jsonl")
     native=[r for r in contexts if r.get("event_type")=="stage65_native_recovery_set"]
+    native_episode_keys = {
+        (str(r.get("scene_id")), str(r.get("episode_id"))) for r in native
+    }
     anchors=[]
     for r in native:
         report=r.get("stage59_productive_onset") or {}
@@ -39,6 +42,7 @@ def main():
       "expected_episode_count":a.expected_episodes,
       "completed_episode_count":len(progress),
       "native_recovery_set_count":len(native),
+      "native_recovery_episode_count":len(native_episode_keys),
       "native_anchor_steps":[r.get("anchor_step") for r in native],
       "context_event_type_counts":dict(Counter(str(r.get("event_type")) for r in contexts)),
       "query_count":len(queries), "recovery_query_count":len(recovery_queries),
@@ -47,7 +51,9 @@ def main():
       "natural_d0_event_count":len(anchors),
       "natural_d0_scene_count":len({str(r.get("scene_id")) for r in native}),
       "productive_anchor_count":sum(1 for r in anchors for x in (r.get("anchors") or []) if x.get("anchor")=="last_productive_pre_loop" and x.get("valid")),
-      "integrity_passed":len(progress)==a.expected_episodes and len(native)==a.expected_episodes,
+      # A single episode may contain multiple natural D0 events.  Integrity is
+      # episode-level, while native_recovery_set_count remains event-level.
+      "integrity_passed":len(progress)==a.expected_episodes and len(native_episode_keys)==a.expected_episodes,
       "shadow_only":False,"decision_applied":True,"unknown_is_free":False,"gt_used_for_navigation":False,
     }
     a.output.parent.mkdir(parents=True,exist_ok=True); a.output.write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n"); print(json.dumps(report,indent=2,ensure_ascii=False))
