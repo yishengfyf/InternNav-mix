@@ -12898,12 +12898,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             traj_latents = None
                             pix_goal_image = None
                             pix_goal_depth = None
+                            action_seq = []
                             local_actions = []
+                            vlmap_recovery_actions = []
                             pending_s2_recovery_context = None
                             stage65_recovery_active = False
                             messages = []
                             input_images = []
                             llm_outputs = ""
+                            action = None
+                            forward_action = 0
+                            draw_pixel_goal = False
+                            flag = False
                             continue
                         if occ_waypoint_decision.get("valid"):
                             stage15_repair_consecutive_count = int(
