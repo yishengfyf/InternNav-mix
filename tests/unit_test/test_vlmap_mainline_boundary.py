@@ -10,7 +10,8 @@ MODULE = importlib.import_module(
 
 
 def _evaluator(*, legacy=False):
-    value = object.__new__(MODULE.HabitatVLNEvaluator)
+    evaluator_cls = MODULE.Evaluator.evaluators["habitat_vln"]
+    value = object.__new__(evaluator_cls)
     value._legacy_vlmaps_enabled = legacy
     value.vlmap_semantic = None
     return value
