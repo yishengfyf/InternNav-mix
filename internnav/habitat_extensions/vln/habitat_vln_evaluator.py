@@ -97,7 +97,10 @@ from internnav.utils.stage64_recovery_subtask import (
     sanitize_self_authored_instruction,
 )
 from internnav.utils.stage75_route_prompt import (
+    bind_dualvln_temporary_instruction,
     build_dualvln_route_recovery_card,
+    build_dualvln_route_recovery_instruction,
+    build_dualvln_temporary_reference_card,
     route_guidance_from_bridge,
 )
 from internnav.utils.stage43_counterfactual_reobserve import (
@@ -867,6 +870,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "stage75_route_guidance_enable": bool(
                 vlmap_safety_cfg.get("stage75_route_guidance_enable", False)
             ),
+            "stage76_temporary_instruction_enable": bool(
+                vlmap_safety_cfg.get(
+                    "stage76_temporary_instruction_enable", False
+                )
+            ),
             "stage75_route_lookahead_m": max(
                 0.05,
                 float(vlmap_safety_cfg.get("stage75_route_lookahead_m", 0.75)),
@@ -1200,6 +1208,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         candidate_bearing = candidate.get("direction_angle_deg")
         candidate_distance = candidate.get("distance_m")
         if context.get("stage65_native"):
+            if self._get_s2_action_loop_cfg().get(
+                "stage76_temporary_instruction_enable"
+            ):
+                return build_dualvln_temporary_reference_card()
             if self._get_s2_action_loop_cfg().get("stage75_route_guidance_enable"):
                 return build_dualvln_route_recovery_card(
                     dict(context.get("stage75_route_guidance") or {})
@@ -12218,6 +12230,49 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     self.env.step(action_code.LOOKUP)
 
                 if len(vlmap_recovery_actions) == 0 and len(action_seq) == 0 and pixel_goal is None:
+                    recovery_context = pending_s2_recovery_context
+                    recovery_cfg = self._get_s2_action_loop_cfg()
+                    stage76_temporary_instruction = None
+                    stage76_original_instruction_replaced = False
+                    stage76_temporary_instruction_active = False
+                    stage76_instruction_binding_mode = None
+                    if (
+                        recovery_context
+                        and recovery_context.get("stage65_native")
+                        and recovery_cfg.get("stage75_route_guidance_enable")
+                    ):
+                        route_guidance = self._refresh_stage75_route_guidance(
+                            recovery_context,
+                            observations=observations,
+                            depth_m=current_depth_m,
+                            current_query_step=int(step_id),
+                        )
+                        if route_guidance.get("arrived"):
+                            # The temporary subtask has an explicit map-state
+                            # terminal condition. Continue this query with the
+                            # untouched original instruction and no anchor card.
+                            pending_s2_recovery_context = None
+                            recovery_context = None
+                            stage65_recovery_active = False
+                            s2_recovery_context_expired_count += 1
+                    if (
+                        recovery_context
+                        and recovery_context.get("stage65_native")
+                        and recovery_cfg.get(
+                            "stage76_temporary_instruction_enable"
+                        )
+                    ):
+                        stage76_temporary_instruction = (
+                            build_dualvln_route_recovery_instruction(
+                                dict(
+                                    recovery_context.get(
+                                        "stage75_route_guidance"
+                                    )
+                                    or {}
+                                )
+                            )
+                        )
+
                     if action == action_code.LOOKDOWN:
                         # last action is look down
                         sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
@@ -12226,11 +12281,42 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
                         )
                         input_img_id = -1
+                        if stage76_temporary_instruction is not None:
+                            stage76_temporary_instruction_active = bool(
+                                recovery_context.get(
+                                    "stage76_temporary_instruction_bound", False
+                                )
+                            )
+                            stage76_instruction_binding_mode = (
+                                "lookdown_continuation"
+                                if stage76_temporary_instruction_active
+                                else "lookdown_without_native_binding"
+                            )
                     else:
                         sources = copy.deepcopy(self.conversation)
-                        sources[0]["value"] = sources[0]["value"].replace(
-                            '<instruction>.', episode.instruction.instruction_text[:-1]
-                        )
+                        if stage76_temporary_instruction is not None:
+                            (
+                                sources[0]["value"],
+                                stage76_original_instruction_replaced,
+                            ) = bind_dualvln_temporary_instruction(
+                                sources[0]["value"],
+                                stage76_temporary_instruction,
+                            )
+                            stage76_temporary_instruction_active = bool(
+                                stage76_original_instruction_replaced
+                            )
+                            stage76_instruction_binding_mode = (
+                                "native_instruction_slot"
+                                if stage76_original_instruction_replaced
+                                else "native_instruction_slot_replace_failed"
+                            )
+                            recovery_context[
+                                "stage76_temporary_instruction_bound"
+                            ] = bool(stage76_original_instruction_replaced)
+                        else:
+                            sources[0]["value"] = sources[0]["value"].replace(
+                                '<instruction>.', episode.instruction.instruction_text[:-1]
+                            )
                         cur_images = rgb_list[-1:]
                         if step_id == 0:
                             history_id = []
@@ -12256,27 +12342,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         input_images = [rgb_list[i] for i in history_id] + cur_images
                         input_img_id = 0
 
-                    recovery_context = pending_s2_recovery_context
-                    recovery_cfg = self._get_s2_action_loop_cfg()
-                    if (
-                        recovery_context
-                        and recovery_context.get("stage65_native")
-                        and recovery_cfg.get("stage75_route_guidance_enable")
-                    ):
-                        route_guidance = self._refresh_stage75_route_guidance(
-                            recovery_context,
-                            observations=observations,
-                            depth_m=current_depth_m,
-                            current_query_step=int(step_id),
-                        )
-                        if route_guidance.get("arrived"):
-                            # The temporary subtask has an explicit map-state
-                            # terminal condition.  Continue this query with the
-                            # untouched original instruction and no anchor card.
-                            pending_s2_recovery_context = None
-                            recovery_context = None
-                            stage65_recovery_active = False
-                            s2_recovery_context_expired_count += 1
                     if recovery_context and not recovery_cfg.get("recovery_context_shadow_only"):
                         sources[0]["value"] += (
                             " "
@@ -12413,6 +12478,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 (recovery_context or {}).get(
                                     "stage75_route_guidance"
                                 )
+                            ),
+                            "stage76_temporary_instruction": (
+                                stage76_temporary_instruction
+                            ),
+                            "stage76_temporary_instruction_active": bool(
+                                stage76_temporary_instruction_active
+                            ),
+                            "stage76_original_instruction_replaced": bool(
+                                stage76_original_instruction_replaced
+                            ),
+                            "stage76_instruction_binding_mode": (
+                                stage76_instruction_binding_mode
                             ),
                         },
                         semantic_state=dict(self.occ_memory.last_semantic_decision or {}),

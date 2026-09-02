@@ -83,7 +83,9 @@ def route_guidance_from_bridge(
     if not math.isfinite(distance):
         result["reason"] = "nonfinite_path_distance"
         return result
-    result["arrived"] = bool(distance <= max(0.0, float(arrival_distance_m)))
+    result["arrived"] = bool(
+        distance <= max(0.0, float(arrival_distance_m)) + 1e-9
+    )
     if result["arrived"]:
         result.update(
             {
@@ -143,4 +145,61 @@ def build_dualvln_route_recovery_card(guidance: Dict[str, Any]) -> str:
         "only one TURN LEFT (←), TURN RIGHT (→), or look-down (↓) observation action, "
         "then re-observe. When it is visible, output the next waypoint coordinates in "
         "the current image. Output STOP only when the original task is complete."
+    )
+
+
+def build_dualvln_route_recovery_instruction(guidance: Dict[str, Any]) -> str:
+    """Create a temporary task that fits directly in DualVLN's instruction slot."""
+    destination = (
+        "return to the previously visited place shown in the recovery reference "
+        "observation"
+    )
+    if not guidance or not guidance.get("valid") or guidance.get("arrived"):
+        return destination
+    direction = str(guidance.get("natural_direction") or "ahead")
+    bearing = int(guidance.get("quantized_bearing_deg", 0) or 0)
+    distance = float(guidance.get("quantized_distance_m", 0.0) or 0.0)
+    if direction == "ahead":
+        orientation = "facing the route ahead"
+    elif direction == "behind":
+        orientation = "turning around about 180 degrees"
+    elif "left" in direction:
+        orientation = f"turning left about {bearing} degrees"
+    elif "right" in direction:
+        orientation = f"turning right about {bearing} degrees"
+    else:
+        orientation = f"turning toward the route about {bearing} degrees"
+    return (
+        f"{destination} by first {orientation} and then following the previously "
+        f"travelled route for about {distance:.2f} meters"
+    )
+
+
+def build_dualvln_temporary_reference_card() -> str:
+    """Bind the extra image without restating the original episode task."""
+    return (
+        "The image marked recovery reference observation shows the destination of "
+        "this temporary navigation task. Compare it with the current view and your "
+        "historical observations. In case the destination is out of view, use only "
+        "one TURN LEFT (←), TURN RIGHT (→), or look-down (↓) observation action, "
+        "then re-observe. When it is visible, output the next waypoint coordinates "
+        "in the current image. Output STOP when you have reached this temporary "
+        "destination."
+    )
+
+
+def bind_dualvln_temporary_instruction(
+    prompt_template: str, temporary_instruction: str
+) -> tuple[str, bool]:
+    """Replace exactly the native DualVLN instruction slot in a prompt copy."""
+    marker = "<instruction>"
+    if str(prompt_template).count(marker) != 1 or not str(
+        temporary_instruction
+    ).strip():
+        return str(prompt_template), False
+    return (
+        str(prompt_template).replace(
+            marker, str(temporary_instruction).strip(), 1
+        ),
+        True,
     )

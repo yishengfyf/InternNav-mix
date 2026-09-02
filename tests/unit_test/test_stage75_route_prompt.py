@@ -14,6 +14,15 @@ assert _spec.loader is not None
 _spec.loader.exec_module(_module)
 
 build_dualvln_route_recovery_card = _module.build_dualvln_route_recovery_card
+build_dualvln_route_recovery_instruction = (
+    _module.build_dualvln_route_recovery_instruction
+)
+build_dualvln_temporary_reference_card = (
+    _module.build_dualvln_temporary_reference_card
+)
+bind_dualvln_temporary_instruction = (
+    _module.bind_dualvln_temporary_instruction
+)
 natural_route_direction = _module.natural_route_direction
 route_guidance_from_bridge = _module.route_guidance_from_bridge
 
@@ -90,3 +99,53 @@ def test_unreachable_route_uses_visual_fallback_without_fake_direction():
     assert guidance["valid"] is False
     assert "about" not in card
     assert "Compare that reference with the current view" in card
+
+
+def test_temporary_instruction_fits_native_task_slot_and_reference_protocol():
+    guidance = route_guidance_from_bridge(
+        {
+            "path_reachable": True,
+            "path_m": 0.26,
+            "initial_direction_angle_deg": 61.0,
+        }
+    )
+    instruction = build_dualvln_route_recovery_instruction(guidance)
+    card = build_dualvln_temporary_reference_card()
+    assert instruction.startswith("return to the previously visited place")
+    assert "turning left about 60 degrees" in instruction
+    assert "0.25 meters" in instruction
+    assert "original task" not in instruction
+    assert "temporary navigation task" in card
+    assert "Output STOP when you have reached this temporary destination" in card
+
+
+def test_arrival_threshold_tolerates_grid_float_roundoff():
+    arrived = route_guidance_from_bridge(
+        {
+            "path_reachable": True,
+            "path_m": 0.15000000000000002,
+            "initial_direction_angle_deg": 0.0,
+        },
+        arrival_distance_m=0.15,
+    )
+    assert arrived["arrived"] is True
+
+
+def test_temporary_instruction_replaces_only_native_instruction_slot():
+    template = (
+        "You are an autonomous navigation assistant. Your task is to "
+        "<instruction>. Where should you go next to stay on track?"
+    )
+    bound, replaced = bind_dualvln_temporary_instruction(
+        template, "return to the recovery reference observation"
+    )
+    assert replaced is True
+    assert "<instruction>" not in bound
+    assert bound.startswith("You are an autonomous navigation assistant")
+    assert "Where should you go next to stay on track?" in bound
+
+    unchanged, replaced = bind_dualvln_temporary_instruction(
+        "prompt without a slot", "return to the reference"
+    )
+    assert replaced is False
+    assert unchanged == "prompt without a slot"
