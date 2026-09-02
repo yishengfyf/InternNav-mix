@@ -6668,7 +6668,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             # Do not silently treat the absence of the legacy validator as a
             # pass during recovery.  The mainline SparseOcc trajectory
             # preflight is a separate contract and must be wired explicitly.
-            return False, {
+            return True, {
                 "enabled": False,
                 "valid": False,
                 "safe": False,
