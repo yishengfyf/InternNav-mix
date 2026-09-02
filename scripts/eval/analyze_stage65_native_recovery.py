@@ -6,7 +6,17 @@ from pathlib import Path
 
 def rows(root: Path, name: str):
     out=[]
-    for path in glob.glob(str(root / "vlmap_safety_debug" / "*" / name)):
+    # Returns may preserve an extra ``run/`` component (and rank-specific
+    # directories) while lightweight latest returns may flatten it.  Search
+    # recursively so a missing top-level match cannot masquerade as zero S2
+    # queries/actions.
+    patterns = [str(root / "**" / name), str(root / name)]
+    seen = set()
+    for pattern in patterns:
+      for path in glob.glob(pattern, recursive=True):
+        if path in seen:
+          continue
+        seen.add(path)
         for line in Path(path).read_text(encoding="utf-8").splitlines():
             if line.strip(): out.append(json.loads(line))
     return out

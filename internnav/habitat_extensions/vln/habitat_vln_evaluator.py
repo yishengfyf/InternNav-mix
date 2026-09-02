@@ -12188,6 +12188,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             ],
                             "current_step": int(step_id),
                             "observation_index": int(replay_observation_index - 1),
+                            "recovery_context_active": bool(
+                                pending_s2_recovery_context is not None
+                            ),
+                            "stage65_native": bool(
+                                pending_s2_recovery_context
+                                and pending_s2_recovery_context.get("stage65_native")
+                            ),
+                            "recovery_anchor_step": (
+                                None
+                                if not pending_s2_recovery_context
+                                else pending_s2_recovery_context.get("stage65_anchor_step")
+                            ),
                         },
                         semantic_state=dict(self.occ_memory.last_semantic_decision or {}),
                     )
