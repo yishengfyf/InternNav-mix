@@ -857,6 +857,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "stage73_continuous_recovery_enable": bool(
                 vlmap_safety_cfg.get("stage73_continuous_recovery_enable", False)
             ),
+            "stage74_recovery_prompt_v2_enable": bool(
+                vlmap_safety_cfg.get("stage74_recovery_prompt_v2_enable", False)
+            ),
             "recovery_context_max_images": int(
                 vlmap_safety_cfg.get("s2_recovery_context_max_images", 3)
             ),
@@ -1178,6 +1181,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         candidate_bearing = candidate.get("direction_angle_deg")
         candidate_distance = candidate.get("distance_m")
         if context.get("stage65_native"):
+            if self._get_s2_action_loop_cfg().get("stage74_recovery_prompt_v2_enable"):
+                return (
+                    "Recovery observation for the current navigation task. The original "
+                    "task remains active. A recently repeated action did not produce local "
+                    "progress; do not repeat the same multi-turn sequence. The image marked "
+                    "recovery reference observation shows a previously visited place on the "
+                    "route. Compare it with the current view and historical observations. "
+                    "Use one short turn or look-down action, then re-observe; when the place "
+                    "is visible, output its waypoint coordinates in the current image. Output "
+                    "STOP only when the original task is complete."
+                )
             return (
                 "Recovery observation for the current navigation task. The original "
                 "task remains active. The image marked recovery reference observation "
