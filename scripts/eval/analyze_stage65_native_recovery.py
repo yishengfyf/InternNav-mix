@@ -24,7 +24,11 @@ def rows(root: Path, name: str):
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--run-root",type=Path,required=True); ap.add_argument("--output",type=Path,required=True); ap.add_argument("--expected-episodes",type=int,required=True); a=ap.parse_args()
     root=a.run_root
-    progress=[json.loads(x) for x in (root/"progress.json").read_text().splitlines() if x.strip()] if (root/"progress.json").is_file() else []
+    progress_path = root / "progress.json"
+    if not progress_path.is_file():
+        candidates = sorted(root.glob("**/progress.json"))
+        progress_path = candidates[0] if candidates else progress_path
+    progress=[json.loads(x) for x in progress_path.read_text().splitlines() if x.strip()] if progress_path.is_file() else []
     contexts=rows(root,"s2_recovery_context_events.jsonl")
     queries=rows(root,"replay_ledger/queries.jsonl")
     actions=rows(root,"replay_ledger/actions.jsonl")

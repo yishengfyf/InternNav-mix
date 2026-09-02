@@ -304,7 +304,7 @@ case "${PHASE}" in
     SOURCE_TAG="stage66_native_visual_audit8_20260902_115447"
     SOURCE_RUN="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_${SOURCE_TAG}"
     SOURCE_RETURN="/data/usr_data/yifeifeng/internnav/stage_results/stage59_productive_onset_return_${SOURCE_TAG}"
-    DEST="/data/usr_data/yifeifeng/internnav/stage_results/stage66_native_visual_audit8_return_${SOURCE_TAG}"
+    DEST="/data/usr_data/yifeifeng/internnav/stage_results/stage66_native_visual_audit8_return_${SOURCE_TAG}_v2"
     test -d "${SOURCE_RUN}"
     test ! -e "${DEST}"
     mkdir -p "${DEST}/run" "${DEST}/visual/vis_0" "${DEST}/visual/vlmap_safety_debug"
@@ -318,7 +318,7 @@ case "${PHASE}" in
       dst="${DEST}/visual/vlmap_safety_debug/${rel}"
       mkdir -p "$(dirname "${dst}")"
       cp -a "${src}" "${dst}"
-    done < <(find "${SOURCE_RUN}/vlmap_safety_debug" -type f \( -name '*.jsonl' -o -name '*.json' \) ! -path '*/replay_ledger/*')
+    done < <(find "${SOURCE_RUN}/vlmap_safety_debug" -type f \( -name '*.jsonl' -o -name '*.json' \) ! -path '*/replay_ledger/*/rgb/*' ! -path '*/replay_ledger/*/depth/*')
     printf '%s\n' 0 > "${DEST}/EXIT_STATUS.txt"
     git rev-parse HEAD > "${DEST}/git_commit.txt"
     git status --short > "${DEST}/git_status_short.txt"
