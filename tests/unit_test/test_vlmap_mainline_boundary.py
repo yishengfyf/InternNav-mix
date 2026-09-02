@@ -1,14 +1,12 @@
 """Regression tests for the mainline/legacy VLMaps boundary."""
 
-import importlib.util
+import importlib
 from pathlib import Path
 
 
-EVALUATOR = Path(__file__).resolve().parents[2] / "internnav" / "habitat_extensions" / "vln" / "habitat_vln_evaluator.py"
-SPEC = importlib.util.spec_from_file_location("habitat_vln_evaluator_boundary", EVALUATOR)
-MODULE = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(MODULE)
+MODULE = importlib.import_module(
+    "internnav.habitat_extensions.vln.habitat_vln_evaluator"
+)
 
 
 def _evaluator(*, legacy=False):
