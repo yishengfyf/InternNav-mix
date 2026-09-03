@@ -39,6 +39,7 @@ MIN_PEAK_INLIERS = 24
 MIN_PEAK_INLIER_RATE = 0.08
 MAX_MAD_M = 0.08
 MIN_PEAK_RATIO = 1.10
+CONSENSUS_TOLERANCE_M = 0.05
 CAMERA_HEIGHT_M = 1.25
 
 
@@ -234,6 +235,76 @@ def find_causal_relink(
                 "attempts": attempts,
             }
     return {"valid": False, "attempts": attempts}
+
+
+def select_causal_registration(
+    clouds: list[np.ndarray], current_index: int,
+    trusted_heights: dict[int, float], window: int,
+    primary: dict[str, Any],
+) -> dict[str, Any]:
+    """Select a height update, requiring independent keyframe consensus when possible."""
+    candidates: list[dict[str, Any]] = []
+    attempts: list[dict[str, Any]] = []
+
+    def add(reference: int, attempt: dict[str, Any]) -> None:
+        record = {
+            "reference_observation_index": reference,
+            "reference_gap": current_index - reference,
+            "valid": attempt["valid"],
+            "reason": attempt["reason"],
+            "estimated_delta_m": attempt.get("estimated_delta_m"),
+            "candidate_count": attempt.get("candidate_count"),
+            "peak_inlier_rate": attempt.get("peak_inlier_rate"),
+            "peak_ratio": attempt.get("peak_ratio"),
+            "mad_m": attempt.get("mad_m"),
+        }
+        attempts.append(record)
+        if attempt["valid"]:
+            candidates.append({
+                "reference": reference,
+                "gap": current_index - reference,
+                "registration": attempt,
+                "height_m": trusted_heights[reference] + float(attempt["estimated_delta_m"]),
+            })
+
+    if current_index - 1 in trusted_heights:
+        add(current_index - 1, primary)
+    if window > 0:
+        lower = max(-1, current_index - int(window) - 1)
+        for reference in range(current_index - 2, lower, -1):
+            if reference not in trusted_heights:
+                continue
+            add(reference, estimate_pair_delta(clouds[reference], clouds[current_index]))
+
+    if not candidates:
+        return {"valid": False, "attempts": attempts}
+    # With at least two independently valid references, reject inconsistent
+    # absolute heights instead of allowing one false local peak to poison the chain.
+    if len(candidates) >= 2:
+        clusters = []
+        for candidate in candidates:
+            cluster = [other for other in candidates if abs(other["height_m"] - candidate["height_m"]) <= CONSENSUS_TOLERANCE_M]
+            clusters.append(cluster)
+        cluster = max(clusters, key=lambda group: (len(group), -min(item["gap"] for item in group)))
+        if len(cluster) < 2:
+            return {
+                "valid": False, "reason": "consensus_disagreement",
+                "attempts": attempts, "candidate_heights_m": [item["height_m"] for item in candidates],
+            }
+        selected = min(cluster, key=lambda item: item["gap"])
+        selected = {**selected, "consensus_count": len(cluster), "consensus_spread_m": max(item["height_m"] for item in cluster) - min(item["height_m"] for item in cluster)}
+    else:
+        selected = {**candidates[0], "consensus_count": 1, "consensus_spread_m": 0.0}
+    return {
+        "valid": True,
+        "reference_observation_index": selected["reference"],
+        "reference_gap": selected["gap"],
+        "height_m": selected["height_m"],
+        "registration": selected["registration"],
+        "attempts": attempts,
+        "consensus_count": selected["consensus_count"],
+        "consensus_spread_m": selected["consensus_spread_m"],
+    }
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -443,20 +514,26 @@ def analyze(
                 all_valid_flags.append(bool(pair["valid"]))
                 chain_reference = None
                 chain_registration = None
-                if index - 1 in trusted_heights and pair["valid"]:
+                if relink_window > 0:
+                    selection = select_causal_registration(
+                        clouds, index, trusted_heights, relink_window, pair
+                    )
+                    report["relink_attempts"] = selection["attempts"]
+                    report["chain_consensus_count"] = selection.get("consensus_count")
+                    report["chain_consensus_spread_m"] = selection.get("consensus_spread_m")
+                    if selection["valid"]:
+                        chain_reference = selection["reference_observation_index"]
+                        chain_registration = selection["registration"]
+                        report["chain_registration_source"] = (
+                            "adjacent_pair" if chain_reference == index - 1 else "causal_keyframe_relink"
+                        )
+                        episode_relink_count += int(chain_reference != index - 1)
+                    elif selection.get("reason"):
+                        report["chain_registration_reason"] = selection["reason"]
+                elif index - 1 in trusted_heights and pair["valid"]:
                     chain_reference = index - 1
                     chain_registration = pair
                     report["chain_registration_source"] = "adjacent_pair"
-                elif relink_window > 0:
-                    relink = find_causal_relink(
-                        clouds, index, trusted_heights, relink_window
-                    )
-                    report["relink_attempts"] = relink["attempts"]
-                    if relink["valid"]:
-                        chain_reference = relink["reference_observation_index"]
-                        chain_registration = relink["registration"]
-                        report["chain_registration_source"] = "causal_keyframe_relink"
-                        episode_relink_count += 1
                 if chain_reference is not None and chain_registration is not None:
                     height = trusted_heights[chain_reference] + float(chain_registration["estimated_delta_m"])
                     trusted_heights[index] = height
@@ -632,6 +709,7 @@ def analyze(
             "max_mad_m": MAX_MAD_M,
             "min_peak_ratio": MIN_PEAK_RATIO,
             "causal_relink_window_frames": int(relink_window),
+            "consensus_tolerance_m": CONSENSUS_TOLERANCE_M,
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
