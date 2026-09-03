@@ -12,13 +12,38 @@ fi
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
-PHASE="stage80d_causal_rgbd_height_full3d"
+PHASE="stage80e_causal_rgbd_height_dense"
 TAG="${PHASE}_$(date +%Y%m%d_%H%M%S)"
 
 source /home/yifeifeng/miniconda3/etc/profile.d/conda.sh
 conda activate habiinter
 
 case "${PHASE}" in
+  stage80e_causal_rgbd_height_dense)
+    semantic_return="/data/usr_data/yifeifeng/internnav/stage_results/stage78_semantic_attachment_return_stage78_semantic_attachment_shadow_20260903_175153"
+    replay_run="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_stage78_semantic_attachment_shadow_20260903_175153/vlmap_safety_debug"
+    result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage80e_causal_rgbd_height_dense_return_${TAG}"
+    test -d "${semantic_return}/semantic_debug"
+    test -d "${replay_run}"
+    test ! -e "${result_dir}"
+    python3 -m pytest -q tests/unit_test/test_stage80_causal_rgbd_height_odometry.py
+    mkdir -p "${result_dir}/stage80e_height_viz"
+    python3 scripts/eval/analyze_stage80_causal_rgbd_height_odometry.py \
+      --semantic-root "${semantic_return}/semantic_debug" \
+      --replay-root "${replay_run}" \
+      --relink-window 5 \
+      --full3d-scoring \
+      --depth-stride 8 \
+      --output "${result_dir}/stage80e_causal_rgbd_height_dense_audit.json" \
+      --viz-dir "${result_dir}/stage80e_height_viz"
+    git rev-parse HEAD > "${result_dir}/git_commit.txt"
+    git status --short --branch > "${result_dir}/git_status_short.txt"
+    printf '0\n' > "${result_dir}/EXIT_STATUS.txt"
+    find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
+    latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
+    ln -sfn "${result_dir}" "${latest_link}"
+    echo "CODEX_LATEST_RETURN=${latest_link}"
+    ;;
   stage80d_causal_rgbd_height_full3d)
     semantic_return="/data/usr_data/yifeifeng/internnav/stage_results/stage78_semantic_attachment_return_stage78_semantic_attachment_shadow_20260903_175153"
     replay_run="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_stage78_semantic_attachment_shadow_20260903_175153/vlmap_safety_debug"

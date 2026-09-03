@@ -493,6 +493,7 @@ def _route_query_steps(semantic_root: Path) -> dict[tuple[str, str], list[int]]:
 def analyze(
     *, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Path,
     relink_window: int = 0, full3d_scoring: bool = False,
+    depth_stride: int = DEPTH_STRIDE,
 ) -> dict[str, Any]:
     semantic = _semantic_coverage(semantic_root)
     query_steps = _route_query_steps(semantic_root)
@@ -529,7 +530,10 @@ def analyze(
             relative_base = inverse_first @ _base_pose(pose)
             pitch = float(row.get("camera_pitch_deg", pose.get("camera_pitch_deg", 0.0)) or 0.0)
             intrinsic = np.asarray(row.get("camera_model", {}).get("intrinsic"), dtype=np.float64)
-            cloud = project_depth(depth, intrinsic, relative_base, pitch)
+            cloud = project_depth(
+                depth, intrinsic, relative_base, pitch,
+                stride=max(1, int(depth_stride)),
+            )
             clouds.append(cloud)
             gt = _height(pose)
             report = {
@@ -720,7 +724,7 @@ def analyze(
             "chain_coverage_passed", "vertical_query_passed", "flat_drift_passed",
         )
     )
-    stage = "stage80d" if full3d_scoring else ("stage80b" if relink_window > 0 else "stage80")
+    stage = "stage80e" if full3d_scoring and int(depth_stride) != DEPTH_STRIDE else ("stage80d" if full3d_scoring else ("stage80b" if relink_window > 0 else "stage80"))
     result = {
         "task": f"{stage}_causal_rgbd_height_odometry_offline_audit",
         "schema_version": f"{stage}_causal_rgbd_height_odometry_v1",
@@ -754,7 +758,7 @@ def analyze(
             "rejected_adjacent_delta_imputed": False,
         },
         "parameters": {
-            "depth_stride": DEPTH_STRIDE,
+            "depth_stride": int(depth_stride),
             "depth_range_m": [MIN_DEPTH_M, MAX_DEPTH_M],
             "xy_radius_m": XY_RADIUS_M,
             "xy_neighbors": XY_NEIGHBORS,
@@ -769,6 +773,7 @@ def analyze(
             "causal_relink_window_frames": int(relink_window),
             "consensus_tolerance_m": CONSENSUS_TOLERANCE_M,
             "full3d_scoring": bool(full3d_scoring),
+            "actual_depth_stride": int(depth_stride),
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -784,6 +789,7 @@ def main() -> None:
     parser.add_argument("--viz-dir", type=Path, required=True)
     parser.add_argument("--relink-window", type=int, default=0)
     parser.add_argument("--full3d-scoring", action="store_true")
+    parser.add_argument("--depth-stride", type=int, default=DEPTH_STRIDE)
     args = parser.parse_args()
     result = analyze(
         semantic_root=args.semantic_root,
@@ -792,6 +798,7 @@ def main() -> None:
         viz_dir=args.viz_dir,
         relink_window=max(0, int(args.relink_window)),
         full3d_scoring=bool(args.full3d_scoring),
+        depth_stride=max(1, int(args.depth_stride)),
     )
     summary = {key: result[key] for key in (
         "integrity_passed", "episode_count", "frame_count", "pair_count",
