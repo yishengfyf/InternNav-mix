@@ -150,8 +150,30 @@ def _equal_3d_axes(axis: Any, xyz: np.ndarray) -> None:
     center = (low + high) / 2.0
     radius = max(float(np.max(high - low)) / 2.0, 1e-3)
     axis.set_xlim(center[0] - radius, center[0] + radius)
-    axis.set_ylim(center[2] - radius, center[2] + radius)
-    axis.set_zlim(center[1] - radius, center[1] + radius)
+    axis.set_ylim(center[1] - radius, center[1] + radius)
+    axis.set_zlim(center[2] - radius, center[2] + radius)
+
+
+def _ground_axes(gt: np.ndarray) -> Tuple[int, int, int]:
+    """Infer two ground axes and the up axis from the GT camera trajectory."""
+    if len(gt) >= 2:
+        up = int(np.argmin(np.ptp(gt, axis=0)))
+    else:
+        up = 2
+    ground = [axis for axis in range(3) if axis != up]
+    return ground[0], ground[1], up
+
+
+def _nearest_trajectory_distances(xyz: np.ndarray, gt: np.ndarray) -> np.ndarray:
+    if not len(xyz) or not len(gt):
+        return np.full(len(xyz), np.nan, dtype=np.float64)
+    result = np.empty(len(xyz), dtype=np.float64)
+    for start in range(0, len(xyz), 100_000):
+        chunk = xyz[start : start + 100_000]
+        result[start : start + len(chunk)] = np.sqrt(
+            np.min(np.sum((chunk[:, None, :] - gt[None, :, :]) ** 2, axis=2), axis=1)
+        )
+    return result
 
 
 def _plot_rgb_semantic_gaussians(
@@ -171,6 +193,11 @@ def _plot_rgb_semantic_gaussians(
     xyz, labels, metadata = _semantic_gaussians(ply_path)
     paths = _rgb_paths(rgb_dir)
     chosen = () if not paths else (paths[0], paths[len(paths) // 2], paths[-1])
+    distances = _nearest_trajectory_distances(xyz, gt)
+    local_mask = np.isfinite(distances) & (distances <= 10.0)
+    local_indices = np.flatnonzero(local_mask)
+    local_sample_rel = _sample_indices(labels[local_indices]) if len(local_indices) else np.empty(0, dtype=np.int64)
+    local_sample = local_indices[local_sample_rel] if len(local_indices) else local_indices
     sample = _sample_indices(labels)
     points, point_labels = xyz[sample], labels[sample]
     palette = SEMANTIC_PALETTE_11
@@ -192,33 +219,44 @@ def _plot_rgb_semantic_gaussians(
     axis_3d = fig.add_subplot(grid[1, 0], projection="3d")
     if len(points):
         size = max(0.15, min(3.0, 90_000 / len(points)))
-        axis_3d.scatter(points[:, 0], points[:, 2], points[:, 1], c=colors, s=size, alpha=0.72, linewidths=0)
+        axis_3d.scatter(points[:, 0], points[:, 1], points[:, 2], c=colors, s=size, alpha=0.72, linewidths=0)
         _equal_3d_axes(axis_3d, points)
     axis_3d.set_xlabel("x")
-    axis_3d.set_ylabel("z")
-    axis_3d.set_zlabel("y / height")
+    axis_3d.set_ylabel("y")
+    axis_3d.set_zlabel("z / height")
     axis_3d.view_init(elev=25, azim=-62)
     axis_3d.set_title(f"Aligned semantic Gaussians ({len(xyz):,})")
 
     axis_top = fig.add_subplot(grid[1, 1])
-    if len(points):
-        size = max(0.15, min(3.0, 90_000 / len(points)))
-        axis_top.scatter(points[:, 0], points[:, 2], c=colors, s=size, alpha=0.68, linewidths=0)
+    ground_x, ground_y, _ = _ground_axes(gt)
+    if len(local_sample):
+        local_points = xyz[local_sample]
+        local_labels = labels[local_sample]
+        local_colors = palette[np.minimum(local_labels, len(palette) - 1)]
+        size = max(0.15, min(3.0, 90_000 / len(local_points)))
+        axis_top.scatter(
+            local_points[:, ground_x], local_points[:, ground_y], c=local_colors, s=size, alpha=0.68, linewidths=0
+        )
+    if len(gt):
+        axis_top.plot(gt[:, ground_x], gt[:, ground_y], "k.-", markersize=2.5, linewidth=1.0, label="GT path")
     axis_top.set_aspect("equal", adjustable="datalim")
-    axis_top.set_xlabel("x (m)")
-    axis_top.set_ylabel("z (m)")
-    axis_top.set_title("Semantic Gaussian top view")
+    axis_top.set_xlabel(f"{'xyz'[ground_x]} (m)")
+    axis_top.set_ylabel(f"{'xyz'[ground_y]} (m)")
+    axis_top.set_title(f"Local top view (within 10 m of GT path: {int(local_mask.sum()):,})")
 
     axis_traj = fig.add_subplot(grid[1, 2])
     if len(gt):
-        axis_traj.plot(gt[:, 0], gt[:, 2], "o-", markersize=2.5, linewidth=1.4, label="Habitat GT pose")
+        axis_traj.plot(
+            gt[:, ground_x], gt[:, ground_y], "o-", markersize=2.5, linewidth=1.4, label="Habitat GT pose"
+        )
     if len(aligned):
         axis_traj.plot(
-            aligned[:, 0], aligned[:, 2], "o-", markersize=2.5, linewidth=1.4, label="DROID Sim3 aligned"
+            aligned[:, ground_x], aligned[:, ground_y],
+            "o-", markersize=2.5, linewidth=1.4, label="DROID Sim3 aligned"
         )
     axis_traj.set_aspect("equal", adjustable="datalim")
-    axis_traj.set_xlabel("x (m)")
-    axis_traj.set_ylabel("z (m)")
+    axis_traj.set_xlabel(f"{'xyz'[ground_x]} (m)")
+    axis_traj.set_ylabel(f"{'xyz'[ground_y]} (m)")
     axis_traj.set_title("Trajectory audit (GT is offline only)")
     axis_traj.legend(loc="best")
 
@@ -244,6 +282,17 @@ def _plot_rgb_semantic_gaussians(
         displayed_gaussians=int(len(sample)),
         rgb_frames_found=int(len(paths)),
         rgb_frames_shown=[path.name for path in chosen],
+        within_10m_of_gt_path=int(local_mask.sum()),
+        within_10m_fraction=float(local_mask.mean()) if len(local_mask) else None,
+        distance_to_gt_path_m=(
+            {
+                "median": float(np.nanmedian(distances)),
+                "p90": float(np.nanquantile(distances, 0.9)),
+                "p99": float(np.nanquantile(distances, 0.99)),
+            }
+            if len(distances) and np.isfinite(distances).any()
+            else None
+        ),
     )
     return metadata
 
@@ -337,12 +386,20 @@ def _runtime_summary(log_path: Path) -> Dict[str, Any]:
 def _diagnosis(filter_rows: Dict[int, Dict[str, Any]], mapping: Dict[str, Any]) -> str:
     raw = sum(int(row.get("raw_valid", 0)) for row in filter_rows.values())
     filtered = sum(int(row.get("final_valid", 0)) for row in filter_rows.values())
+    filter_pixels = sum(int(row.get("pixels", 0)) for row in filter_rows.values())
     gaussians = int(mapping.get("total_gaussians", 0))
     combined = sum(int(row.get("combined_valid", 0)) for row in mapping.get("frames", []))
     finite = sum(int(row.get("finite_valid", 0)) for row in mapping.get("frames", []))
+    mapping_pixels = sum(int(row.get("pixels", 0)) for row in mapping.get("frames", []))
     if raw and filtered / raw < 1e-3:
         return "filter_collapse"
-    if filtered and combined / filtered < 0.1:
+    # Mapper can intentionally subsample each image (frame_gaussians_stride).
+    # Compare against the expected retained count at mapper resolution instead
+    # of mistaking stride^2 downsampling for a mapper collapse.
+    expected_at_mapping_resolution = (
+        (filtered / filter_pixels) * mapping_pixels if filter_pixels and mapping_pixels else float(filtered)
+    )
+    if expected_at_mapping_resolution and combined / expected_at_mapping_resolution < 0.1:
         return "mapper_frame_or_mask_collapse"
     if combined and finite / combined < 0.9:
         return "nonfinite_geometry_collapse"
@@ -369,13 +426,16 @@ def _plot(out_path: Path, filter_rows: Dict[int, Dict[str, Any]], aligned: np.nd
     axes[0].set_ylabel("valid pixels")
     axes[0].set_title("FreeOcc filtering audit")
     axes[0].legend()
+    ground_x, ground_y, _ = _ground_axes(gt)
     if len(gt):
-        axes[1].plot(gt[:, 0], gt[:, 2], "o-", markersize=2, label="Habitat GT")
+        axes[1].plot(gt[:, ground_x], gt[:, ground_y], "o-", markersize=2, label="Habitat GT")
     if len(aligned):
-        axes[1].plot(aligned[:, 0], aligned[:, 2], "o-", markersize=2, label="DROID Sim3 aligned")
+        axes[1].plot(
+            aligned[:, ground_x], aligned[:, ground_y], "o-", markersize=2, label="DROID Sim3 aligned"
+        )
     axes[1].set_aspect("equal", adjustable="datalim")
-    axes[1].set_xlabel("x (m)")
-    axes[1].set_ylabel("z (m)")
+    axes[1].set_xlabel(f"{'xyz'[ground_x]} (m)")
+    axes[1].set_ylabel(f"{'xyz'[ground_y]} (m)")
     axes[1].set_title("Keyframe trajectory (top view)")
     axes[1].legend()
     fig.tight_layout()
@@ -395,6 +455,12 @@ def analyze(
     raw_total = sum(int(row.get("raw_valid", 0)) for row in rows.values())
     mv_total = sum(int(row.get("after_multiview", 0)) for row in rows.values())
     final_total = sum(int(row.get("final_valid", 0)) for row in rows.values())
+    support = {
+        f"count_ge_{level}": sum(int(row.get(f"mv_support_ge_{level}") or 0) for row in rows.values())
+        for level in (1, 2, 3)
+    }
+    support_max_values = [row.get("mv_support_max") for row in rows.values() if row.get("mv_support_max") is not None]
+    support["count_max"] = float(max(support_max_values)) if support_max_values else None
     result: Dict[str, Any] = {
         "schema_version": "freeocc_habitat_audit_v1",
         "run_dir": str(run_dir),
@@ -410,6 +476,7 @@ def analyze(
             "multiview_retention": float(mv_total / raw_total) if raw_total else None,
             "final_retention": float(final_total / raw_total) if raw_total else None,
         },
+        "multiview_support": support,
         "final_mapping_call": mapping,
         "trajectory": trajectory,
         "runtime": _runtime_summary(run_dir / "console.log"),

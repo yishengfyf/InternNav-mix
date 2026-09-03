@@ -145,6 +145,35 @@ python scripts/eval/analyze_freeocc_mapping_audit.py \
 `analysis/freeocc_rgb_semantic_gaussians.png`，并在 JSON 中保存 11 类语义点数。
 所有图均带有 offline diagnostic 标记。
 
+第二轮实测结果进一步收敛了问题：`mv_count_th=1, stride=2` 仅保留 840 个
+Gaussian，且对齐后 bbox 最大跨度约 300 m；关闭多视图过滤后虽能稳定导出
+102,566 个带语义 Gaussian，但 bbox 最大跨度仍约 414 m。许多 DROID 深度
+达到 100--1000 m，而 Habitat GT 相机仅移动 2.25 m。因此无过滤结果只证明
+Trident、Gaussian 构建和 PLY 导出可运行，不能证明空间建图有效。
+
+检查上游执行路径还发现：`configs/slam.yaml` 中声明的
+`mono_depth: metric3d-vit_giant2` 没有任何 Python 代码读取；mono tracking 会把
+Dataset 已加载的 depth 设为 `None`，随后 `DepthVideo.get_mapping_item()` 又把
+DROID 的 `est_depth` 同时当作 `depth_prior`。也就是说当前发布代码的 mono
+模式没有真正使用 Metric3D 单目深度先验。后续适配必须显式补齐 RGB→metric
+depth 接口，或先用 Habitat depth 做仅供定位的 oracle ablation，不能继续把
+调低一致性阈值当作修复。
+
+`scripts/eval/evaluate_freeocc_habitat_gt.py` 使用保存的 Habitat depth 与 c2w
+pose 构造离线 observed-surface GT，以 0.10 m 网格比较 Sim(3) 对齐后的
+Gaussian center occupancy proxy，输出 exact IoU、0.10/0.20/0.50 m 的表面
+precision/recall/F1 及双向距离。其产物是：
+
+- `analysis/habitat_gt_occ_metrics.json`；
+- `analysis/habitat_observed_occ.npz`（稀疏 occupied indices、origin、shape、
+  voxel size；没有把未观测体素写成 free）；
+- `analysis/freeocc_rgb_pred_gt_occ.png`（RGB、预测、GT、overlay）。
+
+当前序列没有保存 Habitat semantic sensor 输出和 instance-to-category 映射，
+所以几何 OCC 可量化，semantic mIoU 必须明确保持 `null`；不能用 FreeOcc 自己
+的 Trident 标签伪造 semantic GT。跨 profile 汇总由
+`scripts/eval/compare_freeocc_habitat_profiles.py` 生成。
+
 完整服务器实验保存在并列 run 目录中；为了复用固定自动审批链路，紧凑产物
 还会复制到严格基线的 `diagnostics/<profile>/` 下，再重新生成排除清单自身的
 `SHA256SUMS`。这不会改变任何 DualVLN 运行文件。

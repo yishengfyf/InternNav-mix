@@ -139,14 +139,66 @@ if [ -n "${RUN_TAG}" ]; then
   echo "FREEOCC_RUN_DIR=${OUT_DIR}"
 fi
 
-# Re-render the original strict result with the new RGB/semantic overview and
-# refresh the complete return-root checksum after adding diagnostic bundles.
-if [ -f "${STRICT_DIR}/audit/freeocc_mapping_audit.json" ]; then
+# Re-render every completed profile with corrected Habitat ground axes, build
+# observed-surface GT from depth+pose, and refresh its compact return bundle.
+AUDIT_RUN_DIRS=(
+  "${STRICT_DIR}"
+  "${OUTPUT_ROOT}/${MV1_TAG}"
+  "${OUTPUT_ROOT}/${NOMV_TAG}"
+)
+AUDIT_PROFILE_LABELS=(
+  strict_mv2_stride1
+  diagnostic_mv1_stride2
+  diagnostic_no_multiview_stride4
+)
+AUDIT_PROFILE_KEYS=(strict mv1_stride2 nomv_stride4)
+COMPARE_ARGS=()
+
+for i in "${!AUDIT_RUN_DIRS[@]}"; do
+  AUDIT_DIR="${AUDIT_RUN_DIRS[$i]}"
+  AUDIT_LABEL="${AUDIT_PROFILE_LABELS[$i]}"
+  AUDIT_KEY="${AUDIT_PROFILE_KEYS[$i]}"
+  if [ ! -f "${AUDIT_DIR}/audit/freeocc_mapping_audit.json" ]; then
+    continue
+  fi
+
   python "${INTERNNAV_ROOT}/scripts/eval/analyze_freeocc_mapping_audit.py" \
-    --run-dir "${STRICT_DIR}" \
+    --run-dir "${AUDIT_DIR}" \
     --expected-input-frames 30 \
     --rgb-dir "${INPUT_DIR}" \
-    --profile-label "strict_mv2_stride1"
+    --profile-label "${AUDIT_LABEL}"
+
+  PYTHONPATH="${INTERNNAV_ROOT}" python "${INTERNNAV_ROOT}/scripts/eval/evaluate_freeocc_habitat_gt.py" \
+    --input-dir "${INPUT_DIR}" \
+    --pred-ply "${AUDIT_DIR}/mesh/final_mono.ply" \
+    --trajectory-npz "${AUDIT_DIR}/audit/trajectories.npz" \
+    --out-dir "${AUDIT_DIR}/analysis" \
+    --profile-label "${AUDIT_LABEL}"
+
+  COMPARE_ARGS+=(--run "${AUDIT_KEY}=${AUDIT_DIR}")
+  if [ "${AUDIT_KEY}" != strict ]; then
+    RETURN_DIR="${STRICT_DIR}/diagnostics/${AUDIT_KEY}"
+    mkdir -p "${RETURN_DIR}/analysis" "${RETURN_DIR}/audit" "${RETURN_DIR}/mesh"
+    cp "${AUDIT_DIR}/analysis/freeocc_mapping_summary.json" "${RETURN_DIR}/analysis/"
+    cp "${AUDIT_DIR}/analysis/freeocc_filter_trajectory_audit.png" "${RETURN_DIR}/analysis/"
+    cp "${AUDIT_DIR}/analysis/freeocc_rgb_semantic_gaussians.png" "${RETURN_DIR}/analysis/"
+    cp "${AUDIT_DIR}/analysis/habitat_gt_occ_metrics.json" "${RETURN_DIR}/analysis/"
+    cp "${AUDIT_DIR}/analysis/habitat_observed_occ.npz" "${RETURN_DIR}/analysis/"
+    cp "${AUDIT_DIR}/analysis/freeocc_rgb_pred_gt_occ.png" "${RETURN_DIR}/analysis/"
+  fi
+
+  HASH_TMP="/tmp/${AUDIT_KEY}_SHA256SUMS.$$"
+  (cd "${AUDIT_DIR}" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum) > "${HASH_TMP}"
+  mv "${HASH_TMP}" "${AUDIT_DIR}/SHA256SUMS"
+done
+
+if [ "${#COMPARE_ARGS[@]}" -gt 0 ]; then
+  python "${INTERNNAV_ROOT}/scripts/eval/compare_freeocc_habitat_profiles.py" \
+    "${COMPARE_ARGS[@]}" \
+    --out-dir "${STRICT_DIR}/analysis"
+fi
+
+if [ -d "${STRICT_DIR}" ]; then
   HASH_TMP="/tmp/${STRICT_TAG}_SHA256SUMS.$$"
   (cd "${STRICT_DIR}" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum) > "${HASH_TMP}"
   mv "${HASH_TMP}" "${STRICT_DIR}/SHA256SUMS"
