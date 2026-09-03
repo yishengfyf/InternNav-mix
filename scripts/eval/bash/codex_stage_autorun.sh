@@ -12,7 +12,7 @@ fi
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
-PHASE="stage77_directional_guard_ablation"
+PHASE="stage78_semantic_attachment_shadow"
 TAG="${PHASE}_$(date +%Y%m%d_%H%M%S)"
 
 source /home/yifeifeng/miniconda3/etc/profile.d/conda.sh
@@ -565,6 +565,58 @@ case "${PHASE}" in
     python3 scripts/eval/analyze_stage65_native_recovery.py --run-root "${run_dir}" --expected-episodes 36 --output "${result_dir}/stage65_native_recovery_audit.json"
     # Return action-level videos with this stage so visual review is reproducible.
     cp -a "${run_dir}/vis_debug" "${result_dir}/vis_debug"
+    find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
+    latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
+    test -d "${result_dir}"
+    ln -sfn "${result_dir}" "${latest_link}"
+    echo "CODEX_LATEST_RETURN=${latest_link}"
+    ;;
+  stage78_semantic_attachment_shadow)
+    export STAGE21C_SCORER_CHECKPOINT=/data/usr_data/yifeifeng/internnav/stage_results/shared_checkpoints/stage21b_seed_53/best.pt
+    export STAGE59_MANIFEST=/home/yifeifeng/workspace/InternNav/scripts/eval/manifests/stage78_semantic_attachment_smoke7_episode_seed_replay.json
+    export STAGE59_CONFIG=scripts/eval/configs/habitat_dual_system_stage78_semantic_attachment_shadow_cfg.py
+    export STAGE59_PIPELINE_TAG="${TAG}"
+    export STAGE59_RUN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results/runs
+    export STAGE59_RETURN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results
+    export STAGE59_SKIP_AUDIT_REQUIRE_ALL=1
+    baseline_run="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_stage77_directional_guard_ablation_20260903_032106"
+    test -d "${baseline_run}"
+    python3 -m pytest -q \
+      tests/unit_test/test_stage78_semantic_route_attachment.py \
+      tests/unit_test/test_stage78_semantic_attachment_analyzer.py
+    bash scripts/eval/bash/stage59_productive_onset96.sh
+    base_return="/data/usr_data/yifeifeng/internnav/stage_results/stage59_productive_onset_return_${TAG}"
+    result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage78_semantic_attachment_return_${TAG}"
+    run_dir="/data/usr_data/yifeifeng/internnav/stage_results/runs/compare_vlmap_stage59_productive_onset_${TAG}"
+    test -d "${base_return}"
+    test ! -e "${result_dir}"
+    mkdir -p "${result_dir}"
+    cp -a "${base_return}/." "${result_dir}/"
+    python3 scripts/eval/analyze_stage59_productive_onset.py \
+      --run-root "${run_dir}" --manifest "${STAGE59_MANIFEST}" \
+      --output "${result_dir}/stage59_productive_onset_audit.json"
+    python3 scripts/eval/analyze_stage65_native_recovery.py \
+      --run-root "${run_dir}" --expected-episodes 7 \
+      --output "${result_dir}/stage65_native_recovery_audit.json"
+    python3 scripts/eval/analyze_stage78_semantic_attachment.py \
+      --run-root "${run_dir}" --baseline-root "${baseline_run}" \
+      --manifest "${STAGE59_MANIFEST}" \
+      --output "${result_dir}/stage78_semantic_attachment_audit.json" \
+      --bev-dir "${result_dir}/semantic_recovery_bev"
+    mkdir -p "${result_dir}/semantic_debug"
+    for rank_dir in "${run_dir}"/vlmap_safety_debug/*; do
+      test -d "${rank_dir}" || continue
+      rank_name=$(basename "${rank_dir}")
+      mkdir -p "${result_dir}/semantic_debug/${rank_name}"
+      if [[ -d "${rank_dir}/online_lseg_shadow" ]]; then
+        cp -a "${rank_dir}/online_lseg_shadow" \
+          "${result_dir}/semantic_debug/${rank_name}/"
+      fi
+      if [[ -f "${rank_dir}/s2_recovery_context_events.jsonl" ]]; then
+        cp -a "${rank_dir}/s2_recovery_context_events.jsonl" \
+          "${result_dir}/semantic_debug/${rank_name}/"
+      fi
+    done
     find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
     latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
     test -d "${result_dir}"

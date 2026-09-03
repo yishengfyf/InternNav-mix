@@ -103,6 +103,9 @@ from internnav.utils.stage75_route_prompt import (
     build_dualvln_temporary_reference_card,
     route_guidance_from_bridge,
 )
+from internnav.utils.stage78_semantic_route_attachment import (
+    attach_semantic_nodes_to_route,
+)
 from internnav.utils.stage43_counterfactual_reobserve import (
     SCHEMA_VERSION as STAGE43_SCHEMA_VERSION,
     normalize_angle_deg,
@@ -875,6 +878,40 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "stage76_temporary_instruction_enable", False
                 )
             ),
+            "stage78_semantic_route_audit_enable": bool(
+                vlmap_safety_cfg.get(
+                    "stage78_semantic_route_audit_enable", False
+                )
+            ),
+            "stage78_semantic_route_max_distance_m": max(
+                0.05,
+                float(
+                    vlmap_safety_cfg.get(
+                        "stage78_semantic_route_max_distance_m", 0.75
+                    )
+                ),
+            ),
+            "stage78_semantic_route_min_views": max(
+                1,
+                int(
+                    vlmap_safety_cfg.get(
+                        "stage78_semantic_route_min_views", 2
+                    )
+                ),
+            ),
+            "stage78_semantic_route_min_confidence": float(
+                vlmap_safety_cfg.get(
+                    "stage78_semantic_route_min_confidence", 0.35
+                )
+            ),
+            "stage78_recovery_bev_radius_cells": max(
+                8,
+                int(
+                    vlmap_safety_cfg.get(
+                        "stage78_recovery_bev_radius_cells", 24
+                    )
+                ),
+            ),
             "stage75_route_lookahead_m": max(
                 0.05,
                 float(vlmap_safety_cfg.get("stage75_route_lookahead_m", 0.75)),
@@ -1345,6 +1382,68 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             event["bridge_reason"] = bridge.get("reason")
             event["path_preview"] = list(bridge.get("path_preview") or [])
         context["current_query_step"] = int(current_query_step)
+        context["stage75_route_guidance"] = dict(event)
+        if cfg.get("stage78_semantic_route_audit_enable"):
+            semantic_nodes = []
+            for raw_node in self.online_lseg_shadow.snapshot_nodes(filtered=True):
+                node = dict(raw_node)
+                centroid = list(node.get("centroid") or [])
+                if len(centroid) < 2:
+                    continue
+                try:
+                    grid = self.occ_memory._xy_to_grid_cell(
+                        float(centroid[0]), float(centroid[1])
+                    )
+                    row, col = int(grid[0]), int(grid[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                node["grid"] = [row, col]
+                node["occ_state_at_centroid"] = self.occ_memory._cell_state(
+                    row, col
+                )
+                semantic_nodes.append(node)
+            semantic_attachment = attach_semantic_nodes_to_route(
+                semantic_nodes,
+                list(event.get("path_preview") or []),
+                cell_size_m=float(getattr(self.occ_memory, "cs", 0.05)),
+                max_route_distance_m=float(
+                    cfg["stage78_semantic_route_max_distance_m"]
+                ),
+                min_multiview_observations=int(
+                    cfg["stage78_semantic_route_min_views"]
+                ),
+                min_mean_confidence=float(
+                    cfg["stage78_semantic_route_min_confidence"]
+                ),
+            )
+            event["stage78_semantic_route_attachment"] = semantic_attachment
+            center_grid = event.get("start_grid") or getattr(
+                self.occ_memory, "last_pose_grid", None
+            )
+            if center_grid is not None:
+                pose_trace = list(getattr(self.occ_memory, "pose_trace", []) or [])
+                current_pose = (
+                    dict(pose_trace[-1])
+                    if pose_trace and isinstance(pose_trace[-1], dict)
+                    else {"grid": list(center_grid)}
+                )
+                current_pose["grid"] = list(center_grid)
+                event["stage78_recovery_bev_spatial"] = (
+                    build_recovery_bev_spatial_snapshot(
+                        center_grid=center_grid,
+                        free_cells=getattr(self.occ_memory, "free2d_counts", {}).keys(),
+                        occupied_cells=getattr(self.occ_memory, "occ2d_counts", {}).keys(),
+                        pose_trace=pose_trace,
+                        semantic_cells=[
+                            node["grid"] for node in semantic_nodes
+                        ],
+                        semantic_nodes=semantic_nodes,
+                        current_pose=current_pose,
+                        hfov_deg=float(self.sim_sensors_config.depth_sensor.hfov),
+                        candidate_path=list(event.get("path_preview") or []),
+                        radius_cells=int(cfg["stage78_recovery_bev_radius_cells"]),
+                    )
+                )
         context["stage75_route_guidance"] = dict(event)
         self._write_s2_recovery_context_event(event)
         return event
