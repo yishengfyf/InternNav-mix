@@ -1,0 +1,25 @@
+diff --git a/src/gaussian_mapping.py b/src/gaussian_mapping.py
+--- a/src/gaussian_mapping.py
++++ b/src/gaussian_mapping.py
+@@ -1986,6 +1986,20 @@ class GaussianMapper(object):
+         
+         self._init_ov_model()
+ 
++        # A bounded stream can finish with fewer retained keyframes than the
++        # mapper warmup.  The old state machine matched neither final branch in
++        # that case and busy-looped forever.  Drain every available frame once
++        # and terminate normally; downstream audit code can still mark the run
++        # as under-warmup and avoid treating it as a production-quality map.
++        if the_end and self.cur_idx > 0 and ((self.cur_idx + 1) <= self.warmup):
++            self.info(
++                f"[FreeOccAudit] Finalizing short sequence with {self.cur_idx} "
++                f"keyframes below mapper warmup={self.warmup}."
++            )
++            self._update(iters=self.mapping_iters, delay_to_tracking=False, release_cache=False)
++            self.count += 1
++            self._last_call(mapping_queue=mapping_queue, received_item=received_item)
++            return True
++
+         # 1) Normal online update: new frames are available and warmup has passed.
+         if (not the_end) and (self.last_idx + self.delay < (self.cur_idx + 1)) and ((self.cur_idx + 1) > self.warmup):
+             self._update(delay_to_tracking=True, iters=self.mapping_iters, release_cache=False)

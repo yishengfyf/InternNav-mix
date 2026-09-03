@@ -223,3 +223,9 @@ metric depth，还必须修复/替换 DROID 在原地大角度转向时的姿态
 每帧深度和相邻位姿作为联合门控。Trident 语义目前也只能定性展示：该序列
 未录制 semantic sensor GT，且可视化中 `table/floor/ceiling` 明显占比过高，
 在补录 instance-to-category GT 前不得报告 semantic mIoU。
+
+补充边界检查还发现：短窗口经 DROID motion filter 后若保留的关键帧数不超过
+mapper warmup，原 `GaussianMapper.__call__(the_end=True)` 的两个结束分支都不
+匹配，会无限忙循环。`patches/freeocc_short_sequence_finalization.patch` 让结束
+阶段无延迟地消费现有关键帧并正常退出；此类结果仍会标记为 under-warmup
+诊断，不能据此评估正常长序列精度。
