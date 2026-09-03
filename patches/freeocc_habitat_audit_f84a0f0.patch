@@ -1,0 +1,415 @@
+diff --git a/src/datasets.py b/src/datasets.py
+index 96cbe82..5ca6d4e 100644
+--- a/src/datasets.py
++++ b/src/datasets.py
+@@ -67,14 +67,16 @@ class BaseDataset(TorchDataset):
+         )
+ 
+         # ScanNet-like pose folders sometimes contain invalid tail poses.
+-        last_valid_frame = -1
++        # When every pose is valid the usable prefix is the full sequence.
++        # Returning -1 here silently dropped the final RGB/depth/pose triplet.
++        last_valid_frame = len(pose_paths)
+         for i, pose_path in enumerate(pose_paths):
+             with open(pose_path, "r") as f:
+                 lines = f.readlines()
+             rows = [list(map(float, line.split(" "))) for line in lines]
+             c2w = np.array(rows).reshape(4, 4)
+             if np.isnan(c2w).any() or np.isinf(c2w).any():
+-                last_valid_frame = i + 1
++                last_valid_frame = i
+                 break
+             self.poses.append(c2w)
+ 
+diff --git a/src/depth_video.py b/src/depth_video.py
+index 1842fb2..f47b8ef 100755
+--- a/src/depth_video.py
++++ b/src/depth_video.py
+@@ -1,3 +1,4 @@
++import json
+ from typing import Optional, List
+ import torch
+ import torch.multiprocessing as mp
+@@ -255,6 +256,9 @@ class DepthVideo:
+                     conf = torch.index_select(self.confidence, 0, dirty_index).clone()
+ 
+         mask = torch.ones_like(disps, dtype=torch.bool)
++        raw_mask = disps > 0
++        raw_counts = raw_mask.sum(dim=(1, 2))
++        raw_disp_sum = torch.where(raw_mask, disps, torch.zeros_like(disps)).sum(dim=(1, 2))
+         if multiview:
+             # Only take pixels where multiple points are consistent across views and they do not have an outlier disparity
+             thresh = bin_th * torch.ones_like(disps.mean(dim=[1, 2]))
+@@ -265,14 +269,48 @@ class DepthVideo:
+             mv_mask = count >= mv_count_th
+             mask = mask & mv_mask
+ 
++        multiview_counts = (mask & raw_mask).sum(dim=(1, 2))
++
+         if uncertainty:
+             conf_mask = conf > conf_th
+             mask = mask & conf_mask
+ 
++        uncertainty_counts = (mask & raw_mask).sum(dim=(1, 2))
++
+         # Filter away spurious points with very low disparities (relative to distribution and hard threshold)
+         inliers = torch.logical_and(disps > min_disp_th * disps.mean(dim=[1, 2], keepdim=True), disps > hard_disp_th)
+         mask = mask & inliers
+ 
++        final_counts = (mask & raw_mask).sum(dim=(1, 2))
++        frame_ids = dirty_index.detach().cpu().tolist()
++        audit_rows = []
++        for row_i, frame_id in enumerate(frame_ids):
++            audit_rows.append(
++                {
++                    "frame_id": int(frame_id),
++                    "pixels": int(disps[row_i].numel()),
++                    "raw_valid": int(raw_counts[row_i].item()),
++                    "raw_disp_mean": float(
++                        (raw_disp_sum[row_i] / raw_counts[row_i].clamp_min(1)).item()
++                    ),
++                    "after_multiview": int(multiview_counts[row_i].item()),
++                    "after_uncertainty": int(uncertainty_counts[row_i].item()),
++                    "final_valid": int(final_counts[row_i].item()),
++                }
++            )
++        self.last_filter_audit = {
++            "multiview": bool(multiview),
++            "mv_count_th": int(mv_count_th),
++            "bin_th": float(bin_th),
++            "uncertainty": bool(uncertainty),
++            "conf_th": float(conf_th),
++            "frames": audit_rows,
++        }
++        if not hasattr(self, "filter_audit_history"):
++            self.filter_audit_history = []
++        self.filter_audit_history.append(self.last_filter_audit)
++        print("[FreeOccAudit][filter] " + json.dumps(self.last_filter_audit), flush=True)
++
+         disps[~mask] = 0.0  # Filter away invalid points
+         # Assign clean values to datastructure
+         if set_video:
+diff --git a/src/gaussian_mapping.py b/src/gaussian_mapping.py
+index 97aa921..80d2dea 100644
+--- a/src/gaussian_mapping.py
++++ b/src/gaussian_mapping.py
+@@ -1,4 +1,5 @@
+ import os
++import json
+ from typing import List, Optional, Tuple
+ import gc
+ from termcolor import colored
+@@ -645,6 +646,7 @@ class GaussianMapper(object):
+         self.save_mesh_each_update = bool(getattr(self.cfg.mapping, "save_mesh_each_update", False))
+         self.save_mesh_each_update_every = int(getattr(self.cfg.mapping, "save_mesh_each_update_every", 1))  # save once per N updates
+         self._mesh_export_counter = 0
++        self.mapping_audit_history = []
+ 
+     def info(self, msg: str):
+         print(colored("[Gaussian Mapper] " + msg, "magenta"))
+@@ -1003,18 +1005,105 @@ class GaussianMapper(object):
+         torch.cuda.empty_cache()
+         gc.collect()
+ 
+-        final_aligned_gaussians = self.get_aligned_gaussians()
+-        ply_path = f"{self.output}/mesh/final_{self.mode}.ply"
+-        final_aligned_gaussians.save_ply(ply_path)
+-        self.info(f"Mesh saved at {ply_path} (from get_current_gaussians)")
++        result = self.get_current_gaussians()
++        if isinstance(result, tuple) and len(result) == 3 and isinstance(result[0], GaussianModel):
++            raw_gaussians, _, _ = result
++            self.gaussians = raw_gaussians
+ 
+-        self.info(f"{len(self.iteration_info)} iterations, {len(self.cameras)/len(self.iteration_info)} cams/it")
++            raw_ply_path = f"{self.output}/mesh/final_{self.mode}_raw.ply"
++            raw_gaussians.save_ply(raw_ply_path)
++            self.info(f"Raw mesh saved at {raw_ply_path}")
++
++            final_aligned_gaussians = self.get_aligned_gaussians(g=raw_gaussians)
++            ply_path = f"{self.output}/mesh/final_{self.mode}.ply"
++            final_aligned_gaussians.save_ply(ply_path)
++            self.info(f"Aligned mesh saved at {ply_path}")
++        else:
++            self.info("[FreeOccAudit] No valid Gaussians available for final PLY export.")
++
++        self._save_audit_artifacts()
++
++        iterations = len(self.iteration_info)
++        cams_per_iteration = len(self.cameras) / iterations if iterations else 0.0
++        self.info(f"{iterations} iterations, {cams_per_iteration} cams/it")
+ 
+         if mapping_queue is not None:
+             mapping_queue.put("done")
+         if received_item is not None:
+             received_item.wait()
+ 
++    def _save_audit_artifacts(self):
++        """Persist filter/mapping counts and estimated/GT trajectories for offline audit."""
++        audit_dir = os.path.join(self.output, "audit")
++        os.makedirs(audit_dir, exist_ok=True)
++
++        with self.video.get_lock():
++            n_frames = int(self.video.counter.value)
++            frame_ids = torch.arange(n_frames, device=self.video.device, dtype=torch.long)
++            timestamps = self.video.timestamp[:n_frames].detach().cpu().numpy()
++            est_w2c_lie = self.video.poses[:n_frames].detach().clone()
++            gt_c2w_lie = self.video.poses_gt[:n_frames].detach().clone()
++            raw_disps = self.video.disps_up[:n_frames] if self.video.upsampled else self.video.disps[:n_frames]
++            clean_disps = self.video.disps_clean[:n_frames]
++            raw_disp_counts = (raw_disps > 0).sum(dim=(1, 2)).detach().cpu().numpy()
++            clean_disp_counts = (clean_disps > 0).sum(dim=(1, 2)).detach().cpu().numpy()
++
++        est_w2c = lie_to_matrix(est_w2c_lie).detach()
++        est_c2w = torch.linalg.inv(est_w2c)
++        gt_c2w = lie_to_matrix(gt_c2w_lie).detach()
++
++        np.savez_compressed(
++            os.path.join(audit_dir, "trajectories.npz"),
++            frame_ids=frame_ids.cpu().numpy(),
++            timestamps=timestamps,
++            estimated_w2c=est_w2c.cpu().numpy(),
++            estimated_c2w=est_c2w.cpu().numpy(),
++            gt_c2w=gt_c2w.cpu().numpy(),
++            raw_disp_valid_counts=raw_disp_counts,
++            clean_disp_valid_counts=clean_disp_counts,
++        )
++
++        def _save_matrix_trajectory(name, matrices):
++            rows = []
++            matrices = matrices.detach().cpu().numpy()
++            for frame_id, timestamp, matrix in zip(frame_ids.cpu().tolist(), timestamps.tolist(), matrices):
++                rows.append(
++                    [int(frame_id), float(timestamp)]
++                    + [float(value) for value in matrix.reshape(-1).tolist()]
++                )
++            np.savetxt(
++                os.path.join(audit_dir, name),
++                np.asarray(rows, dtype=np.float64),
++                fmt=["%d", "%.9f"] + ["%.9f"] * 16,
++                header="frame_id timestamp c2w_00 c2w_01 c2w_02 c2w_03 c2w_10 c2w_11 c2w_12 c2w_13 c2w_20 c2w_21 c2w_22 c2w_23 c2w_30 c2w_31 c2w_32 c2w_33",
++            )
++
++        _save_matrix_trajectory("trajectory_estimated_c2w.txt", est_c2w)
++        _save_matrix_trajectory("trajectory_gt_c2w.txt", gt_c2w)
++
++        audit = {
++            "schema_version": 1,
++            "mode": str(self.mode),
++            "video_frames": n_frames,
++            "camera_uids": [int(cam.uid) for cam in self.cameras],
++            "gaussian_frame_uids": sorted(int(uid) for uid in self.cam2gaussian.keys()),
++            "skipped_keyframe_uids": sorted(int(uid) for uid in self.skipped_kfs),
++            "filter_calls": getattr(self.video, "filter_audit_history", []),
++            "mapping_calls": self.mapping_audit_history,
++            "sim3": {
++                "scale": float(getattr(self, "last_sim3_scale", 1.0)),
++                "pre_rmse": float(getattr(self, "last_sim3_pre_rmse", 0.0)),
++                "post_rmse": float(getattr(self, "last_sim3_post_rmse", 0.0)),
++                "pairs": int(getattr(self, "last_sim3_pairs", 0)),
++            },
++            "raw_disp_valid_total": int(raw_disp_counts.sum()),
++            "clean_disp_valid_total": int(clean_disp_counts.sum()),
++        }
++        audit_path = os.path.join(audit_dir, "freeocc_mapping_audit.json")
++        with open(audit_path, "w", encoding="utf-8") as handle:
++            json.dump(audit, handle, indent=2, sort_keys=True)
++        self.info(f"[FreeOccAudit] Audit artifacts saved under {audit_dir}")
++
+     def update_gui(self, last_new_cam: Camera) -> None:
+         # Debug: make sure this is called (multiprocess safe)
+         # print("[GUI] update_gui called", flush=True)
+@@ -1396,9 +1485,6 @@ class GaussianMapper(object):
+         if len(self.cam2gaussian) == 0:
+             return _set_identity("cam2gaussian empty")
+         
+-        if getattr(self, "gt_scene_data", None) is None:
+-            return _set_identity("GT occ not loaded (gt_scene_data is None)")
+-
+         used_indices = sorted(list(self.cam2gaussian.keys()))
+         idxs = torch.tensor(used_indices, device=device, dtype=torch.long)
+ 
+@@ -1447,11 +1533,9 @@ class GaussianMapper(object):
+         valid_mask = ts_mask & est_mask & gt_mask
+         n_valid = valid_mask.sum().item()
+         if n_valid < min_pairs:
+-            self.info(f"[Sim3] Not enough valid pose pairs after filtering: {n_valid} < {min_pairs}. Use identity Sim3.")
+-            self.align_s = 1.0
+-            self.align_R = torch.eye(3, device=device)
+-            self.align_t = torch.zeros(3, device=device)
+-            return
++            return _set_identity(
++                f"not enough valid pose pairs after filtering: {n_valid} < {min_pairs}"
++            )
+ 
+         poses_w2c_lie = poses_w2c_lie[valid_mask]
+         poses_gt_c2w  = poses_gt_c2w[valid_mask]
+@@ -1812,7 +1896,16 @@ class GaussianMapper(object):
+         lr_opa = float(getattr(self.cfg.mapping, "frame_gaussians_lr_opa", 1e-5))
+         views_per_iter = int(getattr(self.cfg.mapping, "frame_gaussians_views_per_iter", 10))
+ 
+-        g, frame_slices, views = self.get_current_gaussians(window_size=win)
++        result = self.get_current_gaussians(window_size=win)
++        if not (
++            isinstance(result, tuple)
++            and len(result) == 3
++            and isinstance(result[0], GaussianModel)
++            and len(result[2]) > 0
++        ):
++            self.info("[FreeOccAudit] No valid Gaussians in mapping window; skip optimization.")
++            return []
++        g, frame_slices, views = result
+ 
+         # -----------------------------
+         # Optimize scale & rotation
+@@ -1904,8 +1997,6 @@ class GaussianMapper(object):
+             self._update(delay_to_tracking=True, iters=self.mapping_iters, release_cache=False)
+             self.count += 1
+ 
+-            # force
+-            self.last_idx = self.cur_idx
+             return False
+ 
+         # 3) Final stage: the last keyframe batch is ready, run the final update and last_call.
+@@ -1919,13 +2010,14 @@ class GaussianMapper(object):
+             self._last_call(mapping_queue=mapping_queue, received_item=received_item)
+             return True
+ 
+-    def get_aligned_gaussians(self):
++    def get_aligned_gaussians(self, g=None):
+ 
+         scene_data = self.gt_scene_data
+         gt_occ_pts = self.gt_occ_pts  # Only kept for later visualization; Sim3 alignment uses poses only.
+ 
+         # Use the 3DGS representation tied to SLAM xyz from get_current_gaussians().
+-        g, frame_slices, views = self.get_current_gaussians()
++        if g is None:
++            g, frame_slices, views = self.get_current_gaussians()
+         self.gaussians = g
+ 
+         # Ensure the global Sim(3) alignment has been estimated from SLAM/GT trajectories.
+@@ -1992,6 +2084,12 @@ class GaussianMapper(object):
+         views = []
+         mask_all = []
+         view_id_all = []
++        audit = {
++            "call_index": len(self.mapping_audit_history),
++            "window_size": None if window_size is None else int(window_size),
++            "candidate_frame_uids": list(win_uids),
++            "frames": [],
++        }
+ 
+         for uid in win_uids:
+             fg = self.cam2gaussian[uid]
+@@ -2035,15 +2133,28 @@ class GaussianMapper(object):
+                 d = d[0]
+             H, W = int(d.shape[-2]), int(d.shape[-1])
+ 
++            frame_audit = {
++                "frame_id": int(uid),
++                "timestamp": float(_ts.item() if isinstance(_ts, torch.Tensor) else _ts),
++                "pixels": int(d.numel()),
++                "depth_valid": int((d > 0).sum().item()),
++                "static_valid": int(stat_mask.sum().item()),
++                "cached_mask_valid": int(fg.mask.sum().item()),
++            }
++
+             fx, fy, cx, cy = [float(x) / self.stride for x in intrinsics]
+ 
+             # build valid mask
+             valid = (d > 0)
+             valid = valid & stat_mask
+             valid = valid & fg.mask
++            frame_audit["combined_valid"] = int(valid.sum().item())
+ 
+             # --- early skip frames with no valid points ---
+             if valid.sum().item() == 0:
++                frame_audit["finite_valid"] = 0
++                frame_audit["appended_gaussians"] = 0
++                audit["frames"].append(frame_audit)
+                 fg.mask = valid.detach()
+                 fg.cpu()
+                 self.cam2gaussian[uid] = fg
+@@ -2131,16 +2242,35 @@ class GaussianMapper(object):
+             finite = finite & torch.isfinite(rotations).all(dim=-1)
+             finite = finite & torch.isfinite(opacities).all(dim=-1)
+ 
++            finite_valid = int(finite.sum().item())
++            frame_audit["finite_valid"] = finite_valid
++            frame_audit["appended_gaussians"] = finite_valid
++            if finite_valid > 0:
++                finite_depth = z[valid][finite]
++                frame_audit["depth_min"] = float(finite_depth.min().item())
++                frame_audit["depth_mean"] = float(finite_depth.mean().item())
++                frame_audit["depth_max"] = float(finite_depth.max().item())
++            audit["frames"].append(frame_audit)
++
+             if finite.sum().item() == 0:
+                 fg.mask = valid.detach()
+                 fg.cpu()
+                 self.cam2gaussian[uid] = fg
+                 continue
+ 
++            # Keep only finite rows in the exported/optimized representation and
++            # reflect that selection back into the persistent per-pixel mask.
++            valid_finite = valid.clone()
++            valid_finite[valid] = finite
++            fg.mask = valid_finite.detach()
++            pts_w = pts_w[finite]
++            rgb = rgb[finite]
++            feat = feat[finite]
++            scales = scales[finite]
++            rotations = rotations[finite]
++            opacities = opacities[finite]
+             Ni = pts_w.shape[0]
+ 
+-            fg.mask = valid.detach()
+-
+             # build View for optimization
+             views.append(
+                 View(
+@@ -2158,7 +2288,7 @@ class GaussianMapper(object):
+             view_idx = len(views)
+ 
+             view_id_all.append(torch.full((Ni,), view_idx, device=finite.device, dtype=torch.long))  # NEW
+-            mask_all.append(finite)
++            mask_all.append(torch.ones((Ni,), device=pts_w.device, dtype=torch.bool))
+             pts_all.append(pts_w)
+             rgb_all.append(rgb)
+             feat_all.append(feat)
+@@ -2173,6 +2303,10 @@ class GaussianMapper(object):
+ 
+         # If nothing collected, return empty
+         if len(pts_all) == 0:
++            audit["frames_with_gaussians"] = 0
++            audit["total_gaussians"] = 0
++            self.mapping_audit_history.append(audit)
++            print("[FreeOccAudit][mapping] " + json.dumps(audit), flush=True)
+             return [], {}, []
+ 
+         # -----------------------------
+@@ -2186,17 +2320,22 @@ class GaussianMapper(object):
+         op0 = torch.cat(op_all, dim=0)
+         masks = torch.cat(mask_all, dim=0)
+         view_ids = torch.cat(view_id_all, dim=0)
++        total_points = int(pts.shape[0])
++        audit["frames_with_gaussians"] = int(len(pts_all))
++        audit["total_gaussians"] = total_points
++        self.mapping_audit_history.append(audit)
++        print("[FreeOccAudit][mapping] " + json.dumps(audit), flush=True)
+ 
+         g = GaussianModel(sh_degree=0, config=self.cfg.mapping.input, use_surface_points=True)
+         g._surface_xyz = nn.Parameter(pts, requires_grad=False)
+         g._features_dc = nn.Parameter(rgb[:, :, None], requires_grad=False)
+-        g._features_rest = nn.Parameter(torch.empty((Ni, 0, 1), device=self.device, dtype=torch.float32), requires_grad=False)
++        g._features_rest = nn.Parameter(torch.empty((total_points, 0, 1), device=self.device, dtype=torch.float32), requires_grad=False)
+         g._scaling = nn.Parameter(scales0, requires_grad=False)
+         g._rotation = nn.Parameter(F.normalize(rots0, dim=-1, eps=1e-8), requires_grad=False)
+         g._opacity = nn.Parameter(op0, requires_grad=False)
+         g._mask = nn.Parameter(masks, requires_grad=False)
+-        g.max_radii2D = torch.zeros((Ni,), device=self.device, dtype=torch.float32)
+-        g.xyz_gradient_accum = torch.zeros((Ni, 1), device=self.device, dtype=torch.float32)
++        g.max_radii2D = torch.zeros((total_points,), device=self.device, dtype=torch.float32)
++        g.xyz_gradient_accum = torch.zeros((total_points, 1), device=self.device, dtype=torch.float32)
+         g.ov_feat = feat
+         g._view_ids = view_ids
+         g.views = views
