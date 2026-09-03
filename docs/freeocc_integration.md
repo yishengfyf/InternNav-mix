@@ -283,3 +283,13 @@ Metric3D checkpoint；而 DROID 在大角度原地旋转时也会发生姿态跳
 下一步必须先做“稳定姿态/初始化 + 真正的 RGB→metric-depth”两条链路的隔离
 实验，再考虑把 FreeOcc 作为 DualVLN 在线 worker。仅调低 `mv_count_th` 会
 增加错误点，不能视为修复。
+
+### audit7：延迟初始化的 RGB-only 对照（2026-09-03）
+
+同一 SN83 序列再从第 20 帧开始取 60 帧（跳过最初的纯旋转/初始化段），仍
+使用 `mode=mono, use_gt_poses=false`。相较从第 0 帧开始的实验，姿态相对误差
+最大值降至约 27°、中心 RMSE 降至 0.065 m，Gaussian 增至 362,695，观察表面
+IoU/F1@0.10m 提升至 0.034/0.117；但这仍远低于 oracle，说明“等待足够视差
+后再启动 DROID”是有效缓解而非完整解决方案。适配 DualVLN 时可以把前 N 帧
+作为 warm-up、只缓存 RGB，并在检测到平移/视差后启动 FreeOcc worker；同时
+保留姿态质量门控，异常时冻结地图而不是继续写入错误坐标。
