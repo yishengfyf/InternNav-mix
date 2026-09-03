@@ -80,6 +80,15 @@ def _ply_header(path: Path) -> Dict[str, Any]:
     return result
 
 
+def _final_ply(run_dir: Path, raw: bool = False) -> Path:
+    candidates = sorted((run_dir / "mesh").glob("final_*.ply"))
+    candidates = [path for path in candidates if path.name.endswith("_raw.ply") == raw]
+    if not candidates:
+        suffix = "*_raw.ply" if raw else "*.ply"
+        return run_dir / "mesh" / f"missing_{suffix.replace('*', 'map')}"
+    return candidates[0]
+
+
 def _property_index(name: str) -> int:
     try:
         return int(name.rsplit("_", 1)[-1])
@@ -455,8 +464,13 @@ def analyze(
     raw_total = sum(int(row.get("raw_valid", 0)) for row in rows.values())
     mv_total = sum(int(row.get("after_multiview", 0)) for row in rows.values())
     final_total = sum(int(row.get("final_valid", 0)) for row in rows.values())
+    support_available = any(row.get("mv_support_ge_1") is not None for row in rows.values())
     support = {
-        f"count_ge_{level}": sum(int(row.get(f"mv_support_ge_{level}") or 0) for row in rows.values())
+        f"count_ge_{level}": (
+            sum(int(row.get(f"mv_support_ge_{level}") or 0) for row in rows.values())
+            if support_available
+            else None
+        )
         for level in (1, 2, 3)
     }
     support_max_values = [row.get("mv_support_max") for row in rows.values() if row.get("mv_support_max") is not None]
@@ -480,8 +494,8 @@ def analyze(
         "final_mapping_call": mapping,
         "trajectory": trajectory,
         "runtime": _runtime_summary(run_dir / "console.log"),
-        "ply_raw": _ply_header(run_dir / "mesh" / "final_mono_raw.ply"),
-        "ply_aligned": _ply_header(run_dir / "mesh" / "final_mono.ply"),
+        "ply_raw": _ply_header(_final_ply(run_dir, raw=True)),
+        "ply_aligned": _ply_header(_final_ply(run_dir, raw=False)),
     }
     result["diagnosis"] = _diagnosis(rows, mapping)
     if expected_input_frames is not None:
@@ -515,7 +529,7 @@ def main() -> int:
     try:
         result["semantic_visualization"] = _plot_rgb_semantic_gaussians(
             out_dir / "freeocc_rgb_semantic_gaussians.png",
-            args.run_dir / "mesh" / "final_mono.ply",
+            _final_ply(args.run_dir, raw=False),
             args.rgb_dir,
             aligned,
             gt,

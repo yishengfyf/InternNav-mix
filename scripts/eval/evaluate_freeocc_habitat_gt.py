@@ -133,6 +133,17 @@ def _nearest_distances(source: np.ndarray, target: np.ndarray) -> np.ndarray:
         return result
 
 
+def _distance_stats(values: np.ndarray) -> Dict[str, float | None]:
+    finite = values[np.isfinite(values)]
+    if not len(finite):
+        return {"mean": None, "median": None, "p90": None}
+    return {
+        "mean": float(np.mean(finite)),
+        "median": float(np.median(finite)),
+        "p90": float(np.quantile(finite, 0.9)),
+    }
+
+
 def _surface_metrics(
     gt_indices: np.ndarray,
     pred_indices: np.ndarray,
@@ -160,16 +171,8 @@ def _surface_metrics(
         result[f"precision_at_{threshold:.2f}m"] = precision
         result[f"recall_at_{threshold:.2f}m"] = recall
         result[f"f1_at_{threshold:.2f}m"] = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    result["pred_to_gt_distance_m"] = {
-        "mean": float(np.mean(pred_to_gt)) if len(pred_to_gt) else None,
-        "median": float(np.median(pred_to_gt)) if len(pred_to_gt) else None,
-        "p90": float(np.quantile(pred_to_gt, 0.9)) if len(pred_to_gt) else None,
-    }
-    result["gt_to_pred_distance_m"] = {
-        "mean": float(np.mean(gt_to_pred)) if len(gt_to_pred) else None,
-        "median": float(np.median(gt_to_pred)) if len(gt_to_pred) else None,
-        "p90": float(np.quantile(gt_to_pred, 0.9)) if len(gt_to_pred) else None,
-    }
+    result["pred_to_gt_distance_m"] = _distance_stats(pred_to_gt)
+    result["gt_to_pred_distance_m"] = _distance_stats(gt_to_pred)
     return result
 
 
@@ -312,7 +315,7 @@ def main() -> int:
         "metrics": metrics,
     }
     (args.out_dir / "habitat_gt_occ_metrics.json").write_text(
-        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+        json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8"
     )
     np.savez_compressed(
         args.out_dir / "habitat_observed_occ.npz",
@@ -331,7 +334,7 @@ def main() -> int:
         gt_c2w,
         args.profile_label,
     )
-    print(json.dumps(report, indent=2, ensure_ascii=False))
+    print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
     return 0
 
 

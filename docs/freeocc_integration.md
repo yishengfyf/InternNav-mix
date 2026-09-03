@@ -174,6 +174,21 @@ precision/recall/F1 及双向距离。其产物是：
 的 Trident 标签伪造 semantic GT。跨 profile 汇总由
 `scripts/eval/compare_freeocc_habitat_profiles.py` 生成。
 
+### audit3：定位 mono 失败来自深度还是位姿
+
+在接入真正的 RGB 单目深度网络前，先运行两个严格隔离的 oracle ablation：
+
+1. `oracle_habitat_depth_estimated_pose_stride4`：给 DROID/Mapper Habitat depth，
+   仍由 DROID 估计 pose。它回答“有正确尺度深度后，估计位姿是否足以建图”。
+2. `oracle_habitat_depth_and_pose_stride4`：同时给 Habitat depth 和 GT pose，
+   作为 FreeOcc Gaussian+Trident 后半链路在这段数据上的上界。
+
+两者都明确不是 RGB-only 候选，也不能接入 DualVLN；depth/pose 只在独立进程
+中作为诊断输入。若第二项好而第一项差，下一步需要同时解决 RGB-only pose；
+若两项都好，则优先补接 Metric3D 等单目 metric-depth；若第二项仍差，问题在
+相机约定、Mapper 或语义 Gaussian，而不是 DROID。该分解避免盲目下载大模型
+后才发现下游坐标链路仍错误。
+
 完整服务器实验保存在并列 run 目录中；为了复用固定自动审批链路，紧凑产物
 还会复制到严格基线的 `diagnostics/<profile>/` 下，再重新生成排除清单自身的
 `SHA256SUMS`。这不会改变任何 DualVLN 运行文件。

@@ -15,6 +15,8 @@ EXPECTED_FREEOCC_COMMIT="f84a0f0ce28146b703d4d5bb5e061dc9a80be04e"
 STRICT_TAG="dhjEzFoUFzH_6763_30f_strict_audit1"
 MV1_TAG="dhjEzFoUFzH_6763_30f_mv1_stride2_audit2"
 NOMV_TAG="dhjEzFoUFzH_6763_30f_nomv_stride4_audit2"
+RGBD_EST_TAG="dhjEzFoUFzH_6763_30f_rgbd_depth_oracle_estpose_stride4_audit3"
+RGBD_GT_TAG="dhjEzFoUFzH_6763_30f_rgbd_depth_pose_oracle_stride4_audit3"
 STRICT_DIR="${OUTPUT_ROOT}/${STRICT_TAG}"
 
 source /home/yifeifeng/miniconda3/etc/profile.d/conda.sh
@@ -51,6 +53,9 @@ if [ ! -f "${STRICT_DIR}/analysis/freeocc_mapping_summary.json" ]; then
   RUN_TAG="${STRICT_TAG}"
   PROFILE_LABEL="strict_mv2_stride1"
   PROFILE_KEY="strict"
+  RUN_MODE=mono
+  USE_GT_POSES=false
+  GT_MOTION_THRESH=0.1
   PROFILE_OVERRIDES=(
     mapping.online_opt.filter.multiview=true
     mapping.online_opt.filter.mv_count_th=2
@@ -60,6 +65,9 @@ elif [ ! -f "${OUTPUT_ROOT}/${MV1_TAG}/analysis/freeocc_mapping_summary.json" ];
   RUN_TAG="${MV1_TAG}"
   PROFILE_LABEL="diagnostic_mv1_stride2"
   PROFILE_KEY="mv1_stride2"
+  RUN_MODE=mono
+  USE_GT_POSES=false
+  GT_MOTION_THRESH=0.1
   PROFILE_OVERRIDES=(
     mapping.online_opt.filter.multiview=true
     mapping.online_opt.filter.mv_count_th=1
@@ -69,8 +77,35 @@ elif [ ! -f "${OUTPUT_ROOT}/${NOMV_TAG}/analysis/freeocc_mapping_summary.json" ]
   RUN_TAG="${NOMV_TAG}"
   PROFILE_LABEL="diagnostic_no_multiview_stride4"
   PROFILE_KEY="nomv_stride4"
+  RUN_MODE=mono
+  USE_GT_POSES=false
+  GT_MOTION_THRESH=0.1
   PROFILE_OVERRIDES=(
     mapping.online_opt.filter.multiview=false
+    mapping.frame_gaussians_stride=4
+  )
+elif [ ! -f "${OUTPUT_ROOT}/${RGBD_EST_TAG}/analysis/freeocc_mapping_summary.json" ]; then
+  RUN_TAG="${RGBD_EST_TAG}"
+  PROFILE_LABEL="oracle_habitat_depth_estimated_pose_stride4"
+  PROFILE_KEY="rgbd_depth_oracle_estpose"
+  RUN_MODE=rgbd
+  USE_GT_POSES=false
+  GT_MOTION_THRESH=0.1
+  PROFILE_OVERRIDES=(
+    mapping.online_opt.filter.multiview=true
+    mapping.online_opt.filter.mv_count_th=2
+    mapping.frame_gaussians_stride=4
+  )
+elif [ ! -f "${OUTPUT_ROOT}/${RGBD_GT_TAG}/analysis/freeocc_mapping_summary.json" ]; then
+  RUN_TAG="${RGBD_GT_TAG}"
+  PROFILE_LABEL="oracle_habitat_depth_and_pose_stride4"
+  PROFILE_KEY="rgbd_depth_pose_oracle"
+  RUN_MODE=rgbd
+  USE_GT_POSES=true
+  GT_MOTION_THRESH=0.0
+  PROFILE_OVERRIDES=(
+    mapping.online_opt.filter.multiview=true
+    mapping.online_opt.filter.mv_count_th=2
     mapping.frame_gaussians_stride=4
   )
 else
@@ -79,6 +114,9 @@ else
   PROFILE_LABEL=""
   PROFILE_KEY=""
   PROFILE_OVERRIDES=()
+  RUN_MODE=mono
+  USE_GT_POSES=false
+  GT_MOTION_THRESH=0.1
 fi
 
 if [ -n "${RUN_TAG}" ]; then
@@ -90,8 +128,9 @@ if [ -n "${RUN_TAG}" ]; then
   HYDRA_FULL_ERROR=1 \
   PYTHONPATH=thirdparty/Trident:src/gs2occ/localagg_prob:. \
   python run.py \
-    mode=mono \
-    use_gt_poses=False \
+    mode="${RUN_MODE}" \
+    use_gt_poses="${USE_GT_POSES}" \
+    gt_motion_thresh="${GT_MOTION_THRESH}" \
     run_visualization=False \
     run_mapping_gui=False \
     run_loop_detection=False \
@@ -132,8 +171,7 @@ if [ -n "${RUN_TAG}" ]; then
   cp "${OUT_DIR}/analysis/freeocc_rgb_semantic_gaussians.png" "${RETURN_DIR}/analysis/"
   cp "${OUT_DIR}/audit/freeocc_mapping_audit.json" "${RETURN_DIR}/audit/"
   cp "${OUT_DIR}/audit/trajectories.npz" "${RETURN_DIR}/audit/"
-  cp "${OUT_DIR}/mesh/final_mono.ply" "${RETURN_DIR}/mesh/"
-  cp "${OUT_DIR}/mesh/final_mono_raw.ply" "${RETURN_DIR}/mesh/"
+  cp "${OUT_DIR}/mesh/"final_*.ply "${RETURN_DIR}/mesh/"
   cp "${OUT_DIR}/config.yaml" "${RETURN_DIR}/"
   cp "${OUT_DIR}/console.log" "${RETURN_DIR}/"
   echo "FREEOCC_RUN_DIR=${OUT_DIR}"
@@ -145,13 +183,17 @@ AUDIT_RUN_DIRS=(
   "${STRICT_DIR}"
   "${OUTPUT_ROOT}/${MV1_TAG}"
   "${OUTPUT_ROOT}/${NOMV_TAG}"
+  "${OUTPUT_ROOT}/${RGBD_EST_TAG}"
+  "${OUTPUT_ROOT}/${RGBD_GT_TAG}"
 )
 AUDIT_PROFILE_LABELS=(
   strict_mv2_stride1
   diagnostic_mv1_stride2
   diagnostic_no_multiview_stride4
+  oracle_habitat_depth_estimated_pose_stride4
+  oracle_habitat_depth_and_pose_stride4
 )
-AUDIT_PROFILE_KEYS=(strict mv1_stride2 nomv_stride4)
+AUDIT_PROFILE_KEYS=(strict mv1_stride2 nomv_stride4 rgbd_depth_oracle_estpose rgbd_depth_pose_oracle)
 COMPARE_ARGS=()
 
 for i in "${!AUDIT_RUN_DIRS[@]}"; do
@@ -168,9 +210,14 @@ for i in "${!AUDIT_RUN_DIRS[@]}"; do
     --rgb-dir "${INPUT_DIR}" \
     --profile-label "${AUDIT_LABEL}"
 
+  if [ -f "${AUDIT_DIR}/mesh/final_mono.ply" ]; then
+    ALIGNED_PLY="${AUDIT_DIR}/mesh/final_mono.ply"
+  else
+    ALIGNED_PLY="${AUDIT_DIR}/mesh/final_rgbd.ply"
+  fi
   PYTHONPATH="${INTERNNAV_ROOT}" python "${INTERNNAV_ROOT}/scripts/eval/evaluate_freeocc_habitat_gt.py" \
     --input-dir "${INPUT_DIR}" \
-    --pred-ply "${AUDIT_DIR}/mesh/final_mono.ply" \
+    --pred-ply "${ALIGNED_PLY}" \
     --trajectory-npz "${AUDIT_DIR}/audit/trajectories.npz" \
     --out-dir "${AUDIT_DIR}/analysis" \
     --profile-label "${AUDIT_LABEL}"
