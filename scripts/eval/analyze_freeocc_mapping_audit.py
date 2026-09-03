@@ -375,6 +375,10 @@ def _trajectory_summary(npz_path: Path) -> Tuple[Dict[str, Any], np.ndarray, np.
             if len(rotation_errors)
             else None
         ),
+        "relative_rotation_error_by_timestamp": [
+            {"timestamp": float(timestamp), "degrees": float(error)}
+            for timestamp, error in zip(timestamps, rotation_errors)
+        ],
     }
     if len(estimated) >= 3 and np.ptp(estimated, axis=0).max() > 1e-8 and np.ptp(gt, axis=0).max() > 1e-8:
         scale, rotation, translation = _umeyama(estimated, gt)
@@ -448,7 +452,13 @@ def _diagnosis(filter_rows: Dict[int, Dict[str, Any]], mapping: Dict[str, Any]) 
     return "no_count_collapse_detected"
 
 
-def _plot(out_path: Path, filter_rows: Dict[int, Dict[str, Any]], aligned: np.ndarray, gt: np.ndarray) -> None:
+def _plot(
+    out_path: Path,
+    filter_rows: Dict[int, Dict[str, Any]],
+    aligned: np.ndarray,
+    gt: np.ndarray,
+    trajectory: Dict[str, Any],
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -458,7 +468,7 @@ def _plot(out_path: Path, filter_rows: Dict[int, Dict[str, Any]], aligned: np.nd
     raw = [filter_rows[idx].get("raw_valid", 0) for idx in frame_ids]
     mv = [filter_rows[idx].get("after_multiview", 0) for idx in frame_ids]
     final = [filter_rows[idx].get("final_valid", 0) for idx in frame_ids]
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     axes[0].plot(frame_ids, raw, label="raw disparity")
     axes[0].plot(frame_ids, mv, label="after multiview")
     axes[0].plot(frame_ids, final, label="final filter")
@@ -478,6 +488,19 @@ def _plot(out_path: Path, filter_rows: Dict[int, Dict[str, Any]], aligned: np.nd
     axes[1].set_ylabel(f"{'xyz'[ground_y]} (m)")
     axes[1].set_title("Keyframe trajectory (top view)")
     axes[1].legend()
+    rotation_rows = trajectory.get("relative_rotation_error_by_timestamp", [])
+    if rotation_rows:
+        axes[2].plot(
+            [row["timestamp"] for row in rotation_rows],
+            [row["degrees"] for row in rotation_rows],
+            "o-",
+            markersize=3,
+        )
+    axes[2].axhline(10.0, color="tab:red", linestyle="--", linewidth=1, label="10° diagnostic line")
+    axes[2].set_xlabel("input timestamp / frame id")
+    axes[2].set_ylabel("relative rotation error (deg)")
+    axes[2].set_title("DROID orientation drift (first-frame rebased)")
+    axes[2].legend()
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
@@ -553,7 +576,7 @@ def main() -> int:
     result["profile_label"] = args.profile_label
     output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     try:
-        _plot(out_dir / "freeocc_filter_trajectory_audit.png", rows, aligned, gt)
+        _plot(out_dir / "freeocc_filter_trajectory_audit.png", rows, aligned, gt, result["trajectory"])
     except ImportError:
         result["plot_warning"] = "matplotlib is unavailable"
         output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")

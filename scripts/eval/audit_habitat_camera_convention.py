@@ -134,6 +134,7 @@ def _plot_example(
     direct: Dict[str, np.ndarray | int],
     converted: Dict[str, np.ndarray | int],
     pair: Tuple[int, int],
+    aggregate_metrics: Dict[str, Dict[str, float | int | None]],
 ) -> None:
     import matplotlib
 
@@ -174,17 +175,20 @@ def _plot_example(
         fig.colorbar(scatter, ax=axis, fraction=0.046, label="relative depth error")
 
     axes[1, 2].axis("off")
-    values = []
-    for result in (direct, converted):
-        error = np.asarray(result["relative_depth_error"])
-        values.append(float(np.mean(error < 0.10)) if len(error) else 0.0)
+    values = [
+        float(aggregate_metrics[key].get("depth_consistent_10pct", 0.0))
+        for key in (
+            "saved_pose_is_opencv_c2w",
+            "saved_pose_is_habitat_c2w_apply_axis_flip",
+        )
+    ]
     inset = axes[1, 2].inset_axes([0.12, 0.18, 0.78, 0.68])
     positions = np.arange(2)
     inset.bar(positions, values, color=["#2ca02c", "#d62728"])
     inset.set_xticks(positions, ["direct", "axis-flipped"])
     inset.set_ylim(0, 1)
     inset.set_ylabel("depth agreement <10%")
-    inset.set_title("Example-pair convention check")
+    inset.set_title("All cross-frame pairs")
     for axis in axes.flat[:2]:
         axis.axis("off")
     fig.suptitle("Habitat / FreeOcc camera-coordinate audit (offline only)", fontsize=16)
@@ -240,7 +244,20 @@ def analyze(
     (out_dir / "habitat_camera_convention_audit.json").write_text(
         json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )
-    example_index = max(range(len(pairs)), key=lambda index: int(all_results[winner][index]["target_observed"]))
+    def agreement(result: Dict[str, np.ndarray | int]) -> float:
+        error = np.asarray(result["relative_depth_error"])
+        return float(np.mean(error < 0.10)) if len(error) else 0.0
+
+    # Prefer a pair for which the two conventions visibly disagree.  Selecting
+    # only by overlap can pick duplicate/stationary views where both are 100%.
+    example_index = max(
+        range(len(pairs)),
+        key=lambda index: (
+            agreement(all_results["saved_pose_is_opencv_c2w"][index])
+            - agreement(all_results["saved_pose_is_habitat_c2w_apply_axis_flip"][index]),
+            int(all_results[winner][index]["target_observed"]),
+        ),
+    )
     i, j = pairs[example_index]
     _plot_example(
         out_dir / "habitat_camera_convention_audit.png",
@@ -248,6 +265,7 @@ def analyze(
         all_results["saved_pose_is_opencv_c2w"][example_index],
         all_results["saved_pose_is_habitat_c2w_apply_axis_flip"][example_index],
         (i, j),
+        candidate_metrics,
     )
     return summary
 
