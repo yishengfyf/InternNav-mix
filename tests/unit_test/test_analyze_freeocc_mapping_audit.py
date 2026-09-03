@@ -2,7 +2,10 @@ import json
 
 import numpy as np
 
-from scripts.eval.analyze_freeocc_mapping_audit import analyze
+from scripts.eval.analyze_freeocc_mapping_audit import (
+    _relative_rotation_errors_degrees,
+    analyze,
+)
 
 
 def _matrix_trajectory(points):
@@ -54,3 +57,18 @@ def test_analyzer_detects_filter_collapse(tmp_path):
     assert summary["ply_aligned"]["vertices"] == 3
     assert summary["trajectory"]["sim3_scale"] == 0.5
     assert np.allclose(aligned, target)
+
+
+def test_relative_rotation_error_is_global_frame_invariant():
+    gt = _matrix_trajectory([[0, 0, 0], [1, 0, 0]])
+    estimated = gt.copy()
+    global_rotation = np.asarray(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32
+    )
+    estimated[:, :3, :3] = np.einsum("ij,njk->nik", global_rotation, gt[:, :3, :3])
+    assert np.allclose(_relative_rotation_errors_degrees(estimated, gt), 0.0)
+
+    estimated[1, :3, :3] = estimated[1, :3, :3] @ global_rotation
+    errors = _relative_rotation_errors_degrees(estimated, gt)
+    assert np.isclose(errors[0], 0.0)
+    assert np.isclose(errors[1], 90.0)

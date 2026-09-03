@@ -312,6 +312,24 @@ def _path_length(points: np.ndarray) -> float:
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
 
 
+def _relative_rotation_errors_degrees(estimated_c2w: np.ndarray, gt_c2w: np.ndarray) -> np.ndarray:
+    """Compare orientation changes independently of an unknown global frame.
+
+    Both trajectories are rebased to their first camera.  This avoids crediting
+    a position-only Sim(3) fit for orientation quality and is well-defined for
+    monocular trajectories whose world frame is arbitrary.
+    """
+    if not len(estimated_c2w):
+        return np.empty(0, dtype=np.float64)
+    estimated_rotation = estimated_c2w[:, :3, :3]
+    gt_rotation = gt_c2w[:, :3, :3]
+    estimated_relative = np.einsum("ij,njk->nik", estimated_rotation[0].T, estimated_rotation)
+    gt_relative = np.einsum("ij,njk->nik", gt_rotation[0].T, gt_rotation)
+    residual = np.einsum("nij,nkj->nik", estimated_relative, gt_relative)
+    cosine = np.clip((np.trace(residual, axis1=1, axis2=2) - 1.0) / 2.0, -1.0, 1.0)
+    return np.degrees(np.arccos(cosine))
+
+
 def _umeyama(source: np.ndarray, target: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
     if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
         raise ValueError(f"trajectory shape mismatch: {source.shape} vs {target.shape}")
@@ -333,17 +351,30 @@ def _umeyama(source: np.ndarray, target: np.ndarray) -> Tuple[float, np.ndarray,
 
 def _trajectory_summary(npz_path: Path) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
     data = np.load(npz_path, allow_pickle=False)
-    estimated = np.asarray(data["estimated_c2w"], dtype=np.float64)[:, :3, 3]
-    gt = np.asarray(data["gt_c2w"], dtype=np.float64)[:, :3, 3]
+    estimated_c2w = np.asarray(data["estimated_c2w"], dtype=np.float64)
+    gt_c2w = np.asarray(data["gt_c2w"], dtype=np.float64)
     timestamps = np.asarray(data["timestamps"], dtype=np.float64)
-    finite = np.isfinite(estimated).all(axis=1) & np.isfinite(gt).all(axis=1)
-    estimated, gt, timestamps = estimated[finite], gt[finite], timestamps[finite]
+    finite = np.isfinite(estimated_c2w).all(axis=(1, 2)) & np.isfinite(gt_c2w).all(axis=(1, 2))
+    estimated_c2w, gt_c2w, timestamps = estimated_c2w[finite], gt_c2w[finite], timestamps[finite]
+    estimated = estimated_c2w[:, :3, 3]
+    gt = gt_c2w[:, :3, 3]
+    rotation_errors = _relative_rotation_errors_degrees(estimated_c2w, gt_c2w)
     summary: Dict[str, Any] = {
         "pairs": int(len(estimated)),
         "estimated_path_length_raw": _path_length(estimated),
         "gt_path_length_m": _path_length(gt),
         "timestamp_min": float(timestamps.min()) if len(timestamps) else None,
         "timestamp_max": float(timestamps.max()) if len(timestamps) else None,
+        "relative_rotation_error_deg": (
+            {
+                "median": float(np.median(rotation_errors)),
+                "p90": float(np.quantile(rotation_errors, 0.9)),
+                "max": float(rotation_errors.max()),
+                "final": float(rotation_errors[-1]),
+            }
+            if len(rotation_errors)
+            else None
+        ),
     }
     if len(estimated) >= 3 and np.ptp(estimated, axis=0).max() > 1e-8 and np.ptp(gt, axis=0).max() > 1e-8:
         scale, rotation, translation = _umeyama(estimated, gt)

@@ -245,6 +245,17 @@ if [ "${#COMPARE_ARGS[@]}" -gt 0 ]; then
     --out-dir "${STRICT_DIR}/analysis"
 fi
 
+# Cross-frame measured-depth reprojection distinguishes a genuinely correct
+# camera convention from the case where prediction and GT repeat the same axis
+# error.  This is still an offline audit and is never consumed by navigation.
+python "${INTERNNAV_ROOT}/scripts/eval/audit_habitat_camera_convention.py" \
+  --input-dir "${INPUT_DIR}" \
+  --out-dir "${STRICT_DIR}/analysis" \
+  --fx 388.19104 \
+  --fy 388.19104 \
+  --cx 319.5 \
+  --cy 239.5
+
 if [ -d "${STRICT_DIR}" ]; then
   HASH_TMP="/tmp/${STRICT_TAG}_SHA256SUMS.$$"
   (cd "${STRICT_DIR}" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum) > "${HASH_TMP}"
