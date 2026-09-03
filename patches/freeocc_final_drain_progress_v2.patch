@@ -1,7 +1,7 @@
 diff --git a/src/gaussian_mapping.py b/src/gaussian_mapping.py
 --- a/src/gaussian_mapping.py
 +++ b/src/gaussian_mapping.py
-@@ -2010,9 +2010,15 @@ class GaussianMapper(object):
+@@ -2010,8 +2010,15 @@ class GaussianMapper(object):
          # 2) Final stage: the last keyframe batch is not fully consumed yet, keep updating.
          if the_end and (self.last_idx + self.delay < self.cur_idx) and ((self.cur_idx + 1) > self.warmup):
 +            previous_last_idx = self.last_idx
