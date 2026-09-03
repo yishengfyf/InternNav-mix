@@ -2,6 +2,7 @@ import numpy as np
 
 from scripts.eval.analyze_stage80_causal_rgbd_height_odometry import (
     estimate_pair_delta,
+    find_causal_relink,
     project_depth,
 )
 
@@ -36,3 +37,17 @@ def test_projection_uses_known_camera_pitch_without_height_gt():
     assert level.shape == down.shape == (4, 3)
     assert not np.allclose(level, down)
     assert np.allclose(level[:, 2], [2.025, 2.025, 1.225, 1.225])
+
+
+def test_causal_keyframe_relink_skips_an_untrusted_frame():
+    x, y = np.meshgrid(np.linspace(-0.8, 0.8, 30), np.linspace(-0.8, 0.8, 30))
+    base = np.column_stack((x.ravel(), y.ravel(), (0.4 + 0.2 * x).ravel()))
+    unrelated = base.copy()
+    unrelated[:, 0] += 3.0
+    recovered = base.copy()
+    recovered[:, 2] -= 0.18
+    result = find_causal_relink([base, unrelated, recovered], 2, {0: 0.0}, 5)
+    assert result["valid"] is True
+    assert result["reference_observation_index"] == 0
+    assert result["reference_gap"] == 2
+    assert abs(result["height_m"] - 0.18) < 1e-6

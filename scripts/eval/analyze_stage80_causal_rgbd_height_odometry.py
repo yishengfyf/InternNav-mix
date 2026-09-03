@@ -201,6 +201,41 @@ def estimate_pair_delta(previous: np.ndarray, current: np.ndarray) -> dict[str, 
     }
 
 
+def find_causal_relink(
+    clouds: list[np.ndarray], current_index: int,
+    trusted_heights: dict[int, float], window: int,
+) -> dict[str, Any]:
+    """Find the nearest older trusted keyframe that independently passes the gate."""
+    attempts = []
+    lower = max(-1, int(current_index) - int(window) - 1)
+    for reference in range(int(current_index) - 2, lower, -1):
+        if reference not in trusted_heights:
+            continue
+        attempt = estimate_pair_delta(clouds[reference], clouds[current_index])
+        attempts.append({
+            "reference_observation_index": reference,
+            "reference_gap": current_index - reference,
+            "valid": attempt["valid"],
+            "reason": attempt["reason"],
+            "estimated_delta_m": attempt.get("estimated_delta_m"),
+            "candidate_count": attempt.get("candidate_count"),
+            "peak_inlier_rate": attempt.get("peak_inlier_rate"),
+            "peak_ratio": attempt.get("peak_ratio"),
+            "mad_m": attempt.get("mad_m"),
+        })
+        if attempt["valid"]:
+            return {
+                "valid": True,
+                "reference_observation_index": reference,
+                "reference_gap": current_index - reference,
+                "height_m": trusted_heights[reference]
+                + float(attempt["estimated_delta_m"]),
+                "registration": attempt,
+                "attempts": attempts,
+            }
+    return {"valid": False, "attempts": attempts}
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -329,7 +364,10 @@ def _route_query_steps(semantic_root: Path) -> dict[tuple[str, str], list[int]]:
     return {key: sorted(set(value)) for key, value in result.items()}
 
 
-def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Path) -> dict[str, Any]:
+def analyze(
+    *, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Path,
+    relink_window: int = 0,
+) -> dict[str, Any]:
     semantic = _semantic_coverage(semantic_root)
     query_steps = _route_query_steps(semantic_root)
     episode_reports = []
@@ -338,6 +376,8 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
     all_valid_flags: list[bool] = []
     sign_correct = 0
     sign_total = 0
+    all_chain_flags: list[bool] = []
+    total_relink_count = 0
 
     ledgers = sorted(replay_root.glob("**/replay_ledger/*/observations.jsonl"))
     if not ledgers:
@@ -353,8 +393,9 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
         inverse_first = np.linalg.inv(first_pose)
         clouds: list[np.ndarray] = []
         frame_reports: list[dict[str, Any]] = []
-        chain_height: float | None = 0.0
-        chain_broken_at: int | None = None
+        trusted_heights: dict[int, float] = {0: 0.0}
+        first_chain_unavailable_at: int | None = None
+        episode_relink_count = 0
         for index, row in enumerate(rows):
             pose = row.get("pose") or {}
             depth_path = episode_dir / str(row.get("depth_path"))
@@ -377,6 +418,10 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
                 "offline_gt_delta_m": 0.0 if index == 0 and gt is not None else None,
                 "offline_delta_abs_error_m": 0.0 if index == 0 and gt is not None else None,
                 "chain_height_m": 0.0 if index == 0 else None,
+                "chain_reference_observation_index": None,
+                "chain_reference_gap": None,
+                "chain_registration_source": "initial_frame" if index == 0 else None,
+                "relink_attempts": [],
                 "gt_used_by_estimator": False,
             }
             if index:
@@ -396,13 +441,31 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
                         sign_total += 1
                         sign_correct += int(np.sign(pair["estimated_delta_m"]) == np.sign(gt_delta))
                 all_valid_flags.append(bool(pair["valid"]))
-                if chain_height is not None and pair["valid"]:
-                    chain_height += float(pair["estimated_delta_m"])
-                    report["chain_height_m"] = chain_height
-                else:
-                    if chain_broken_at is None:
-                        chain_broken_at = index
-                    chain_height = None
+                chain_reference = None
+                chain_registration = None
+                if index - 1 in trusted_heights and pair["valid"]:
+                    chain_reference = index - 1
+                    chain_registration = pair
+                    report["chain_registration_source"] = "adjacent_pair"
+                elif relink_window > 0:
+                    relink = find_causal_relink(
+                        clouds, index, trusted_heights, relink_window
+                    )
+                    report["relink_attempts"] = relink["attempts"]
+                    if relink["valid"]:
+                        chain_reference = relink["reference_observation_index"]
+                        chain_registration = relink["registration"]
+                        report["chain_registration_source"] = "causal_keyframe_relink"
+                        episode_relink_count += 1
+                if chain_reference is not None and chain_registration is not None:
+                    height = trusted_heights[chain_reference] + float(chain_registration["estimated_delta_m"])
+                    trusted_heights[index] = height
+                    report["chain_height_m"] = height
+                    report["chain_reference_observation_index"] = chain_reference
+                    report["chain_reference_gap"] = index - chain_reference
+                elif first_chain_unavailable_at is None:
+                    first_chain_unavailable_at = index
+                all_chain_flags.append(index in trusted_heights)
             frame_reports.append(report)
 
         pair_errors = [
@@ -444,8 +507,10 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
             "pair_valid_coverage": float(valid_pairs / max(1, len(frame_reports) - 1)),
             "pair_reason_counts": dict(sorted(Counter(row["pair_registration_reason"] for row in frame_reports[1:]).items())),
             "valid_delta_abs_error_m": _stats(pair_errors),
-            "chain_broken_at_observation_index": chain_broken_at,
+            "first_chain_unavailable_observation_index": first_chain_unavailable_at,
             "chain_frame_count": len(chain_rows),
+            "chain_frame_coverage": float(len(chain_rows) / len(frame_reports)),
+            "causal_keyframe_relink_count": episode_relink_count,
             "chain_height_abs_error_m": _stats(chain_errors),
             "chain_end_height_m": chain_rows[-1]["chain_height_m"] if chain_rows else None,
             "offline_gt_end_height_m": frame_reports[-1]["offline_gt_height_m"],
@@ -454,6 +519,7 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
             "frames": frame_reports,
         }
         episode_reports.append(report)
+        total_relink_count += episode_relink_count
         _render_curve(report, viz_dir / f"{key[0]}_{key[1]}_height_curve.png")
 
     vertical_keys = {("PX4nDJXEHrG", "9891"), ("SN83YJsR3w2", "3316")}
@@ -478,12 +544,24 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
                 if row["chain_height_m"] is not None
             ]
             max_drift = max(errors_for_flat) if errors_for_flat else None
-            drift_valid = max_drift is not None and max_drift <= 0.15 and report["chain_broken_at_observation_index"] is None
+            drift_valid = (
+                max_drift is not None
+                and max_drift <= 0.15
+                and report["chain_frame_coverage"] >= 0.95
+            )
             flat_drift_pass &= drift_valid
-            flat_drift_details.append({"episode_key": list(key2), "passed": drift_valid, "max_abs_chain_height_m": max_drift})
+            flat_drift_details.append({
+                "episode_key": list(key2), "passed": drift_valid,
+                "max_abs_chain_height_m": max_drift,
+                "chain_frame_coverage": report["chain_frame_coverage"],
+            })
 
     coverage = float(np.mean(all_valid_flags)) if all_valid_flags else 0.0
     delta_stats = _stats(all_delta_errors)
+    chain_coverage = float(
+        (sum(all_chain_flags) + len(episode_reports))
+        / max(1, len(all_chain_flags) + len(episode_reports))
+    )
     release = {
         "min_pair_valid_coverage": 0.80,
         "pair_valid_coverage": coverage,
@@ -492,6 +570,9 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
         "delta_mae_passed": delta_stats["mean"] is not None and delta_stats["mean"] <= 0.05,
         "max_delta_p95_m": 0.12,
         "delta_p95_passed": delta_stats["p95"] is not None and delta_stats["p95"] <= 0.12,
+        "min_chain_frame_coverage": 0.95,
+        "chain_frame_coverage": chain_coverage,
+        "chain_coverage_passed": chain_coverage >= 0.95,
         "vertical_query_passed": vertical_query_pass and len(vertical_query_details) == 2,
         "vertical_query_details": vertical_query_details,
         "flat_drift_passed": flat_drift_pass and len(flat_drift_details) == 3,
@@ -501,12 +582,13 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
         release[name]
         for name in (
             "pair_coverage_passed", "delta_mae_passed", "delta_p95_passed",
-            "vertical_query_passed", "flat_drift_passed",
+            "chain_coverage_passed", "vertical_query_passed", "flat_drift_passed",
         )
     )
+    stage = "stage80b" if relink_window > 0 else "stage80"
     result = {
-        "task": "stage80_causal_rgbd_height_odometry_offline_audit",
-        "schema_version": "stage80_causal_rgbd_height_odometry_v1",
+        "task": f"{stage}_causal_rgbd_height_odometry_offline_audit",
+        "schema_version": f"{stage}_causal_rgbd_height_odometry_v1",
         "integrity_passed": not errors and len(episode_reports) == 6,
         "errors": errors,
         "episode_count": len(episode_reports),
@@ -519,6 +601,8 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
             float(sign_correct / sign_total) if sign_total else None
         ),
         "nontrivial_delta_sign_sample_count": sign_total,
+        "chain_frame_coverage": chain_coverage,
+        "causal_keyframe_relink_count": total_relink_count,
         "release_gate": release,
         "episode_reports": episode_reports,
         "contract": {
@@ -532,6 +616,7 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
             "sparseocc_modified": False,
             "prompt_injected": False,
             "action_applied": False,
+            "rejected_adjacent_delta_imputed": False,
         },
         "parameters": {
             "depth_stride": DEPTH_STRIDE,
@@ -546,6 +631,7 @@ def analyze(*, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Pa
             "min_peak_inlier_rate": MIN_PEAK_INLIER_RATE,
             "max_mad_m": MAX_MAD_M,
             "min_peak_ratio": MIN_PEAK_RATIO,
+            "causal_relink_window_frames": int(relink_window),
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -559,17 +645,20 @@ def main() -> None:
     parser.add_argument("--replay-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--viz-dir", type=Path, required=True)
+    parser.add_argument("--relink-window", type=int, default=0)
     args = parser.parse_args()
     result = analyze(
         semantic_root=args.semantic_root,
         replay_root=args.replay_root,
         output=args.output,
         viz_dir=args.viz_dir,
+        relink_window=max(0, int(args.relink_window)),
     )
     summary = {key: result[key] for key in (
         "integrity_passed", "episode_count", "frame_count", "pair_count",
         "valid_pair_count", "pair_valid_coverage", "valid_delta_abs_error_m",
-        "nontrivial_delta_sign_agreement", "release_gate",
+        "nontrivial_delta_sign_agreement", "chain_frame_coverage",
+        "causal_keyframe_relink_count", "release_gate",
     )}
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
