@@ -575,6 +575,10 @@ case "${PHASE}" in
     export STAGE21C_SCORER_CHECKPOINT=/data/usr_data/yifeifeng/internnav/stage_results/shared_checkpoints/stage21b_seed_53/best.pt
     export STAGE59_MANIFEST=/home/yifeifeng/workspace/InternNav/scripts/eval/manifests/stage78_semantic_attachment_smoke7_episode_seed_replay.json
     export STAGE59_CONFIG=scripts/eval/configs/habitat_dual_system_stage78_semantic_attachment_shadow_cfg.py
+    # LSeg is loaded after frozen S2 enables deterministic CUDA kernels. Set
+    # CuBLAS' workspace contract before spawning Python, otherwise LSeg
+    # initialization aborts and leaves an empty semantic ledger.
+    export CUBLAS_WORKSPACE_CONFIG=:4096:8
     export STAGE59_PIPELINE_TAG="${TAG}"
     export STAGE59_RUN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results/runs
     export STAGE59_RETURN_ROOT=/data/usr_data/yifeifeng/internnav/stage_results
