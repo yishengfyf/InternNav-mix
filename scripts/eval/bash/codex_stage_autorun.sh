@@ -12,13 +12,33 @@ fi
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
-PHASE="stage78_semantic_attachment_shadow"
+PHASE="stage79_invalid_route_vertical_semantics"
 TAG="${PHASE}_$(date +%Y%m%d_%H%M%S)"
 
 source /home/yifeifeng/miniconda3/etc/profile.d/conda.sh
 conda activate habiinter
 
 case "${PHASE}" in
+  stage79_invalid_route_vertical_semantics)
+    input_return="/data/usr_data/yifeifeng/internnav/stage_results/stage78_semantic_attachment_return_stage78_semantic_attachment_shadow_20260903_175153"
+    result_dir="/data/usr_data/yifeifeng/internnav/stage_results/stage79_invalid_route_vertical_semantics_return_${TAG}"
+    test -d "${input_return}"
+    test -f "${input_return}/stage78_semantic_attachment_audit.json"
+    test ! -e "${result_dir}"
+    python3 -m pytest -q tests/unit_test/test_stage79_invalid_route_vertical_semantics.py
+    mkdir -p "${result_dir}/stage79_invalid_route_viz"
+    python3 scripts/eval/analyze_stage79_invalid_route_vertical_semantics.py \
+      --input-root "${input_return}" \
+      --output "${result_dir}/stage79_invalid_route_vertical_semantics_audit.json" \
+      --viz-dir "${result_dir}/stage79_invalid_route_viz"
+    git rev-parse HEAD > "${result_dir}/git_commit.txt"
+    git status --short --branch > "${result_dir}/git_status_short.txt"
+    printf '0\n' > "${result_dir}/EXIT_STATUS.txt"
+    find "${result_dir}" -type f | sort > "${result_dir}/RETURN_MANIFEST.txt"
+    latest_link="${REPO_ROOT}/results/stage_17/codex_latest_return"
+    ln -sfn "${result_dir}" "${latest_link}"
+    echo "CODEX_LATEST_RETURN=${latest_link}"
+    ;;
   stage56_height_bin_mix5)
     export STAGE21C_SCORER_CHECKPOINT=/data/usr_data/yifeifeng/internnav/stage_results/shared_checkpoints/stage21b_seed_53/best.pt
     export STAGE56_MANIFEST=/home/yifeifeng/workspace/InternNav/scripts/eval/manifests/stage23a_sensor_layer12_mix5_episode_seed_replay.json
