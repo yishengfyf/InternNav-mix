@@ -263,3 +263,23 @@ DualVLN 进程。该摘要仍标记 shadow-only，不改变 SparseOcc 的安全�
 `last_idx=112` 重复循环；应用 `freeocc_final_drain_progress_v2.patch` 后打印
 `Final drain made no progress; exporting current map.` 并正常导出。补丁必须
 应用在服务器的 FreeOcc 源码目录，而不是 InternNav worktree。
+
+### audit6：真实 RGB-only 反例（2026-09-03）
+
+为验证 oracle 结论是否能迁移到真实输入，使用 SN83 的前 60 帧运行
+`mode=mono, use_gt_poses=false`（不把 replay depth/pose 送入 FreeOcc）。该
+序列仍能完成 DROID、Backend、Trident 和 PLY 导出，但审计显示：
+
+- 多视图过滤后仅保留 247,596 / 3,686,400 像素（6.7%），最终 Gaussian 约
+  21,476 个；
+- 相机姿态相对误差在 timestamp 26 突然约 56°，timestamp 36 后累计约
+  140–144°；
+- 仅做离线 Sim(3) 后相机中心 RMSE 为 0.729 m，10 cm precision/recall/F1
+  分别约 0.108 / 0.004 / 0.008，exact surface IoU 约 0.0013。
+
+这组结果与 GT depth+GT pose 的 0.475 IoU、0.722 F1@0.10m 形成明确对照：
+当前上游 `mono_depth: metric3d-vit_giant2` 只是 YAML 字符串，代码没有加载
+Metric3D checkpoint；而 DROID 在大角度原地旋转时也会发生姿态跳变。因此
+下一步必须先做“稳定姿态/初始化 + 真正的 RGB→metric-depth”两条链路的隔离
+实验，再考虑把 FreeOcc 作为 DualVLN 在线 worker。仅调低 `mv_count_th` 会
+增加错误点，不能视为修复。
