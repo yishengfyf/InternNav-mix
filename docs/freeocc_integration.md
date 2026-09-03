@@ -229,3 +229,37 @@ mapper warmup，原 `GaussianMapper.__call__(the_end=True)` 的两个结束分�
 匹配，会无限忙循环。`patches/freeocc_short_sequence_finalization.patch` 让结束
 阶段无延迟地消费现有关键帧并正常退出；此类结果仍会标记为 under-warmup
 诊断，不能据此评估正常长序列精度。
+
+### audit5：多 episode 密度/精度复核（2026-09-03）
+
+为区分“FreeOcc 后端本身稀疏”和“输入帧/过滤策略造成的稀疏”，在四个
+DualVLN replay episode 上使用相同的 Habitat depth + GT camera pose oracle，
+输出分辨率 256×320、`multiview=true`、`mv_count_th=2`。r47 额外跑了
+`frame_gaussians_stride=1`，其余使用工程折中 `stride=2`。所有指标都只比较
+匹配帧产生的 observed surface；未观测体素不计为 free，semantic mIoU 保持
+`null`（replay 没有 Habitat semantic sensor/实例类别真值）。
+
+| episode/profile | frames / mapper cameras | Gaussian centers | exact surface IoU | F1 @ 0.10 m | F1 @ 0.20 m | precision / recall @ 0.10 m |
+|---|---:|---:|---:|---:|---:|---:|
+| r47 stride=1 | 100 / 100 | 7,125,925 | 0.658 | 0.854 | 0.900 | 0.950 / 0.775 |
+| SN83 stride=2 | 120 / 101 | 1,589,243 | 0.475 | 0.722 | 0.782 | 0.974 / 0.574 |
+| 5q7 stride=2 | 120 / 102 | 1,807,107 | 0.544 | 0.776 | 0.828 | 0.987 / 0.639 |
+| PuK stride=2 | 120 / 120 | 1,867,225 | 0.233 | 0.444 | 0.548 | 0.952 / 0.290 |
+
+结论：stride=1 确实能把覆盖率推高，但单个 PLY 约 0.8 GB；stride=2 将
+PLY 压到约 170–210 MB，预测中心的 10 cm precision 仍为 95–99%，但不同
+场景的 recall 受可见表面、运动路径和多视图支持显著影响（PuK 的 observed
+surface 更大，recall 下降并不等价于坐标系错误）。四个 profile 的预测点均
+100% 落在 GT 评估网格内，且 GT-pose 轨迹 RMSE < 1e-6 m，说明本轮 oracle
+实验没有发现新的坐标变换错误。当前“画面稀疏”主要是 Gaussian 表示和
+`stride`/关键帧覆盖问题，不是 FreeOcc 单目后端的固定上限。
+
+`scripts/eval/summarize_freeocc_replay_results.py` 会生成上述 JSON/柱状图；
+`scripts/eval/compact_freeocc_voxels.py` 可把百万级 Gaussian 合并为 10 cm
+语义体素（通常约数万体素），作为受困判断的只读摘要，避免把完整 PLY 放入
+DualVLN 进程。该摘要仍标记 shadow-only，不改变 SparseOcc 的安全权威。
+
+本轮还修复并验证了 final-drain no-progress 卡死：5q7 旧进程在
+`last_idx=112` 重复循环；应用 `freeocc_final_drain_progress_v2.patch` 后打印
+`Final drain made no progress; exporting current map.` 并正常导出。补丁必须
+应用在服务器的 FreeOcc 源码目录，而不是 InternNav worktree。
