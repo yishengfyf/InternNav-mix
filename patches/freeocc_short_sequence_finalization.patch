@@ -1,7 +1,7 @@
 diff --git a/src/gaussian_mapping.py b/src/gaussian_mapping.py
 --- a/src/gaussian_mapping.py
 +++ b/src/gaussian_mapping.py
-@@ -1986,6 +1986,20 @@ class GaussianMapper(object):
+@@ -1986,6 +1986,21 @@ class GaussianMapper(object):
          
          self._init_ov_model()
  
