@@ -230,7 +230,9 @@ for i in "${!AUDIT_RUN_DIRS[@]}"; do
     --pred-ply "${ALIGNED_PLY}" \
     --trajectory-npz "${AUDIT_DIR}/audit/trajectories.npz" \
     --out-dir "${AUDIT_DIR}/analysis" \
-    --profile-label "${AUDIT_LABEL}"
+    --profile-label "${AUDIT_LABEL}" \
+    --frame-start "$(awk '/^t_start:/{print $2; exit}' "${AUDIT_DIR}/config.yaml")" \
+    --frame-stop "$(awk '/^t_stop:/{print $2; exit}' "${AUDIT_DIR}/config.yaml")"
 
   COMPARE_ARGS+=(--run "${AUDIT_KEY}=${AUDIT_DIR}")
   if [ "${AUDIT_KEY}" != strict ]; then

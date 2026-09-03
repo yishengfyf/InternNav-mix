@@ -37,6 +37,29 @@ def _numeric_paths(folder: Path, suffixes: Iterable[str]) -> Sequence[Path]:
     return sorted(paths, key=key)
 
 
+def _select_frame_range(paths: Sequence[Path], frame_start: int | None, frame_stop: int | None) -> Sequence[Path]:
+    """Select the same numeric frame interval used by the FreeOcc run.
+
+    ``frame_stop`` is exclusive, matching Python/Hydra ``t_stop`` semantics.
+    Keeping this at the file-list level prevents an accidental comparison of a
+    short prediction window against the entire RGB-D episode.
+    """
+    if frame_start is None and frame_stop is None:
+        return paths
+    selected = []
+    for path in paths:
+        try:
+            frame_id = int(path.stem)
+        except ValueError:
+            continue
+        if frame_start is not None and frame_id < frame_start:
+            continue
+        if frame_stop is not None and frame_id >= frame_stop:
+            continue
+        selected.append(path)
+    return selected
+
+
 def _load_observed_surface(
     input_dir: Path,
     fx: float,
@@ -46,26 +69,33 @@ def _load_observed_surface(
     depth_scale: float,
     pixel_stride: int,
     max_depth_m: float,
+    frame_start: int | None = None,
+    frame_stop: int | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     import cv2
 
-    depth_paths = _numeric_paths(input_dir / "depth", (".png", ".npy"))
-    pose_paths = _numeric_paths(input_dir / "pose", (".txt",))
-    color_paths = _numeric_paths(input_dir / "color", (".jpg", ".jpeg", ".png"))
-    count = min(len(depth_paths), len(pose_paths), len(color_paths))
+    depth_paths = _select_frame_range(_numeric_paths(input_dir / "depth", (".png", ".npy")), frame_start, frame_stop)
+    pose_paths = _select_frame_range(_numeric_paths(input_dir / "pose", (".txt",)), frame_start, frame_stop)
+    color_paths = _select_frame_range(_numeric_paths(input_dir / "color", (".jpg", ".jpeg", ".png")), frame_start, frame_stop)
+    by_id = lambda paths: {int(path.stem): path for path in paths if path.stem.isdigit()}
+    depth_by_id, pose_by_id, color_by_id = by_id(depth_paths), by_id(pose_paths), by_id(color_paths)
+    frame_ids = sorted(set(depth_by_id) & set(pose_by_id) & set(color_by_id))
+    count = len(frame_ids)
     if count == 0:
         raise ValueError(f"missing color/depth/pose triplets under {input_dir}")
 
     points, colors = [], []
     per_frame = []
-    for index in range(count):
-        depth_path = depth_paths[index]
+    for frame_id in frame_ids:
+        depth_path = depth_by_id[frame_id]
+        color_path = color_by_id[frame_id]
+        pose_path = pose_by_id[frame_id]
         if depth_path.suffix.lower() == ".npy":
             depth = np.load(depth_path).astype(np.float32)
         else:
             depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED).astype(np.float32) / depth_scale
-        color = cv2.cvtColor(cv2.imread(str(color_paths[index])), cv2.COLOR_BGR2RGB)
-        pose = np.loadtxt(pose_paths[index], dtype=np.float64).reshape(4, 4)
+        color = cv2.cvtColor(cv2.imread(str(color_path)), cv2.COLOR_BGR2RGB)
+        pose = np.loadtxt(pose_path, dtype=np.float64).reshape(4, 4)
         if not np.isfinite(pose).all():
             continue
         height, width = depth.shape
@@ -85,11 +115,14 @@ def _load_observed_surface(
         finite = np.isfinite(world).all(axis=1)
         points.append(world[finite])
         colors.append(color[::pixel_stride, ::pixel_stride][valid][finite])
-        per_frame.append({"frame": int(index), "valid_points": int(finite.sum())})
+        per_frame.append({"frame": int(frame_id), "valid_points": int(finite.sum())})
     xyz = np.concatenate(points, axis=0) if points else np.empty((0, 3), dtype=np.float64)
     rgb = np.concatenate(colors, axis=0) if colors else np.empty((0, 3), dtype=np.uint8)
     return xyz, rgb, {
         "triplets": int(count),
+        "frame_start": None if frame_start is None else int(frame_start),
+        "frame_stop": None if frame_stop is None else int(frame_stop),
+        "frame_ids": frame_ids,
         "pixel_stride": int(pixel_stride),
         "max_depth_m": float(max_depth_m),
         "surface_points": int(len(xyz)),
@@ -184,13 +217,15 @@ def _plot(
     pred_labels: np.ndarray,
     gt_c2w: np.ndarray,
     profile_label: str,
+    frame_start: int | None = None,
+    frame_stop: int | None = None,
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    paths = _rgb_paths(input_dir)
+    paths = _select_frame_range(_rgb_paths(input_dir), frame_start, frame_stop)
     chosen = () if not paths else (paths[0], paths[len(paths) // 2], paths[-1])
     ground_x, ground_y, up_axis = _ground_axes(gt_c2w[:, :3, 3])
     fig = plt.figure(figsize=(18, 10), constrained_layout=True)
@@ -271,12 +306,15 @@ def main() -> int:
     parser.add_argument("--pixel-stride", type=int, default=4)
     parser.add_argument("--max-depth-m", type=float, default=10.0)
     parser.add_argument("--voxel-size", type=float, default=0.10)
+    parser.add_argument("--frame-start", type=int, default=None, help="inclusive numeric frame id")
+    parser.add_argument("--frame-stop", type=int, default=None, help="exclusive numeric frame id")
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     gt_xyz, _gt_rgb, gt_meta = _load_observed_surface(
         args.input_dir, args.fx, args.fy, args.cx, args.cy,
         args.depth_scale, args.pixel_stride, args.max_depth_m,
+        args.frame_start, args.frame_stop,
     )
     if not len(gt_xyz):
         raise ValueError("Habitat depth produced no valid observed surface points")
@@ -333,6 +371,8 @@ def main() -> int:
         pred_labels,
         gt_c2w,
         args.profile_label,
+        args.frame_start,
+        args.frame_stop,
     )
     print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
     return 0
