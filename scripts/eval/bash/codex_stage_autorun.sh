@@ -596,7 +596,7 @@ case "${PHASE}" in
       --run-root "${run_dir}" --manifest "${STAGE59_MANIFEST}" \
       --output "${result_dir}/stage59_productive_onset_audit.json"
     python3 scripts/eval/analyze_stage65_native_recovery.py \
-      --run-root "${run_dir}" --expected-episodes 7 \
+      --run-root "${run_dir}" --expected-episodes 6 \
       --output "${result_dir}/stage65_native_recovery_audit.json"
     python3 scripts/eval/analyze_stage78_semantic_attachment.py \
       --run-root "${run_dir}" --baseline-root "${baseline_run}" \
