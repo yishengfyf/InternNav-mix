@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +41,12 @@ def main() -> int:
     manifest = []
     for out_id, (row, rgb_path, depth_path, matrix) in enumerate(selected):
         stem = f"{out_id:06d}"
-        shutil.copy2(rgb_path, color_dir / f"{stem}{rgb_path.suffix.lower()}")
+        # The FreeOcc ScanNet loader enumerates ``color/*.jpg`` only.  Replay
+        # ledgers may store PNG or JPEG, so normalize to JPEG while preserving
+        # the RGB pixels (the original path remains in the manifest).
+        from PIL import Image
+
+        Image.open(rgb_path).convert("RGB").save(color_dir / f"{stem}.jpg", quality=95)
         with np.load(depth_path, allow_pickle=False) as data:
             if "depth_m" not in data:
                 raise ValueError(f"{depth_path} has no depth_m array")
