@@ -117,3 +117,34 @@ python scripts/eval/analyze_freeocc_mapping_audit.py \
 `analysis/freeocc_filter_trajectory_audit.png`。下一轮先用原严格参数重跑，
 只有证据显示 `filter_collapse` 时才做 `multiview=False` 离线诊断对照；该对照
 不改变 `unknown != free`，也不授予 FreeOcc 在线安全权威。
+
+### 严格基线结果与 audit2 诊断设计
+
+严格 30 帧基线最终完整读取 30 张 RGB，DROID 选择 22 个关键帧，Mapper 也
+消费了全部 22 个关键帧，尾帧修复生效。DROID 原始有效 disparity 为
+1,802,240 像素，但 `multiview=True, mv_count_th=2` 后只剩 9 个，最终 PLY
+也只有 9 个 Gaussian。根因因此定位在 DROID `depth_filter` 的多视图一致性
+层，而不是 Trident、动态掩码、非有限几何或 Mapper final drain。DROID
+轨迹与 Habitat GT 做仅供审计的 Sim(3) 对齐后 RMSE 为 0.3818 m；GT 路径
+2.25 m，而对齐后 DROID 路径仍为 4.09 m，表明全局尺度对齐不能消除局部漂移。
+
+`freeocc_habitat_smoke_audit.sh` 的后续无参数调用按以下顺序，每次只推进一个
+有界 profile：
+
+1. `diagnostic_mv1_stride2`：仍启用多视图过滤，但把支持视图阈值从 2 降为 1；
+   Gaussian stride 设为 2 控制显存。此实验用于判断失败是“完全没有跨视图
+   支持”还是“阈值过严”。
+2. `diagnostic_no_multiview_stride4`：关闭多视图过滤并用 stride 4 将理论上限
+   从约 180 万 Gaussian 降到约 11.3 万。它只验证 Trident/Gaussian/导出链路，
+   不能据此宣称几何可信。
+
+增量补丁 `patches/freeocc_habitat_audit_counts_v2.patch` 额外记录每帧
+`depth_filter` 的 `count>=1/2/3`、均值和最大值；这能避免仅凭最终阈值后数量
+猜测过滤行为。分析器新增：三张输入 RGB、Sim(3) 对齐语义 Gaussian 透视图、
+语义俯视图和 GT/DROID 轨迹的六宫格图
+`analysis/freeocc_rgb_semantic_gaussians.png`，并在 JSON 中保存 11 类语义点数。
+所有图均带有 offline diagnostic 标记。
+
+完整服务器实验保存在并列 run 目录中；为了复用固定自动审批链路，紧凑产物
+还会复制到严格基线的 `diagnostics/<profile>/` 下，再重新生成排除清单自身的
+`SHA256SUMS`。这不会改变任何 DualVLN 运行文件。
