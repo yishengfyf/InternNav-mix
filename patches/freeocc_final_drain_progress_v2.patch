@@ -1,0 +1,18 @@
+diff --git a/src/gaussian_mapping.py b/src/gaussian_mapping.py
+--- a/src/gaussian_mapping.py
++++ b/src/gaussian_mapping.py
+@@ -2010,9 +2010,15 @@ class GaussianMapper(object):
+         # 2) Final stage: the last keyframe batch is not fully consumed yet, keep updating.
+         if the_end and (self.last_idx + self.delay < self.cur_idx) and ((self.cur_idx + 1) > self.warmup):
++            previous_last_idx = self.last_idx
+             self._update(delay_to_tracking=True, iters=self.mapping_iters, release_cache=False)
+             self.count += 1
++            # Some streams end with filtered frame ids beyond the last camera
++            # that can be consumed.  In that case _update makes no progress and
++            # the old state machine spins forever at the same last_idx.
++            if self.last_idx <= previous_last_idx:
++                print("[FreeOccAudit] Final drain made no progress; exporting current map.", flush=True)
++                self._last_call(mapping_queue=mapping_queue, received_item=received_item)
++                return True
+ 
+             return False

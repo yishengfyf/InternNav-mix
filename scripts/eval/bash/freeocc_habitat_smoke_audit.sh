@@ -12,6 +12,7 @@ CUDA_DEVICE="${CUDA_DEVICE:-1}"
 PATCH_FILE="${INTERNNAV_ROOT}/patches/freeocc_habitat_audit_f84a0f0.patch"
 COUNTS_PATCH_FILE="${INTERNNAV_ROOT}/patches/freeocc_habitat_audit_counts_v2.patch"
 SHORT_SEQUENCE_PATCH_FILE="${INTERNNAV_ROOT}/patches/freeocc_short_sequence_finalization.patch"
+FINAL_DRAIN_PATCH_FILE="${INTERNNAV_ROOT}/patches/freeocc_final_drain_progress_v2.patch"
 EXPECTED_FREEOCC_COMMIT="f84a0f0ce28146b703d4d5bb5e061dc9a80be04e"
 STRICT_TAG="dhjEzFoUFzH_6763_30f_strict_audit1"
 MV1_TAG="dhjEzFoUFzH_6763_30f_mv1_stride2_audit2"
@@ -28,6 +29,7 @@ test "$(git rev-parse HEAD)" = "${EXPECTED_FREEOCC_COMMIT}"
 test -f "${PATCH_FILE}"
 test -f "${COUNTS_PATCH_FILE}"
 test -f "${SHORT_SEQUENCE_PATCH_FILE}"
+test -f "${FINAL_DRAIN_PATCH_FILE}"
 
 if grep -Fq '[FreeOccAudit][filter]' src/depth_video.py; then
   echo "FreeOcc audit patch already applied"
@@ -51,6 +53,14 @@ else
   git apply --check "${SHORT_SEQUENCE_PATCH_FILE}"
   git apply "${SHORT_SEQUENCE_PATCH_FILE}"
   echo "FreeOcc short-sequence finalization patch applied"
+fi
+
+if grep -Fq 'Final drain made no progress' src/gaussian_mapping.py; then
+  echo "FreeOcc final-drain progress patch already applied"
+else
+  git apply --check "${FINAL_DRAIN_PATCH_FILE}"
+  git apply "${FINAL_DRAIN_PATCH_FILE}"
+  echo "FreeOcc final-drain progress patch applied"
 fi
 
 python -m py_compile src/datasets.py src/depth_video.py src/gaussian_mapping.py
