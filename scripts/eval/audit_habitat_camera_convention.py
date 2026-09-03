@@ -174,13 +174,14 @@ def _plot_example(
         fig.colorbar(scatter, ax=axis, fraction=0.046, label="relative depth error")
 
     axes[1, 2].axis("off")
-    labels = ["direct", "axis-flipped"]
     values = []
     for result in (direct, converted):
         error = np.asarray(result["relative_depth_error"])
         values.append(float(np.mean(error < 0.10)) if len(error) else 0.0)
     inset = axes[1, 2].inset_axes([0.12, 0.18, 0.78, 0.68])
-    inset.bar(labels, values, color=["#2ca02c", "#d62728"])
+    positions = np.arange(2)
+    inset.bar(positions, values, color=["#2ca02c", "#d62728"])
+    inset.set_xticks(positions, ["direct", "axis-flipped"])
     inset.set_ylim(0, 1)
     inset.set_ylabel("depth agreement <10%")
     inset.set_title("Example-pair convention check")

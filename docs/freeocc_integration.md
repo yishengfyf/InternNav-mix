@@ -192,3 +192,34 @@ precision/recall/F1 及双向距离。其产物是：
 完整服务器实验保存在并列 run 目录中；为了复用固定自动审批链路，紧凑产物
 还会复制到严格基线的 `diagnostics/<profile>/` 下，再重新生成排除清单自身的
 `SHA256SUMS`。这不会改变任何 DualVLN 运行文件。
+
+### audit4：坐标约定与姿态退化复核
+
+全 oracle（Habitat depth + pose）的 71,596 个 Gaussian 全部位于 GT 网格内；
+预测中心到 Habitat observed surface 的平均距离为 0.0037 m，10 cm precision
+为 98.77%。但 0.10 m 网格内只有 15,119 个唯一预测体素，对比 198,954 个
+GT observed-surface 体素，10 cm recall 只有 10.61%，exact IoU 为 7.30%。因此
+图上最明显的差异主要是 Gaussian center proxy 的稀疏覆盖，而不是整体刚体
+坐标错位；当前结果还不是完整 free/occupied voxel volume。
+
+为了排除预测端和 GT 端共同重复同一轴错误造成的“假自洽”，
+`scripts/eval/audit_habitat_camera_convention.py` 在 135 个跨帧对上执行实测深度
+重投影。直接把保存 pose 当作 OpenCV c2w 时，10% 深度一致率为 87.03%，一致
+区域 RGB L1 为 0.0402；额外施加 Habitat camera 到 OpenCV 的
+`diag(1,-1,-1)` 翻转后，二者分别退化到 46.77% 和 0.1765。保存的 pose 因此
+已经是 `+z forward, +y image-down` 的 OpenCV c2w，不能再翻转。产物为
+`analysis/habitat_camera_convention_audit.json/png`。
+
+真正的严重错误位于 RGB-only DROID pose。位置 Sim(3) 只能对齐相机中心，
+不能修复朝向。新增的首帧归一化相对旋转审计显示：严格 mono 最终姿态误差
+约 170.58°；即使输入 Habitat 真值深度、仍让 DROID 估计 pose，误差也在
+timestamp 14 突然跳到约 58.94°，并在 timestamp 26 跳到约 110.31°。相应
+全 oracle 的最大相对旋转误差只有 0.038°。这解释了“depth oracle + estimated
+pose”相机中心 RMSE 仅 0.103 m、表面 F1@0.50m 却只有 0.0053 的矛盾。
+
+当前结论是：FreeOcc 后半段的 depth→Gaussian→语义 PLY 坐标链路在 oracle
+条件下可以工作；Habitat/FreeOcc 坐标转换不是主故障。下一阶段不能只补单目
+metric depth，还必须修复/替换 DROID 在原地大角度转向时的姿态跟踪，并把
+每帧深度和相邻位姿作为联合门控。Trident 语义目前也只能定性展示：该序列
+未录制 semantic sensor GT，且可视化中 `table/floor/ceiling` 明显占比过高，
+在补录 instance-to-category GT 前不得报告 semantic mIoU。
