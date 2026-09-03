@@ -120,7 +120,9 @@ def project_depth(
     return (camera_pose @ camera.T).T[:, :3]
 
 
-def estimate_pair_delta(previous: np.ndarray, current: np.ndarray) -> dict[str, Any]:
+def estimate_pair_delta(
+    previous: np.ndarray, current: np.ndarray, *, full3d_scoring: bool = False
+) -> dict[str, Any]:
     """Estimate current_height - previous_height without semantic labels or GT."""
     previous = np.asarray(previous, dtype=np.float64).reshape(-1, 3)
     current = np.asarray(current, dtype=np.float64).reshape(-1, 3)
@@ -165,6 +167,41 @@ def estimate_pair_delta(previous: np.ndarray, current: np.ndarray) -> dict[str, 
     second_count = int(np.max(competitors)) if competitors.size else 0
     peak_ratio = float(peak_count / max(1, second_count))
     peak_center = float((edges[peak_index] + edges[peak_index + 1]) / 2.0)
+    full3d_best_rate = None
+    full3d_second_rate = None
+    if full3d_scoring:
+        # Histogram modes can be produced by repeated walls/floors at the same
+        # XY. Score the strongest modes against the complete 3-D cloud before
+        # accepting one, so a local z peak cannot silently poison the chain.
+        candidate_bins = np.argsort(counts)[::-1]
+        candidate_centers = []
+        for candidate_bin in candidate_bins:
+            if counts[candidate_bin] <= 0:
+                break
+            center = float((edges[candidate_bin] + edges[candidate_bin + 1]) / 2.0)
+            if all(abs(center - old) > HISTOGRAM_BIN_M * 0.5 for old in candidate_centers):
+                candidate_centers.append(center)
+            if len(candidate_centers) >= 8:
+                break
+        tree3d = cKDTree(previous)
+        rates = []
+        for center in candidate_centers:
+            nearest, _ = tree3d.query(
+                current + np.asarray((0.0, 0.0, center)),
+                k=1,
+                distance_upper_bound=0.08,
+            )
+            rate = float(np.count_nonzero(np.isfinite(nearest)) / len(current))
+            rates.append((rate, center))
+        rates.sort(reverse=True)
+        if rates:
+            full3d_best_rate, peak_center = rates[0]
+            full3d_second_rate = rates[1][0] if len(rates) > 1 else 0.0
+            selected_bin = int(np.clip(np.searchsorted(edges, peak_center, side="right") - 1, 0, len(counts) - 1))
+            peak_count = int(counts[selected_bin])
+            score_competitors = counts.copy()
+            score_competitors[max(0, selected_bin - 1) : selected_bin + 2] = 0
+            peak_ratio = float(peak_count / max(1, int(np.max(score_competitors))))
     peak_values = dz[np.abs(dz - peak_center) <= REFINE_RADIUS_M]
     if not peak_values.size:
         return {**base, "reason": "empty_peak"}
@@ -199,12 +236,20 @@ def estimate_pair_delta(previous: np.ndarray, current: np.ndarray) -> dict[str, 
         "peak_inlier_rate": inlier_rate,
         "peak_ratio": peak_ratio,
         "mad_m": mad,
+        "full3d_scoring": bool(full3d_scoring),
+        "full3d_best_inlier_rate": full3d_best_rate,
+        "full3d_second_inlier_rate": full3d_second_rate,
+        "full3d_score_ratio": (
+            float(full3d_best_rate / max(1e-9, full3d_second_rate))
+            if full3d_best_rate is not None else None
+        ),
     }
 
 
 def find_causal_relink(
     clouds: list[np.ndarray], current_index: int,
     trusted_heights: dict[int, float], window: int,
+    *, full3d_scoring: bool = False,
 ) -> dict[str, Any]:
     """Find the nearest older trusted keyframe that independently passes the gate."""
     attempts = []
@@ -212,7 +257,9 @@ def find_causal_relink(
     for reference in range(int(current_index) - 2, lower, -1):
         if reference not in trusted_heights:
             continue
-        attempt = estimate_pair_delta(clouds[reference], clouds[current_index])
+        attempt = estimate_pair_delta(
+            clouds[reference], clouds[current_index], full3d_scoring=full3d_scoring
+        )
         attempts.append({
             "reference_observation_index": reference,
             "reference_gap": current_index - reference,
@@ -223,6 +270,9 @@ def find_causal_relink(
             "peak_inlier_rate": attempt.get("peak_inlier_rate"),
             "peak_ratio": attempt.get("peak_ratio"),
             "mad_m": attempt.get("mad_m"),
+            "full3d_best_inlier_rate": attempt.get("full3d_best_inlier_rate"),
+            "full3d_second_inlier_rate": attempt.get("full3d_second_inlier_rate"),
+            "full3d_score_ratio": attempt.get("full3d_score_ratio"),
         })
         if attempt["valid"]:
             return {
@@ -240,7 +290,7 @@ def find_causal_relink(
 def select_causal_registration(
     clouds: list[np.ndarray], current_index: int,
     trusted_heights: dict[int, float], window: int,
-    primary: dict[str, Any],
+    primary: dict[str, Any], *, full3d_scoring: bool = False,
 ) -> dict[str, Any]:
     """Select a height update, requiring independent keyframe consensus when possible."""
     candidates: list[dict[str, Any]] = []
@@ -257,6 +307,9 @@ def select_causal_registration(
             "peak_inlier_rate": attempt.get("peak_inlier_rate"),
             "peak_ratio": attempt.get("peak_ratio"),
             "mad_m": attempt.get("mad_m"),
+            "full3d_best_inlier_rate": attempt.get("full3d_best_inlier_rate"),
+            "full3d_second_inlier_rate": attempt.get("full3d_second_inlier_rate"),
+            "full3d_score_ratio": attempt.get("full3d_score_ratio"),
         }
         attempts.append(record)
         if attempt["valid"]:
@@ -274,7 +327,9 @@ def select_causal_registration(
         for reference in range(current_index - 2, lower, -1):
             if reference not in trusted_heights:
                 continue
-            add(reference, estimate_pair_delta(clouds[reference], clouds[current_index]))
+            add(reference, estimate_pair_delta(
+                clouds[reference], clouds[current_index], full3d_scoring=full3d_scoring
+            ))
 
     if not candidates:
         return {"valid": False, "attempts": attempts}
@@ -437,7 +492,7 @@ def _route_query_steps(semantic_root: Path) -> dict[tuple[str, str], list[int]]:
 
 def analyze(
     *, semantic_root: Path, replay_root: Path, output: Path, viz_dir: Path,
-    relink_window: int = 0,
+    relink_window: int = 0, full3d_scoring: bool = False,
 ) -> dict[str, Any]:
     semantic = _semantic_coverage(semantic_root)
     query_steps = _route_query_steps(semantic_root)
@@ -496,7 +551,9 @@ def analyze(
                 "gt_used_by_estimator": False,
             }
             if index:
-                pair = estimate_pair_delta(clouds[index - 1], cloud)
+                pair = estimate_pair_delta(
+                    clouds[index - 1], cloud, full3d_scoring=full3d_scoring
+                )
                 report.update({f"registration_{name}": value for name, value in pair.items()})
                 report["pair_registration_valid"] = bool(pair["valid"])
                 report["pair_registration_reason"] = pair["reason"]
@@ -516,7 +573,8 @@ def analyze(
                 chain_registration = None
                 if relink_window > 0:
                     selection = select_causal_registration(
-                        clouds, index, trusted_heights, relink_window, pair
+                        clouds, index, trusted_heights, relink_window, pair,
+                        full3d_scoring=full3d_scoring,
                     )
                     report["relink_attempts"] = selection["attempts"]
                     report["chain_consensus_count"] = selection.get("consensus_count")
@@ -662,7 +720,7 @@ def analyze(
             "chain_coverage_passed", "vertical_query_passed", "flat_drift_passed",
         )
     )
-    stage = "stage80b" if relink_window > 0 else "stage80"
+    stage = "stage80d" if full3d_scoring else ("stage80b" if relink_window > 0 else "stage80")
     result = {
         "task": f"{stage}_causal_rgbd_height_odometry_offline_audit",
         "schema_version": f"{stage}_causal_rgbd_height_odometry_v1",
@@ -710,6 +768,7 @@ def analyze(
             "min_peak_ratio": MIN_PEAK_RATIO,
             "causal_relink_window_frames": int(relink_window),
             "consensus_tolerance_m": CONSENSUS_TOLERANCE_M,
+            "full3d_scoring": bool(full3d_scoring),
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -724,6 +783,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--viz-dir", type=Path, required=True)
     parser.add_argument("--relink-window", type=int, default=0)
+    parser.add_argument("--full3d-scoring", action="store_true")
     args = parser.parse_args()
     result = analyze(
         semantic_root=args.semantic_root,
@@ -731,6 +791,7 @@ def main() -> None:
         output=args.output,
         viz_dir=args.viz_dir,
         relink_window=max(0, int(args.relink_window)),
+        full3d_scoring=bool(args.full3d_scoring),
     )
     summary = {key: result[key] for key in (
         "integrity_passed", "episode_count", "frame_count", "pair_count",
