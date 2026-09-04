@@ -378,3 +378,29 @@ worker 或离线消融，不应被误认为已经解决姿态问题。
 度。结合本轮深度结果，当前优先级明确为：先修复原地转向时的 RGB-only pose
 跟踪/初始化，再以 Metric3D 作为深度增强对照；在此之前不替换 FreeOcc 前端、
 不接管 SparseOcc 安全判断。
+
+### audit9--11：同一 60 帧窗口的深度/位姿隔离复核（2026-09-04）
+
+为避免把输入帧编号误当作序列索引，SN83 的 `20--79` 帧统一以
+`t_start=0,t_stop=60` 送入 FreeOcc；FreeOcc 实际读取 60 张图，GT 评估仍用
+原始帧号 20--79。所有实验保持 `multiview=true`、`mv_count_th=2`、
+`frame_gaussians_stride=4`、256x320 输出和 0.1 m 评估网格。
+
+| 输入 | pose | mapper cams | semantic Gaussians | exact IoU | F1@0.10m | F1@0.20m | F1@0.50m |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Habitat GT depth | Habitat GT pose | 43 | 171,814 | 0.405 | 0.715 | 0.807 | 0.893 |
+| Metric3D Giant2 depth | Habitat GT pose | 56 | 68,350 | 0.099 | 0.355 | 0.608 | 0.876 |
+| Metric3D Giant2 depth | DROID estimate | 53 | 48,124 | 0.023 | 0.112 | 0.260 | 0.664 |
+
+GT-depth+GT-pose 的相对旋转误差最大约 0.04 deg，Metric3D+GT-pose 的深度
+替换使后端仍保持正确坐标，但由于深度有效区域和多视图支持下降，10 cm recall
+降到 0.216；Metric3D+DROID pose 进一步降到 0.061。后者的相对旋转误差
+median/p90/max 为 2.88/14.47/19.19 deg，且最后约 19 deg 的漂移集中在
+转向后段；它没有出现 GT-depth+DROID 曾见到的 110 deg 级跳变，说明 Metric3D
+对跟踪有帮助，但仍不能作为姿态修复方案。
+
+这三路实验把结论固定为：FreeOcc 后端和 Habitat 相机坐标链路在 oracle 条件
+下是可用的；当前 RGB-only 的主要瓶颈仍是 DROID 的转向姿态稳定性，其次是
+Metric3D 的低频率（约 0.85 FPS）和深度有效/多视图覆盖。下一步应先做姿态
+门控、warm-up 和关键帧策略的独立消融，再考虑 MASt3R-SLAM 等前端替换；在
+此之前不把任何 FreeOcc 输出接入 DualVLN 的安全决策。
