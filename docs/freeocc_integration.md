@@ -299,3 +299,46 @@ IoU/F1@0.10m 提升至 0.034/0.117；但这仍远低于 oracle，说明“等待
 0.235，且姿态最大相对误差约 89.6°。这验证了关闭多视图确实能“变密”，却会
 把错误深度和错误姿态一起写入地图；因此工程默认仍应保留多视图过滤，把密度
 优化放在关键帧调度、体素合并和真实 metric-depth 上，而不是关闭一致性约束。
+
+## 体素分辨率约定
+
+FreeOcc 当前代码调用 EmbodiedOcc/Occ-ScanNet GT 时固定使用 0.08 m voxel；
+InternNav 的 SparseOcc 与候选规划默认使用 0.05 m 二维 cell。因此接入时保留
+三个有明确职责的尺度：
+
+- 0.08 m：FreeOcc 原生 3D OCC、与官方 ScanNet/EmbodiedOcc 结果公平比较；
+- 0.10 m：跨 episode 的低成本语义长期记忆和可视化；
+- 0.05 m：将 3D voxel 投影到现有 BEV 后的候选规划接口。
+
+10 cm voxel 适合辅助判断房间结构、墙/门/家具分布，但不应直接裁决机器人能否
+穿过窄通道。投影到 5 cm BEV 时需要按机器人 footprint 加上半个 3D voxel
+对角线做保守膨胀，且 SparseOcc 仍是安全权威。实验报告必须同时注明 voxel
+size；不同分辨率的 exact IoU 不可直接横向比较。
+
+## RGB-only metric depth 适配
+
+上游 README 截至 commit `f84a0f0` 只完整提供 RGB-D 数据和运行说明。
+`configs/slam.yaml` 虽声明 `mono_depth: metric3d-vit_giant2`，但 `run.py` 与
+`src/` 没有读取该字段，也没有 Metric3D/ZoeDepth/Depth Anything/Lotus 的安装
+或权重说明。原生 `mode=mono` 还会显式丢弃 dataset depth。因此不能通过补一
+个 Hydra 参数来启用 metric depth。
+
+本分支新增 `prepare_freeocc_metric_depth.py`，复用 InternNav 已有的
+Depth Anything V2 Metric Hypersim Small 模型，把 RGB 预测为毫米 PNG。推理
+仍然只输入 RGB；Habitat depth 仅可通过 `--audit-gt-depth` 计算 AbsRel/RMSE/
+delta1，不参与预测。生成的数据随后使用 FreeOcc 的成熟 RGB-D 路径，但必须
+标记为 `rgb+pseudo-depth`，不能和真实 RGB-D/oracle 混称。
+
+示例：
+
+```bash
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python scripts/eval/prepare_freeocc_metric_depth.py \
+  --input-dir /path/to/replay_episode \
+  --output-dir /path/to/replay_episode_da2_metric \
+  --checkpoint checkpoints/depth_anything_v2_metric_hypersim_vits.pth \
+  --audit-gt-depth --copy-audit-poses
+```
+
+`check_freeocc_official_setup.py` 会统一检查 README 所需配置、checkpoint、Python
+包和 CUDA 扩展，并明确报告 `mono_depth` 是否存在 Python consumer。A6000 的
+编译架构应为 8.6；README 中的 `TORCH_CUDA_ARCH_LIST=12.0` 不是 A6000 配置。
