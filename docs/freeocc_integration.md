@@ -342,3 +342,39 @@ PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python scripts/eval/prepare_freeocc_metric_d
 `check_freeocc_official_setup.py` 会统一检查 README 所需配置、checkpoint、Python
 包和 CUDA 扩展，并明确报告 `mono_depth` 是否存在 Python consumer。A6000 的
 编译架构应为 8.6；README 中的 `TORCH_CUDA_ARCH_LIST=12.0` 不是 A6000 配置。
+
+### audit8：先行完成的 RGB-only 深度/姿态基线（2026-09-04）
+
+按照“先验证输入质量，再决定是否替换前端”的顺序，本轮没有把伪深度接入
+FreeOcc，也没有继续运行 MASt3R-SLAM。使用 replay 中保存的 Habitat depth 仅
+做离线审计，预测阶段只读取 RGB。审计脚本同时修复了 replay 中同一数字帧同时
+存在 `.jpg` 和 `.png` 时的重复计数问题（commit `3fef267`），每个 frame stem
+现在只推理一次，优先选用 PNG。
+
+Depth Anything V2 Metric Hypersim Small（输入 518）结果：
+
+| episode / window | frames | AbsRel | RMSE (m) | delta1 | FPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SN83 20--80 | 60 | 0.355 | 1.053 | 0.495 | 18.44 |
+| 5q7 full | 120 | 0.309 | 1.008 | 0.371 | 18.09 |
+| PuK full | 120 | 0.502 | 1.522 | 0.317 | 18.64 |
+| r47 full | 107 | 0.453 | 1.283 | 0.199 | 16.70 |
+
+Metric3D ViT-Giant2（`metric_depth_vit_giant2_800k.pth`）结果：
+
+| episode / window | frames | AbsRel | RMSE (m) | delta1 | FPS | peak CUDA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SN83 20--80 | 60 | 0.283 | 0.545 | 0.681 | 0.83 | 7.94 GB |
+| 5q7 full | 120 | 0.074 | 0.336 | 0.974 | 0.85 | 7.94 GB |
+| PuK full | 120 | 0.102 | 0.529 | 0.952 | 0.85 | 7.94 GB |
+| r47 full | 107 | 0.066 | 0.211 | 0.974 | 0.86 | 7.94 GB |
+
+Metric3D 明显优于当前 DA2 Small，但 SN83 原地转向窗口仍有较大的深度误差，
+且 Giant2 约 0.85 FPS，不能直接逐步阻塞 DualVLN。它适合作为低频异步深度
+worker 或离线消融，不应被误认为已经解决姿态问题。
+
+已有 FreeOcc pose audit 显示，GT depth + DROID pose 在 timestamp 14/26
+分别出现约 59/110 度相对旋转跳变；GT depth + GT pose 的最大误差仅约 0.038
+度。结合本轮深度结果，当前优先级明确为：先修复原地转向时的 RGB-only pose
+跟踪/初始化，再以 Metric3D 作为深度增强对照；在此之前不替换 FreeOcc 前端、
+不接管 SparseOcc 安全判断。
