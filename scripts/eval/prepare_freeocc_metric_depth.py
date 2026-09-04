@@ -105,8 +105,18 @@ def _load_metric3d(args: argparse.Namespace, device: torch.device) -> tuple[Pred
 
 
 def _numeric_images(folder: Path) -> Sequence[Path]:
-    paths = [path for path in folder.iterdir() if path.suffix.lower() in {".jpg", ".jpeg", ".png"}]
-    return sorted(paths, key=lambda path: (int(path.stem) if path.stem.isdigit() else 2**31, path.name))
+    # Replay folders can contain JPG and PNG copies of the same numeric frame.
+    # Keep exactly one source per stem so metrics/FPS count physical frames.
+    by_stem: dict[int, Path] = {}
+    priority = {".png": 0, ".jpg": 1, ".jpeg": 2}
+    for path in folder.iterdir():
+        if path.suffix.lower() not in priority or not path.stem.isdigit():
+            continue
+        frame_id = int(path.stem)
+        current = by_stem.get(frame_id)
+        if current is None or priority[path.suffix.lower()] < priority[current.suffix.lower()]:
+            by_stem[frame_id] = path
+    return [by_stem[frame_id] for frame_id in sorted(by_stem)]
 
 
 def _link_or_copy(source: Path, target: Path) -> None:
