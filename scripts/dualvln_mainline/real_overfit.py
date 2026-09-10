@@ -146,7 +146,8 @@ def main():
         "num_history": 2,
         "memory_fraction": 0.50,
         "dtype": "bfloat16",
-        "attention": "flash_attention_2",
+        "attention": "sdpa",
+        "trainable_dtype": "float32",
         "trainable_allowlist": [
             "model.task_state_estimator.*",
             "model.evidence_memory.*",
@@ -223,14 +224,18 @@ def main():
             config=config,
             local_files_only=True,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
             low_cpu_mem_usage=True,
         ).to(device)
         model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
         trainable = configure_trainable_parameters(
             model,
             ("model.task_state_estimator.*", "model.evidence_memory.*", "model.cond_projector.*", "model.latent_queries"),
         )
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.data = parameter.data.float()
         optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=3e-4)
         completed_config = {
             **planned_config,
