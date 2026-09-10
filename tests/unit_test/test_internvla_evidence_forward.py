@@ -34,6 +34,7 @@ def tiny_model():
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=256,
+        rope_scaling={"type": "mrope", "mrope_section": [1, 1, 2]},
         vision_config={
             "depth": 1,
             "hidden_size": 32,
