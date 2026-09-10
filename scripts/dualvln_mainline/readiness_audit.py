@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 DATASET_CANDIDATES = (
+    Path("/data/usr_data/yifeifeng/internnav/dualvln_mainline/data/traj_data"),
     Path("/data/usr_data/yifeifeng/internnav/worktrees/dualvln-spatial-memory-v1/traj_data"),
     Path("/data/usr_data/yifeifeng/internnav/traj_data"),
     Path("/data/usr_data/yifeifeng/internnav/hf_repos/InternData-N1/vln_n1/traj_data"),
@@ -66,6 +67,11 @@ def main():
 
     datasets = {name: [str(root / name) for root in DATASET_CANDIDATES if (root / name).is_dir()] for name in ("r2r", "rxr", "scalevln")}
     raw_data = {name: (RAW_DATA_ROOT / name).is_dir() for name in ("r2r", "rxr", "scalevln")}
+    isolated_deps = Path("/data/usr_data/yifeifeng/internnav/dualvln_mainline/python_deps")
+    if isolated_deps.is_dir():
+        import sys
+
+        sys.path.insert(0, str(isolated_deps))
     packages = {
         name: importlib.util.find_spec(name) is not None
         for name in ("torch", "pytest", "transformers", "diffusers", "flash_attn", "pyarrow", "peft", "deepspeed", "decord", "torchcodec")

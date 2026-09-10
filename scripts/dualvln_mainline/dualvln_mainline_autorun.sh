@@ -150,4 +150,40 @@ sha256sum \
     internnav/model/basemodel/internvla_n1/evidence_memory.py \
     >"${overfit_dir}/SOURCE_SHA256SUMS"
 ln -sfn "${overfit_id}" "${result_root}/latest"
-exit "${overfit_exit}"
+if [[ "${overfit_exit}" -ne 0 ]]; then
+    exit "${overfit_exit}"
+fi
+
+dependency_id="dependencies_$(date -u +%Y%m%dT%H%M%SZ)_${commit}"
+dependency_dir="${result_root}/${dependency_id}"
+mkdir -p "${dependency_dir}"
+set +e
+"${python_bin}" scripts/dualvln_mainline/bootstrap_dependencies.py \
+    --run-id "${dependency_id}" \
+    --commit "$(git rev-parse HEAD)" \
+    --target /data/usr_data/yifeifeng/internnav/dualvln_mainline/python_deps \
+    --output-dir "${dependency_dir}" \
+    2>&1 | tee "${dependency_dir}/dependencies.log"
+dependency_exit=${PIPESTATUS[0]}
+set -e
+sha256sum scripts/dualvln_mainline/bootstrap_dependencies.py >"${dependency_dir}/SOURCE_SHA256SUMS"
+ln -sfn "${dependency_id}" "${result_root}/latest"
+if [[ "${dependency_exit}" -ne 0 ]]; then
+    exit "${dependency_exit}"
+fi
+
+data_id="data_bootstrap_$(date -u +%Y%m%dT%H%M%SZ)_${commit}"
+data_dir="${result_root}/${data_id}"
+mkdir -p "${data_dir}"
+set +e
+"${python_bin}" scripts/dualvln_mainline/bootstrap_minimal_data.py \
+    --run-id "${data_id}" \
+    --commit "$(git rev-parse HEAD)" \
+    --data-root /data/usr_data/yifeifeng/internnav/dualvln_mainline/data/traj_data/r2r \
+    --output-dir "${data_dir}" \
+    2>&1 | tee "${data_dir}/bootstrap.log"
+data_exit=${PIPESTATUS[0]}
+set -e
+sha256sum scripts/dualvln_mainline/bootstrap_minimal_data.py >"${data_dir}/SOURCE_SHA256SUMS"
+ln -sfn "${data_id}" "${result_root}/latest"
+exit "${data_exit}"
