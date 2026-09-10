@@ -118,6 +118,7 @@ def main():
         assert trajectory_count == 4
         assert torch.all(batch["labels"][batch["input_ids"].eq(EVIDENCE_TOKEN_INDEX)].eq(-100))
         assert torch.all(batch["labels"][batch["input_ids"].eq(TRAJ_TOKEN_INDEX)].eq(-100))
+        assert batch["traj_poses"].dtype == torch.float32
         report["status"] = "passed"
         report["metrics"] = {
             "dataset_samples": len(dataset),
@@ -134,6 +135,7 @@ def main():
             "pixel_values_shape": list(batch["pixel_values"].shape),
             "traj_images_shape": list(batch["traj_images"].shape),
             "traj_poses_shape": list(batch["traj_poses"].shape),
+            "traj_poses_dtype": str(batch["traj_poses"].dtype),
             "duration_s": time.monotonic() - start,
         }
         report["analysis"] = "真实 R2R train 样本已通过 processor、dataset 与 collator；历史均来自当前帧之前，evidence/traj 标签均被屏蔽。该阶段未加载 7B 参数。"

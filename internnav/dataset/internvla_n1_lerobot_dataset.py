@@ -1176,7 +1176,7 @@ class NavPixelGoalDataset(Dataset):
                     discrete_traj_pose, self.predict_step_num
                 )
                 rel_pose_resample = clip_or_pad(rel_pose_resample, self.predict_step_num)
-                traj_poses_gt.append(torch.tensor(rel_pose_resample))
+                traj_poses_gt.append(torch.as_tensor(rel_pose_resample, dtype=torch.float32))
 
             data_dict["traj_images"] = traj_images[:goal_len][::interval]
             data_dict["traj_depths"] = torch.stack(traj_depths[:goal_len][::interval])
@@ -1385,7 +1385,7 @@ class DataCollatorForSupervisedDataset(object):
             batch['t_s_pos'] = t_s_pos
             batch['traj_images'] = torch.stack(traj_image_batch)
             batch['traj_depths'] = torch.stack(traj_depth_batch)
-            batch['traj_poses'] = torch.stack(traj_pose_batch)
+            batch['traj_poses'] = torch.stack(traj_pose_batch).float()
             batch['video_frame_num'] = torch.tensor(video_frame_num)
 
         return batch
