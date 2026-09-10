@@ -93,4 +93,35 @@ sha256sum \
     >"${run_dir}/SOURCE_SHA256SUMS"
 
 ln -sfn "${run_id}" "${result_root}/latest"
-exit "${test_exit}"
+if [[ "${test_exit}" -ne 0 ]]; then
+    exit "${test_exit}"
+fi
+
+readiness_id="readiness_$(date -u +%Y%m%dT%H%M%SZ)_${commit}"
+readiness_dir="${result_root}/${readiness_id}"
+mkdir -p "${readiness_dir}"
+"${python_bin}" scripts/dualvln_mainline/readiness_audit.py \
+    --run-id "${readiness_id}" \
+    --commit "$(git rev-parse HEAD)" \
+    --output-dir "${readiness_dir}" \
+    2>&1 | tee "${readiness_dir}/readiness.log"
+sha256sum scripts/dualvln_mainline/readiness_audit.py >"${readiness_dir}/SOURCE_SHA256SUMS"
+ln -sfn "${readiness_id}" "${result_root}/latest"
+
+overfit_id="overfit_synthetic_$(date -u +%Y%m%dT%H%M%SZ)_${commit}"
+overfit_dir="${result_root}/${overfit_id}"
+mkdir -p "${overfit_dir}"
+set +e
+"${python_bin}" scripts/dualvln_mainline/synthetic_overfit.py \
+    --run-id "${overfit_id}" \
+    --commit "$(git rev-parse HEAD)" \
+    --output-dir "${overfit_dir}" \
+    2>&1 | tee "${overfit_dir}/overfit.log"
+overfit_exit=${PIPESTATUS[0]}
+set -e
+sha256sum \
+    scripts/dualvln_mainline/synthetic_overfit.py \
+    internnav/model/basemodel/internvla_n1/evidence_memory.py \
+    >"${overfit_dir}/SOURCE_SHA256SUMS"
+ln -sfn "${overfit_id}" "${result_root}/latest"
+exit "${overfit_exit}"
