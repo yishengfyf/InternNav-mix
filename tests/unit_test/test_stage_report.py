@@ -20,7 +20,9 @@ def test_stage_report_writes_chinese_summary_metrics_and_svg(tmp_path):
     assert metrics["metrics"]["passed"] == 3
     assert metrics["metrics"]["pass_rate"] == 0.75
     assert "简述与分析" in summary
+    assert "状态：`失败`" in summary
     assert "P1 协议检查" in svg
+    assert "P1 协议检查：失败" in svg
 
 
 def test_missing_junit_produces_explicit_failed_report(tmp_path):

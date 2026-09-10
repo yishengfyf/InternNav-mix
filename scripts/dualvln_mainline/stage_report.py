@@ -7,6 +7,10 @@ from typing import Dict
 from xml.etree import ElementTree
 
 
+def status_label(status: str) -> str:
+    return {"passed": "通过", "failed": "失败"}.get(status, status)
+
+
 def summarize_junit(path: Path) -> Dict[str, float]:
     if not path.is_file():
         return {"tests": 0, "passed": 0, "failures": 0, "errors": 0, "skipped": 0, "duration_s": 0.0}
@@ -68,7 +72,7 @@ def write_svg(report: dict, path: Path) -> None:
             f'<rect x="82" y="{y}" width="{width:.1f}" height="22" fill="{color}" rx="3"/>'
             f'<text x="526" y="{y + 17}" font-size="15" font-weight="600">{value}</text>'
         )
-    title = escape(f'{report["stage"]}：{report["status"]}')
+    title = escape(f'{report["stage"]}：{status_label(report["status"])}')
     subtitle = escape(f'commit {report["git_commit"][:12]} | pass rate {metrics["pass_rate"]:.1%}')
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="620" height="250" viewBox="0 0 620 250">'
@@ -88,7 +92,7 @@ def write_report(report: dict, output_dir: Path) -> None:
 - 阶段：`{report['stage']}`
 - 运行：`{report['run_id']}`
 - 提交：`{report['git_commit']}`
-- 状态：`{report['status']}`
+- 状态：`{status_label(report['status'])}`
 - 退出码：`{report['exit_code']}`
 
 |指标|结果|
@@ -126,7 +130,7 @@ def main() -> int:
     write_report(report, args.output_dir)
     metrics = report["metrics"]
     print("=== 阶段结果简述 ===")
-    print(f"阶段: {report['stage']} | 状态: {report['status']} | 退出码: {report['exit_code']}")
+    print(f"阶段: {report['stage']} | 状态: {status_label(report['status'])} | 退出码: {report['exit_code']}")
     print(
         f"测试: {metrics['tests']} | 通过: {metrics['passed']} | 失败: {metrics['failures']} | "
         f"错误: {metrics['errors']} | 跳过: {metrics['skipped']} | 通过率: {metrics['pass_rate']:.1%}"
