@@ -795,18 +795,18 @@ def get_annotations_from_lerobot_data(data_path, setting):
             )
 
             table = pq.read_table(parquet_path)
-            df = table.to_pandas()
-
-            ep_actions = df["action"].tolist()
+            ep_actions = table["action"].to_pylist()
 
             pose_key = f"pose.{setting}"
             goal_key = f"goal.{setting}"
             relative_goal_frame_id_key = f"relative_goal_frame_id.{setting}"
 
-            if pose_key in df.columns and goal_key in df.columns and relative_goal_frame_id_key in df.columns:
-                ep_poses = df[pose_key].apply(lambda x: x.tolist()).tolist()
+            if all(key in table.column_names for key in (pose_key, goal_key, relative_goal_frame_id_key)):
+                ep_poses = table[pose_key].to_pylist()
+                goals = table[goal_key].to_pylist()
+                relative_goal_frame_ids = table[relative_goal_frame_id_key].to_pylist()
                 ep_pixel_goals = [
-                    [df[relative_goal_frame_id_key][idx].tolist(), df[goal_key][idx].tolist()] for idx in range(len(df))
+                    [relative_goal_frame_ids[idx], goals[idx]] for idx in range(table.num_rows)
                 ]
             else:
                 print(f"Warning: Missing data for setting {setting} in episode {ep_id}, filling with defaults.")
