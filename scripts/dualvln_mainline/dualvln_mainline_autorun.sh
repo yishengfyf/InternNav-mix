@@ -186,4 +186,22 @@ data_exit=${PIPESTATUS[0]}
 set -e
 sha256sum scripts/dualvln_mainline/bootstrap_minimal_data.py >"${data_dir}/SOURCE_SHA256SUMS"
 ln -sfn "${data_id}" "${result_root}/latest"
-exit "${data_exit}"
+if [[ "${data_exit}" -ne 0 ]]; then
+    exit "${data_exit}"
+fi
+
+fixture_id="data_fixture_$(date -u +%Y%m%dT%H%M%SZ)_${commit}"
+fixture_dir="${result_root}/${fixture_id}"
+mkdir -p "${fixture_dir}"
+set +e
+PYTHONPATH=/data/usr_data/yifeifeng/internnav/dualvln_mainline/python_deps \
+    "${python_bin}" scripts/dualvln_mainline/real_data_fixture.py \
+    --run-id "${fixture_id}" \
+    --commit "$(git rev-parse HEAD)" \
+    --output-dir "${fixture_dir}" \
+    2>&1 | tee "${fixture_dir}/fixture.log"
+fixture_exit=${PIPESTATUS[0]}
+set -e
+sha256sum scripts/dualvln_mainline/real_data_fixture.py >"${fixture_dir}/SOURCE_SHA256SUMS"
+ln -sfn "${fixture_id}" "${result_root}/latest"
+exit "${fixture_exit}"

@@ -164,7 +164,7 @@ def train(attn_implementation="flash_attention_2"):
     else:
         data_args.transform_train = v2.Resize((data_args.resize_h, data_args.resize_w))
 
-    if 'internvla-n1-system2' in model_args.model_name_or_path.lower():
+    if 'internvla-n1' in model_args.model_name_or_path.lower():
         model = InternVLAN1ForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
@@ -227,7 +227,7 @@ def train(attn_implementation="flash_attention_2"):
         model.config.trajectory_loss_weight = model_args.trajectory_loss_weight
     set_model(model_args, model)
 
-    if torch.distributed.get_rank() == 0:
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         model.visual.print_trainable_parameters()
         model.model.print_trainable_parameters()
 
