@@ -227,7 +227,7 @@ def main():
             attn_implementation="flash_attention_2",
             low_cpu_mem_usage=True,
         ).to(device)
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_disable()
         model.enable_input_require_grads()
         trainable = configure_trainable_parameters(
             model,
