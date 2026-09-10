@@ -48,6 +48,7 @@ def tiny_model():
             "out_hidden_size": 32,
         },
         image_token_id=IMAGE_TOKEN_INDEX,
+        video_token_id=151656,
         vision_start_token_id=151652,
         vision_end_token_id=151653,
         use_evidence_memory=True,
