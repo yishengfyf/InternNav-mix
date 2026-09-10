@@ -44,13 +44,16 @@ fi
     "${python_bin}" -c 'import pytest, torch; print(f"torch={torch.__version__}"); print(f"pytest={pytest.__version__}")'
     "${python_bin}" -m pytest -q \
         tests/unit_test/test_evidence_memory.py \
+        tests/unit_test/test_evidence_sequence.py \
         tests/unit_test/test_trainable_policy.py
 } 2>&1 | tee "${run_dir}/protocol_test.log"
 
 sha256sum \
     internnav/model/basemodel/internvla_n1/evidence_memory.py \
+    internnav/model/basemodel/internvla_n1/evidence_sequence.py \
     internnav/model/basemodel/internvla_n1/trainable.py \
     tests/unit_test/test_evidence_memory.py \
+    tests/unit_test/test_evidence_sequence.py \
     tests/unit_test/test_trainable_policy.py \
     >"${run_dir}/SOURCE_SHA256SUMS"
 
