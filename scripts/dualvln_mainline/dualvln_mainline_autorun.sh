@@ -72,6 +72,7 @@ set +e
         tests/unit_test/test_evidence_conditioning.py \
         tests/unit_test/test_internvla_evidence_forward.py \
         tests/unit_test/test_evidence_sequence.py \
+        tests/unit_test/test_encoder_lazy_imports.py \
         tests/unit_test/test_stage_report.py \
         tests/unit_test/test_trainable_policy.py
 } 2>&1 | tee "${run_dir}/protocol_test.log"
@@ -103,6 +104,7 @@ sha256sum \
     tests/unit_test/test_evidence_conditioning.py \
     tests/unit_test/test_internvla_evidence_forward.py \
     tests/unit_test/test_evidence_sequence.py \
+    tests/unit_test/test_encoder_lazy_imports.py \
     tests/unit_test/test_stage_report.py \
     tests/unit_test/test_trainable_policy.py \
     scripts/dualvln_mainline/stage_report.py \
@@ -234,6 +236,8 @@ sha256sum \
     internnav/model/basemodel/internvla_n1/evidence_memory.py \
     internnav/model/basemodel/internvla_n1/evidence_conditioning.py \
     internnav/model/basemodel/internvla_n1/trainable.py \
+    internnav/model/basemodel/internvla_n1/internvla_n1_arch.py \
+    internnav/model/encoder/__init__.py \
     >"${real_overfit_dir}/SOURCE_SHA256SUMS"
 ln -sfn "${real_overfit_id}" "${result_root}/latest"
 exit "${real_overfit_exit}"

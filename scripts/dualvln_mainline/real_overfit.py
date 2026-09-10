@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -239,9 +240,12 @@ def main():
         report["metrics"] = {"samples": args.samples, "steps_completed": args.steps, "initial_total_loss": initial_total, "final_total_loss": final_total, "total_loss_reduction": reduction, "initial_s2_loss": initial_s2, "final_s2_loss": final_s2, "initial_trajectory_loss": initial_trajectory, "final_trajectory_loss": final_trajectory, "peak_allocated_mib": torch.cuda.max_memory_allocated() / 1024**2, "peak_reserved_mib": torch.cuda.max_memory_reserved() / 1024**2, "duration_s": time.monotonic() - start, "trainable_parameters": trainable.trainable_parameters}
         report["analysis"] = "真实 R2R train 样本与 InternVLA-N1 checkpoint 已完成过拟合门槛。" if passed else "训练完成但 S2/trajectory 双 loss 未同时达到 30% 总下降门槛，需要依据曲线调整学习率、步数或训练范围后重试。"
     except Exception as error:
+        error_traceback = traceback.format_exc()
         report["metrics"]["duration_s"] = time.monotonic() - start
         report["error"] = f"{type(error).__name__}: {error}"
+        report["traceback"] = error_traceback
         report["analysis"] = "真实 checkpoint 过拟合异常退出；未影响并行进程，具体原因见 metrics.json 与 overfit.log。"
+        print(error_traceback, file=sys.stderr)
     write_report(args, report, series)
     print(f"real_overfit={report['status']} metrics={json.dumps(report['metrics'], ensure_ascii=False)}")
     raise SystemExit(0 if report["status"] == "passed" else 1)
