@@ -204,4 +204,36 @@ fixture_exit=${PIPESTATUS[0]}
 set -e
 sha256sum scripts/dualvln_mainline/real_data_fixture.py >"${fixture_dir}/SOURCE_SHA256SUMS"
 ln -sfn "${fixture_id}" "${result_root}/latest"
-exit "${fixture_exit}"
+if [[ "${fixture_exit}" -ne 0 ]]; then
+    exit "${fixture_exit}"
+fi
+
+gpu3_free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits --id=3 | tr -d ' ')
+if [[ "${gpu3_free}" -lt 26000 ]]; then
+    echo "GPU 3 free memory ${gpu3_free} MiB is below the protected 26000 MiB threshold; real overfit deferred."
+    exit 0
+fi
+
+real_overfit_id="overfit_real8_$(date -u +%Y%m%dT%H%M%SZ)_${commit}"
+real_overfit_dir="${result_root}/${real_overfit_id}"
+mkdir -p "${real_overfit_dir}"
+set +e
+CUDA_VISIBLE_DEVICES=3 \
+PYTHONPATH=/data/usr_data/yifeifeng/internnav/dualvln_mainline/python_deps \
+    "${python_bin}" scripts/dualvln_mainline/real_overfit.py \
+    --run-id "${real_overfit_id}" \
+    --commit "$(git rev-parse HEAD)" \
+    --output-dir "${real_overfit_dir}" \
+    2>&1 | tee "${real_overfit_dir}/overfit.log"
+real_overfit_exit=${PIPESTATUS[0]}
+set -e
+sha256sum \
+    scripts/dualvln_mainline/real_overfit.py \
+    internnav/dataset/internvla_n1_lerobot_dataset.py \
+    internnav/model/basemodel/internvla_n1/internvla_n1.py \
+    internnav/model/basemodel/internvla_n1/evidence_memory.py \
+    internnav/model/basemodel/internvla_n1/evidence_conditioning.py \
+    internnav/model/basemodel/internvla_n1/trainable.py \
+    >"${real_overfit_dir}/SOURCE_SHA256SUMS"
+ln -sfn "${real_overfit_id}" "${result_root}/latest"
+exit "${real_overfit_exit}"

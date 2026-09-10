@@ -94,6 +94,8 @@ def main():
             image_processor=processor.image_processor,
             transform_train=None,
             use_evidence_memory=True,
+            max_pixels=224 * 224,
+            min_pixels=224 * 224,
         )
         dataset = NavPixelGoalDataset(tokenizer, data_args)
         selected_index = next(

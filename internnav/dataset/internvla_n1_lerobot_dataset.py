@@ -983,6 +983,11 @@ class NavPixelGoalDataset(Dataset):
         ]
         self.data_args = data_args
         self.tokenizer = tokenizer
+        if hasattr(data_args, "max_pixels"):
+            self.data_args.image_processor.max_pixels = data_args.max_pixels
+            self.data_args.image_processor.min_pixels = data_args.min_pixels
+            self.data_args.image_processor.size["longest_edge"] = data_args.max_pixels
+            self.data_args.image_processor.size["shortest_edge"] = data_args.min_pixels
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -1201,6 +1206,7 @@ class DataCollatorForSupervisedDataset(object):
     evidence_token_id: int = EVIDENCE_TOKEN_INDEX
     num_evidence_tokens: int = 4
     num_trajectory_tokens: int = 4
+    spatial_merge_size: int = 2
 
     def process_input_with_traj_tokens(
         self,
@@ -1287,6 +1293,13 @@ class DataCollatorForSupervisedDataset(object):
             concat_images = torch.cat([image for image in images], dim=0)
             grid_thw = [instance["image_grid_thw"] for instance in instances if "image_grid_thw" in instance]
             grid_thw = torch.cat(grid_thw, dim=0)
+            expected_image_tokens = int(grid_thw.prod(dim=1).sum().item() // self.spatial_merge_size**2)
+            actual_image_tokens = int(input_ids.eq(IMAGE_TOKEN_INDEX).sum().item())
+            if actual_image_tokens != expected_image_tokens:
+                raise ValueError(
+                    "sequence truncation broke image alignment: "
+                    f"input has {actual_image_tokens} image tokens but grids require {expected_image_tokens}"
+                )
         else:
             concat_images = None
             grid_thw = None
