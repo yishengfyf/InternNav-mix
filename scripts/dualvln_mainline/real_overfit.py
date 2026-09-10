@@ -145,8 +145,8 @@ def main():
         "model_max_length": 1024,
         "num_history": 2,
         "memory_fraction": 0.50,
-        "dtype": "float16 autocast, bfloat16 checkpoint",
-        "attention": "flash_attention_2",
+        "dtype": "bfloat16",
+        "attention": "eager",
         "trainable_dtype": "float32",
         "trainable_allowlist": [
             "model.task_state_estimator.*",
@@ -224,10 +224,10 @@ def main():
             config=config,
             local_files_only=True,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation="eager",
             low_cpu_mem_usage=True,
         ).to(device)
-        model.gradient_checkpointing_disable()
+        model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
         trainable = configure_trainable_parameters(
             model,
@@ -256,7 +256,7 @@ def main():
                 for sample_idx, cpu_batch in enumerate(cpu_batches):
                     torch.manual_seed(1000 + sample_idx)
                     torch.cuda.manual_seed_all(1000 + sample_idx)
-                    with torch.autocast("cuda", dtype=torch.float16):
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
                         output = model(**move_batch(cpu_batch, device))
                     totals.append(float(output.loss))
                     s2_values.append(float(output.s2_loss))
@@ -270,7 +270,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             torch.manual_seed(2000)
             torch.cuda.manual_seed_all(2000)
-            with torch.autocast("cuda", dtype=torch.float16):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 audit_output = model(**move_batch(cpu_batches[0], device))
             getattr(audit_output, loss_name).backward()
             gradient_audit[loss_name] = summarize_gradients(model, torch)
@@ -302,7 +302,7 @@ def main():
         with (args.output_dir / "train_log.jsonl").open("w", encoding="utf-8") as log_file:
             for step in range(args.steps):
                 batch = move_batch(cpu_batches[step % len(cpu_batches)], device)
-                with torch.autocast("cuda", dtype=torch.float16):
+                with torch.autocast("cuda", dtype=torch.bfloat16):
                     output = model(**batch)
                 optimizer.zero_grad(set_to_none=True)
                 output.loss.backward()
