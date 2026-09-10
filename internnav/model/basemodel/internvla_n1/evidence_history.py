@@ -5,8 +5,6 @@ from typing import Sequence
 
 import numpy as np
 
-from internnav.utils.geometry_utils import quat_to_euler_angles
-
 
 @dataclass(frozen=True)
 class CausalHistoryMetadata:
@@ -68,7 +66,11 @@ def planar_pose_from_sim_observation(position: Sequence[float], quaternion_wxyz:
         raise ValueError("global position must contain at least x and y")
     if quaternion.shape != (4,):
         raise ValueError("global rotation must be a wxyz quaternion")
-    yaw = float(quat_to_euler_angles(quaternion)[2])
+    quaternion_norm = float(np.linalg.norm(quaternion))
+    if quaternion_norm <= 0:
+        raise ValueError("global rotation quaternion cannot be zero")
+    w, x, y, z = quaternion / quaternion_norm
+    yaw = float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
     return position[:2], yaw
 
 
