@@ -284,7 +284,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     raise ValueError(
                         f"trajectory placeholder count {n_traj_tokens} does not match latent queries {latent_queries.shape[0]}"
                     )
-                inputs_embeds[traj_idx] = latent_queries
+                inputs_embeds[traj_idx] = latent_queries.to(inputs_embeds.dtype)
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
@@ -498,7 +498,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         input_ids = input_ids.to(self.get_model().device)
         with torch.no_grad():
             text_embeds = self.get_model().embed_tokens(input_ids)
-        latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1)
+        latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1).to(text_embeds.dtype)
         image_idx = input_ids == IMAGE_TOKEN_INDEX
         N_QUERY = self.get_n_query()
         input_ids = torch.cat([input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY]).to(input_ids.device)], dim=1)
