@@ -67,7 +67,7 @@ def write_report(args, report, series=None):
 
 {report['analysis']}
 
-逐步 loss 见 `train_log.jsonl`，曲线见 `metrics.svg`，训练配置和样本 manifest 见 `config.json` 与 `sample_manifest.json`。
+逐步 loss 见 `train_log.jsonl`，分 loss 梯度审计见 `gradient_audit.json`，曲线见 `metrics.svg`，训练配置和样本 manifest 见 `config.json` 与 `sample_manifest.json`。
 """
     (args.output_dir / "summary.md").write_text(summary, encoding="utf-8")
     if series:
@@ -79,6 +79,49 @@ def write_report(args, report, series=None):
 
 def move_batch(batch, device):
     return {key: value.to(device) if hasattr(value, "to") else value for key, value in batch.items()}
+
+
+def parameter_group(name):
+    for group in ("task_state_estimator", "evidence_memory", "cond_projector", "latent_queries"):
+        if group in name:
+            return group
+    return "other"
+
+
+def summarize_gradients(model, torch):
+    summaries = {}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        group = parameter_group(name)
+        summary = summaries.setdefault(
+            group,
+            {
+                "parameters": 0,
+                "with_gradient": 0,
+                "nonfinite_gradients": 0,
+                "gradient_l2_squared": 0.0,
+                "gradient_max_abs": 0.0,
+                "parameter_dtypes": set(),
+            },
+        )
+        summary["parameters"] += parameter.numel()
+        summary["parameter_dtypes"].add(str(parameter.dtype))
+        if parameter.grad is None:
+            continue
+        summary["with_gradient"] += parameter.numel()
+        finite = torch.isfinite(parameter.grad)
+        summary["nonfinite_gradients"] += parameter.grad.numel() - int(finite.sum())
+        if finite.any():
+            finite_gradient = parameter.grad.detach()[finite].float()
+            summary["gradient_l2_squared"] += float(finite_gradient.square().sum())
+            summary["gradient_max_abs"] = max(
+                summary["gradient_max_abs"], float(finite_gradient.abs().max())
+            )
+    for summary in summaries.values():
+        summary["gradient_l2"] = summary.pop("gradient_l2_squared") ** 0.5
+        summary["parameter_dtypes"] = sorted(summary["parameter_dtypes"])
+    return summaries
 
 
 def main():
@@ -217,6 +260,39 @@ def main():
 
         initial_total, initial_s2, initial_trajectory = evaluate()
         model.train()
+        gradient_audit = {}
+        for loss_name in ("s2_loss", "trajectory_loss"):
+            optimizer.zero_grad(set_to_none=True)
+            torch.manual_seed(2000)
+            torch.cuda.manual_seed_all(2000)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                audit_output = model(**move_batch(cpu_batches[0], device))
+            getattr(audit_output, loss_name).backward()
+            gradient_audit[loss_name] = summarize_gradients(model, torch)
+        optimizer.zero_grad(set_to_none=True)
+        (args.output_dir / "gradient_audit.json").write_text(
+            json.dumps(gradient_audit, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        nonfinite_audit = sum(
+            group["nonfinite_gradients"]
+            for loss_summary in gradient_audit.values()
+            for group in loss_summary.values()
+        )
+        report["metrics"].update(
+            {
+                "samples": args.samples,
+                "steps_completed": 0,
+                "initial_total_loss": initial_total,
+                "initial_s2_loss": initial_s2,
+                "initial_trajectory_loss": initial_trajectory,
+                "gradient_audit_nonfinite": nonfinite_audit,
+            }
+        )
+        if nonfinite_audit:
+            raise FloatingPointError(
+                f"pre-update gradient audit found {nonfinite_audit} non-finite values"
+            )
         series = {"total_loss": [], "s2_loss": [], "trajectory_loss": []}
         with (args.output_dir / "train_log.jsonl").open("w", encoding="utf-8") as log_file:
             for step in range(args.steps):
@@ -225,19 +301,24 @@ def main():
                     output = model(**batch)
                 optimizer.zero_grad(set_to_none=True)
                 output.loss.backward()
-                torch.nn.utils.clip_grad_norm_((parameter for parameter in model.parameters() if parameter.requires_grad), 1.0)
+                trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_parameters,
+                    1.0,
+                    error_if_nonfinite=True,
+                )
                 optimizer.step()
                 values = (float(output.loss.detach()), float(output.s2_loss.detach()), float(output.trajectory_loss.detach()))
                 for key, value in zip(series, values):
                     series[key].append(value)
-                log_file.write(json.dumps({"step": step, "total_loss": values[0], "s2_loss": values[1], "trajectory_loss": values[2], "allocated_mib": torch.cuda.memory_allocated() / 1024**2, "reserved_mib": torch.cuda.memory_reserved() / 1024**2}) + "\n")
+                log_file.write(json.dumps({"step": step, "total_loss": values[0], "s2_loss": values[1], "trajectory_loss": values[2], "gradient_norm": float(gradient_norm), "allocated_mib": torch.cuda.memory_allocated() / 1024**2, "reserved_mib": torch.cuda.memory_reserved() / 1024**2}) + "\n")
         final_total, final_s2, final_trajectory = evaluate()
         reduction = 1.0 - final_total / initial_total
         passed = reduction >= 0.30 and final_s2 < initial_s2 and final_trajectory < initial_trajectory
         adapter_state = {name: parameter.detach().cpu() for name, parameter in model.named_parameters() if parameter.requires_grad}
         torch.save(adapter_state, args.output_dir / "adapter_state.pt")
         report["status"] = "passed" if passed else "failed"
-        report["metrics"] = {"samples": args.samples, "steps_completed": args.steps, "initial_total_loss": initial_total, "final_total_loss": final_total, "total_loss_reduction": reduction, "initial_s2_loss": initial_s2, "final_s2_loss": final_s2, "initial_trajectory_loss": initial_trajectory, "final_trajectory_loss": final_trajectory, "peak_allocated_mib": torch.cuda.max_memory_allocated() / 1024**2, "peak_reserved_mib": torch.cuda.max_memory_reserved() / 1024**2, "duration_s": time.monotonic() - start, "trainable_parameters": trainable.trainable_parameters}
+        report["metrics"].update({"samples": args.samples, "steps_completed": args.steps, "initial_total_loss": initial_total, "final_total_loss": final_total, "total_loss_reduction": reduction, "initial_s2_loss": initial_s2, "final_s2_loss": final_s2, "initial_trajectory_loss": initial_trajectory, "final_trajectory_loss": final_trajectory, "peak_allocated_mib": torch.cuda.max_memory_allocated() / 1024**2, "peak_reserved_mib": torch.cuda.max_memory_reserved() / 1024**2, "duration_s": time.monotonic() - start, "trainable_parameters": trainable.trainable_parameters})
         report["analysis"] = "真实 R2R train 样本与 InternVLA-N1 checkpoint 已完成过拟合门槛。" if passed else "训练完成但 S2/trajectory 双 loss 未同时达到 30% 总下降门槛，需要依据曲线调整学习率、步数或训练范围后重试。"
     except Exception as error:
         error_traceback = traceback.format_exc()
