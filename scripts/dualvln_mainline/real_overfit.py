@@ -146,7 +146,7 @@ def main():
         "num_history": 2,
         "memory_fraction": 0.50,
         "dtype": "bfloat16",
-        "attention": "sdpa",
+        "attention": "flash_attention_2",
         "trainable_dtype": "float32",
         "trainable_allowlist": [
             "model.task_state_estimator.*",
@@ -224,7 +224,7 @@ def main():
             config=config,
             local_files_only=True,
             torch_dtype=torch.bfloat16,
-            attn_implementation="sdpa",
+            attn_implementation="flash_attention_2",
             low_cpu_mem_usage=True,
         ).to(device)
         model.gradient_checkpointing_enable()
