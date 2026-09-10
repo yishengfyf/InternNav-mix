@@ -15,6 +15,20 @@ fi
 
 result_root=/data/usr_data/yifeifeng/internnav/dualvln_mainline/results/codex_latest_return
 commit=$(git rev-parse --short=12 HEAD)
+
+for incomplete_dir in "${result_root}"/overfit_synthetic_*; do
+    if [[ -d "${incomplete_dir}" && -f "${incomplete_dir}/overfit.log" && ! -f "${incomplete_dir}/metrics.json" ]]; then
+        incomplete_id=$(basename "${incomplete_dir}")
+        python3 scripts/dualvln_mainline/stage_report.py \
+            --stage "P1 16 样本合成协议过拟合" \
+            --run-id "${incomplete_id}" \
+            --commit "unknown-before-report-repair" \
+            --exit-code 1 \
+            --junit "${incomplete_dir}/junit.xml" \
+            --output-dir "${incomplete_dir}" \
+            --note "运行在生成结构化指标前异常退出，原始错误见 overfit.log；后续运行已增加失败报告兜底。"
+    fi
+done
 run_id="protocol_$(date -u +%Y%m%dT%H%M%SZ)_${commit}"
 run_dir="${result_root}/${run_id}"
 mkdir -p "${run_dir}"
@@ -119,6 +133,16 @@ set +e
     2>&1 | tee "${overfit_dir}/overfit.log"
 overfit_exit=${PIPESTATUS[0]}
 set -e
+if [[ ! -f "${overfit_dir}/metrics.json" ]]; then
+    "${python_bin}" scripts/dualvln_mainline/stage_report.py \
+        --stage "P1 16 样本合成协议过拟合" \
+        --run-id "${overfit_id}" \
+        --commit "$(git rev-parse HEAD)" \
+        --exit-code "${overfit_exit}" \
+        --junit "${overfit_dir}/junit.xml" \
+        --output-dir "${overfit_dir}" \
+        --note "运行在生成训练指标前异常退出，原始错误见 overfit.log。"
+fi
 sha256sum \
     scripts/dualvln_mainline/synthetic_overfit.py \
     internnav/model/basemodel/internvla_n1/evidence_memory.py \

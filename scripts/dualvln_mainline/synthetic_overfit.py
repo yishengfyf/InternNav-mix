@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 import time
 from html import escape
 from pathlib import Path
@@ -8,6 +9,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from internnav.model.basemodel.internvla_n1.evidence_memory import TaskConditionedEvidenceMemory
 
