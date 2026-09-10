@@ -11,11 +11,18 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 import transformers
-from decord import VideoReader
 from PIL import Image
 from torch.utils.data import Dataset
-from torchcodec.decoders import VideoDecoder
 from transformers.image_utils import to_numpy_array
+
+try:
+    from decord import VideoReader
+except ImportError:
+    VideoReader = None
+try:
+    from torchcodec.decoders import VideoDecoder
+except ImportError:
+    VideoDecoder = None
 
 from .rope2d import get_rope_index_2, get_rope_index_25
 from .vlln_lerobot_dataset import VLLNDataset
@@ -53,78 +60,81 @@ VIDEOCHATGPT = {
 }
 
 
+TRAJ_DATA_ROOT = os.environ.get("INTERNNAV_TRAJ_DATA_ROOT", "traj_data")
+
+
 R2R_125CM_0_30 = {
-    "data_path": "traj_data/r2r",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "r2r"),
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 30,
 }
 
 R2R_125CM_0_45 = {
-    "data_path": "traj_data/r2r",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "r2r"),
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 45,
 }
 
 R2R_60CM_15_15 = {
-    "data_path": "traj_data/r2r",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "r2r"),
     "height": 60,
     "pitch_1": 15,
     "pitch_2": 15,
 }
 
 R2R_60CM_30_30 = {
-    "data_path": "traj_data/r2r",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "r2r"),
     "height": 60,
     "pitch_1": 30,
     "pitch_2": 30,
 }
 
 RxR_125CM_0_30 = {
-    "data_path": "traj_data/rxr",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "rxr"),
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 30,
 }
 
 RxR_125CM_0_45 = {
-    "data_path": "traj_data/rxr",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "rxr"),
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 45,
 }
 
 RxR_60CM_15_15 = {
-    "data_path": "traj_data/rxr",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "rxr"),
     "height": 60,
     "pitch_1": 15,
     "pitch_2": 15,
 }
 
 RxR_60CM_30_30 = {
-    "data_path": "traj_data/rxr",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "rxr"),
     "height": 60,
     "pitch_1": 30,
     "pitch_2": 30,
 }
 
 SCALEVLN_125CM_0_30 = {
-    "data_path": "traj_data/scalevln",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "scalevln"),
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 30,
 }
 
 SCALEVLN_125CM_0_45 = {
-    "data_path": "traj_data/scalevln",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "scalevln"),
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 45,
 }
 
 SCALEVLN_60CM_30_30 = {
-    "data_path": "traj_data/scalevln",
+    "data_path": os.path.join(TRAJ_DATA_ROOT, "scalevln"),
     "height": 60,
     "pitch_1": 30,
     "pitch_2": 30,
@@ -395,6 +405,8 @@ class LazySupervisedDataset(Dataset):
             print(f"torchcodec attempt failed: {e}")
 
     def video_decord(self, video_file):
+        if VideoReader is None:
+            raise RuntimeError("decord is not installed")
         if not os.path.exists(video_file):
             print(f"File not exist: {video_file}")
         vr = VideoReader(video_file, num_threads=4)
@@ -414,6 +426,8 @@ class LazySupervisedDataset(Dataset):
         return self.process_video_frames(video, frame_idx, video_length)
 
     def video_torchcodec(self, video_file):
+        if VideoDecoder is None:
+            raise RuntimeError("torchcodec is not installed")
         device = "cpu"  # or e.g. "cuda"
         decoder = VideoDecoder(video_file, device=device)
         total_frames = decoder.metadata.num_frames

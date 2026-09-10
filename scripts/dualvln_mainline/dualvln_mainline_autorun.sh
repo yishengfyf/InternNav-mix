@@ -70,6 +70,7 @@ set +e
         tests/unit_test/test_evidence_memory.py \
         tests/unit_test/test_evidence_history.py \
         tests/unit_test/test_evidence_conditioning.py \
+        tests/unit_test/test_internvla_evidence_forward.py \
         tests/unit_test/test_evidence_sequence.py \
         tests/unit_test/test_stage_report.py \
         tests/unit_test/test_trainable_policy.py
@@ -100,6 +101,7 @@ sha256sum \
     tests/unit_test/test_evidence_memory.py \
     tests/unit_test/test_evidence_history.py \
     tests/unit_test/test_evidence_conditioning.py \
+    tests/unit_test/test_internvla_evidence_forward.py \
     tests/unit_test/test_evidence_sequence.py \
     tests/unit_test/test_stage_report.py \
     tests/unit_test/test_trainable_policy.py \
