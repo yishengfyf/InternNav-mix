@@ -14,6 +14,7 @@ from internnav.agent.base import Agent
 from internnav.configs.agent import AgentCfg
 from internnav.configs.model.base_encoders import ModelCfg
 from internnav.model import get_config, get_policy
+from internnav.model.basemodel.internvla_n1.evidence_history import planar_pose_from_sim_observation
 from internnav.model.utils.misc import set_random_seed
 from internnav.model.utils.vln_utils import S1Input, S1Output, S2Input, S2Output
 
@@ -247,7 +248,10 @@ class InternVLAN1Agent(Agent):
         rgb = obs['rgb']
         depth = obs['depth']
         instruction = obs['instruction']
-        pose = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+        if 'globalgps' not in obs or 'globalrotation' not in obs:
+            raise ValueError("InternVLA evidence inference requires causal globalgps/globalrotation observations")
+        position, yaw = planar_pose_from_sim_observation(obs['globalgps'], obs['globalrotation'])
+        pose = np.asarray([position[0], position[1], yaw], dtype=np.float32)
 
         # S2 inference is done in a separate thread
         if self.should_infer_s2(mode) or self.look_down:  # The look down frame must be inferred

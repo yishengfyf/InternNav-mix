@@ -37,6 +37,10 @@
 
 writer 在不读取任务状态的前提下组合观测特征和空间元数据。reader 将 task-state query 加到可学习 evidence queries 上，再对历史条目做 cross-attention。始终有效的 null evidence 使空历史输入有明确定义。模块同时返回历史读取权重、null 权重、阶段 logits 和空历史标记，供审计使用。
 
+为避免把 S2 的 `3584` 维 hidden size 直接用作 Transformer reader 宽度，首版固定采用 `3584 -> 512` 的 memory bottleneck，并将 reader 输出经独立线性层投影回 `3584` 维 S2 token 空间。按 `task_dim=512`、4 个 evidence token 和 8 个 attention heads 计算，memory 模块约 730 万参数；单元测试设置 700--800 万参数门槛，防止配置回退为约两亿参数的宽 reader。
+
+训练 LeRobot pose 与在线仿真 observation 统一编码为当前机器人平面坐标系下的 `[dx, dy, sin(dyaw), cos(dyaw)]`。在线 `globalgps/globalrotation` 属于仿真理想位姿/理想里程计条件，后续与估计里程计、纯视觉条件分开报告，不将它描述为真实部署必然可得输入。
+
 task-state 训练监督可以来自训练标注或经过 mask 的软伪标签，但推理 API 不接受 GT progress。有效 evidence 的年龄不得为负；调用方必须保证输入仅来自因果历史前缀。
 
 ## 4. S2 接入顺序

@@ -54,6 +54,8 @@ set +e
     "${python_bin}" -m pytest -q \
         --junitxml="${run_dir}/junit.xml" \
         tests/unit_test/test_evidence_memory.py \
+        tests/unit_test/test_evidence_history.py \
+        tests/unit_test/test_evidence_conditioning.py \
         tests/unit_test/test_evidence_sequence.py \
         tests/unit_test/test_stage_report.py \
         tests/unit_test/test_trainable_policy.py
@@ -71,9 +73,19 @@ set -e
 
 sha256sum \
     internnav/model/basemodel/internvla_n1/evidence_memory.py \
+    internnav/model/basemodel/internvla_n1/evidence_history.py \
+    internnav/model/basemodel/internvla_n1/evidence_conditioning.py \
     internnav/model/basemodel/internvla_n1/evidence_sequence.py \
+    internnav/model/basemodel/internvla_n1/internvla_n1.py \
+    internnav/model/basemodel/internvla_n1/internvla_n1_arch.py \
+    internnav/model/basemodel/internvla_n1/internvla_n1_policy.py \
+    internnav/dataset/internvla_n1_lerobot_dataset.py \
+    internnav/agent/internvla_n1_agent.py \
+    internnav/trainer/internvla_n1_trainer.py \
     internnav/model/basemodel/internvla_n1/trainable.py \
     tests/unit_test/test_evidence_memory.py \
+    tests/unit_test/test_evidence_history.py \
+    tests/unit_test/test_evidence_conditioning.py \
     tests/unit_test/test_evidence_sequence.py \
     tests/unit_test/test_stage_report.py \
     tests/unit_test/test_trainable_policy.py \

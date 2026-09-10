@@ -27,8 +27,8 @@ def prepare_conditioned_sequences(
     batch_size = len(input_ids)
     if len(labels) != batch_size or len(evidence_insert_positions) != batch_size:
         raise ValueError("input_ids, labels, and evidence_insert_positions must have equal batch sizes")
-    if num_evidence_tokens <= 0 or num_trajectory_tokens <= 0:
-        raise ValueError("evidence and trajectory token counts must be positive")
+    if num_evidence_tokens <= 0 or num_trajectory_tokens < 0:
+        raise ValueError("evidence token count must be positive and trajectory token count cannot be negative")
     if max_length is not None and max_length < num_evidence_tokens + num_trajectory_tokens:
         raise ValueError("max_length cannot hold the requested evidence and trajectory tokens")
 

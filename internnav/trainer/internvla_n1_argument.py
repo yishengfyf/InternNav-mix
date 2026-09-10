@@ -13,6 +13,15 @@ class ModelArguments:
 
     system1: Optional[str] = field(default='nextdit')
     n_query: int = field(default=4)
+    use_evidence_memory: bool = field(default=False)
+    evidence_task_dim: int = field(default=512)
+    evidence_bottleneck_dim: int = field(default=512)
+    num_evidence_tokens: int = field(default=4)
+    evidence_num_heads: int = field(default=8)
+    evidence_num_stages: int = field(default=4)
+    evidence_dropout: float = field(default=0.0)
+    s2_loss_weight: float = field(default=1.0)
+    trajectory_loss_weight: float = field(default=1.0)
 
 
 @dataclass

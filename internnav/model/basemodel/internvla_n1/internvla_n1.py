@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -13,12 +14,22 @@ from transformers import (
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from .evidence_conditioning import gather_visual_evidence, pool_visual_features
+from .evidence_sequence import replace_evidence_embeddings
 from .internvla_n1_arch import InternVLAN1MetaForCausalLM, InternVLAN1MetaModel
 
 TRAJ_TOKEN_INDEX = 151667
+EVIDENCE_TOKEN_INDEX = 151668
 IMAGE_TOKEN_INDEX = 151655
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
+
+
+@dataclass
+class DualVLNCausalLMOutput(CausalLMOutputWithPast):
+    s2_loss: Optional[torch.FloatTensor] = None
+    trajectory_loss: Optional[torch.FloatTensor] = None
+    stage_loss: Optional[torch.FloatTensor] = None
 
 
 class InternVLAN1ModelConfig(Qwen2_5_VLConfig):
@@ -55,6 +66,96 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
     def get_model(self):
         return self.model
 
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        evidence_keys = (
+            "evidence_relative_poses",
+            "evidence_ages",
+            "evidence_qualities",
+            "evidence_valid_mask",
+            "evidence_history_counts",
+            "evidence_image_counts",
+            "evidence_prompt_lengths",
+        )
+        evidence_kwargs = {key: kwargs.get(key) for key in evidence_keys if kwargs.get(key) is not None}
+        model_inputs = super().prepare_inputs_for_generation(*args, **kwargs)
+        model_inputs.update(evidence_kwargs)
+        return model_inputs
+
+    def _inject_evidence_embeddings(
+        self,
+        input_ids,
+        inputs_embeds,
+        image_embeds,
+        image_grid_thw,
+        attention_mask,
+        labels,
+        evidence_relative_poses,
+        evidence_ages,
+        evidence_qualities,
+        evidence_valid_mask,
+        evidence_history_counts,
+        evidence_image_counts,
+        evidence_prompt_lengths=None,
+    ):
+        if not getattr(self.config, "use_evidence_memory", False):
+            return inputs_embeds, None
+        required = {
+            "image_embeds": image_embeds,
+            "image_grid_thw": image_grid_thw,
+            "evidence_relative_poses": evidence_relative_poses,
+            "evidence_ages": evidence_ages,
+            "evidence_qualities": evidence_qualities,
+            "evidence_valid_mask": evidence_valid_mask,
+            "evidence_history_counts": evidence_history_counts,
+            "evidence_image_counts": evidence_image_counts,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(f"evidence conditioning is enabled but inputs are missing: {', '.join(missing)}")
+
+        merge_size = self.config.vision_config.spatial_merge_size
+        pooled_images = pool_visual_features(image_embeds, image_grid_thw, merge_size)
+        visual_batch = gather_visual_evidence(
+            pooled_images,
+            evidence_image_counts,
+            evidence_history_counts,
+            max_history=evidence_valid_mask.shape[1],
+        )
+        prompt_mask = (
+            attention_mask.bool()
+            if attention_mask is not None and attention_mask.ndim == 2
+            else torch.ones(input_ids.shape, dtype=torch.bool, device=input_ids.device)
+        )
+        prompt_mask &= input_ids.ne(IMAGE_TOKEN_INDEX)
+        prompt_mask &= input_ids.ne(EVIDENCE_TOKEN_INDEX)
+        prompt_mask &= input_ids.ne(TRAJ_TOKEN_INDEX)
+        if labels is not None:
+            prompt_mask &= labels.eq(-100)
+        if evidence_prompt_lengths is not None:
+            prompt_lengths = evidence_prompt_lengths.to(device=input_ids.device)
+            prompt_mask &= torch.arange(input_ids.shape[1], device=input_ids.device)[None, :] < prompt_lengths[:, None]
+
+        task_state = self.get_model().task_state_estimator(
+            visual_batch.current_features,
+            inputs_embeds,
+            prompt_mask,
+        )
+        evidence_output = self.get_model().evidence_memory(
+            visual_batch.history_features,
+            evidence_relative_poses,
+            evidence_ages,
+            evidence_qualities,
+            evidence_valid_mask,
+            task_state,
+        )
+        inputs_embeds = replace_evidence_embeddings(
+            input_ids,
+            inputs_embeds,
+            evidence_output.tokens,
+            EVIDENCE_TOKEN_INDEX,
+        )
+        return inputs_embeds, evidence_output
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -79,6 +180,14 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         traj_depths: Optional[torch.Tensor] = None,
         video_frame_num: Optional[torch.Tensor] = None,
         traj_poses: Optional[torch.Tensor] = None,
+        evidence_frame_ids: Optional[torch.Tensor] = None,
+        evidence_relative_poses: Optional[torch.Tensor] = None,
+        evidence_ages: Optional[torch.Tensor] = None,
+        evidence_qualities: Optional[torch.Tensor] = None,
+        evidence_valid_mask: Optional[torch.Tensor] = None,
+        evidence_history_counts: Optional[torch.Tensor] = None,
+        evidence_image_counts: Optional[torch.Tensor] = None,
+        evidence_prompt_lengths: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -125,8 +234,10 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        evidence_output = None
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
+            image_embeds = None
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -174,6 +285,23 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
+            if input_ids.eq(EVIDENCE_TOKEN_INDEX).any():
+                inputs_embeds, evidence_output = self._inject_evidence_embeddings(
+                    input_ids,
+                    inputs_embeds,
+                    image_embeds,
+                    image_grid_thw,
+                    attention_mask,
+                    labels,
+                    evidence_relative_poses,
+                    evidence_ages,
+                    evidence_qualities,
+                    evidence_valid_mask,
+                    evidence_history_counts,
+                    evidence_image_counts,
+                    evidence_prompt_lengths,
+                )
+
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
         if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
             # calculate RoPE index once per generation in the pre-fill stage only
@@ -220,7 +348,19 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         logits = self.lm_head(hidden_states)
 
         loss = None
+        s2_loss = None
+        trajectory_loss = None
+        stage_loss = None
         if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous().float()
+            shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+            s2_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        if traj_poses is not None:
             traj_hidden_states = []
             for b in range(hidden_states.shape[0]):
                 traj_hidden_states.append(hidden_states[b, t_s_pos[b] : t_s_pos[b] + self.config.n_query, :])
@@ -280,10 +420,12 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 )
                 noise_pred = self.get_model().action_decoder(noise_pred)
                 target = noise - relative_poses
-                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                trajectory_element_loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
                 mask = loss_mask.flatten(0, 1)[:, None, None]
-                masked_loss = loss * mask
-                loss = masked_loss.sum() / mask.sum() / (loss.shape[1] * loss.shape[2])
+                masked_loss = trajectory_element_loss * mask
+                trajectory_loss = masked_loss.sum() / mask.sum() / (
+                    trajectory_element_loss.shape[1] * trajectory_element_loss.shape[2]
+                )
             elif 'navdp' in self.get_system1_type():
                 if 'async' in self.get_system1_type():
                     cur_images = traj_images.flatten(0, 1)
@@ -300,25 +442,56 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     pg_action_loss = (pred_pg - noise).square()
                     mask = loss_mask.flatten(0, 1)[:, None, None]
                     masked_loss = pg_action_loss * mask
-                    loss = masked_loss.sum() / mask.sum() / (pg_action_loss.shape[1] * pg_action_loss.shape[2])
+                    trajectory_loss = masked_loss.sum() / mask.sum() / (
+                        pg_action_loss.shape[1] * pg_action_loss.shape[2]
+                    )
 
             else:
                 raise NotImplementedError
+
+        if evidence_output is not None and hasattr(self.config, "evidence_stage_loss_weight"):
+            # Stage supervision is optional and never required by the runtime inference API.
+            stage_loss = None
+        weighted_losses = []
+        if s2_loss is not None:
+            weighted_losses.append(getattr(self.config, "s2_loss_weight", 1.0) * s2_loss)
+        if trajectory_loss is not None:
+            weighted_losses.append(getattr(self.config, "trajectory_loss_weight", 1.0) * trajectory_loss)
+        if stage_loss is not None:
+            weighted_losses.append(getattr(self.config, "evidence_stage_loss_weight", 1.0) * stage_loss)
+        if weighted_losses:
+            loss = sum(weighted_losses)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return DualVLNCausalLMOutput(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            s2_loss=s2_loss,
+            trajectory_loss=trajectory_loss,
+            stage_loss=stage_loss,
         )
 
-    def generate_latents(self, input_ids, pixel_values, image_grid_thw):
-        input_ids.to(self.get_model().device)
+    def generate_latents(
+        self,
+        input_ids,
+        pixel_values,
+        image_grid_thw,
+        attention_mask=None,
+        evidence_relative_poses=None,
+        evidence_ages=None,
+        evidence_qualities=None,
+        evidence_valid_mask=None,
+        evidence_history_counts=None,
+        evidence_image_counts=None,
+        evidence_prompt_lengths=None,
+    ):
+        input_ids = input_ids.to(self.get_model().device)
         with torch.no_grad():
             text_embeds = self.get_model().embed_tokens(input_ids)
         latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1)
@@ -327,9 +500,26 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         input_ids = torch.cat([input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY]).to(input_ids.device)], dim=1)
 
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).unsqueeze(0)
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
 
         text_embeds[image_idx] = image_embeds.to(text_embeds.device)[: image_idx.sum(), :]
+
+        if input_ids.eq(EVIDENCE_TOKEN_INDEX).any():
+            text_embeds, _ = self._inject_evidence_embeddings(
+                input_ids,
+                text_embeds,
+                image_embeds,
+                image_grid_thw,
+                attention_mask,
+                None,
+                evidence_relative_poses,
+                evidence_ages,
+                evidence_qualities,
+                evidence_valid_mask,
+                evidence_history_counts,
+                evidence_image_counts,
+                evidence_prompt_lengths,
+            )
 
         text_embeds = torch.cat([text_embeds, latent_queries], dim=1)
 

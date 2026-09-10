@@ -19,6 +19,12 @@ from transformers.image_utils import to_numpy_array
 
 from .rope2d import get_rope_index_2, get_rope_index_25
 from .vlln_lerobot_dataset import VLLNDataset
+from internnav.model.basemodel.internvla_n1.evidence_history import (
+    build_causal_history_metadata,
+    planar_poses_from_transforms,
+    select_causal_history_ids,
+)
+from internnav.model.basemodel.internvla_n1.evidence_sequence import prepare_conditioned_sequences
 
 # Define placeholders for dataset paths
 CAMBRIAN_737K = {
@@ -174,6 +180,7 @@ IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
 VIDEO_TOKEN_INDEX = 151656
 TRAJ_TOKEN_INDEX = 151667
+EVIDENCE_TOKEN_INDEX = 151668
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
 DEFAULT_TRAJ_TOKEN = "<traj>"
@@ -895,6 +902,7 @@ class NavPixelGoalDataset(Dataset):
                                     (start_frame_id, start_frame_id + 1),
                                     turn_actions,
                                     None,
+                                    poses,
                                 )
                             )
                     else:
@@ -915,6 +923,7 @@ class NavPixelGoalDataset(Dataset):
                                 (start_frame_id, start_frame_id + goal_len + 1),
                                 action,
                                 pose,
+                                poses,
                             )
                         )
 
@@ -930,6 +939,7 @@ class NavPixelGoalDataset(Dataset):
                         (actions_len - 1, actions_len),
                         0,
                         None,
+                        poses,
                     )
                 )
 
@@ -999,11 +1009,9 @@ class NavPixelGoalDataset(Dataset):
             (start_frame_id, end_frame_id),
             action,
             pose,
+            episode_poses,
         ) = self.list_data_dict[i]
-        if start_frame_id != 0:
-            history_id = np.unique(np.linspace(0, start_frame_id - 1, self.num_history, dtype=np.int32)).tolist()
-        else:
-            history_id = []
+        history_id = select_causal_history_ids(start_frame_id, self.num_history)
 
         images = []
         grid_thws = []
@@ -1107,6 +1115,31 @@ class NavPixelGoalDataset(Dataset):
         data_dict["pixel_values"] = torch.cat(images, dim=0)
         data_dict["image_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in grid_thws], dim=0)
 
+        if getattr(self.data_args, "use_evidence_memory", False):
+            planar_positions, planar_yaws = planar_poses_from_transforms(np.asarray(episode_poses))
+            history_metadata = build_causal_history_metadata(
+                history_id,
+                planar_positions,
+                planar_yaws,
+                current_frame_id=start_frame_id,
+            )
+            image_token_mask = data_dict["input_ids"][0].eq(IMAGE_TOKEN_INDEX)
+            image_block_starts = torch.nonzero(
+                image_token_mask & ~torch.roll(image_token_mask, 1), as_tuple=False
+            ).flatten()
+            if image_token_mask[0]:
+                image_block_starts[0] = 0
+            if len(image_block_starts) <= len(history_id):
+                raise ValueError("cannot locate the current observation image block")
+            current_image_pad_start = int(image_block_starts[len(history_id)].item())
+            data_dict["evidence_insert_position"] = max(0, current_image_pad_start - 1)
+            data_dict["evidence_frame_ids"] = torch.from_numpy(history_metadata.frame_ids)
+            data_dict["evidence_relative_poses"] = torch.from_numpy(history_metadata.relative_poses)
+            data_dict["evidence_ages"] = torch.from_numpy(history_metadata.ages)
+            data_dict["evidence_qualities"] = torch.from_numpy(history_metadata.qualities)
+            data_dict["evidence_history_count"] = len(history_id)
+            data_dict["evidence_image_count"] = len(images)
+
         if self.pixel_goal_only:
             goal_len = end_frame_id - start_frame_id - 1
             interval = 2
@@ -1151,6 +1184,9 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    evidence_token_id: int = EVIDENCE_TOKEN_INDEX
+    num_evidence_tokens: int = 4
+    num_trajectory_tokens: int = 4
 
     def process_input_with_traj_tokens(
         self,
@@ -1189,7 +1225,27 @@ class DataCollatorForSupervisedDataset(object):
         input_ids = [ids.squeeze(0) for ids in input_ids]
         labels = [ids.squeeze(0) for ids in labels]
 
-        if "traj_images" in instances[0]:
+        has_evidence = "evidence_insert_position" in instances[0]
+        has_trajectory = "traj_images" in instances[0]
+        if has_evidence:
+            if not all("evidence_insert_position" in instance for instance in instances):
+                raise ValueError("evidence metadata must be present for every sample in a batch")
+            if has_trajectory and not all("traj_images" in instance for instance in instances):
+                raise ValueError("trajectory supervision must be present for every evidence sample in a batch")
+            conditioned = prepare_conditioned_sequences(
+                input_ids=input_ids,
+                labels=labels,
+                evidence_insert_positions=[instance["evidence_insert_position"] for instance in instances],
+                evidence_token_id=self.evidence_token_id,
+                trajectory_token_id=TRAJ_TOKEN_INDEX,
+                num_evidence_tokens=self.num_evidence_tokens,
+                num_trajectory_tokens=self.num_trajectory_tokens if has_trajectory else 0,
+                max_length=self.tokenizer.model_max_length,
+            )
+            input_ids = list(conditioned.input_ids)
+            labels = list(conditioned.labels)
+            t_s_pos = list(conditioned.trajectory_positions)
+        elif has_trajectory:
             input_ids, labels, t_s_pos = self.process_input_with_traj_tokens(input_ids, labels)
 
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -1234,6 +1290,35 @@ class DataCollatorForSupervisedDataset(object):
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
+
+        if has_evidence:
+            history_counts = torch.tensor([instance["evidence_history_count"] for instance in instances])
+            image_counts = torch.tensor([instance["evidence_image_count"] for instance in instances])
+            max_history = int(history_counts.max().item()) if len(history_counts) else 0
+
+            def pad_history(key, trailing_shape, value=0):
+                result = torch.full((len(instances), max_history, *trailing_shape), value, dtype=torch.float32)
+                for sample_idx, instance in enumerate(instances):
+                    count = instance["evidence_history_count"]
+                    if count:
+                        result[sample_idx, :count] = instance[key].float()
+                return result
+
+            frame_ids = torch.full((len(instances), max_history), -1, dtype=torch.long)
+            valid_mask = torch.zeros((len(instances), max_history), dtype=torch.bool)
+            for sample_idx, instance in enumerate(instances):
+                count = instance["evidence_history_count"]
+                if count:
+                    frame_ids[sample_idx, :count] = instance["evidence_frame_ids"]
+                    valid_mask[sample_idx, :count] = True
+            batch["evidence_frame_ids"] = frame_ids
+            batch["evidence_relative_poses"] = pad_history("evidence_relative_poses", (4,))
+            batch["evidence_ages"] = pad_history("evidence_ages", (1,))
+            batch["evidence_qualities"] = pad_history("evidence_qualities", (2,))
+            batch["evidence_valid_mask"] = valid_mask
+            batch["evidence_history_counts"] = history_counts
+            batch["evidence_image_counts"] = image_counts
+            batch['position_ids'] = None
 
         if "traj_images" in instances[0]:
             traj_images, traj_depths, traj_poses = tuple(
@@ -1379,7 +1464,10 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     if data_args.data_flatten:
         data_collator = FlattenedDataCollatorForSupervisedDataset(tokenizer=tokenizer)
         return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    data_collator = DataCollatorForSupervisedDataset(
+        tokenizer=tokenizer,
+        num_evidence_tokens=getattr(data_args, "num_evidence_tokens", 4),
+    )
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 

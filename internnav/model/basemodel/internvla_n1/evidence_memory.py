@@ -21,6 +21,7 @@ class TaskConditionedEvidenceMemory(nn.Module):
         feature_dim: int,
         task_dim: int,
         hidden_dim: int,
+        output_dim: int | None = None,
         pose_dim: int = 4,
         quality_dim: int = 2,
         num_evidence_tokens: int = 4,
@@ -31,7 +32,8 @@ class TaskConditionedEvidenceMemory(nn.Module):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
-        if min(feature_dim, task_dim, hidden_dim, pose_dim, num_evidence_tokens, num_stages) <= 0:
+        output_dim = hidden_dim if output_dim is None else output_dim
+        if min(feature_dim, task_dim, hidden_dim, output_dim, pose_dim, num_evidence_tokens, num_stages) <= 0:
             raise ValueError("feature, task, hidden, pose, token, and stage dimensions must be positive")
         if quality_dim < 0:
             raise ValueError("quality_dim must be non-negative")
@@ -39,6 +41,7 @@ class TaskConditionedEvidenceMemory(nn.Module):
         self.feature_dim = feature_dim
         self.task_dim = task_dim
         self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
         self.pose_dim = pose_dim
         self.quality_dim = quality_dim
         self.num_evidence_tokens = num_evidence_tokens
@@ -63,7 +66,9 @@ class TaskConditionedEvidenceMemory(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
-        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.bottleneck_norm = nn.LayerNorm(hidden_dim)
+        self.output_projection = nn.Linear(hidden_dim, output_dim)
+        self.output_norm = nn.LayerNorm(output_dim)
         self.stage_head = nn.Linear(task_dim, num_stages)
 
         nn.init.normal_(self.evidence_queries, std=0.02)
@@ -155,7 +160,8 @@ class TaskConditionedEvidenceMemory(nn.Module):
             average_attn_weights=False,
         )
         hidden = self.read_norm(queries + retrieved)
-        tokens = self.output_norm(hidden + self.read_mlp(hidden))
+        bottleneck_tokens = self.bottleneck_norm(hidden + self.read_mlp(hidden))
+        tokens = self.output_norm(self.output_projection(bottleneck_tokens))
 
         weights = per_head_weights.mean(dim=1)
         read_weights = weights[..., :-1]

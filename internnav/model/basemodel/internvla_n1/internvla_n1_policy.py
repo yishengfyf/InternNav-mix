@@ -10,7 +10,13 @@ from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedModel
 
 from internnav.configs.model.base_encoders import ModelCfg
+from internnav.model.basemodel.internvla_n1.evidence_history import (
+    build_causal_history_metadata,
+    select_causal_history_ids,
+)
+from internnav.model.basemodel.internvla_n1.evidence_sequence import prepare_conditioned_sequences
 from internnav.model.basemodel.internvla_n1.internvla_n1 import (
+    EVIDENCE_TOKEN_INDEX,
     InternVLAN1ForCausalLM,
     InternVLAN1ModelConfig,
 )
@@ -57,6 +63,7 @@ class InternVLAN1Net(PreTrainedModel):
         self.episode_idx = 0  # S2's episode idx is different from the system's idx
         self.conversation_history = []  # Multi-turn conversation exists when looking down
         self.llm_output = ""
+        self.last_history_ids = []
 
     def init_prompts(self):
         self.DEFAULT_IMAGE_TOKEN = "<image>"
@@ -92,6 +99,56 @@ class InternVLAN1Net(PreTrainedModel):
         self.episode_idx = 0
         self.conversation_history = []
         self.llm_output = ""
+        self.last_history_ids = []
+
+    def _append_observation(self, image, depth, pose):
+        planar_pose = np.asarray(pose, dtype=np.float32)
+        if planar_pose.shape != (3,):
+            raise ValueError("pose must contain planar x, y, yaw")
+        self.rgb_list.append(image)
+        self.depth_list.append(depth)
+        self.pose_list.append(planar_pose)
+
+    def _prepare_evidence_inputs(self, inputs, history_ids):
+        if not getattr(self.model.config, "use_evidence_memory", False):
+            return inputs, {}
+        input_ids = inputs.input_ids[0]
+        image_mask = input_ids.eq(self.model.config.image_token_id)
+        image_block_starts = torch.nonzero(image_mask & ~torch.roll(image_mask, 1), as_tuple=False).flatten()
+        if image_mask[0]:
+            image_block_starts[0] = 0
+        if len(image_block_starts) <= len(history_ids):
+            raise ValueError("cannot locate current observation image block during evidence prefill")
+        insert_position = max(0, int(image_block_starts[len(history_ids)].item()) - 1)
+        conditioned = prepare_conditioned_sequences(
+            input_ids=(input_ids,),
+            labels=(torch.full_like(input_ids, -100),),
+            evidence_insert_positions=(insert_position,),
+            evidence_token_id=EVIDENCE_TOKEN_INDEX,
+            trajectory_token_id=151667,
+            num_evidence_tokens=self.model.config.num_evidence_tokens,
+            num_trajectory_tokens=0,
+        )
+        inputs["input_ids"] = conditioned.input_ids[0].unsqueeze(0)
+        inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+
+        planar_poses = np.asarray(self.pose_list, dtype=np.float32)
+        metadata = build_causal_history_metadata(
+            history_ids,
+            planar_poses[:, :2],
+            planar_poses[:, 2],
+            current_frame_id=len(self.pose_list) - 1,
+        )
+        evidence_kwargs = {
+            "evidence_relative_poses": torch.from_numpy(metadata.relative_poses).unsqueeze(0).to(self.device),
+            "evidence_ages": torch.from_numpy(metadata.ages).unsqueeze(0).to(self.device),
+            "evidence_qualities": torch.from_numpy(metadata.qualities).unsqueeze(0).to(self.device),
+            "evidence_valid_mask": torch.ones((1, len(history_ids)), dtype=torch.bool, device=self.device),
+            "evidence_history_counts": torch.tensor([len(history_ids)], device=self.device),
+            "evidence_image_counts": torch.tensor([len(self.input_images)], device=self.device),
+            "evidence_prompt_lengths": torch.tensor([inputs["input_ids"].shape[1]], device=self.device),
+        }
+        return inputs, evidence_kwargs
 
     def parse_actions(self, output):
         action_patterns = '|'.join(re.escape(action) for action in self.actions2idx)
@@ -104,7 +161,7 @@ class InternVLAN1Net(PreTrainedModel):
     def step_no_infer(self, rgb, depth, pose):
         image = Image.fromarray(rgb).convert('RGB')
         image = image.resize((self.resize_w, self.resize_h))
-        self.rgb_list.append(image)
+        self._append_observation(image, depth, pose)
         self.episode_idx += 1
 
     def s2_step(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
@@ -113,7 +170,7 @@ class InternVLAN1Net(PreTrainedModel):
         image = Image.fromarray(rgb).convert('RGB')
         if not look_down:  # Don't add look_down images to rgb_list
             image = image.resize((self.resize_w, self.resize_h))
-            self.rgb_list.append(image)
+            self._append_observation(image, depth, pose)
 
         # 2. Prepare input for the model
         if not look_down:
@@ -127,11 +184,12 @@ class InternVLAN1Net(PreTrainedModel):
             if self.episode_idx == 0:
                 history_id = []
             else:
-                history_id = np.unique(np.linspace(0, self.episode_idx - 1, self.num_history, dtype=np.int32)).tolist()
+                history_id = select_causal_history_ids(self.episode_idx, self.num_history)
                 placeholder = (self.DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
                 sources[0]["value"] += f' These are your historical observations: {placeholder}.'
 
             history_id = sorted(history_id)
+            self.last_history_ids = history_id
             self.input_images = [self.rgb_list[i] for i in history_id] + cur_images
             input_img_id = 0
             self.episode_idx += 1  # Only increment when not looking down to maintain correspondence with rgb_list idx
@@ -144,6 +202,7 @@ class InternVLAN1Net(PreTrainedModel):
             self.conversation_history.append(
                 {'role': 'assistant', 'content': [{'type': 'text', 'text': self.llm_output}]}
             )
+            history_id = self.last_history_ids
 
         prompt = self.conjunctions[0] + self.DEFAULT_IMAGE_TOKEN
         sources[0]["value"] += f" {prompt}."
@@ -163,6 +222,7 @@ class InternVLAN1Net(PreTrainedModel):
         text = self.processor.apply_chat_template(self.conversation_history, tokenize=False, add_generation_prompt=True)
 
         inputs = self.processor(text=[text], images=self.input_images, return_tensors="pt").to(self.device)
+        inputs, evidence_kwargs = self._prepare_evidence_inputs(inputs, history_id)
 
         # 3. Model inference
         with torch.no_grad():
@@ -173,6 +233,7 @@ class InternVLAN1Net(PreTrainedModel):
                 use_cache=True,
                 past_key_values=None,
                 return_dict_in_generate=True,
+                **evidence_kwargs,
             ).sequences
         self.llm_output = self.processor.tokenizer.decode(
             output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
@@ -188,7 +249,13 @@ class InternVLAN1Net(PreTrainedModel):
 
             image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
             with torch.no_grad():
-                traj_latents = self.model.generate_latents(output_ids, inputs.pixel_values, image_grid_thw)
+                traj_latents = self.model.generate_latents(
+                    output_ids,
+                    inputs.pixel_values,
+                    image_grid_thw,
+                    attention_mask=torch.ones_like(output_ids),
+                    **evidence_kwargs,
+                )
             output.output_latent = traj_latents
 
         else:  # Output action

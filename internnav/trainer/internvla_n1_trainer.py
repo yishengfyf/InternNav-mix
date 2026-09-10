@@ -39,6 +39,7 @@ from transformers import (
 
 from internnav.dataset.internvla_n1_lerobot_dataset import make_supervised_data_module
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.basemodel.internvla_n1.trainable import configure_trainable_parameters
 from internnav.trainer.internvla_n1_argument import (
     DataArguments,
     ModelArguments,
@@ -76,6 +77,21 @@ def smart_tokenizer_and_embedding_resize(
 
 
 def set_model(model_args, model):
+    if model_args.use_evidence_memory:
+        summary = configure_trainable_parameters(
+            model,
+            (
+                "model.task_state_estimator.*",
+                "model.evidence_memory.*",
+                "model.cond_projector.*",
+                "model.latent_queries",
+            ),
+        )
+        print(
+            f"Evidence first-stage trainable parameters: {summary.trainable_parameters:,}; "
+            f"frozen parameters: {summary.frozen_parameters:,}"
+        )
+        return
     if model_args.tune_mm_vision:
         for n, p in model.visual.named_parameters():
             p.requires_grad = True
@@ -127,6 +143,8 @@ def train(attn_implementation="flash_attention_2"):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    data_args.use_evidence_memory = model_args.use_evidence_memory
+    data_args.num_evidence_tokens = model_args.num_evidence_tokens
 
     local_rank = training_args.local_rank
     os.makedirs(training_args.output_dir, exist_ok=True)
@@ -204,6 +222,9 @@ def train(attn_implementation="flash_attention_2"):
 
     if data_args.model_type == "internvla-n1":
         model.get_model().initialize_vision_modules(model_args=model_args)
+        model.get_model().initialize_evidence_modules(model_args=model_args)
+        model.config.s2_loss_weight = model_args.s2_loss_weight
+        model.config.trajectory_loss_weight = model_args.trajectory_loss_weight
     set_model(model_args, model)
 
     if torch.distributed.get_rank() == 0:

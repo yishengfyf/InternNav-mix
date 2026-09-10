@@ -82,3 +82,19 @@ def test_replace_embeddings_rejects_placeholder_count_mismatch():
             evidence_tokens=torch.zeros(2, 2, 4),
             evidence_token_id=90,
         )
+
+
+def test_sequence_without_trajectory_still_reserves_evidence():
+    result = prepare_conditioned_sequences(
+        input_ids=(torch.tensor([1, 2, 3]),),
+        labels=(torch.tensor([-100, 2, 3]),),
+        evidence_insert_positions=(1,),
+        evidence_token_id=90,
+        trajectory_token_id=91,
+        num_evidence_tokens=2,
+        num_trajectory_tokens=0,
+        max_length=5,
+    )
+
+    assert result.input_ids[0].tolist() == [1, 90, 90, 2, 3]
+    assert result.labels[0].tolist() == [-100, -100, -100, 2, 3]

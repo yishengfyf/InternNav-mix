@@ -15,11 +15,12 @@ def make_inputs(batch_size=2, history_size=5):
     }
 
 
-def make_memory():
+def make_memory(output_dim=8):
     return TaskConditionedEvidenceMemory(
         feature_dim=6,
         task_dim=7,
         hidden_dim=8,
+        output_dim=output_dim,
         pose_dim=4,
         quality_dim=2,
         num_evidence_tokens=3,
@@ -43,6 +44,25 @@ def test_fixed_shapes_masks_and_empty_history_are_stable():
     assert torch.count_nonzero(output.read_weights[1]) == 0
     assert torch.allclose(output.null_weights[1], torch.ones_like(output.null_weights[1]))
     assert torch.isfinite(output.tokens).all()
+
+
+def test_bottleneck_projects_to_s2_hidden_space_without_parameter_explosion():
+    memory = TaskConditionedEvidenceMemory(
+        feature_dim=3584,
+        task_dim=512,
+        hidden_dim=512,
+        output_dim=3584,
+        num_evidence_tokens=4,
+        num_heads=8,
+    )
+    trainable = sum(parameter.numel() for parameter in memory.parameters())
+
+    assert memory.output_projection.weight.shape == (3584, 512)
+    assert 7_000_000 < trainable < 8_000_000
+
+    small_memory = make_memory(output_dim=11)
+    output = small_memory(**make_inputs())
+    assert output.tokens.shape == (2, 3, 11)
 
 
 def test_padding_values_do_not_change_retrieval():

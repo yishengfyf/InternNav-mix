@@ -3,6 +3,9 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 
+from .evidence_conditioning import ObservableTaskStateEstimator
+from .evidence_memory import TaskConditionedEvidenceMemory
+
 LatentEmbSize = 768
 MODEL_PATH_TO = "checkpoints"
 
@@ -143,6 +146,39 @@ class InternVLAN1MetaModel:
                     self.navdp = build_navdp(config, memory_size=2)
             else:
                 raise NotImplementedError
+        if getattr(config, "use_evidence_memory", False):
+            self._create_evidence_modules(config)
+
+    def _create_evidence_modules(self, config):
+        self.task_state_estimator = ObservableTaskStateEstimator(
+            input_dim=config.hidden_size,
+            task_dim=config.evidence_task_dim,
+        )
+        self.evidence_memory = TaskConditionedEvidenceMemory(
+            feature_dim=config.hidden_size,
+            task_dim=config.evidence_task_dim,
+            hidden_dim=config.evidence_bottleneck_dim,
+            output_dim=config.hidden_size,
+            pose_dim=4,
+            quality_dim=2,
+            num_evidence_tokens=config.num_evidence_tokens,
+            num_heads=config.evidence_num_heads,
+            num_stages=config.evidence_num_stages,
+            dropout=config.evidence_dropout,
+        )
+
+    def initialize_evidence_modules(self, model_args):
+        self.config.use_evidence_memory = model_args.use_evidence_memory
+        if not model_args.use_evidence_memory:
+            return
+        self.config.evidence_task_dim = model_args.evidence_task_dim
+        self.config.evidence_bottleneck_dim = model_args.evidence_bottleneck_dim
+        self.config.num_evidence_tokens = model_args.num_evidence_tokens
+        self.config.evidence_num_heads = model_args.evidence_num_heads
+        self.config.evidence_num_stages = model_args.evidence_num_stages
+        self.config.evidence_dropout = model_args.evidence_dropout
+        if getattr(self, "evidence_memory", None) is None:
+            self._create_evidence_modules(self.config)
 
     def initialize_vision_modules(self, model_args):
         if 'nextdit' in model_args.system1:
