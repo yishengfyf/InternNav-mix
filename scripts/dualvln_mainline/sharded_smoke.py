@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--commit", required=True)
     parser.add_argument("--attention", default="flash_attention_2", choices=("flash_attention_2", "eager", "sdpa"))
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
+    parser.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float32"))
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -102,11 +103,12 @@ def main():
         config.s2_loss_weight = 1.0
         config.trajectory_loss_weight = 1.0
         config.use_cache = False
+        model_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
         model = InternVLAN1ForCausalLM.from_pretrained(
             CHECKPOINT,
             config=config,
             local_files_only=True,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=model_dtype,
             attn_implementation=args.attention,
             low_cpu_mem_usage=True,
             device_map="auto",
@@ -125,7 +127,10 @@ def main():
         input_device = model.get_input_embeddings().weight.device
         batch = {key: value.to(input_device) if hasattr(value, "to") else value for key, value in batch.items()}
         model.train()
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        if args.dtype == "bfloat16":
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                output = model(**batch)
+        else:
             output = model(**batch)
         output.loss.backward()
         gradient_audit = summarize_gradients(model, torch)
@@ -148,6 +153,7 @@ def main():
             "input_device": str(input_device),
             "attention": args.attention,
             "gradient_checkpointing": not args.no_gradient_checkpointing,
+            "dtype": args.dtype,
             "device_map": getattr(model, "hf_device_map", {}),
             "per_gpu_memory": per_gpu,
             "trainable_parameters": trainable.trainable_parameters,
