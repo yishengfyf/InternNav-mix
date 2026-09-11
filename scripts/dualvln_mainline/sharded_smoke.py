@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float32"))
     parser.add_argument("--loss", default="total", choices=("total", "s2", "trajectory"))
     parser.add_argument("--gradient-bypass", action="store_true")
+    parser.add_argument("--bypass-mode", choices=("mean", "cross_attention"), default="mean")
     parser.add_argument("--evidence", default="on", choices=("on", "off", "detached"))
     parser.add_argument("--no-trajectory", action="store_true")
     parser.add_argument("--no-s2", action="store_true")
@@ -120,6 +121,7 @@ def main():
         config.use_cache = False
         config.evidence_gradient_bypass = args.gradient_bypass
         config.evidence_gradient_bypass_scale = 0.1
+        config.evidence_gradient_bypass_mode = args.bypass_mode
         config.evidence_detach_tokens = args.evidence == "detached"
         config.numeric_diagnostics = True
         model_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
@@ -283,6 +285,7 @@ def main():
             "dtype": args.dtype,
             "gradient_bypass": args.gradient_bypass,
             "gradient_bypass_scale": 0.1,
+            "gradient_bypass_mode": args.bypass_mode,
             "device_map": getattr(model, "hf_device_map", {}),
             "per_gpu_memory": per_gpu,
             "trainable_parameters": trainable.trainable_parameters,
