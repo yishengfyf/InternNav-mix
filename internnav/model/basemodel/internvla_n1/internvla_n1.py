@@ -169,6 +169,17 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             prompt_mask,
         )
         self._record_numeric("task_state", task_state)
+        ablation = getattr(self.config, "evidence_ablation", "task_spatial")
+        task_state, evidence_relative_poses, evidence_ages, evidence_qualities, evidence_valid_mask = (
+            self._apply_evidence_ablation(
+                ablation,
+                task_state,
+                evidence_relative_poses,
+                evidence_ages,
+                evidence_qualities,
+                evidence_valid_mask,
+            )
+        )
         evidence_output = self.get_model().evidence_memory(
             visual_batch.history_features,
             evidence_relative_poses,
@@ -195,6 +206,32 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             inputs_embeds.retain_grad()
             self.numeric_gradient_tensors["inputs_embeds_after_evidence"] = inputs_embeds
         return inputs_embeds, evidence_output
+
+    @staticmethod
+    def _apply_evidence_ablation(ablation, task_state, relative_poses, ages, qualities, valid_mask):
+        if ablation not in {"null", "content", "spatial", "task_spatial"}:
+            raise ValueError(f"unknown evidence ablation: {ablation}")
+        if ablation != "task_spatial":
+            task_state = torch.zeros_like(task_state)
+        if ablation in {"null", "content"}:
+            relative_poses = torch.zeros_like(relative_poses)
+            ages = torch.zeros_like(ages)
+            qualities = torch.zeros_like(qualities)
+        if ablation == "null":
+            valid_mask = torch.zeros_like(valid_mask)
+        return task_state, relative_poses, ages, qualities, valid_mask
+
+    def _apply_late_evidence_adapter(self, hidden_states, evidence_output):
+        bypass_mode = getattr(self.config, "evidence_gradient_bypass_mode", "mean")
+        if bypass_mode == "cross_attention":
+            evidence_residual = self._late_evidence_residual(hidden_states, evidence_output.tokens)
+        elif bypass_mode == "mean":
+            evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True)
+            evidence_residual = evidence_residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        else:
+            raise ValueError(f"unknown evidence_gradient_bypass_mode: {bypass_mode}")
+        residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
+        return hidden_states + residual_scale * evidence_residual
 
     def forward(
         self,
@@ -418,16 +455,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         self._record_numeric("qwen_hidden_states", hidden_states)
         if gradient_bypass:
             hidden_states = hidden_states.detach()
-            bypass_mode = getattr(self.config, "evidence_gradient_bypass_mode", "mean")
-            if bypass_mode == "cross_attention":
-                evidence_residual = self._late_evidence_residual(hidden_states, evidence_output.tokens)
-            elif bypass_mode == "mean":
-                evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True)
-                evidence_residual = evidence_residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
-            else:
-                raise ValueError(f"unknown evidence_gradient_bypass_mode: {bypass_mode}")
-            residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
-            hidden_states = hidden_states + residual_scale * evidence_residual
+            hidden_states = self._apply_late_evidence_adapter(hidden_states, evidence_output)
         logits = self.lm_head(hidden_states)
         self._record_numeric("logits", logits)
 
@@ -519,8 +547,10 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 trajectory_element_loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
                 mask = loss_mask.flatten(0, 1)[:, None, None]
                 masked_loss = trajectory_element_loss * mask
-                trajectory_loss = masked_loss.sum() / mask.sum() / (
-                    trajectory_element_loss.shape[1] * trajectory_element_loss.shape[2]
+                trajectory_loss = (
+                    masked_loss.sum()
+                    / mask.sum()
+                    / (trajectory_element_loss.shape[1] * trajectory_element_loss.shape[2])
                 )
                 self._record_numeric("trajectory_loss", trajectory_loss)
             elif 'navdp' in self.get_system1_type():
@@ -539,8 +569,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     pg_action_loss = (pred_pg - noise).square()
                     mask = loss_mask.flatten(0, 1)[:, None, None]
                     masked_loss = pg_action_loss * mask
-                    trajectory_loss = masked_loss.sum() / mask.sum() / (
-                        pg_action_loss.shape[1] * pg_action_loss.shape[2]
+                    trajectory_loss = (
+                        masked_loss.sum() / mask.sum() / (pg_action_loss.shape[1] * pg_action_loss.shape[2])
                     )
 
             else:
@@ -601,6 +631,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
         text_embeds[image_idx] = image_embeds.to(text_embeds.device)[: image_idx.sum(), :]
 
+        evidence_output = None
         if input_ids.eq(EVIDENCE_TOKEN_INDEX).any():
             text_embeds, evidence_output = self._inject_evidence_embeddings(
                 input_ids,
@@ -622,7 +653,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
         position_ids, _ = self.get_rope_index(input_ids, image_grid_thw)
         with torch.no_grad():
-            gradient_bypass = bool(getattr(self.config, "evidence_gradient_bypass", False) and evidence_output is not None)
+            gradient_bypass = bool(
+                getattr(self.config, "evidence_gradient_bypass", False) and evidence_output is not None
+            )
             outputs = self.model(
                 inputs_embeds=text_embeds.detach() if gradient_bypass else text_embeds,
                 position_ids=position_ids,
@@ -634,10 +667,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         if gradient_bypass:
             hidden_states = hidden_states.detach()
             residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
-            hidden_states = hidden_states + residual_scale * latent_queries.to(hidden_states.device, hidden_states.dtype)
-            evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True) if evidence_output is not None else None
-            if evidence_residual is not None:
-                hidden_states = hidden_states + residual_scale * evidence_residual.to(hidden_states.device, hidden_states.dtype)
+            hidden_states = hidden_states + residual_scale * latent_queries.to(
+                hidden_states.device, hidden_states.dtype
+            )
+            if evidence_output is not None:
+                hidden_states = self._apply_late_evidence_adapter(hidden_states, evidence_output)
 
         return hidden_states
 

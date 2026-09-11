@@ -77,6 +77,18 @@ task-state 训练监督可以来自训练标注或经过 mask 的软伪标签，
 
 B1/B2/M1/M2 使用相同的新训练数据、更新步数、历史帧、token 数量、优化预算和随机种子。仅用于验证的历史 audit 数据不得转成训练样本。
 
+在 N0 已确认原始 input-token evidence 无有效梯度后，N2 首轮统一采用冻结 Qwen 的 late-adapter 诊断路径，具体实现固定为：
+
+- B0：不插入 evidence、不更新参数，只记录原 checkpoint 在固定样本上的损失；
+- B1：只保留可学习 null evidence，屏蔽真实历史、空间元数据与 task-state，作为无历史的适配器对照；
+- B2：读取真实历史视觉内容，但将位姿、年龄、质量和 task-state 置零；
+- M1：读取历史视觉内容和空间元数据，但将 task-state 置零；
+- M2：读取历史视觉内容、空间元数据，并使用由当前视觉和因果 prompt 估计的 task-state。
+
+四个可训练组均使用相同的 4 个 evidence token、cross-attention late adapter、初始化、seed、学习率、样本顺序和更新数。B1 的含义相应收窄为“无历史的冻结特征适配器”，不能描述成完整 Qwen 继续训练。该对照首先回答训练信号与小样本拟合差异，不直接等价于未见场景导航收益。
+
+训练 forward 和 `generate_latents` 必须调用同一 late evidence adapter。特别是 cross-attention 模式下，推理不得退化为 evidence 均值，否则闭环结果不属于训练时验证的模型。
+
 ## 7. 验证门槛
 
 1. CPU 协议测试：shape、padding 不变性、空历史、因果年龄、任务条件化、梯度、显式训练白名单及错误白名单拒绝。

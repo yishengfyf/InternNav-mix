@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn as nn
 
@@ -68,7 +69,22 @@ def tiny_model():
 def test_tiny_production_forward_injects_evidence_and_splits_s2_loss():
     model = tiny_model()
     input_ids = torch.tensor(
-        [[10, 151652, IMAGE_TOKEN_INDEX, 151653, 11, 151652, IMAGE_TOKEN_INDEX, 151653, EVIDENCE_TOKEN_INDEX, EVIDENCE_TOKEN_INDEX, 12, 13]]
+        [
+            [
+                10,
+                151652,
+                IMAGE_TOKEN_INDEX,
+                151653,
+                11,
+                151652,
+                IMAGE_TOKEN_INDEX,
+                151653,
+                EVIDENCE_TOKEN_INDEX,
+                EVIDENCE_TOKEN_INDEX,
+                12,
+                13,
+            ]
+        ]
     )
     labels = torch.tensor([[-100] * 10 + [12, 13]])
     output = model(
@@ -103,3 +119,54 @@ def test_late_evidence_residual_is_position_specific_and_differentiable():
     assert not torch.allclose(residual[:, 0], residual[:, 1])
     residual.square().sum().backward()
     assert evidence.grad is not None and evidence.grad.abs().sum() > 0
+
+
+def test_late_adapter_uses_configured_cross_attention_in_all_callers():
+    model = tiny_model()
+    model.config.evidence_gradient_bypass_mode = "cross_attention"
+    model.config.evidence_gradient_bypass_scale = 0.5
+    hidden = torch.randn(1, 3, model.config.hidden_size)
+    tokens = torch.randn(1, 2, model.config.hidden_size, requires_grad=True)
+    evidence_output = type("EvidenceOutput", (), {"tokens": tokens})()
+
+    adapted = model._apply_late_evidence_adapter(hidden, evidence_output)
+    expected = hidden + 0.5 * model._late_evidence_residual(hidden, tokens)
+
+    assert torch.allclose(adapted, expected)
+    adapted.sum().backward()
+    assert tokens.grad is not None and tokens.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize(
+    ("ablation", "keeps_task", "keeps_metadata", "keeps_history"),
+    (
+        ("null", False, False, False),
+        ("content", False, False, True),
+        ("spatial", False, True, True),
+        ("task_spatial", True, True, True),
+    ),
+)
+def test_evidence_ablation_contract(ablation, keeps_task, keeps_metadata, keeps_history):
+    task = torch.ones(1, 4)
+    poses = torch.ones(1, 2, 4)
+    ages = torch.ones(1, 2, 1)
+    qualities = torch.ones(1, 2, 2)
+    valid = torch.ones(1, 2, dtype=torch.bool)
+
+    result = InternVLAN1ForCausalLM._apply_evidence_ablation(ablation, task, poses, ages, qualities, valid)
+
+    assert bool(result[0].any()) is keeps_task
+    assert all(bool(tensor.any()) is keeps_metadata for tensor in result[1:4])
+    assert bool(result[4].any()) is keeps_history
+
+
+def test_evidence_ablation_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="unknown evidence ablation"):
+        InternVLAN1ForCausalLM._apply_evidence_ablation(
+            "invalid",
+            torch.zeros(1, 4),
+            torch.zeros(1, 2, 4),
+            torch.zeros(1, 2, 1),
+            torch.zeros(1, 2, 2),
+            torch.zeros(1, 2, dtype=torch.bool),
+        )
