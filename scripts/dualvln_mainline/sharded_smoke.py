@@ -132,6 +132,35 @@ def main():
             device_map="auto",
             max_memory=max_memory,
         )
+        module_diagnostics = {}
+
+        def summarize_tensor(tensor):
+            detached = tensor.detach()
+            finite = torch.isfinite(detached)
+            values = detached[finite].float()
+            return {
+                "shape": list(detached.shape),
+                "dtype": str(detached.dtype),
+                "device": str(detached.device),
+                "finite": bool(finite.all()),
+                "nonfinite": int(detached.numel() - finite.sum().item()),
+                "min": float(values.min()) if values.numel() else None,
+                "max": float(values.max()) if values.numel() else None,
+                "max_abs": float(values.abs().max()) if values.numel() else None,
+            }
+
+        def record_output(name):
+            def hook(_module, _inputs, output):
+                if torch.is_tensor(output):
+                    module_diagnostics[name] = summarize_tensor(output)
+            return hook
+
+        if args.evidence != "off":
+            estimator = model.get_model().task_state_estimator
+            estimator.visual_projection.register_forward_hook(record_output("task.visual_projection"))
+            estimator.text_projection.register_forward_hook(record_output("task.text_projection"))
+            for index, layer in enumerate(estimator.fusion):
+                layer.register_forward_hook(record_output(f"task.fusion.{index}"))
         if not args.no_gradient_checkpointing:
             model.gradient_checkpointing_enable()
         if not args.forward_only:
@@ -146,6 +175,11 @@ def main():
         for parameter in model.parameters():
             if parameter.requires_grad:
                 parameter.data = parameter.data.float()
+        trainable_parameter_diagnostics = {
+            name: summarize_tensor(parameter)
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
         checkpoint_nonfinite = 0
         checkpoint_parameters = 0
         if args.check_checkpoint:
@@ -201,6 +235,8 @@ def main():
             "valid_trajectory_frames": int(batch["video_frame_num"].sum()) if "video_frame_num" in batch else 0,
             "first_nonfinite_tensor": first_nonfinite,
             "finite_checks": numeric_diagnostics,
+            "module_finite_checks": module_diagnostics,
+            "trainable_parameter_checks": trainable_parameter_diagnostics,
             "checkpoint_parameters_checked": checkpoint_parameters,
             "checkpoint_nonfinite": checkpoint_nonfinite,
             "nonfinite_gradients": nonfinite,
