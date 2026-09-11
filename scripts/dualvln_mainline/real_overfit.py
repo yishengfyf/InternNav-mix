@@ -55,6 +55,7 @@ def write_report(args, report, series=None):
 |---|---:|
 |真实训练样本|{metrics.get('samples', 0)}|
 |优化步数|{metrics.get('steps_completed', 0)}|
+|训练结构|{metrics.get('architecture', 'unknown')}|
 |初始总 loss|{metrics.get('initial_total_loss', 0):.6f}|
 |最终总 loss|{metrics.get('final_total_loss', 0):.6f}|
 |总 loss 下降|{metrics.get('total_loss_reduction', 0):.2%}|
@@ -131,6 +132,8 @@ def main():
     parser.add_argument("--commit", required=True)
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--samples", type=int, default=8)
+    parser.add_argument("--sharded", action="store_true")
+    parser.add_argument("--gradient-bypass", action="store_true")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     planned_config = {
@@ -145,6 +148,8 @@ def main():
         "model_max_length": 1024,
         "num_history": 2,
         "memory_fraction": 0.50,
+        "architecture": "frozen-feature adapter baseline" if args.gradient_bypass else "input-token evidence",
+        "sharded": args.sharded,
         "dtype": "bfloat16",
         "attention": "flash_attention_2",
         "trainable_dtype": "float32",
@@ -177,7 +182,8 @@ def main():
             raise RuntimeError("CUDA is unavailable")
         torch.manual_seed(23)
         torch.cuda.manual_seed_all(23)
-        torch.cuda.set_per_process_memory_fraction(0.50, device=0)
+        if not args.sharded:
+            torch.cuda.set_per_process_memory_fraction(0.50, device=0)
         device = torch.device("cuda:0")
 
         tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT, local_files_only=True, use_fast=False)
@@ -219,6 +225,11 @@ def main():
         config.s2_loss_weight = 1.0
         config.trajectory_loss_weight = 1.0
         config.use_cache = False
+        config.evidence_gradient_bypass = args.gradient_bypass
+        config.evidence_gradient_bypass_scale = 0.1
+        load_kwargs = {}
+        if args.sharded:
+            load_kwargs.update(device_map="auto", max_memory={0: "20GiB", 1: "20GiB", 2: "20GiB", 3: "20GiB", "cpu": "64GiB"})
         model = InternVLAN1ForCausalLM.from_pretrained(
             CHECKPOINT,
             config=config,
@@ -226,8 +237,12 @@ def main():
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             low_cpu_mem_usage=True,
-        ).to(device)
-        model.gradient_checkpointing_enable()
+            **load_kwargs,
+        )
+        if not args.sharded:
+            model = model.to(device)
+        if not args.gradient_bypass:
+            model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
         trainable = configure_trainable_parameters(
             model,
@@ -237,6 +252,7 @@ def main():
             if parameter.requires_grad:
                 parameter.data = parameter.data.float()
         model.get_model().reset_evidence_parameters()
+        input_device = model.get_input_embeddings().weight.device
         optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=3e-4)
         completed_config = {
             **planned_config,
@@ -258,7 +274,7 @@ def main():
                     torch.manual_seed(1000 + sample_idx)
                     torch.cuda.manual_seed_all(1000 + sample_idx)
                     with torch.autocast("cuda", dtype=torch.bfloat16):
-                        output = model(**move_batch(cpu_batch, device))
+                        output = model(**move_batch(cpu_batch, input_device))
                     totals.append(float(output.loss))
                     s2_values.append(float(output.s2_loss))
                     trajectory_values.append(float(output.trajectory_loss))
@@ -272,7 +288,7 @@ def main():
             torch.manual_seed(2000)
             torch.cuda.manual_seed_all(2000)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                audit_output = model(**move_batch(cpu_batches[0], device))
+                audit_output = model(**move_batch(cpu_batches[0], input_device))
             getattr(audit_output, loss_name).backward()
             gradient_audit[loss_name] = summarize_gradients(model, torch)
         optimizer.zero_grad(set_to_none=True)
@@ -285,24 +301,38 @@ def main():
             for loss_summary in gradient_audit.values()
             for group in loss_summary.values()
         )
+        required_gradient_groups = {
+            "s2_loss": ("task_state_estimator", "evidence_memory"),
+            "trajectory_loss": ("latent_queries", "cond_projector"),
+        }
+        missing_gradient_groups = [
+            f"{loss_name}:{group_name}"
+            for loss_name, group_names in required_gradient_groups.items()
+            for group_name in group_names
+            if gradient_audit.get(loss_name, {}).get(group_name, {}).get("gradient_l2", 0.0) <= 0
+        ]
         report["metrics"].update(
             {
+                "architecture": planned_config["architecture"],
                 "samples": args.samples,
                 "steps_completed": 0,
                 "initial_total_loss": initial_total,
                 "initial_s2_loss": initial_s2,
                 "initial_trajectory_loss": initial_trajectory,
                 "gradient_audit_nonfinite": nonfinite_audit,
+                "missing_gradient_groups": missing_gradient_groups,
             }
         )
         if nonfinite_audit:
             raise FloatingPointError(
                 f"pre-update gradient audit found {nonfinite_audit} non-finite values"
             )
+        if missing_gradient_groups:
+            raise FloatingPointError(f"pre-update gradient audit found zero gradients: {missing_gradient_groups}")
         series = {"total_loss": [], "s2_loss": [], "trajectory_loss": []}
         with (args.output_dir / "train_log.jsonl").open("w", encoding="utf-8") as log_file:
             for step in range(args.steps):
-                batch = move_batch(cpu_batches[step % len(cpu_batches)], device)
+                batch = move_batch(cpu_batches[step % len(cpu_batches)], input_device)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     output = model(**batch)
                 optimizer.zero_grad(set_to_none=True)
@@ -320,11 +350,22 @@ def main():
                 log_file.write(json.dumps({"step": step, "total_loss": values[0], "s2_loss": values[1], "trajectory_loss": values[2], "gradient_norm": float(gradient_norm), "allocated_mib": torch.cuda.memory_allocated() / 1024**2, "reserved_mib": torch.cuda.memory_reserved() / 1024**2}) + "\n")
         final_total, final_s2, final_trajectory = evaluate()
         reduction = 1.0 - final_total / initial_total
-        passed = reduction >= 0.30 and final_s2 < initial_s2 and final_trajectory < initial_trajectory
+        frozen_gradient_parameters = sum(
+            parameter.numel() for parameter in model.parameters() if not parameter.requires_grad and parameter.grad is not None
+        )
+        passed = (
+            reduction >= 0.30
+            and final_s2 < initial_s2
+            and final_trajectory < initial_trajectory
+            and frozen_gradient_parameters == 0
+        )
         adapter_state = {name: parameter.detach().cpu() for name, parameter in model.named_parameters() if parameter.requires_grad}
         torch.save(adapter_state, args.output_dir / "adapter_state.pt")
         report["status"] = "passed" if passed else "failed"
-        report["metrics"].update({"samples": args.samples, "steps_completed": args.steps, "initial_total_loss": initial_total, "final_total_loss": final_total, "total_loss_reduction": reduction, "initial_s2_loss": initial_s2, "final_s2_loss": final_s2, "initial_trajectory_loss": initial_trajectory, "final_trajectory_loss": final_trajectory, "peak_allocated_mib": torch.cuda.max_memory_allocated() / 1024**2, "peak_reserved_mib": torch.cuda.max_memory_reserved() / 1024**2, "duration_s": time.monotonic() - start, "trainable_parameters": trainable.trainable_parameters})
+        per_gpu_peak_mib = {
+            str(index): torch.cuda.max_memory_allocated(index) / 1024**2 for index in range(torch.cuda.device_count())
+        }
+        report["metrics"].update({"samples": args.samples, "steps_completed": args.steps, "initial_total_loss": initial_total, "final_total_loss": final_total, "total_loss_reduction": reduction, "initial_s2_loss": initial_s2, "final_s2_loss": final_s2, "initial_trajectory_loss": initial_trajectory, "final_trajectory_loss": final_trajectory, "peak_allocated_mib": max(per_gpu_peak_mib.values()), "per_gpu_peak_allocated_mib": per_gpu_peak_mib, "frozen_gradient_parameters": frozen_gradient_parameters, "duration_s": time.monotonic() - start, "trainable_parameters": trainable.trainable_parameters})
         report["analysis"] = "真实 R2R train 样本与 InternVLA-N1 checkpoint 已完成过拟合门槛。" if passed else "训练完成但 S2/trajectory 双 loss 未同时达到 30% 总下降门槛，需要依据曲线调整学习率、步数或训练范围后重试。"
     except Exception as error:
         error_traceback = traceback.format_exc()
