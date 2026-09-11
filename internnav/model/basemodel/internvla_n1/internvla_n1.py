@@ -335,12 +335,17 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+        # Optional training-safe path: keep evidence placeholders in the VLM
+        # sequence, but route adapter gradients through a late residual instead
+        # of the numerically unstable frozen VLM backward graph.
+        gradient_bypass = bool(getattr(self.config, "evidence_gradient_bypass", False) and evidence_output is not None)
+        vlm_inputs_embeds = inputs_embeds.detach() if gradient_bypass else inputs_embeds
         outputs = self.model(
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=vlm_inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -349,6 +354,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         )
 
         hidden_states = outputs[0]
+        if gradient_bypass:
+            hidden_states = hidden_states.detach()
+            evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True)
+            evidence_residual = evidence_residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            hidden_states = hidden_states + evidence_residual
         logits = self.lm_head(hidden_states)
 
         loss = None
@@ -370,6 +380,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 traj_hidden_states.append(hidden_states[b, t_s_pos[b] : t_s_pos[b] + self.config.n_query, :])
 
             traj_hidden_states = torch.stack(traj_hidden_states, dim=0)
+            if gradient_bypass:
+                latent_queries = self.get_model().latent_queries.to(
+                    device=traj_hidden_states.device, dtype=traj_hidden_states.dtype
+                )
+                traj_hidden_states = traj_hidden_states + latent_queries
             traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(1, traj_poses.size(1), 1, 1).flatten(0, 1)
             # In a dispatched model, the trajectory head may live on a different
             # GPU from the input batch. Keep all trajectory supervision together
@@ -513,7 +528,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         text_embeds[image_idx] = image_embeds.to(text_embeds.device)[: image_idx.sum(), :]
 
         if input_ids.eq(EVIDENCE_TOKEN_INDEX).any():
-            text_embeds, _ = self._inject_evidence_embeddings(
+            text_embeds, evidence_output = self._inject_evidence_embeddings(
                 input_ids,
                 text_embeds,
                 image_embeds,
@@ -533,14 +548,21 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
         position_ids, _ = self.get_rope_index(input_ids, image_grid_thw)
         with torch.no_grad():
+            gradient_bypass = bool(getattr(self.config, "evidence_gradient_bypass", False) and evidence_output is not None)
             outputs = self.model(
-                inputs_embeds=text_embeds,
+                inputs_embeds=text_embeds.detach() if gradient_bypass else text_embeds,
                 position_ids=position_ids,
                 # attention_mask=attention_mask,
                 output_hidden_states=True,
                 return_dict=True,
             )
         hidden_states = outputs.hidden_states[-1][:, -N_QUERY:, :]
+        if gradient_bypass:
+            hidden_states = hidden_states.detach()
+            hidden_states = hidden_states + latent_queries.to(hidden_states.device, hidden_states.dtype)
+            evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True) if evidence_output is not None else None
+            if evidence_residual is not None:
+                hidden_states = hidden_states + evidence_residual.to(hidden_states.device, hidden_states.dtype)
 
         return hidden_states
 

@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float32"))
     parser.add_argument("--loss", default="total", choices=("total", "s2", "trajectory"))
+    parser.add_argument("--gradient-bypass", action="store_true")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -104,6 +105,7 @@ def main():
         config.s2_loss_weight = 1.0
         config.trajectory_loss_weight = 1.0
         config.use_cache = False
+        config.evidence_gradient_bypass = args.gradient_bypass
         model_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
         model = InternVLAN1ForCausalLM.from_pretrained(
             CHECKPOINT,
@@ -162,6 +164,7 @@ def main():
             "attention": args.attention,
             "gradient_checkpointing": not args.no_gradient_checkpointing,
             "dtype": args.dtype,
+            "gradient_bypass": args.gradient_bypass,
             "device_map": getattr(model, "hf_device_map", {}),
             "per_gpu_memory": per_gpu,
             "trainable_parameters": trainable.trainable_parameters,
