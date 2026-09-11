@@ -236,6 +236,7 @@ def main():
         for parameter in model.parameters():
             if parameter.requires_grad:
                 parameter.data = parameter.data.float()
+        model.get_model().reset_evidence_parameters()
         optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=3e-4)
         completed_config = {
             **planned_config,

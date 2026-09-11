@@ -175,6 +175,8 @@ def main():
         for parameter in model.parameters():
             if parameter.requires_grad:
                 parameter.data = parameter.data.float()
+        if args.evidence != "off":
+            model.get_model().reset_evidence_parameters()
         trainable_parameter_diagnostics = {
             name: summarize_tensor(parameter)
             for name, parameter in model.named_parameters()

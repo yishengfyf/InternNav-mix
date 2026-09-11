@@ -76,6 +76,18 @@ class TaskConditionedEvidenceMemory(nn.Module):
         nn.init.normal_(self.evidence_queries, std=0.02)
         nn.init.normal_(self.null_evidence, std=0.02)
 
+    def reset_parameters(self) -> None:
+        """Initialize modules added after loading a pretrained checkpoint."""
+        for module in self.modules():
+            if module is self or module is self.reader:
+                continue
+            reset = getattr(module, "reset_parameters", None)
+            if callable(reset):
+                reset()
+        self.reader._reset_parameters()
+        nn.init.normal_(self.evidence_queries, std=0.02)
+        nn.init.normal_(self.null_evidence, std=0.02)
+
     def _validate_inputs(
         self,
         history_features: torch.Tensor,

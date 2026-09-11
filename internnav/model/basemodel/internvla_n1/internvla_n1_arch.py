@@ -169,6 +169,13 @@ class InternVLAN1MetaModel:
             dropout=config.evidence_dropout,
         )
 
+    def reset_evidence_parameters(self):
+        """Reset only checkpoint-external evidence modules after dispatched loading."""
+        if not getattr(self.config, "use_evidence_memory", False):
+            return
+        self.task_state_estimator.reset_parameters()
+        self.evidence_memory.reset_parameters()
+
     def initialize_evidence_modules(self, model_args):
         self.config.use_evidence_memory = model_args.use_evidence_memory
         if not model_args.use_evidence_memory:

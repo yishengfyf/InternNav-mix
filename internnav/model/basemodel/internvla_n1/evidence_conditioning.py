@@ -72,6 +72,15 @@ class ObservableTaskStateEstimator(nn.Module):
             nn.LayerNorm(task_dim),
         )
 
+    def reset_parameters(self) -> None:
+        """Initialize modules added after loading a pretrained checkpoint."""
+        for module in self.modules():
+            if module is self:
+                continue
+            reset = getattr(module, "reset_parameters", None)
+            if callable(reset):
+                reset()
+
     def forward(
         self,
         current_features: torch.Tensor,
