@@ -170,6 +170,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         )
         self._record_numeric("evidence_tokens", evidence_output.tokens)
         evidence_tokens = evidence_output.tokens
+        if getattr(self.config, "numeric_diagnostics", False) and evidence_tokens.requires_grad:
+            evidence_tokens.retain_grad()
+            self.numeric_gradient_tensors["evidence_tokens"] = evidence_tokens
         if getattr(self.config, "evidence_detach_tokens", False):
             evidence_tokens = evidence_tokens.detach()
         inputs_embeds = replace_evidence_embeddings(
@@ -179,6 +182,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             EVIDENCE_TOKEN_INDEX,
         )
         self._record_numeric("inputs_embeds_after_evidence", inputs_embeds)
+        if getattr(self.config, "numeric_diagnostics", False) and inputs_embeds.requires_grad:
+            inputs_embeds.retain_grad()
+            self.numeric_gradient_tensors["inputs_embeds_after_evidence"] = inputs_embeds
         return inputs_embeds, evidence_output
 
     def forward(
@@ -262,6 +268,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         evidence_output = None
         if getattr(self.config, "numeric_diagnostics", False):
             self.numeric_diagnostics = {}
+            self.numeric_gradient_tensors = {}
             self._record_numeric("pixel_values", pixel_values)
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)

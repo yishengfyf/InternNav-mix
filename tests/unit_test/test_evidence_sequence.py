@@ -74,6 +74,19 @@ def test_replace_embeddings_is_per_sample_and_preserves_other_tokens():
     assert torch.count_nonzero(inputs_embeds) == 0
 
 
+def test_replace_embeddings_preserves_replacement_gradient():
+    input_ids = torch.tensor([[1, 90, 90, 2]])
+    inputs_embeds = torch.zeros(1, 4, 3, requires_grad=True)
+    evidence_tokens = torch.randn(1, 2, 3, requires_grad=True)
+
+    result = replace_evidence_embeddings(input_ids, inputs_embeds, evidence_tokens, evidence_token_id=90)
+    result.square().sum().backward()
+
+    assert evidence_tokens.grad is not None
+    assert evidence_tokens.grad.abs().sum() > 0
+    assert torch.count_nonzero(inputs_embeds.grad[input_ids.eq(90)]) == 0
+
+
 def test_replace_embeddings_rejects_placeholder_count_mismatch():
     with pytest.raises(ValueError, match="each sample must contain 2"):
         replace_evidence_embeddings(

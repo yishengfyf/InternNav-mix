@@ -55,6 +55,7 @@ def main():
             NavPixelGoalDataset,
         )
         from internnav.model.basemodel.internvla_n1.internvla_n1 import (
+            EVIDENCE_TOKEN_INDEX,
             InternVLAN1ForCausalLM,
             InternVLAN1ModelConfig,
         )
@@ -208,6 +209,10 @@ def main():
         if not args.forward_only:
             selected_loss.backward()
         gradient_audit = {} if args.forward_only else summarize_gradients(model, torch)
+        retained_gradient_audit = {}
+        if not args.forward_only:
+            for name, tensor in getattr(model, "numeric_gradient_tensors", {}).items():
+                retained_gradient_audit[name] = None if tensor.grad is None else summarize_tensor(tensor.grad)
         nonfinite = sum(item["nonfinite_gradients"] for item in gradient_audit.values())
         numeric_diagnostics = getattr(model, "numeric_diagnostics", {})
         first_nonfinite = next(
@@ -222,6 +227,17 @@ def main():
             }
             for index in range(4)
         }
+        evidence_positions = [
+            torch.nonzero(row.eq(EVIDENCE_TOKEN_INDEX), as_tuple=False).flatten().tolist()
+            for row in batch["input_ids"]
+        ]
+        supervised_positions = (
+            [torch.nonzero(row.ne(-100), as_tuple=False).flatten().tolist() for row in batch["labels"]]
+            if "labels" in batch else []
+        )
+        trajectory_positions = [
+            list(range(int(start), int(start) + model.config.n_query)) for start in batch.get("t_s_pos", [])
+        ]
         report["status"] = "passed" if first_nonfinite is None and torch.isfinite(selected_loss) and nonfinite == 0 else "failed"
         report["metrics"] = {
             "sample_index": selected[0],
@@ -243,6 +259,12 @@ def main():
             "checkpoint_nonfinite": checkpoint_nonfinite,
             "nonfinite_gradients": nonfinite,
             "gradient_audit": gradient_audit,
+            "retained_gradient_audit": retained_gradient_audit,
+            "sequence_positions": {
+                "evidence": evidence_positions,
+                "supervised_labels": supervised_positions,
+                "trajectory": trajectory_positions,
+            },
             "input_device": str(input_device),
             "attention": args.attention,
             "gradient_checkpointing": not args.no_gradient_checkpointing,
