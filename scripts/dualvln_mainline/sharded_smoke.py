@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--attention", default="flash_attention_2", choices=("flash_attention_2", "eager", "sdpa"))
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float32"))
+    parser.add_argument("--loss", default="total", choices=("total", "s2", "trajectory"))
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -132,7 +133,12 @@ def main():
                 output = model(**batch)
         else:
             output = model(**batch)
-        output.loss.backward()
+        selected_loss = {
+            "total": output.loss,
+            "s2": output.s2_loss,
+            "trajectory": output.trajectory_loss,
+        }[args.loss]
+        selected_loss.backward()
         gradient_audit = summarize_gradients(model, torch)
         nonfinite = sum(item["nonfinite_gradients"] for item in gradient_audit.values())
         per_gpu = {
@@ -143,12 +149,13 @@ def main():
             }
             for index in range(4)
         }
-        report["status"] = "passed" if torch.isfinite(output.loss) and nonfinite == 0 else "failed"
+        report["status"] = "passed" if torch.isfinite(selected_loss) and nonfinite == 0 else "failed"
         report["metrics"] = {
             "sample_index": selected[0],
             "loss": float(output.loss.detach()),
             "s2_loss": float(output.s2_loss.detach()),
             "trajectory_loss": float(output.trajectory_loss.detach()),
+            "backward_loss": args.loss,
             "nonfinite_gradients": nonfinite,
             "gradient_audit": gradient_audit,
             "input_device": str(input_device),
