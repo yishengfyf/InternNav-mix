@@ -339,19 +339,33 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         # sequence, but route adapter gradients through a late residual instead
         # of the numerically unstable frozen VLM backward graph.
         gradient_bypass = bool(getattr(self.config, "evidence_gradient_bypass", False) and evidence_output is not None)
-        vlm_inputs_embeds = inputs_embeds.detach() if gradient_bypass else inputs_embeds
-        outputs = self.model(
-            input_ids=None,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=vlm_inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
+        if gradient_bypass:
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=None,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    cache_position=cache_position,
+                )
+        else:
+            outputs = self.model(
+                input_ids=None,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+            )
 
         hidden_states = outputs[0]
         if gradient_bypass:
