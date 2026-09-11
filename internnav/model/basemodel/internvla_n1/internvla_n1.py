@@ -371,9 +371,13 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
             traj_hidden_states = torch.stack(traj_hidden_states, dim=0)
             traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(1, traj_poses.size(1), 1, 1).flatten(0, 1)
-            loss_mask = torch.arange(traj_images.size(1), device=self.device).expand(
+            # In a dispatched model, the trajectory head may live on a different
+            # GPU from the input batch. Keep all trajectory supervision together
+            # with the latent/NextDiT branch so sharded training does not mix devices.
+            trajectory_device = traj_hidden_states.device
+            loss_mask = torch.arange(traj_images.size(1), device=trajectory_device).expand(
                 traj_images.size(0), traj_images.size(1)
-            ) < video_frame_num.unsqueeze(1)
+            ) < video_frame_num.to(trajectory_device).unsqueeze(1)
 
             if 'nextdit' in self.get_system1_type():
                 if 'async' in self.get_system1_type():
@@ -401,7 +405,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     traj_hidden_states = self.get_model().cond_projector(traj_hidden_states)
                     latents = traj_hidden_states
 
-                relative_poses = traj_poses.flatten(0, 1)
+                relative_poses = traj_poses.flatten(0, 1).to(trajectory_device)
                 bsz = relative_poses.shape[0]
                 noise = torch.randn(relative_poses.shape, device=relative_poses.device, dtype=relative_poses.dtype)
                 u = torch.rand(size=(bsz,), device="cpu")
