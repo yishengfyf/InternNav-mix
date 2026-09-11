@@ -66,6 +66,25 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
     def get_model(self):
         return self.model
 
+    def _record_numeric(self, name, tensor):
+        if not getattr(self.config, "numeric_diagnostics", False) or tensor is None:
+            return
+        if not hasattr(self, "numeric_diagnostics"):
+            self.numeric_diagnostics = {}
+        detached = tensor.detach()
+        finite = torch.isfinite(detached)
+        finite_values = detached[finite].float()
+        self.numeric_diagnostics[name] = {
+            "shape": list(detached.shape),
+            "dtype": str(detached.dtype),
+            "device": str(detached.device),
+            "finite": bool(finite.all()),
+            "nonfinite": int(detached.numel() - finite.sum().item()),
+            "min": float(finite_values.min()) if finite_values.numel() else None,
+            "max": float(finite_values.max()) if finite_values.numel() else None,
+            "max_abs": float(finite_values.abs().max()) if finite_values.numel() else None,
+        }
+
     def prepare_inputs_for_generation(self, *args, **kwargs):
         evidence_keys = (
             "evidence_relative_poses",
@@ -140,6 +159,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             inputs_embeds,
             prompt_mask,
         )
+        self._record_numeric("task_state", task_state)
         evidence_output = self.get_model().evidence_memory(
             visual_batch.history_features,
             evidence_relative_poses,
@@ -148,12 +168,17 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             evidence_valid_mask,
             task_state,
         )
+        self._record_numeric("evidence_tokens", evidence_output.tokens)
+        evidence_tokens = evidence_output.tokens
+        if getattr(self.config, "evidence_detach_tokens", False):
+            evidence_tokens = evidence_tokens.detach()
         inputs_embeds = replace_evidence_embeddings(
             input_ids,
             inputs_embeds,
-            evidence_output.tokens,
+            evidence_tokens,
             EVIDENCE_TOKEN_INDEX,
         )
+        self._record_numeric("inputs_embeds_after_evidence", inputs_embeds)
         return inputs_embeds, evidence_output
 
     def forward(
@@ -235,12 +260,17 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         evidence_output = None
+        if getattr(self.config, "numeric_diagnostics", False):
+            self.numeric_diagnostics = {}
+            self._record_numeric("pixel_values", pixel_values)
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
+            self._record_numeric("text_embeddings", inputs_embeds)
             image_embeds = None
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                self._record_numeric("image_embeddings", image_embeds)
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
                 if n_image_tokens != n_image_features:
@@ -255,6 +285,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                self._record_numeric("inputs_embeds_before_evidence", inputs_embeds)
 
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
@@ -368,6 +399,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             )
 
         hidden_states = outputs[0]
+        self._record_numeric("qwen_hidden_states", hidden_states)
         if gradient_bypass:
             hidden_states = hidden_states.detach()
             evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True)
@@ -375,6 +407,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
             hidden_states = hidden_states + residual_scale * evidence_residual
         logits = self.lm_head(hidden_states)
+        self._record_numeric("logits", logits)
 
         loss = None
         s2_loss = None
@@ -388,6 +421,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+            self._record_numeric("s2_loss", s2_loss)
 
         if traj_poses is not None:
             traj_hidden_states = []
@@ -395,6 +429,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 traj_hidden_states.append(hidden_states[b, t_s_pos[b] : t_s_pos[b] + self.config.n_query, :])
 
             traj_hidden_states = torch.stack(traj_hidden_states, dim=0)
+            self._record_numeric("trajectory_hidden_states", traj_hidden_states)
             if gradient_bypass:
                 latent_queries = self.get_model().latent_queries.to(
                     device=traj_hidden_states.device, dtype=traj_hidden_states.dtype
@@ -465,6 +500,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 trajectory_loss = masked_loss.sum() / mask.sum() / (
                     trajectory_element_loss.shape[1] * trajectory_element_loss.shape[2]
                 )
+                self._record_numeric("trajectory_loss", trajectory_loss)
             elif 'navdp' in self.get_system1_type():
                 if 'async' in self.get_system1_type():
                     cur_images = traj_images.flatten(0, 1)
