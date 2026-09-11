@@ -150,6 +150,7 @@ def main():
             "s2_loss": float(output.s2_loss.detach()),
             "trajectory_loss": float(output.trajectory_loss.detach()),
             "nonfinite_gradients": nonfinite,
+            "gradient_audit": gradient_audit,
             "input_device": str(input_device),
             "attention": args.attention,
             "gradient_checkpointing": not args.no_gradient_checkpointing,
