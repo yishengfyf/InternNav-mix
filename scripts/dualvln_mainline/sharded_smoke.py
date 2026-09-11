@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--commit", required=True)
+    parser.add_argument("--attention", default="flash_attention_2", choices=("flash_attention_2", "eager", "sdpa"))
+    parser.add_argument("--no-gradient-checkpointing", action="store_true")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -34,7 +36,7 @@ def main():
         "git_commit": args.commit,
         "status": "failed",
         "metrics": {},
-        "analysis": "四卡模型分片 smoke 未完成。",
+            "analysis": "四卡模型分片 smoke 未完成。",
     }
     try:
         import torch
@@ -105,12 +107,13 @@ def main():
             config=config,
             local_files_only=True,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=args.attention,
             low_cpu_mem_usage=True,
             device_map="auto",
             max_memory=max_memory,
         )
-        model.gradient_checkpointing_enable()
+        if not args.no_gradient_checkpointing:
+            model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
         trainable = configure_trainable_parameters(
             model,
@@ -143,6 +146,8 @@ def main():
             "trajectory_loss": float(output.trajectory_loss.detach()),
             "nonfinite_gradients": nonfinite,
             "input_device": str(input_device),
+            "attention": args.attention,
+            "gradient_checkpointing": not args.no_gradient_checkpointing,
             "device_map": getattr(model, "hf_device_map", {}),
             "per_gpu_memory": per_gpu,
             "trainable_parameters": trainable.trainable_parameters,
