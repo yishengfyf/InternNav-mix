@@ -372,7 +372,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             hidden_states = hidden_states.detach()
             evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True)
             evidence_residual = evidence_residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
-            hidden_states = hidden_states + evidence_residual
+            residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
+            hidden_states = hidden_states + residual_scale * evidence_residual
         logits = self.lm_head(hidden_states)
 
         loss = None
@@ -398,7 +399,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 latent_queries = self.get_model().latent_queries.to(
                     device=traj_hidden_states.device, dtype=traj_hidden_states.dtype
                 )
-                traj_hidden_states = traj_hidden_states + latent_queries
+                residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
+                traj_hidden_states = traj_hidden_states + residual_scale * latent_queries
             traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(1, traj_poses.size(1), 1, 1).flatten(0, 1)
             # In a dispatched model, the trajectory head may live on a different
             # GPU from the input batch. Keep all trajectory supervision together
@@ -573,10 +575,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         hidden_states = outputs.hidden_states[-1][:, -N_QUERY:, :]
         if gradient_bypass:
             hidden_states = hidden_states.detach()
-            hidden_states = hidden_states + latent_queries.to(hidden_states.device, hidden_states.dtype)
+            residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
+            hidden_states = hidden_states + residual_scale * latent_queries.to(hidden_states.device, hidden_states.dtype)
             evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True) if evidence_output is not None else None
             if evidence_residual is not None:
-                hidden_states = hidden_states + evidence_residual.to(hidden_states.device, hidden_states.dtype)
+                hidden_states = hidden_states + residual_scale * evidence_residual.to(hidden_states.device, hidden_states.dtype)
 
         return hidden_states
 

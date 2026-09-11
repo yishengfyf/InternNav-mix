@@ -106,6 +106,7 @@ def main():
         config.trajectory_loss_weight = 1.0
         config.use_cache = False
         config.evidence_gradient_bypass = args.gradient_bypass
+        config.evidence_gradient_bypass_scale = 0.1
         model_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
         model = InternVLAN1ForCausalLM.from_pretrained(
             CHECKPOINT,
@@ -165,6 +166,7 @@ def main():
             "gradient_checkpointing": not args.no_gradient_checkpointing,
             "dtype": args.dtype,
             "gradient_bypass": args.gradient_bypass,
+            "gradient_bypass_scale": 0.1,
             "device_map": getattr(model, "hf_device_map", {}),
             "per_gpu_memory": per_gpu,
             "trainable_parameters": trainable.trainable_parameters,
