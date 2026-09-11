@@ -238,6 +238,17 @@ def main():
         trajectory_positions = [
             list(range(int(start), int(start) + model.config.n_query)) for start in batch.get("t_s_pos", [])
         ]
+        input_gradient_regions = {}
+        input_gradient = getattr(model, "numeric_gradient_tensors", {}).get("inputs_embeds_after_evidence")
+        if input_gradient is not None and input_gradient.grad is not None:
+            region_positions = {
+                "evidence": evidence_positions,
+                "supervised_predecessors": [[max(0, position - 1) for position in row] for row in supervised_positions],
+                "trajectory": trajectory_positions,
+            }
+            for name, rows in region_positions.items():
+                values = [input_gradient.grad[index, positions] for index, positions in enumerate(rows) if positions]
+                input_gradient_regions[name] = summarize_tensor(torch.cat(values, dim=0)) if values else None
         report["status"] = "passed" if first_nonfinite is None and torch.isfinite(selected_loss) and nonfinite == 0 else "failed"
         report["metrics"] = {
             "sample_index": selected[0],
@@ -260,6 +271,7 @@ def main():
             "nonfinite_gradients": nonfinite,
             "gradient_audit": gradient_audit,
             "retained_gradient_audit": retained_gradient_audit,
+            "input_gradient_regions": input_gradient_regions,
             "sequence_positions": {
                 "evidence": evidence_positions,
                 "supervised_labels": supervised_positions,
