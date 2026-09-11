@@ -85,6 +85,15 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             "max_abs": float(finite_values.abs().max()) if finite_values.numel() else None,
         }
 
+    @staticmethod
+    def _late_evidence_residual(hidden_states, evidence_tokens):
+        """Read evidence per output position without backpropagating through the frozen VLM."""
+        evidence_tokens = evidence_tokens.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        queries = F.normalize(hidden_states.detach().float(), dim=-1)
+        keys = F.normalize(evidence_tokens.float(), dim=-1)
+        weights = torch.softmax(torch.matmul(queries, keys.transpose(-1, -2)), dim=-1)
+        return torch.matmul(weights.to(evidence_tokens.dtype), evidence_tokens)
+
     def prepare_inputs_for_generation(self, *args, **kwargs):
         evidence_keys = (
             "evidence_relative_poses",
@@ -409,8 +418,14 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         self._record_numeric("qwen_hidden_states", hidden_states)
         if gradient_bypass:
             hidden_states = hidden_states.detach()
-            evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True)
-            evidence_residual = evidence_residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            bypass_mode = getattr(self.config, "evidence_gradient_bypass_mode", "mean")
+            if bypass_mode == "cross_attention":
+                evidence_residual = self._late_evidence_residual(hidden_states, evidence_output.tokens)
+            elif bypass_mode == "mean":
+                evidence_residual = evidence_output.tokens.mean(dim=1, keepdim=True)
+                evidence_residual = evidence_residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            else:
+                raise ValueError(f"unknown evidence_gradient_bypass_mode: {bypass_mode}")
             residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
             hidden_states = hidden_states + residual_scale * evidence_residual
         logits = self.lm_head(hidden_states)

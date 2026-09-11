@@ -134,6 +134,7 @@ def main():
     parser.add_argument("--samples", type=int, default=8)
     parser.add_argument("--sharded", action="store_true")
     parser.add_argument("--gradient-bypass", action="store_true")
+    parser.add_argument("--bypass-mode", choices=("mean", "cross_attention"), default="mean")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     planned_config = {
@@ -148,7 +149,10 @@ def main():
         "model_max_length": 1024,
         "num_history": 2,
         "memory_fraction": 0.50,
-        "architecture": "frozen-feature adapter baseline" if args.gradient_bypass else "input-token evidence",
+        "architecture": (
+            f"frozen-feature adapter baseline ({args.bypass_mode})"
+            if args.gradient_bypass else "input-token evidence"
+        ),
         "sharded": args.sharded,
         "dtype": "bfloat16",
         "attention": "flash_attention_2",
@@ -227,6 +231,7 @@ def main():
         config.use_cache = False
         config.evidence_gradient_bypass = args.gradient_bypass
         config.evidence_gradient_bypass_scale = 0.1
+        config.evidence_gradient_bypass_mode = args.bypass_mode
         load_kwargs = {}
         if args.sharded:
             load_kwargs.update(device_map="auto", max_memory={0: "20GiB", 1: "20GiB", 2: "20GiB", 3: "20GiB", "cpu": "64GiB"})

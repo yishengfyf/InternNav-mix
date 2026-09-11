@@ -91,3 +91,15 @@ def test_tiny_production_forward_injects_evidence_and_splits_s2_loss():
     assert output.trajectory_loss is None
     output.loss.backward()
     assert model.model.evidence_memory.output_projection.weight.grad is not None
+
+
+def test_late_evidence_residual_is_position_specific_and_differentiable():
+    hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    evidence = torch.tensor([[[2.0, 0.0], [0.0, 3.0]]], requires_grad=True)
+
+    residual = InternVLAN1ForCausalLM._late_evidence_residual(hidden, evidence)
+
+    assert residual.shape == hidden.shape
+    assert not torch.allclose(residual[:, 0], residual[:, 1])
+    residual.square().sum().backward()
+    assert evidence.grad is not None and evidence.grad.abs().sum() > 0
