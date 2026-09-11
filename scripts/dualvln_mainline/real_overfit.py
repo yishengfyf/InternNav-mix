@@ -135,6 +135,7 @@ def main():
     parser.add_argument("--sharded", action="store_true")
     parser.add_argument("--gradient-bypass", action="store_true")
     parser.add_argument("--bypass-mode", choices=("mean", "cross_attention"), default="mean")
+    parser.add_argument("--bypass-scale", type=float, default=0.1)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     planned_config = {
@@ -154,6 +155,7 @@ def main():
             if args.gradient_bypass else "input-token evidence"
         ),
         "sharded": args.sharded,
+        "bypass_scale": args.bypass_scale,
         "dtype": "bfloat16",
         "attention": "flash_attention_2",
         "trainable_dtype": "float32",
@@ -230,7 +232,7 @@ def main():
         config.trajectory_loss_weight = 1.0
         config.use_cache = False
         config.evidence_gradient_bypass = args.gradient_bypass
-        config.evidence_gradient_bypass_scale = 0.1
+        config.evidence_gradient_bypass_scale = args.bypass_scale
         config.evidence_gradient_bypass_mode = args.bypass_mode
         load_kwargs = {}
         if args.sharded:
