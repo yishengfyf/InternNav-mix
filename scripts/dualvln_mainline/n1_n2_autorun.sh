@@ -38,9 +38,18 @@ for gpu_index in 0 1 2 3; do
     fi
 done
 
-python_bin=/home/yifeifeng/anaconda3/envs/internvla/bin/python
-if [[ ! -x "${python_bin}" ]]; then
-    echo "missing InternVLA Python: ${python_bin}" >&2
+python_bin=
+for candidate in \
+    /home/yifeifeng/anaconda3/envs/internvla/bin/python \
+    /home/yifeifeng/miniconda3/envs/internvla/bin/python \
+    /data/usr_data/yifeifeng/miniconda3/envs/internvla/bin/python; do
+    if [[ -x "${candidate}" ]] && "${candidate}" -c 'import torch, pytest' >/dev/null 2>&1; then
+        python_bin=${candidate}
+        break
+    fi
+done
+if [[ -z "${python_bin}" ]]; then
+    echo "no candidate InternVLA Python provides both torch and pytest" >&2
     exit 3
 fi
 
