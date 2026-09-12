@@ -170,3 +170,19 @@ def test_evidence_ablation_rejects_unknown_mode():
             torch.zeros(1, 2, 2),
             torch.zeros(1, 2, dtype=torch.bool),
         )
+
+
+def test_task_state_ablation_can_normalize_and_scale_query():
+    task = torch.tensor([[3.0, 4.0]])
+    result = InternVLAN1ForCausalLM._apply_evidence_ablation(
+        "task_spatial",
+        task,
+        torch.zeros(1, 1, 4),
+        torch.zeros(1, 1, 1),
+        torch.zeros(1, 1, 2),
+        torch.ones(1, 1, dtype=torch.bool),
+        normalize_task_state=True,
+        task_state_scale=0.5,
+    )
+
+    assert torch.allclose(result[0], torch.tensor([[0.3, 0.4]]))

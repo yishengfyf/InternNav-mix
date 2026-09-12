@@ -178,6 +178,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 evidence_ages,
                 evidence_qualities,
                 evidence_valid_mask,
+                normalize_task_state=bool(getattr(self.config, "evidence_normalize_task_state", False)),
+                task_state_scale=float(getattr(self.config, "evidence_task_state_scale", 1.0)),
             )
         )
         evidence_output = self.get_model().evidence_memory(
@@ -208,11 +210,24 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         return inputs_embeds, evidence_output
 
     @staticmethod
-    def _apply_evidence_ablation(ablation, task_state, relative_poses, ages, qualities, valid_mask):
+    def _apply_evidence_ablation(
+        ablation,
+        task_state,
+        relative_poses,
+        ages,
+        qualities,
+        valid_mask,
+        normalize_task_state=False,
+        task_state_scale=1.0,
+    ):
         if ablation not in {"null", "content", "spatial", "task_spatial"}:
             raise ValueError(f"unknown evidence ablation: {ablation}")
         if ablation != "task_spatial":
             task_state = torch.zeros_like(task_state)
+        else:
+            if normalize_task_state:
+                task_state = F.normalize(task_state, p=2, dim=-1)
+            task_state = task_state * task_state_scale
         if ablation in {"null", "content"}:
             relative_poses = torch.zeros_like(relative_poses)
             ages = torch.zeros_like(ages)

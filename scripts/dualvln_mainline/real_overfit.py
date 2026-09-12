@@ -142,6 +142,12 @@ def main():
     parser.add_argument("--gradient-bypass", action="store_true")
     parser.add_argument("--bypass-mode", choices=("mean", "cross_attention"), default="mean")
     parser.add_argument("--bypass-scale", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=23)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--task-state-lr-scale", type=float, default=1.0)
+    parser.add_argument("--task-state-scale", type=float, default=1.0)
+    parser.add_argument("--normalize-task-state", action="store_true")
+    parser.add_argument("--freeze-task-state", action="store_true")
     parser.add_argument(
         "--experiment",
         choices=("B0", "B1", "B2", "M1", "M2"),
@@ -157,7 +163,12 @@ def main():
         "steps": args.steps,
         "batch_size": 1,
         "gradient_accumulation": 1,
-        "learning_rate": 3e-4,
+        "seed": args.seed,
+        "learning_rate": args.learning_rate,
+        "task_state_learning_rate": args.learning_rate * args.task_state_lr_scale,
+        "task_state_scale": args.task_state_scale,
+        "normalize_task_state": args.normalize_task_state,
+        "freeze_task_state": args.freeze_task_state,
         "max_pixels": 224 * 224,
         "model_max_length": 1024,
         "num_history": 2,
@@ -211,8 +222,8 @@ def main():
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is unavailable")
-        torch.manual_seed(23)
-        torch.cuda.manual_seed_all(23)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
         if not args.sharded:
             torch.cuda.set_per_process_memory_fraction(0.50, device=0)
         device = torch.device("cuda:0")
@@ -270,6 +281,8 @@ def main():
         config.evidence_gradient_bypass = args.gradient_bypass
         config.evidence_gradient_bypass_scale = args.bypass_scale
         config.evidence_gradient_bypass_mode = args.bypass_mode
+        config.evidence_task_state_scale = args.task_state_scale
+        config.evidence_normalize_task_state = args.normalize_task_state
         config.evidence_ablation = {
             "B0": "null",
             "B1": "null",
@@ -298,15 +311,14 @@ def main():
         trainable = None
         if args.experiment != "B0":
             model.enable_input_require_grads()
-            trainable = configure_trainable_parameters(
-                model,
-                (
-                    "model.task_state_estimator.*",
-                    "model.evidence_memory.*",
-                    "model.cond_projector.*",
-                    "model.latent_queries",
-                ),
-            )
+            allowlist = [
+                "model.evidence_memory.*",
+                "model.cond_projector.*",
+                "model.latent_queries",
+            ]
+            if not args.freeze_task_state:
+                allowlist.insert(0, "model.task_state_estimator.*")
+            trainable = configure_trainable_parameters(model, tuple(allowlist))
             for parameter in model.parameters():
                 if parameter.requires_grad:
                     parameter.data = parameter.data.float()
@@ -331,8 +343,8 @@ def main():
             totals, s2_values, trajectory_values = [], [], []
             with torch.no_grad():
                 for sample_idx, cpu_batch in enumerate(cpu_batches):
-                    torch.manual_seed(1000 + sample_idx)
-                    torch.cuda.manual_seed_all(1000 + sample_idx)
+                    torch.manual_seed(args.seed + 1000 + sample_idx)
+                    torch.cuda.manual_seed_all(args.seed + 1000 + sample_idx)
                     with torch.autocast("cuda", dtype=torch.bfloat16):
                         output = model(**move_batch(cpu_batch, input_device))
                     totals.append(float(output.loss))
@@ -379,15 +391,22 @@ def main():
             write_report(args, report, series)
             print(f"real_overfit={report['status']} metrics={json.dumps(report['metrics'], ensure_ascii=False)}")
             return
-        optimizer = torch.optim.AdamW(
-            (parameter for parameter in model.parameters() if parameter.requires_grad), lr=3e-4
-        )
+        task_parameters = []
+        other_parameters = []
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            (task_parameters if "task_state_estimator" in name else other_parameters).append(parameter)
+        optimizer_groups = [{"params": other_parameters, "lr": args.learning_rate}]
+        if task_parameters:
+            optimizer_groups.append({"params": task_parameters, "lr": args.learning_rate * args.task_state_lr_scale})
+        optimizer = torch.optim.AdamW(optimizer_groups)
         model.train()
         gradient_audit = {}
         for loss_name in ("s2_loss", "trajectory_loss"):
             optimizer.zero_grad(set_to_none=True)
-            torch.manual_seed(2000)
-            torch.cuda.manual_seed_all(2000)
+            torch.manual_seed(args.seed + 2000)
+            torch.cuda.manual_seed_all(args.seed + 2000)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 audit_output = model(**move_batch(cpu_batches[0], input_device))
             getattr(audit_output, loss_name).backward()
@@ -402,7 +421,9 @@ def main():
         )
         required_gradient_groups = {
             "s2_loss": (
-                ("task_state_estimator", "evidence_memory") if args.experiment == "M2" else ("evidence_memory",)
+                ("task_state_estimator", "evidence_memory")
+                if args.experiment == "M2" and not args.freeze_task_state
+                else ("evidence_memory",)
             ),
             "trajectory_loss": ("latent_queries", "cond_projector"),
         }
@@ -416,6 +437,7 @@ def main():
             {
                 "architecture": planned_config["architecture"],
                 "experiment": args.experiment,
+                "seed": args.seed,
                 "samples": args.samples,
                 "steps_completed": 0,
                 "initial_total_loss": initial_total,

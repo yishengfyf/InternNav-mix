@@ -89,6 +89,17 @@ B1/B2/M1/M2 使用相同的新训练数据、更新步数、历史帧、token �
 
 训练 forward 和 `generate_latents` 必须调用同一 late evidence adapter。特别是 cross-attention 模式下，推理不得退化为 evidence 均值，否则闭环结果不属于训练时验证的模型。
 
+### 6.1 多 seed 与 task-state 优化门槛
+
+单次 seed 的 loss 下降百分比不能决定是否进入闭环，因为不同消融的随机初始化会改变初始 loss。N2 稳定性阶段固定使用 seed `23/47/71`，以最终 loss 的跨 seed 均值和逐 seed 一致性判断：
+
+- M2 平均最终总 loss 与 S2 loss 均不得超过 B2 的 `101%`；
+- M2 平均最终 trajectory loss 不得超过 B2 的 `105%`；
+- 至少 `2/3` seed 的 M2 最终总 loss 不超过对应 B2 的 `101%`；
+- 所有运行必须梯度 finite、冻结参数无梯度并完成预定更新数。
+
+若原 M2 未通过，先在 seed 23 筛选最小优化干预：task-state `0.1` 缩放、task-state 单位范数、estimator `0.1x` 学习率。按最终总 loss 选择一项，再在 seed 47/71 复验；不并行叠加多个改动，以保持归因清晰。只有复验通过上述门槛，才允许进入 1--4 episode 短闭环。
+
 ## 7. 验证门槛
 
 1. CPU 协议测试：shape、padding 不变性、空历史、因果年龄、任务条件化、梯度、显式训练白名单及错误白名单拒绝。
