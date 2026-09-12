@@ -10,13 +10,9 @@ from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedModel
 
 from internnav.configs.model.base_encoders import ModelCfg
-from internnav.model.basemodel.internvla_n1.evidence_history import (
-    build_causal_history_metadata,
-    select_causal_history_ids,
-)
-from internnav.model.basemodel.internvla_n1.evidence_sequence import prepare_conditioned_sequences
+from internnav.model.basemodel.internvla_n1.evidence_history import select_causal_history_ids
+from internnav.model.basemodel.internvla_n1.evidence_inference import prepare_evidence_inputs
 from internnav.model.basemodel.internvla_n1.internvla_n1 import (
-    EVIDENCE_TOKEN_INDEX,
     InternVLAN1ForCausalLM,
     InternVLAN1ModelConfig,
 )
@@ -110,45 +106,14 @@ class InternVLAN1Net(PreTrainedModel):
         self.pose_list.append(planar_pose)
 
     def _prepare_evidence_inputs(self, inputs, history_ids):
-        if not getattr(self.model.config, "use_evidence_memory", False):
-            return inputs, {}
-        input_ids = inputs.input_ids[0]
-        image_mask = input_ids.eq(self.model.config.image_token_id)
-        image_block_starts = torch.nonzero(image_mask & ~torch.roll(image_mask, 1), as_tuple=False).flatten()
-        if image_mask[0]:
-            image_block_starts[0] = 0
-        if len(image_block_starts) <= len(history_ids):
-            raise ValueError("cannot locate current observation image block during evidence prefill")
-        insert_position = max(0, int(image_block_starts[len(history_ids)].item()) - 1)
-        conditioned = prepare_conditioned_sequences(
-            input_ids=(input_ids,),
-            labels=(torch.full_like(input_ids, -100),),
-            evidence_insert_positions=(insert_position,),
-            evidence_token_id=EVIDENCE_TOKEN_INDEX,
-            trajectory_token_id=151667,
-            num_evidence_tokens=self.model.config.num_evidence_tokens,
-            num_trajectory_tokens=0,
-        )
-        inputs["input_ids"] = conditioned.input_ids[0].unsqueeze(0)
-        inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
-
-        planar_poses = np.asarray(self.pose_list, dtype=np.float32)
-        metadata = build_causal_history_metadata(
+        return prepare_evidence_inputs(
+            self.model,
+            inputs,
             history_ids,
-            planar_poses[:, :2],
-            planar_poses[:, 2],
-            current_frame_id=len(self.pose_list) - 1,
+            self.pose_list,
+            len(self.input_images),
+            self.device,
         )
-        evidence_kwargs = {
-            "evidence_relative_poses": torch.from_numpy(metadata.relative_poses).unsqueeze(0).to(self.device),
-            "evidence_ages": torch.from_numpy(metadata.ages).unsqueeze(0).to(self.device),
-            "evidence_qualities": torch.from_numpy(metadata.qualities).unsqueeze(0).to(self.device),
-            "evidence_valid_mask": torch.ones((1, len(history_ids)), dtype=torch.bool, device=self.device),
-            "evidence_history_counts": torch.tensor([len(history_ids)], device=self.device),
-            "evidence_image_counts": torch.tensor([len(self.input_images)], device=self.device),
-            "evidence_prompt_lengths": torch.tensor([inputs["input_ids"].shape[1]], device=self.device),
-        }
-        return inputs, evidence_kwargs
 
     def parse_actions(self, output):
         action_patterns = '|'.join(re.escape(action) for action in self.actions2idx)

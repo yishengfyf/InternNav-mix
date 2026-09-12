@@ -9,6 +9,7 @@ import copy
 import itertools
 import random
 import re
+import time
 from collections import OrderedDict
 
 import cv2
@@ -18,7 +19,16 @@ import numpy as np
 import quaternion
 import torch
 import tqdm
-from depth_camera_filtering import filter_depth
+try:
+    from depth_camera_filtering import filter_depth
+
+    DEPTH_FILTER_BACKEND = "depth_camera_filtering"
+except ImportError:
+    DEPTH_FILTER_BACKEND = "finite_clip_fallback"
+
+    def filter_depth(depth, blur_type=None):
+        del blur_type
+        return np.nan_to_num(np.asarray(depth), nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
 from habitat.config.default import get_agent_config
 from habitat.config.default_structured_configs import (
     CollisionsMeasurementConfig,
@@ -40,7 +50,17 @@ from internnav.habitat_extensions.vln.utils import (
     preprocess_depth_image_v2,
     xyz_yaw_pitch_to_tf_matrix,
 )
-from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.basemodel.internvla_n1.evidence_history import select_causal_history_ids
+from internnav.model.basemodel.internvla_n1.evidence_inference import (
+    configure_task_spatial_inference,
+    load_evidence_adapter,
+    planar_pose_from_habitat_observation,
+    prepare_evidence_inputs,
+)
+from internnav.model.basemodel.internvla_n1.internvla_n1 import (
+    InternVLAN1ForCausalLM,
+    InternVLAN1ModelConfig,
+)
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 
 # Import for Habitat registry side effects — do not remove
@@ -70,6 +90,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.epoch = args.epoch
         self.max_steps_per_episode = args.max_steps_per_episode
         self.output_path = args.output_path
+        self.protocol_name = getattr(args, "protocol_name", "legacy")
+        self.seed = int(getattr(args, "seed", 0))
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
 
         # create habitat config
         self.config_path = cfg.env.env_settings['config_path']
@@ -113,13 +139,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         processor.tokenizer.padding_side = 'left'
 
         device = torch.device(f"cuda:{self.local_rank}")
+        self.adapter_manifest = None
         if self.model_args.mode == 'dual_system':
+            model_config = InternVLAN1ModelConfig.from_pretrained(
+                self.model_args.model_path,
+                local_files_only=True,
+            )
+            adapter_path = getattr(self.model_args, "evidence_adapter_path", None)
+            if adapter_path:
+                configure_task_spatial_inference(model_config)
             model = InternVLAN1ForCausalLM.from_pretrained(
                 self.model_args.model_path,
+                config=model_config,
+                local_files_only=True,
                 torch_dtype=torch.bfloat16,
                 attn_implementation="flash_attention_2",
                 device_map={"": device},
             )
+            self.adapter_manifest = load_evidence_adapter(model, adapter_path) if adapter_path else None
         elif self.model_args.mode == 'system2':
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_args.model_path,
@@ -135,6 +172,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         self.model = model
         self.processor = processor
+        os.makedirs(self.output_path, exist_ok=True)
+        with open(os.path.join(self.output_path, "inference_manifest.json"), "w", encoding="utf-8") as manifest:
+            json.dump(
+                {
+                    "protocol_name": self.protocol_name,
+                    "model_path": self.model_args.model_path,
+                    "mode": self.model_args.mode,
+                    "evidence_enabled": bool(getattr(model.config, "use_evidence_memory", False)),
+                    "evidence_adapter": self.adapter_manifest,
+                    "depth_filter_backend": DEPTH_FILTER_BACKEND,
+                    "pose_source": "habitat_gps_compass_ideal_odometry",
+                    "max_episodes": cfg.env.env_settings.get("max_episodes"),
+                    "max_steps_per_episode": self.max_steps_per_episode,
+                },
+                manifest,
+                ensure_ascii=False,
+                indent=2,
+            )
 
         # refactor: this part used in three places
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."
@@ -304,6 +359,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
 
             rgb_list = []
+            pose_list = []
             action_seq = []
             input_images = []
             output_ids = None
@@ -315,9 +371,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             done = False
             flag = False
             pixel_goal = None
+            episode_start_time = time.monotonic()
+            s2_calls = 0
+            s2_latency_s = 0.0
 
             # ---------- 2. Episode step loop -----------
-            while (not done) and (step_id <= self.max_steps_per_episode):
+            while (not done) and (step_id < self.max_steps_per_episode):
                 draw_pixel_goal = False
                 # refactor agent get action
                 rgb = observations["rgb"]
@@ -345,6 +404,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 else:
                     image = image.resize((self.model_args.resize_w, self.model_args.resize_h))
                     rgb_list.append(image)
+                    pose_list.append(planar_pose_from_habitat_observation(observations))
 
                     down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
                     down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
@@ -385,9 +445,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         if step_id == 0:
                             history_id = []
                         else:
-                            history_id = np.unique(
-                                np.linspace(0, step_id - 1, self.num_history, dtype=np.int32)
-                            ).tolist()
+                            history_id = select_causal_history_ids(len(rgb_list) - 1, self.num_history)
                             placeholder = (DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
                             sources[0]["value"] += f' These are your historical observations: {placeholder}.'
 
@@ -413,7 +471,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
                     inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
+                    inputs, evidence_kwargs = prepare_evidence_inputs(
+                        self.model,
+                        inputs,
+                        history_id,
+                        pose_list,
+                        len(input_images),
+                        self.device,
+                    )
 
+                    s2_start_time = time.monotonic()
                     with torch.no_grad():
                         output_ids = self.model.generate(
                             **inputs,
@@ -422,7 +489,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             use_cache=True,
                             past_key_values=None,
                             return_dict_in_generate=True,
+                            **evidence_kwargs,
                         ).sequences
+                    s2_calls += 1
+                    s2_latency_s += time.monotonic() - s2_start_time
 
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
@@ -445,7 +515,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
 
                         with torch.no_grad():
-                            traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+                            traj_latents = self.model.generate_latents(
+                                output_ids,
+                                pixel_values,
+                                image_grid_thw,
+                                attention_mask=torch.ones_like(output_ids),
+                                **evidence_kwargs,
+                            )
 
                         # prepocess align with navdp
                         image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
@@ -596,6 +672,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "ne": metrics["distance_to_goal"],
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
+                "duration_s": time.monotonic() - episode_start_time,
+                "s2_calls": s2_calls,
+                "s2_latency_s": s2_latency_s,
+                "mean_s2_latency_s": s2_latency_s / max(s2_calls, 1),
+                "depth_filter_backend": DEPTH_FILTER_BACKEND,
             }
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
