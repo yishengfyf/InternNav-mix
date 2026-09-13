@@ -168,3 +168,5 @@ B1/B2/M1/M2 使用相同的新训练数据、更新步数、历史帧、token �
 - 软进度代理：训练时根据参考路线中当前因果帧的位置，对四个进度锚点生成相邻插值软标签并监督现有 stage head。该标签不进入推理，且始终称为 route-progress proxy，不称为自然语言子任务阶段。
 
 固定 32 样本、seed 23 和相同更新预算依次比较：R0（instruction-only，无新辅助 loss）、R1（R0 + 任务身份对比）、R2（R1 + 软进度代理）。先要求所有梯度 finite、冻结参数无梯度且 S2/trajectory 不劣于已有 B2 工程容差；再用独立错配指令探针要求 task-state、read weights 或同权重 M2Z/M2 行为出现可重复差异。若 R1 不能产生指令敏感性，停止增加进度 loss，回到表示与负样本设计；若 R1 成立而 R2 只增加位置可解码性，则保留两者分离表述，不把进度代理包装成语义收益。
+
+首轮 8 样本机制筛选中，R1 虽增大 estimator 输出差异但 read L1 仍低于 `0.001`，R2 的训练进度 loss 下降却未改善独立进度 probe。后续单一修复 R1Q 将错配 margin 施加在 `evidence_memory.task_projection(task_state)` 的实际 reader query 空间，使梯度同时约束 estimator 与 reader 投影；R1Q 不启用进度代理。若它仍不能改变读取，则停止用无相关性标签强迫任意历史选择，转向恢复原始多指令/路径对齐数据或更可靠的 evidence relevance 标注。

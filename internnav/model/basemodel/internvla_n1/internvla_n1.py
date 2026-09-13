@@ -672,9 +672,10 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             if "positive_state" in task_aux:
                 valid = task_aux["pair_valid"].to(device=task_aux["anchor_state"].device, dtype=torch.bool)
                 if valid.any():
-                    anchor_state = F.normalize(task_aux["anchor_state"].float(), dim=-1)
-                    positive_state = F.normalize(task_aux["positive_state"].float(), dim=-1)
-                    negative_state = F.normalize(task_aux["negative_state"].float(), dim=-1)
+                    task_projection = self.get_model().evidence_memory.task_projection
+                    anchor_state = F.normalize(task_projection(task_aux["anchor_state"]).float(), dim=-1)
+                    positive_state = F.normalize(task_projection(task_aux["positive_state"]).float(), dim=-1)
+                    negative_state = F.normalize(task_projection(task_aux["negative_state"]).float(), dim=-1)
                     positive_distance = (anchor_state - positive_state).norm(dim=-1)
                     negative_distance = (anchor_state - negative_state).norm(dim=-1)
                     margin = float(getattr(self.config, "evidence_task_contrastive_margin", 0.2))
