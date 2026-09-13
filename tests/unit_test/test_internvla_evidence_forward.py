@@ -113,9 +113,13 @@ def test_generate_latents_extends_attention_mask_for_trajectory_queries():
     model = tiny_model()
     model.config.system1 = "nextdit"
     model.config.n_query = 2
+    task_state_estimator = model.model.task_state_estimator
+    evidence_memory = model.model.evidence_memory
     model.model = nn.Module()  # make the base transformer call observable
     model.model.embed_tokens = nn.Embedding(model.config.vocab_size, model.config.hidden_size)
     model.model.latent_queries = nn.Parameter(torch.zeros(1, 2, model.config.hidden_size))
+    model.model.task_state_estimator = task_state_estimator
+    model.model.evidence_memory = evidence_memory
     model.model.config = model.config
     model.model.device = torch.device("cpu")
     model.visual = FakeVisual(model.config.hidden_size)
