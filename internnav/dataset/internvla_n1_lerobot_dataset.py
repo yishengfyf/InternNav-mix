@@ -1171,16 +1171,20 @@ class NavPixelGoalDataset(Dataset):
 
             if getattr(self.data_args, "task_state_supervision", False):
                 task_key = (data_path, ep_id)
-                route_instructions = self.task_instructions[task_key]
-                instruction_index = route_instructions.index(instruction)
-                pair_valid = len(route_instructions) > 1 and len(self.task_keys) > 1
-                positive_instruction = (
-                    route_instructions[(instruction_index + 1) % len(route_instructions)]
-                    if len(route_instructions) > 1
-                    else instruction
-                )
-                negative_key = self.task_keys[(self.task_key_indices[task_key] + 1) % len(self.task_keys)]
-                negative_instruction = self.task_instructions[negative_key][0]
+                # The converted LeRobot shard retains one instruction per route.
+                # Keep the positive view identical and use the margin term only
+                # to separate a causally paired observation from a wrong route.
+                positive_instruction = instruction
+                negative_instruction = instruction
+                for offset in range(1, len(self.task_keys)):
+                    negative_key = self.task_keys[
+                        (self.task_key_indices[task_key] + offset) % len(self.task_keys)
+                    ]
+                    candidate = self.task_instructions[negative_key][0]
+                    if candidate != instruction:
+                        negative_instruction = candidate
+                        break
+                pair_valid = negative_instruction != instruction
                 data_dict["evidence_positive_instruction_ids"] = torch.tensor(
                     self.tokenizer(positive_instruction, add_special_tokens=False)["input_ids"], dtype=torch.long
                 )
