@@ -116,6 +116,7 @@ def test_generate_latents_extends_attention_mask_for_trajectory_queries():
     model.model = nn.Module()  # make the base transformer call observable
     model.model.embed_tokens = nn.Embedding(model.config.vocab_size, model.config.hidden_size)
     model.model.latent_queries = nn.Parameter(torch.zeros(1, 2, model.config.hidden_size))
+    model.model.config = model.config
     model.model.device = torch.device("cpu")
     model.visual = FakeVisual(model.config.hidden_size)
     captured = {}
