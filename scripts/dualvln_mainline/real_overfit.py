@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ISOLATED_DEPS = Path("/data/usr_data/yifeifeng/internnav/dualvln_mainline/python_deps")
 DATA_ROOT = Path("/data/usr_data/yifeifeng/internnav/dualvln_mainline/data/traj_data")
 CHECKPOINT = Path("/home/yifeifeng/workspace/InternNav/checkpoints/InternVLA-N1")
+TASK_ALIGNMENT = Path("/data/usr_data/yifeifeng/internnav/dualvln_mainline/data/task_alignment/r2r_17DRP5sb8fy.json")
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(ISOLATED_DEPS))
 os.environ["INTERNNAV_TRAJ_DATA_ROOT"] = str(DATA_ROOT)
@@ -143,7 +144,7 @@ def select_task_state_samples(dataset, samples, seed):
         if frame_id < 2 or entry[9] is None or len(entry[10]) < 2:
             continue
         progress = frame_id / (len(entry[10]) - 1)
-        bins[min(int(progress * 4), 3)].append((index, (entry[1], entry[0])))
+        bins[min(int(progress * 4), 3)].append((index, dataset.task_key(entry[1], entry[0], entry[6])))
     rng = random.Random(seed)
     for values in bins:
         rng.shuffle(values)
@@ -182,6 +183,8 @@ def main():
     parser.add_argument("--task-contrastive-weight", type=float, default=0.0)
     parser.add_argument("--stage-loss-weight", type=float, default=0.0)
     parser.add_argument("--task-contrastive-margin", type=float, default=0.2)
+    parser.add_argument("--task-alignment-path", type=Path)
+    parser.add_argument("--smoke-only", action="store_true")
     parser.add_argument(
         "--experiment",
         choices=("B0", "B1", "B2", "M1", "M2"),
@@ -189,6 +192,8 @@ def main():
         help="N2 ablation: null, content-only, spatial-only, or task-conditioned spatial memory",
     )
     args = parser.parse_args()
+    if (args.task_contrastive_weight > 0 or args.stage_loss_weight > 0) and args.task_alignment_path is None:
+        args.task_alignment_path = TASK_ALIGNMENT
     args.output_dir.mkdir(parents=True, exist_ok=True)
     planned_config = {
         "checkpoint": str(CHECKPOINT),
@@ -207,6 +212,8 @@ def main():
         "task_contrastive_weight": args.task_contrastive_weight,
         "stage_loss_weight": args.stage_loss_weight,
         "task_contrastive_margin": args.task_contrastive_margin,
+        "task_alignment_path": str(args.task_alignment_path) if args.task_alignment_path else None,
+        "smoke_only": args.smoke_only,
         "max_pixels": 224 * 224,
         "model_max_length": 1024,
         "num_history": 2,
@@ -283,6 +290,7 @@ def main():
             transform_train=None,
             use_evidence_memory=args.experiment != "B0",
             task_state_supervision=args.task_contrastive_weight > 0 or args.stage_loss_weight > 0,
+            task_alignment_path=str(args.task_alignment_path) if args.task_alignment_path else None,
             max_pixels=224 * 224,
             min_pixels=224 * 224,
         )
@@ -570,11 +578,18 @@ def main():
             for parameter in model.parameters()
             if not parameter.requires_grad and parameter.grad is not None
         )
+        finite_final = all(
+            torch.isfinite(torch.tensor(value)) for value in (final_total, final_s2, final_trajectory)
+        )
         passed = (
-            reduction >= 0.30
-            and final_s2 < initial_s2
-            and final_trajectory < initial_trajectory
-            and frozen_gradient_parameters == 0
+            finite_final and frozen_gradient_parameters == 0
+            if args.smoke_only
+            else (
+                reduction >= 0.30
+                and final_s2 < initial_s2
+                and final_trajectory < initial_trajectory
+                and frozen_gradient_parameters == 0
+            )
         )
         adapter_state = {
             name: parameter.detach().cpu() for name, parameter in model.named_parameters() if parameter.requires_grad
@@ -607,7 +622,9 @@ def main():
             }
         )
         report["analysis"] = (
-            "真实 R2R train 样本与 InternVLA-N1 checkpoint 已完成过拟合门槛。"
+            "真实 R2R train 单步接口、梯度和数值检查通过。"
+            if args.smoke_only and passed
+            else "真实 R2R train 样本与 InternVLA-N1 checkpoint 已完成过拟合门槛。"
             if passed
             else "训练完成但 S2/trajectory 双 loss 未同时达到 30% 总下降门槛，需要依据曲线调整学习率、步数或训练范围后重试。"
         )

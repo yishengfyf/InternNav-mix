@@ -72,6 +72,8 @@ def write_report(args, report):
 |task-state 相对 L2 变化|{metrics.get('mean_instruction_task_relative_l2', 0):.6f}|
 |读取权重平均 L1 变化|{metrics.get('mean_instruction_read_l1', 0):.6f}|
 |stage argmax 翻转率|{metrics.get('instruction_stage_flip_rate', 0):.3f}|
+|同路径复述 task-state 平均余弦|{metrics.get('mean_paraphrase_task_cosine', 0):.6f}|
+|同路径复述读取权重平均 L1|{metrics.get('mean_paraphrase_read_l1', 0):.6f}|
 |stage 最佳置换后四分位准确率|{metrics.get('stage_best_permutation_accuracy', 0):.3f}|
 |四折 PCA-ridge 进度 MAE / 常数 MAE|{metrics.get('progress_probe_mae', 0):.4f} / {metrics.get('progress_constant_mae', 0):.4f}|
 |耗时（秒）|{metrics.get('duration_s', 0):.2f}|
@@ -148,6 +150,41 @@ def mismatch_instructions(instructions, seed):
     raise RuntimeError("could not construct an instruction permutation without fixed text")
 
 
+def mismatch_instructions_by_group(instructions, groups, seed):
+    """Permute instructions while guaranteeing every replacement comes from another route."""
+    if len(instructions) != len(groups) or len(set(groups)) < 2:
+        raise RuntimeError("grouped instruction mismatch needs aligned inputs from at least two routes")
+    rng = random.Random(seed)
+    candidates = {}
+    for source in range(len(instructions)):
+        values = [
+            target
+            for target in range(len(instructions))
+            if groups[source] != groups[target] and instructions[source] != instructions[target]
+        ]
+        rng.shuffle(values)
+        candidates[source] = values
+    target_owner = {}
+
+    def assign(source, visited):
+        for target in candidates[source]:
+            if target in visited:
+                continue
+            visited.add(target)
+            if target not in target_owner or assign(target_owner[target], visited):
+                target_owner[target] = source
+                return True
+        return False
+
+    source_order = list(range(len(instructions)))
+    rng.shuffle(source_order)
+    source_order.sort(key=lambda source: len(candidates[source]))
+    if not all(assign(source, set()) for source in source_order):
+        raise RuntimeError("could not construct an instruction permutation across distinct routes")
+    source_to_target = {source: target for target, source in target_owner.items()}
+    return [instructions[source_to_target[source]] for source in range(len(instructions))]
+
+
 def best_stage_accuracy(predictions, targets):
     best = 0.0
     for permutation in itertools.permutations(range(4)):
@@ -198,6 +235,7 @@ def main():
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--instruction-only-task-state", action="store_true")
+    parser.add_argument("--task-alignment-path", type=Path)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
@@ -239,15 +277,38 @@ def main():
             image_processor=processor.image_processor,
             transform_train=None,
             use_evidence_memory=True,
+            task_alignment_path=str(args.task_alignment_path) if args.task_alignment_path else None,
             max_pixels=224 * 224,
             min_pixels=224 * 224,
         )
         dataset = NavPixelGoalDataset(tokenizer, data_args)
         selected = select_stratified(dataset, args.samples, args.seed)
         instructions = [dataset.list_data_dict[item["index"]][6] for item in selected]
-        shifted_instructions = mismatch_instructions(instructions, args.seed + 1)
+        task_keys = [
+            dataset.task_key(
+                dataset.list_data_dict[item["index"]][1],
+                dataset.list_data_dict[item["index"]][0],
+                dataset.list_data_dict[item["index"]][6],
+            )
+            for item in selected
+        ]
+        shifted_instructions = (
+            mismatch_instructions_by_group(instructions, task_keys, args.seed + 1)
+            if args.task_alignment_path
+            else mismatch_instructions(instructions, args.seed + 1)
+        )
+        paraphrase_instructions = (
+            [
+                dataset.task_instruction_pair(entry[1], entry[0], entry[6])[0]
+                for entry in (dataset.list_data_dict[item["index"]] for item in selected)
+            ]
+            if args.task_alignment_path
+            else list(instructions)
+        )
         manifest = []
-        for item, shuffled_instruction in zip(selected, shifted_instructions):
+        for item, task_key, paraphrase, shuffled_instruction in zip(
+            selected, task_keys, paraphrase_instructions, shifted_instructions
+        ):
             entry = dataset.list_data_dict[item["index"]]
             manifest.append(
                 {
@@ -255,6 +316,8 @@ def main():
                     "current_frame_id": entry[7][0],
                     "episode_length": len(entry[10]),
                     "instruction": entry[6],
+                    "trajectory_id": task_key[1],
+                    "paraphrase_instruction": paraphrase,
                     "shuffled_instruction": shuffled_instruction,
                 }
             )
@@ -309,16 +372,26 @@ def main():
 
         rows = []
         original_features = []
-        for item, original_instruction, shuffled_instruction in zip(selected, instructions, shifted_instructions):
+        for item, original_instruction, paraphrase_instruction, shuffled_instruction in zip(
+            selected, instructions, paraphrase_instructions, shifted_instructions
+        ):
             sample_seed = args.seed * 1000 + item["index"]
             original_state, original_diag = evaluate_sample(item["index"], original_instruction, sample_seed)
+            paraphrase_state, paraphrase_diag = evaluate_sample(item["index"], paraphrase_instruction, sample_seed)
             shuffled_state, shuffled_diag = evaluate_sample(item["index"], shuffled_instruction, sample_seed)
             cosine = float(F.cosine_similarity(original_state[None], shuffled_state[None]))
             relative_l2 = float((original_state - shuffled_state).norm() / original_state.norm().clamp_min(1e-6))
+            paraphrase_cosine = float(F.cosine_similarity(original_state[None], paraphrase_state[None]))
+            paraphrase_relative_l2 = float(
+                (original_state - paraphrase_state).norm() / original_state.norm().clamp_min(1e-6)
+            )
             original_read = torch.tensor(original_diag["read_weights"])
+            paraphrase_read = torch.tensor(paraphrase_diag["read_weights"])
             shuffled_read = torch.tensor(shuffled_diag["read_weights"])
             read_l1 = float((original_read - shuffled_read).abs().mean())
+            paraphrase_read_l1 = float((original_read - paraphrase_read).abs().mean())
             original_stage = int(torch.tensor(original_diag["stage_logits"])[0].argmax())
+            paraphrase_stage = int(torch.tensor(paraphrase_diag["stage_logits"])[0].argmax())
             shuffled_stage = int(torch.tensor(shuffled_diag["stage_logits"])[0].argmax())
             rows.append(
                 {
@@ -326,7 +399,11 @@ def main():
                     "task_cosine": cosine,
                     "task_relative_l2": relative_l2,
                     "read_l1": read_l1,
+                    "paraphrase_task_cosine": paraphrase_cosine,
+                    "paraphrase_task_relative_l2": paraphrase_relative_l2,
+                    "paraphrase_read_l1": paraphrase_read_l1,
                     "stage_original": original_stage,
+                    "stage_paraphrase": paraphrase_stage,
                     "stage_shuffled": shuffled_stage,
                     "stage_probabilities": original_diag["stage_probabilities"][0],
                     "null_weights": original_diag["null_weights"][0],
@@ -351,12 +428,21 @@ def main():
         metrics = {
             "samples": len(rows),
             "unique_episodes": len({item["episode_id"] for item in selected}),
+            "unique_trajectories": len(set(task_keys)),
             "unique_instructions": len(set(instructions)),
             "samples_per_progress_bin": [sum(item["stage"] == stage for item in selected) for stage in range(4)],
             "mean_instruction_task_cosine": cosine,
             "mean_instruction_task_relative_l2": statistics.fmean(row["task_relative_l2"] for row in rows),
             "mean_instruction_read_l1": read_l1,
             "instruction_stage_flip_rate": stage_flip,
+            "mean_paraphrase_task_cosine": statistics.fmean(row["paraphrase_task_cosine"] for row in rows),
+            "mean_paraphrase_task_relative_l2": statistics.fmean(
+                row["paraphrase_task_relative_l2"] for row in rows
+            ),
+            "mean_paraphrase_read_l1": statistics.fmean(row["paraphrase_read_l1"] for row in rows),
+            "paraphrase_stage_flip_rate": statistics.fmean(
+                row["stage_original"] != row["stage_paraphrase"] for row in rows
+            ),
             "stage_best_permutation_accuracy": stage_accuracy,
             "progress_probe_mae": probe_mae,
             "progress_constant_mae": constant_mae,

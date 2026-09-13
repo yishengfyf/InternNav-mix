@@ -49,6 +49,7 @@ class DataArguments:
     resize_w: Optional[int] = field(default=384)
     num_future_steps: Optional[int] = field(default=4)
     max_dialog_turns: Optional[int] = field(default=6)
+    task_alignment_path: Optional[str] = field(default=None)
 
 
 @dataclass

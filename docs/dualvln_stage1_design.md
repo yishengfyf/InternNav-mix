@@ -170,3 +170,11 @@ B1/B2/M1/M2 使用相同的新训练数据、更新步数、历史帧、token �
 固定 32 样本、seed 23 和相同更新预算依次比较：R0（instruction-only，无新辅助 loss）、R1（R0 + 任务身份对比）、R2（R1 + 软进度代理）。先要求所有梯度 finite、冻结参数无梯度且 S2/trajectory 不劣于已有 B2 工程容差；再用独立错配指令探针要求 task-state、read weights 或同权重 M2Z/M2 行为出现可重复差异。若 R1 不能产生指令敏感性，停止增加进度 loss，回到表示与负样本设计；若 R1 成立而 R2 只增加位置可解码性，则保留两者分离表述，不把进度代理包装成语义收益。
 
 首轮 8 样本机制筛选中，R1 虽增大 estimator 输出差异但 read L1 仍低于 `0.001`，R2 的训练进度 loss 下降却未改善独立进度 probe。后续单一修复 R1Q 将错配 margin 施加在 `evidence_memory.task_projection(task_state)` 的实际 reader query 空间，使梯度同时约束 estimator 与 reader 投影；R1Q 不启用进度代理。若它仍不能改变读取，则停止用无相关性标签强迫任意历史选择，转向恢复原始多指令/路径对齐数据或更可靠的 evidence relevance 标注。
+
+## 12. 官方路径复述监督 R1P
+
+官方 R2R train 标注与转换后的 `tasks.jsonl` 已通过指令文本唯一匹配：当前 scene 的 75 条转换指令全部可映射到 25 个官方 `trajectory_id`，每条路径有 3 条人工指令。该映射必须由独立 manifest 固化原始文件 SHA256、匹配数、歧义数和每条路径的复述集合；dataset 仅接受状态为 `passed` 的 schema-v1 manifest，缺失、重复或复述集合不完整时立即停止。
+
+R1P 使用同一视觉与历史输入构造三元组：anchor 为转换样本的原指令，positive 为同一官方 `trajectory_id` 的另一条人工指令，negative 为不同 `trajectory_id` 的指令。监督继续施加在 memory 实际使用的 `task_projection` query 空间。它只约束路线级任务身份，不提供当前任务阶段或哪一帧历史最相关的真值。
+
+公平对照固定为 R0P 与 R1P：两组使用相同 8 条官方路径、seed、初始化、80 steps、instruction-only task-state 与 task-state `0.1x` 学习率；R1P 唯一增加路径复述对比 loss。训练后各自在 32 个真实因果样本上同时测量同路径复述变化和异路径指令变化。进入闭环必须同时满足：梯度有限且冻结参数无梯度；R1P 的 S2/trajectory 最终损失不超过 R0P 的 `105%/110%`；异路径 task cosine `<0.995`、relative L2 `>0.05`，且 read L1 `>=0.01` 或 stage 翻转 `>=0.1`；同路径复述必须在 task-state 距离和 read L1 上均比异路径更接近。任一条件失败即停止继续叠加 task-state 辅助损失，转向 evidence relevance 或同地点不同阶段监督。

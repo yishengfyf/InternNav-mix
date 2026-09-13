@@ -63,6 +63,50 @@ VIDEOCHATGPT = {
 TRAJ_DATA_ROOT = os.environ.get("INTERNNAV_TRAJ_DATA_ROOT", "traj_data")
 
 
+def normalize_task_instruction(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def load_task_alignment_manifest(path):
+    with open(path, encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if manifest.get("schema_version") != 1 or manifest.get("status") != "passed":
+        raise ValueError("task alignment manifest is not a validated schema-v1 manifest")
+    instructions = manifest.get("instructions")
+    if not isinstance(instructions, list) or not instructions:
+        raise ValueError("task alignment manifest has no instructions")
+    for field in ("raw_sha256", "tasks_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get(field, ""))):
+            raise ValueError(f"task alignment manifest has invalid {field}")
+    if manifest.get("converted_instructions") != len(instructions) or manifest.get("matched_instructions") != len(
+        instructions
+    ):
+        raise ValueError("task alignment manifest instruction counts are inconsistent")
+    result = {}
+    route_paraphrases = {}
+    for item in instructions:
+        normalized = normalize_task_instruction(item["instruction"])
+        trajectory_id = item.get("trajectory_id")
+        if not isinstance(trajectory_id, (str, int)):
+            raise ValueError(f"task alignment has invalid trajectory id for {normalized!r}")
+        paraphrases = []
+        for text in item.get("paraphrases", []):
+            candidate = normalize_task_instruction(text)
+            if candidate and candidate not in paraphrases:
+                paraphrases.append(candidate)
+        if normalized in result:
+            raise ValueError(f"task alignment has duplicate instruction {normalized!r}")
+        if normalized not in paraphrases or len(paraphrases) < 2:
+            raise ValueError(f"task alignment has invalid paraphrases for {normalized!r}")
+        previous = route_paraphrases.setdefault(trajectory_id, paraphrases)
+        if previous != paraphrases:
+            raise ValueError(f"task alignment has inconsistent paraphrases for trajectory {trajectory_id!r}")
+        result[normalized] = {**item, "instruction": normalized, "paraphrases": paraphrases}
+    if manifest.get("unique_trajectories") != len(route_paraphrases):
+        raise ValueError("task alignment manifest trajectory count is inconsistent")
+    return result
+
+
 R2R_125CM_0_30 = {
     "data_path": os.path.join(TRAJ_DATA_ROOT, "r2r"),
     "height": 125,
@@ -971,12 +1015,27 @@ class NavPixelGoalDataset(Dataset):
             self.list_data_dict.extend(list_data_dict)
 
         self.num_history = data_args.num_history
+        self.task_alignment = None
+        alignment_path = getattr(data_args, "task_alignment_path", None)
+        if alignment_path:
+            self.task_alignment = load_task_alignment_manifest(alignment_path)
+            missing = [
+                sample[6]
+                for sample in self.list_data_dict
+                if normalize_task_instruction(sample[6]) not in self.task_alignment
+            ]
+            if missing:
+                raise ValueError(f"task alignment is missing {len(missing)} dataset instructions")
         self.task_instructions = {}
         for sample in self.list_data_dict:
-            task_key = (sample[1], sample[0])
+            task_key = self.task_key(sample[1], sample[0], sample[6])
             instructions = self.task_instructions.setdefault(task_key, [])
-            if sample[6] not in instructions:
-                instructions.append(sample[6])
+            aligned = self.task_alignment.get(normalize_task_instruction(sample[6])) if self.task_alignment else None
+            candidates = aligned["paraphrases"] if aligned else [sample[6]]
+            for candidate in candidates:
+                normalized = normalize_task_instruction(candidate)
+                if normalized not in instructions:
+                    instructions.append(normalized)
         self.task_keys = sorted(self.task_instructions, key=lambda key: (str(key[0]), str(key[1])))
         self.task_key_indices = {key: index for index, key in enumerate(self.task_keys)}
         self.idx2actions = {0: 'STOP', 1: "↑", 2: "←", 3: "→", 5: "↓"}
@@ -996,6 +1055,30 @@ class NavPixelGoalDataset(Dataset):
             self.data_args.image_processor.min_pixels = data_args.min_pixels
             self.data_args.image_processor.size["longest_edge"] = data_args.max_pixels
             self.data_args.image_processor.size["shortest_edge"] = data_args.min_pixels
+
+    def task_key(self, data_path, episode_id, instruction):
+        if self.task_alignment is not None:
+            normalized = normalize_task_instruction(instruction)
+            return (data_path, self.task_alignment[normalized]["trajectory_id"])
+        return (data_path, episode_id)
+
+    def task_instruction_pair(self, data_path, episode_id, instruction):
+        task_key = self.task_key(data_path, episode_id, instruction)
+        normalized = normalize_task_instruction(instruction)
+        route_instructions = self.task_instructions[task_key]
+        if normalized not in route_instructions:
+            raise ValueError(f"instruction is not a member of aligned route {task_key!r}")
+        instruction_index = route_instructions.index(normalized)
+        positive_instruction = route_instructions[(instruction_index + 1) % len(route_instructions)]
+        negative_instruction = normalized
+        for offset in range(1, len(self.task_keys)):
+            negative_key = self.task_keys[(self.task_key_indices[task_key] + offset) % len(self.task_keys)]
+            candidate = self.task_instructions[negative_key][0]
+            if candidate != normalized:
+                negative_instruction = candidate
+                break
+        pair_valid = len(route_instructions) > 1 and negative_instruction != normalized
+        return positive_instruction, negative_instruction, pair_valid
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -1170,21 +1253,9 @@ class NavPixelGoalDataset(Dataset):
             data_dict["evidence_instruction_ids"] = torch.tensor(instruction_ids, dtype=torch.long)
 
             if getattr(self.data_args, "task_state_supervision", False):
-                task_key = (data_path, ep_id)
-                # The converted LeRobot shard retains one instruction per route.
-                # Keep the positive view identical and use the margin term only
-                # to separate a causally paired observation from a wrong route.
-                positive_instruction = instruction
-                negative_instruction = instruction
-                for offset in range(1, len(self.task_keys)):
-                    negative_key = self.task_keys[
-                        (self.task_key_indices[task_key] + offset) % len(self.task_keys)
-                    ]
-                    candidate = self.task_instructions[negative_key][0]
-                    if candidate != instruction:
-                        negative_instruction = candidate
-                        break
-                pair_valid = negative_instruction != instruction
+                positive_instruction, negative_instruction, pair_valid = self.task_instruction_pair(
+                    data_path, ep_id, instruction
+                )
                 data_dict["evidence_positive_instruction_ids"] = torch.tensor(
                     self.tokenizer(positive_instruction, add_special_tokens=False)["input_ids"], dtype=torch.long
                 )
