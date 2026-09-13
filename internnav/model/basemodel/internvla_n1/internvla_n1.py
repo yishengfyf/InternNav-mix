@@ -639,11 +639,6 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1).to(text_embeds.dtype)
         image_idx = input_ids == IMAGE_TOKEN_INDEX
         N_QUERY = self.get_n_query()
-        input_ids = torch.cat([input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY]).to(input_ids.device)], dim=1)
-        if attention_mask is not None:
-            attention_mask = torch.cat(
-                [attention_mask.to(input_ids.device), torch.ones_like(input_ids[:, -N_QUERY:])], dim=1
-            )
 
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -668,6 +663,13 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 evidence_prompt_lengths,
             )
 
+        input_ids = torch.cat(
+            [input_ids, input_ids.new_full((input_ids.shape[0], N_QUERY), TRAJ_TOKEN_INDEX)], dim=1
+        )
+        if attention_mask is not None:
+            attention_mask = torch.cat(
+                [attention_mask.to(input_ids.device), torch.ones_like(input_ids[:, -N_QUERY:])], dim=1
+            )
         text_embeds = torch.cat([text_embeds, latent_queries], dim=1)
 
         position_ids, _ = self.get_rope_index(input_ids, image_grid_thw)

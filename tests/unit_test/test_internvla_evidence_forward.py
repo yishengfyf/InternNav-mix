@@ -130,14 +130,24 @@ def test_generate_latents_extends_attention_mask_for_trajectory_queries():
         return FakeOutput()
 
     model.model.forward = fake_model
-    input_ids = torch.tensor([[10, 151652, IMAGE_TOKEN_INDEX, 151653, 11]])
-    pixel_values = torch.zeros(1, 3)
-    image_grid_thw = torch.tensor([[1, 2, 2]])
+    input_ids = torch.tensor(
+        [[10, 151652, IMAGE_TOKEN_INDEX, 151653, 11, 151652, IMAGE_TOKEN_INDEX, 151653,
+          EVIDENCE_TOKEN_INDEX, EVIDENCE_TOKEN_INDEX, 12]]
+    )
+    pixel_values = torch.zeros(2, 3)
+    image_grid_thw = torch.tensor([[1, 2, 2], [1, 2, 2]])
     result = model.generate_latents(
         input_ids,
         pixel_values,
         image_grid_thw,
         attention_mask=torch.ones_like(input_ids),
+        evidence_relative_poses=torch.zeros(1, 1, 4),
+        evidence_ages=torch.ones(1, 1, 1),
+        evidence_qualities=torch.ones(1, 1, 2),
+        evidence_valid_mask=torch.ones(1, 1, dtype=torch.bool),
+        evidence_history_counts=torch.tensor([1]),
+        evidence_image_counts=torch.tensor([2]),
+        evidence_prompt_lengths=torch.tensor([input_ids.shape[1]]),
     )
     assert result.shape[-1] == model.config.hidden_size
     # The production latent path consumes the aligned mask before the final
