@@ -971,6 +971,14 @@ class NavPixelGoalDataset(Dataset):
             self.list_data_dict.extend(list_data_dict)
 
         self.num_history = data_args.num_history
+        self.task_instructions = {}
+        for sample in self.list_data_dict:
+            task_key = (sample[1], sample[0])
+            instructions = self.task_instructions.setdefault(task_key, [])
+            if sample[6] not in instructions:
+                instructions.append(sample[6])
+        self.task_keys = sorted(self.task_instructions, key=lambda key: (str(key[0]), str(key[1])))
+        self.task_key_indices = {key: index for index, key in enumerate(self.task_keys)}
         self.idx2actions = {0: 'STOP', 1: "↑", 2: "←", 3: "→", 5: "↓"}
         self.conjunctions = [
             'you can see ',
@@ -1158,6 +1166,37 @@ class NavPixelGoalDataset(Dataset):
             data_dict["evidence_qualities"] = torch.from_numpy(history_metadata.qualities)
             data_dict["evidence_history_count"] = len(history_id)
             data_dict["evidence_image_count"] = len(images)
+            instruction_ids = self.tokenizer(instruction, add_special_tokens=False)["input_ids"]
+            data_dict["evidence_instruction_ids"] = torch.tensor(instruction_ids, dtype=torch.long)
+
+            if getattr(self.data_args, "task_state_supervision", False):
+                task_key = (data_path, ep_id)
+                route_instructions = self.task_instructions[task_key]
+                instruction_index = route_instructions.index(instruction)
+                pair_valid = len(route_instructions) > 1 and len(self.task_keys) > 1
+                positive_instruction = (
+                    route_instructions[(instruction_index + 1) % len(route_instructions)]
+                    if len(route_instructions) > 1
+                    else instruction
+                )
+                negative_key = self.task_keys[(self.task_key_indices[task_key] + 1) % len(self.task_keys)]
+                negative_instruction = self.task_instructions[negative_key][0]
+                data_dict["evidence_positive_instruction_ids"] = torch.tensor(
+                    self.tokenizer(positive_instruction, add_special_tokens=False)["input_ids"], dtype=torch.long
+                )
+                data_dict["evidence_negative_instruction_ids"] = torch.tensor(
+                    self.tokenizer(negative_instruction, add_special_tokens=False)["input_ids"], dtype=torch.long
+                )
+                data_dict["evidence_task_pair_valid"] = pair_valid
+                route_progress = start_frame_id / max(len(episode_poses) - 1, 1)
+                progress_coordinate = min(max(route_progress, 0.0), 1.0) * 3.0
+                lower = int(np.floor(progress_coordinate))
+                upper = min(lower + 1, 3)
+                progress_target = torch.zeros(4, dtype=torch.float32)
+                progress_target[lower] = upper - progress_coordinate if upper != lower else 1.0
+                if upper != lower:
+                    progress_target[upper] = progress_coordinate - lower
+                data_dict["evidence_progress_targets"] = progress_target
 
         if self.pixel_goal_only:
             goal_len = end_frame_id - start_frame_id - 1
@@ -1345,6 +1384,39 @@ class DataCollatorForSupervisedDataset(object):
             batch["evidence_valid_mask"] = valid_mask
             batch["evidence_history_counts"] = history_counts
             batch["evidence_image_counts"] = image_counts
+            if "evidence_instruction_ids" in instances[0]:
+                instruction_lengths = torch.tensor(
+                    [len(instance["evidence_instruction_ids"]) for instance in instances], dtype=torch.long
+                )
+                batch["evidence_instruction_ids"] = torch.nn.utils.rnn.pad_sequence(
+                    [instance["evidence_instruction_ids"] for instance in instances],
+                    batch_first=True,
+                    padding_value=self.tokenizer.pad_token_id,
+                )
+                batch["evidence_instruction_mask"] = (
+                    torch.arange(batch["evidence_instruction_ids"].shape[1])[None, :] < instruction_lengths[:, None]
+                )
+            if "evidence_positive_instruction_ids" in instances[0]:
+                for source_key, output_key in (
+                    ("evidence_positive_instruction_ids", "evidence_positive_instruction_ids"),
+                    ("evidence_negative_instruction_ids", "evidence_negative_instruction_ids"),
+                ):
+                    lengths = torch.tensor([len(instance[source_key]) for instance in instances], dtype=torch.long)
+                    padded = torch.nn.utils.rnn.pad_sequence(
+                        [instance[source_key] for instance in instances],
+                        batch_first=True,
+                        padding_value=self.tokenizer.pad_token_id,
+                    )
+                    batch[output_key] = padded
+                    batch[output_key.replace("_ids", "_mask")] = (
+                        torch.arange(padded.shape[1])[None, :] < lengths[:, None]
+                    )
+                batch["evidence_task_pair_valid"] = torch.tensor(
+                    [instance["evidence_task_pair_valid"] for instance in instances], dtype=torch.bool
+                )
+                batch["evidence_progress_targets"] = torch.stack(
+                    [instance["evidence_progress_targets"] for instance in instances]
+                )
             batch['position_ids'] = None
 
         if "traj_images" in instances[0]:

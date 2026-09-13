@@ -105,7 +105,8 @@ class InternVLAN1Net(PreTrainedModel):
         self.depth_list.append(depth)
         self.pose_list.append(planar_pose)
 
-    def _prepare_evidence_inputs(self, inputs, history_ids):
+    def _prepare_evidence_inputs(self, inputs, history_ids, instruction):
+        instruction_ids = self.processor.tokenizer(instruction, add_special_tokens=False)["input_ids"]
         return prepare_evidence_inputs(
             self.model,
             inputs,
@@ -113,6 +114,7 @@ class InternVLAN1Net(PreTrainedModel):
             self.pose_list,
             len(self.input_images),
             self.device,
+            instruction_ids,
         )
 
     def parse_actions(self, output):
@@ -187,7 +189,7 @@ class InternVLAN1Net(PreTrainedModel):
         text = self.processor.apply_chat_template(self.conversation_history, tokenize=False, add_generation_prompt=True)
 
         inputs = self.processor(text=[text], images=self.input_images, return_tensors="pt").to(self.device)
-        inputs, evidence_kwargs = self._prepare_evidence_inputs(inputs, history_id)
+        inputs, evidence_kwargs = self._prepare_evidence_inputs(inputs, history_id, instruction)
 
         # 3. Model inference
         with torch.no_grad():

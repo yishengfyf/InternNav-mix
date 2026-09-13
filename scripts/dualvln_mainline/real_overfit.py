@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import random
 import sys
 import time
 import traceback
@@ -66,6 +67,8 @@ def write_report(args, report, series=None):
 |总 loss 下降|{metrics.get('total_loss_reduction', 0):.2%}|
 |初始/最终 S2 loss|{metrics.get('initial_s2_loss', 0):.6f} / {metrics.get('final_s2_loss', 0):.6f}|
 |初始/最终轨迹 loss|{metrics.get('initial_trajectory_loss', 0):.6f} / {metrics.get('final_trajectory_loss', 0):.6f}|
+|初始/最终任务对比 loss|{metrics.get('initial_task_contrastive_loss', 0):.6f} / {metrics.get('final_task_contrastive_loss', 0):.6f}|
+|初始/最终软进度 loss|{metrics.get('initial_stage_loss', 0):.6f} / {metrics.get('final_stage_loss', 0):.6f}|
 |峰值本进程显存 MiB|{metrics.get('peak_allocated_mib', 0):.1f}|
 |耗时（秒）|{metrics.get('duration_s', 0):.3f}|
 
@@ -131,6 +134,33 @@ def summarize_gradients(model, torch):
     return summaries
 
 
+def select_task_state_samples(dataset, samples, seed):
+    if samples % 4:
+        raise ValueError("task-state repair samples must be divisible by four")
+    bins = [[] for _ in range(4)]
+    for index, entry in enumerate(dataset.list_data_dict):
+        frame_id = int(entry[7][0])
+        if frame_id < 2 or entry[9] is None or len(entry[10]) < 2:
+            continue
+        progress = frame_id / (len(entry[10]) - 1)
+        bins[min(int(progress * 4), 3)].append((index, (entry[1], entry[0])))
+    rng = random.Random(seed)
+    for values in bins:
+        rng.shuffle(values)
+    selected, used_tasks = [], set()
+    for values in bins:
+        for index, task_key in values:
+            if task_key in used_tasks:
+                continue
+            selected.append(index)
+            used_tasks.add(task_key)
+            if len(selected) % (samples // 4) == 0:
+                break
+    if len(selected) != samples:
+        raise RuntimeError(f"only found {len(selected)} balanced distinct-route task-state samples")
+    return selected
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -148,6 +178,10 @@ def main():
     parser.add_argument("--task-state-scale", type=float, default=1.0)
     parser.add_argument("--normalize-task-state", action="store_true")
     parser.add_argument("--freeze-task-state", action="store_true")
+    parser.add_argument("--instruction-only-task-state", action="store_true")
+    parser.add_argument("--task-contrastive-weight", type=float, default=0.0)
+    parser.add_argument("--stage-loss-weight", type=float, default=0.0)
+    parser.add_argument("--task-contrastive-margin", type=float, default=0.2)
     parser.add_argument(
         "--experiment",
         choices=("B0", "B1", "B2", "M1", "M2"),
@@ -169,6 +203,10 @@ def main():
         "task_state_scale": args.task_state_scale,
         "normalize_task_state": args.normalize_task_state,
         "freeze_task_state": args.freeze_task_state,
+        "instruction_only_task_state": args.instruction_only_task_state,
+        "task_contrastive_weight": args.task_contrastive_weight,
+        "stage_loss_weight": args.stage_loss_weight,
+        "task_contrastive_margin": args.task_contrastive_margin,
         "max_pixels": 224 * 224,
         "model_max_length": 1024,
         "num_history": 2,
@@ -244,13 +282,20 @@ def main():
             image_processor=processor.image_processor,
             transform_train=None,
             use_evidence_memory=args.experiment != "B0",
+            task_state_supervision=args.task_contrastive_weight > 0 or args.stage_loss_weight > 0,
             max_pixels=224 * 224,
             min_pixels=224 * 224,
         )
         dataset = NavPixelGoalDataset(tokenizer, data_args)
-        selected = [
-            index for index, entry in enumerate(dataset.list_data_dict) if entry[7][0] >= 2 and entry[9] is not None
-        ][: args.samples]
+        selected = (
+            select_task_state_samples(dataset, args.samples, args.seed)
+            if args.instruction_only_task_state
+            else [
+                index
+                for index, entry in enumerate(dataset.list_data_dict)
+                if entry[7][0] >= 2 and entry[9] is not None
+            ][: args.samples]
+        )
         if len(selected) != args.samples:
             raise RuntimeError(f"only found {len(selected)} eligible training samples")
         collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, num_evidence_tokens=4)
@@ -283,6 +328,10 @@ def main():
         config.evidence_gradient_bypass_mode = args.bypass_mode
         config.evidence_task_state_scale = args.task_state_scale
         config.evidence_normalize_task_state = args.normalize_task_state
+        config.evidence_instruction_only_task_state = args.instruction_only_task_state
+        config.evidence_task_contrastive_weight = args.task_contrastive_weight
+        config.evidence_stage_loss_weight = args.stage_loss_weight
+        config.evidence_task_contrastive_margin = args.task_contrastive_margin
         config.evidence_ablation = {
             "B0": "null",
             "B1": "null",
@@ -340,7 +389,7 @@ def main():
 
         def evaluate():
             model.eval()
-            totals, s2_values, trajectory_values = [], [], []
+            totals, s2_values, trajectory_values, contrastive_values, stage_values = [], [], [], [], []
             with torch.no_grad():
                 for sample_idx, cpu_batch in enumerate(cpu_batches):
                     torch.manual_seed(args.seed + 1000 + sample_idx)
@@ -350,13 +399,19 @@ def main():
                     totals.append(float(output.loss))
                     s2_values.append(float(output.s2_loss))
                     trajectory_values.append(float(output.trajectory_loss))
+                    contrastive_values.append(
+                        float(output.task_contrastive_loss) if output.task_contrastive_loss is not None else 0.0
+                    )
+                    stage_values.append(float(output.stage_loss) if output.stage_loss is not None else 0.0)
             return (
                 sum(totals) / len(totals),
                 sum(s2_values) / len(s2_values),
                 sum(trajectory_values) / len(trajectory_values),
+                sum(contrastive_values) / len(contrastive_values),
+                sum(stage_values) / len(stage_values),
             )
 
-        initial_total, initial_s2, initial_trajectory = evaluate()
+        initial_total, initial_s2, initial_trajectory, initial_contrastive, initial_stage = evaluate()
         if args.experiment == "B0":
             finite = all(
                 torch.isfinite(torch.tensor(value)) for value in (initial_total, initial_s2, initial_trajectory)
@@ -375,6 +430,10 @@ def main():
                     "final_s2_loss": initial_s2,
                     "initial_trajectory_loss": initial_trajectory,
                     "final_trajectory_loss": initial_trajectory,
+                    "initial_task_contrastive_loss": initial_contrastive,
+                    "final_task_contrastive_loss": initial_contrastive,
+                    "initial_stage_loss": initial_stage,
+                    "final_stage_loss": initial_stage,
                     "duration_s": time.monotonic() - start,
                     "trainable_parameters": 0,
                     "frozen_gradient_parameters": 0,
@@ -403,7 +462,12 @@ def main():
         optimizer = torch.optim.AdamW(optimizer_groups)
         model.train()
         gradient_audit = {}
-        for loss_name in ("s2_loss", "trajectory_loss"):
+        audit_loss_names = ["s2_loss", "trajectory_loss"]
+        if args.task_contrastive_weight > 0:
+            audit_loss_names.append("task_contrastive_loss")
+        if args.stage_loss_weight > 0:
+            audit_loss_names.append("stage_loss")
+        for loss_name in audit_loss_names:
             optimizer.zero_grad(set_to_none=True)
             torch.manual_seed(args.seed + 2000)
             torch.cuda.manual_seed_all(args.seed + 2000)
@@ -427,6 +491,10 @@ def main():
             ),
             "trajectory_loss": ("latent_queries", "cond_projector"),
         }
+        if args.task_contrastive_weight > 0:
+            required_gradient_groups["task_contrastive_loss"] = ("task_state_estimator",)
+        if args.stage_loss_weight > 0:
+            required_gradient_groups["stage_loss"] = ("task_state_estimator", "evidence_memory")
         missing_gradient_groups = [
             f"{loss_name}:{group_name}"
             for loss_name, group_names in required_gradient_groups.items()
@@ -443,6 +511,8 @@ def main():
                 "initial_total_loss": initial_total,
                 "initial_s2_loss": initial_s2,
                 "initial_trajectory_loss": initial_trajectory,
+                "initial_task_contrastive_loss": initial_contrastive,
+                "initial_stage_loss": initial_stage,
                 "gradient_audit_nonfinite": nonfinite_audit,
                 "missing_gradient_groups": missing_gradient_groups,
             }
@@ -480,6 +550,12 @@ def main():
                             "total_loss": values[0],
                             "s2_loss": values[1],
                             "trajectory_loss": values[2],
+                            "task_contrastive_loss": (
+                                float(output.task_contrastive_loss.detach())
+                                if output.task_contrastive_loss is not None
+                                else 0.0
+                            ),
+                            "stage_loss": float(output.stage_loss.detach()) if output.stage_loss is not None else 0.0,
                             "gradient_norm": float(gradient_norm),
                             "allocated_mib": torch.cuda.memory_allocated() / 1024**2,
                             "reserved_mib": torch.cuda.memory_reserved() / 1024**2,
@@ -487,7 +563,7 @@ def main():
                     )
                     + "\n"
                 )
-        final_total, final_s2, final_trajectory = evaluate()
+        final_total, final_s2, final_trajectory, final_contrastive, final_stage = evaluate()
         reduction = 1.0 - final_total / initial_total
         frozen_gradient_parameters = sum(
             parameter.numel()
@@ -519,6 +595,10 @@ def main():
                 "final_s2_loss": final_s2,
                 "initial_trajectory_loss": initial_trajectory,
                 "final_trajectory_loss": final_trajectory,
+                "initial_task_contrastive_loss": initial_contrastive,
+                "final_task_contrastive_loss": final_contrastive,
+                "initial_stage_loss": initial_stage,
+                "final_stage_loss": final_stage,
                 "peak_allocated_mib": max(per_gpu_peak_mib.values()),
                 "per_gpu_peak_allocated_mib": per_gpu_peak_mib,
                 "frozen_gradient_parameters": frozen_gradient_parameters,

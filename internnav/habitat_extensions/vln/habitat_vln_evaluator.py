@@ -486,6 +486,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         pose_list,
                         len(input_images),
                         self.device,
+                        self.processor.tokenizer(
+                            episode_instruction, add_special_tokens=False
+                        )["input_ids"],
                     )
 
                     s2_start_time = time.monotonic()

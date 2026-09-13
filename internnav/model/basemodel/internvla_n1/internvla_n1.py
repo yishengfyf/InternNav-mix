@@ -30,6 +30,7 @@ class DualVLNCausalLMOutput(CausalLMOutputWithPast):
     s2_loss: Optional[torch.FloatTensor] = None
     trajectory_loss: Optional[torch.FloatTensor] = None
     stage_loss: Optional[torch.FloatTensor] = None
+    task_contrastive_loss: Optional[torch.FloatTensor] = None
 
 
 class InternVLAN1ModelConfig(Qwen2_5_VLConfig):
@@ -103,6 +104,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             "evidence_history_counts",
             "evidence_image_counts",
             "evidence_prompt_lengths",
+            "evidence_instruction_ids",
+            "evidence_instruction_mask",
         )
         evidence_kwargs = {key: kwargs.get(key) for key in evidence_keys if kwargs.get(key) is not None}
         model_inputs = super().prepare_inputs_for_generation(*args, **kwargs)
@@ -124,9 +127,17 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         evidence_history_counts,
         evidence_image_counts,
         evidence_prompt_lengths=None,
+        evidence_instruction_ids=None,
+        evidence_instruction_mask=None,
+        evidence_positive_instruction_ids=None,
+        evidence_positive_instruction_mask=None,
+        evidence_negative_instruction_ids=None,
+        evidence_negative_instruction_mask=None,
+        evidence_task_pair_valid=None,
+        evidence_progress_targets=None,
     ):
         if not getattr(self.config, "use_evidence_memory", False):
-            return inputs_embeds, None
+            return inputs_embeds, None, None
         required = {
             "image_embeds": image_embeds,
             "image_grid_thw": image_grid_thw,
@@ -163,11 +174,21 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             prompt_lengths = evidence_prompt_lengths.to(device=input_ids.device)
             prompt_mask &= torch.arange(input_ids.shape[1], device=input_ids.device)[None, :] < prompt_lengths[:, None]
 
-        task_state = self.get_model().task_state_estimator(
-            visual_batch.current_features,
-            inputs_embeds,
-            prompt_mask,
-        )
+        estimator = self.get_model().task_state_estimator
+
+        def estimate_from_instruction(instruction_ids, instruction_mask):
+            if instruction_ids is None or instruction_mask is None:
+                raise ValueError("instruction-only task state requires aligned instruction ids and mask")
+            embedding_device = self.get_input_embeddings().weight.device
+            instruction_embeddings = self.get_input_embeddings()(instruction_ids.to(embedding_device))
+            return estimator(visual_batch.current_features, instruction_embeddings, instruction_mask)
+
+        instruction_only = bool(getattr(self.config, "evidence_instruction_only_task_state", False))
+        if instruction_only:
+            task_state = estimate_from_instruction(evidence_instruction_ids, evidence_instruction_mask)
+        else:
+            task_state = estimator(visual_batch.current_features, inputs_embeds, prompt_mask)
+        raw_task_state = task_state
         self._record_numeric("task_state", task_state)
         ablation = getattr(self.config, "evidence_ablation", "task_spatial")
         task_state, evidence_relative_poses, evidence_ages, evidence_qualities, evidence_valid_mask = (
@@ -217,7 +238,27 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         if getattr(self.config, "numeric_diagnostics", False) and inputs_embeds.requires_grad:
             inputs_embeds.retain_grad()
             self.numeric_gradient_tensors["inputs_embeds_after_evidence"] = inputs_embeds
-        return inputs_embeds, evidence_output
+        task_aux = {"progress_targets": evidence_progress_targets}
+        paired_fields = (
+            evidence_positive_instruction_ids,
+            evidence_positive_instruction_mask,
+            evidence_negative_instruction_ids,
+            evidence_negative_instruction_mask,
+        )
+        if any(value is not None for value in paired_fields):
+            if not instruction_only or not all(value is not None for value in paired_fields):
+                raise ValueError("task-state contrastive inputs require instruction-only mode and complete pairs")
+            task_aux.update(
+                positive_state=estimate_from_instruction(
+                    evidence_positive_instruction_ids, evidence_positive_instruction_mask
+                ),
+                negative_state=estimate_from_instruction(
+                    evidence_negative_instruction_ids, evidence_negative_instruction_mask
+                ),
+                anchor_state=raw_task_state,
+                pair_valid=evidence_task_pair_valid,
+            )
+        return inputs_embeds, evidence_output, task_aux
 
     @staticmethod
     def _apply_evidence_ablation(
@@ -290,6 +331,14 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         evidence_history_counts: Optional[torch.Tensor] = None,
         evidence_image_counts: Optional[torch.Tensor] = None,
         evidence_prompt_lengths: Optional[torch.Tensor] = None,
+        evidence_instruction_ids: Optional[torch.Tensor] = None,
+        evidence_instruction_mask: Optional[torch.Tensor] = None,
+        evidence_positive_instruction_ids: Optional[torch.Tensor] = None,
+        evidence_positive_instruction_mask: Optional[torch.Tensor] = None,
+        evidence_negative_instruction_ids: Optional[torch.Tensor] = None,
+        evidence_negative_instruction_mask: Optional[torch.Tensor] = None,
+        evidence_task_pair_valid: Optional[torch.Tensor] = None,
+        evidence_progress_targets: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -337,6 +386,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         evidence_output = None
+        task_aux = None
         if getattr(self.config, "numeric_diagnostics", False):
             self.numeric_diagnostics = {}
             self.numeric_gradient_tensors = {}
@@ -399,7 +449,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
             if input_ids.eq(EVIDENCE_TOKEN_INDEX).any():
-                inputs_embeds, evidence_output = self._inject_evidence_embeddings(
+                inputs_embeds, evidence_output, task_aux = self._inject_evidence_embeddings(
                     input_ids,
                     inputs_embeds,
                     image_embeds,
@@ -413,6 +463,14 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     evidence_history_counts,
                     evidence_image_counts,
                     evidence_prompt_lengths,
+                    evidence_instruction_ids,
+                    evidence_instruction_mask,
+                    evidence_positive_instruction_ids,
+                    evidence_positive_instruction_mask,
+                    evidence_negative_instruction_ids,
+                    evidence_negative_instruction_mask,
+                    evidence_task_pair_valid,
+                    evidence_progress_targets,
                 )
 
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
@@ -488,6 +546,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         s2_loss = None
         trajectory_loss = None
         stage_loss = None
+        task_contrastive_loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous().float()
             shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
@@ -601,16 +660,39 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             else:
                 raise NotImplementedError
 
-        if evidence_output is not None and hasattr(self.config, "evidence_stage_loss_weight"):
-            # Stage supervision is optional and never required by the runtime inference API.
-            stage_loss = None
+        if evidence_output is not None and task_aux is not None:
+            progress_targets = task_aux.get("progress_targets")
+            if progress_targets is not None:
+                progress_targets = progress_targets.to(
+                    device=evidence_output.stage_logits.device, dtype=evidence_output.stage_logits.dtype
+                )
+                stage_loss = -(
+                    progress_targets * F.log_softmax(evidence_output.stage_logits, dim=-1)
+                ).sum(dim=-1).mean()
+            if "positive_state" in task_aux:
+                valid = task_aux["pair_valid"].to(device=task_aux["anchor_state"].device, dtype=torch.bool)
+                if valid.any():
+                    positive_similarity = F.cosine_similarity(
+                        task_aux["anchor_state"], task_aux["positive_state"], dim=-1
+                    )
+                    negative_similarity = F.cosine_similarity(
+                        task_aux["anchor_state"], task_aux["negative_state"], dim=-1
+                    )
+                    margin = float(getattr(self.config, "evidence_task_contrastive_margin", 0.2))
+                    task_contrastive_loss = F.relu(
+                        margin - positive_similarity[valid] + negative_similarity[valid]
+                    ).mean()
         weighted_losses = []
         if s2_loss is not None:
             weighted_losses.append(getattr(self.config, "s2_loss_weight", 1.0) * s2_loss)
         if trajectory_loss is not None:
             weighted_losses.append(getattr(self.config, "trajectory_loss_weight", 1.0) * trajectory_loss)
         if stage_loss is not None:
-            weighted_losses.append(getattr(self.config, "evidence_stage_loss_weight", 1.0) * stage_loss)
+            weighted_losses.append(getattr(self.config, "evidence_stage_loss_weight", 0.0) * stage_loss)
+        if task_contrastive_loss is not None:
+            weighted_losses.append(
+                getattr(self.config, "evidence_task_contrastive_weight", 0.0) * task_contrastive_loss
+            )
         if weighted_losses:
             loss = sum(weighted_losses)
 
@@ -627,6 +709,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             s2_loss=s2_loss,
             trajectory_loss=trajectory_loss,
             stage_loss=stage_loss,
+            task_contrastive_loss=task_contrastive_loss,
         )
 
     def generate_latents(
@@ -642,6 +725,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         evidence_history_counts=None,
         evidence_image_counts=None,
         evidence_prompt_lengths=None,
+        evidence_instruction_ids=None,
+        evidence_instruction_mask=None,
     ):
         input_ids = input_ids.to(self.get_model().device)
         with torch.no_grad():
@@ -657,7 +742,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
         evidence_output = None
         if input_ids.eq(EVIDENCE_TOKEN_INDEX).any():
-            text_embeds, evidence_output = self._inject_evidence_embeddings(
+            text_embeds, evidence_output, _ = self._inject_evidence_embeddings(
                 input_ids,
                 text_embeds,
                 image_embeds,
@@ -671,6 +756,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 evidence_history_counts,
                 evidence_image_counts,
                 evidence_prompt_lengths,
+                evidence_instruction_ids,
+                evidence_instruction_mask,
             )
 
         input_ids = torch.cat(

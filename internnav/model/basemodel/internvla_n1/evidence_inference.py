@@ -33,6 +33,7 @@ TASK_SPATIAL_INFERENCE_CONFIG = {
     "evidence_task_state_scale": 1.0,
     "evidence_normalize_task_state": False,
     "evidence_record_diagnostics": True,
+    "evidence_instruction_only_task_state": False,
 }
 
 
@@ -106,6 +107,7 @@ def prepare_evidence_inputs(
     planar_poses: Sequence[np.ndarray],
     image_count: int,
     device: torch.device | str,
+    instruction_input_ids=None,
 ):
     """Insert evidence placeholders and construct causal online metadata for one sample."""
     if not getattr(model.config, "use_evidence_memory", False):
@@ -156,4 +158,12 @@ def prepare_evidence_inputs(
         "evidence_image_counts": torch.tensor([image_count], device=target_device),
         "evidence_prompt_lengths": torch.tensor([inputs["input_ids"].shape[1]], device=target_device),
     }
+    if getattr(model.config, "evidence_instruction_only_task_state", False):
+        if instruction_input_ids is None:
+            raise ValueError("instruction-only task state requires instruction token ids")
+        instruction_ids = torch.as_tensor(
+            instruction_input_ids, dtype=torch.long, device=target_device
+        ).reshape(1, -1)
+        evidence_kwargs["evidence_instruction_ids"] = instruction_ids
+        evidence_kwargs["evidence_instruction_mask"] = torch.ones_like(instruction_ids, dtype=torch.bool)
     return inputs, evidence_kwargs

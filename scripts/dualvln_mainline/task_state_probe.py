@@ -62,7 +62,8 @@ def write_report(args, report):
 - 真实 train 因果样本：`{metrics.get('samples', 0)}`
 - 独立 episode / 指令：`{metrics.get('unique_episodes', 0)} / {metrics.get('unique_instructions', 0)}`
 - 四个粗进度区间样本数：`{metrics.get('samples_per_progress_bin', [])}`
-- 权重：`M2-lr01 seed 23`
+- 权重：`{args.adapter}`
+- Task-state 文本输入：`{'仅原始导航指令' if args.instruction_only_task_state else '完整因果 prompt'}`
 - 诊断标签：路线帧进度四分位，不是自然语言子任务真值
 
 |指标|结果|
@@ -196,6 +197,7 @@ def main():
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--commit", required=True)
+    parser.add_argument("--instruction-only-task-state", action="store_true")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
@@ -262,6 +264,7 @@ def main():
 
         config = InternVLAN1ModelConfig.from_pretrained(CHECKPOINT, local_files_only=True)
         configure_task_spatial_inference(config)
+        config.evidence_instruction_only_task_state = args.instruction_only_task_state
         config.use_cache = False
         model = InternVLAN1ForCausalLM.from_pretrained(
             CHECKPOINT,

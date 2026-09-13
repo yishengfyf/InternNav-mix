@@ -109,6 +109,45 @@ def test_tiny_production_forward_injects_evidence_and_splits_s2_loss():
     assert model.model.evidence_memory.output_projection.weight.grad is not None
 
 
+def test_instruction_only_task_state_has_separate_auxiliary_losses():
+    model = tiny_model()
+    model.config.evidence_instruction_only_task_state = True
+    model.config.evidence_task_contrastive_weight = 0.5
+    model.config.evidence_stage_loss_weight = 0.25
+    input_ids = torch.tensor(
+        [[10, 151652, IMAGE_TOKEN_INDEX, 151653, 11, 151652, IMAGE_TOKEN_INDEX, 151653,
+          EVIDENCE_TOKEN_INDEX, EVIDENCE_TOKEN_INDEX, 12, 13]]
+    )
+    labels = torch.tensor([[-100] * 10 + [12, 13]])
+    output = model(
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=torch.ones_like(input_ids),
+        pixel_values=torch.zeros(2, 3),
+        image_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),
+        evidence_relative_poses=torch.zeros(1, 1, 4),
+        evidence_ages=torch.ones(1, 1, 1),
+        evidence_qualities=torch.ones(1, 1, 2),
+        evidence_valid_mask=torch.ones(1, 1, dtype=torch.bool),
+        evidence_history_counts=torch.tensor([1]),
+        evidence_image_counts=torch.tensor([2]),
+        evidence_instruction_ids=torch.tensor([[20, 21]]),
+        evidence_instruction_mask=torch.ones(1, 2, dtype=torch.bool),
+        evidence_positive_instruction_ids=torch.tensor([[20, 22]]),
+        evidence_positive_instruction_mask=torch.ones(1, 2, dtype=torch.bool),
+        evidence_negative_instruction_ids=torch.tensor([[30, 31]]),
+        evidence_negative_instruction_mask=torch.ones(1, 2, dtype=torch.bool),
+        evidence_task_pair_valid=torch.tensor([True]),
+        evidence_progress_targets=torch.tensor([[0.0, 0.5, 0.5, 0.0]]),
+        return_dict=True,
+    )
+
+    assert output.task_contrastive_loss is not None and torch.isfinite(output.task_contrastive_loss)
+    assert output.stage_loss is not None and torch.isfinite(output.stage_loss)
+    expected = output.s2_loss + 0.5 * output.task_contrastive_loss + 0.25 * output.stage_loss
+    assert torch.allclose(output.loss, expected)
+
+
 def test_generate_latents_extends_attention_mask_for_trajectory_queries():
     model = tiny_model()
     model.config.evidence_record_diagnostics = True

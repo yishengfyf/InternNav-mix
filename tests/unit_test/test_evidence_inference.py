@@ -76,6 +76,30 @@ def test_habitat_pose_and_empty_history_are_causal():
     assert kwargs["evidence_history_counts"].tolist() == [0]
 
 
+def test_instruction_only_inference_requires_and_returns_structured_tokens():
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            use_evidence_memory=True,
+            image_token_id=IMAGE_TOKEN_INDEX,
+            num_evidence_tokens=2,
+            evidence_instruction_only_task_state=True,
+        )
+    )
+    inputs = AttrDict(
+        input_ids=torch.tensor([[10, 151652, IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, 151653, 11]]),
+        attention_mask=torch.ones(1, 6, dtype=torch.long),
+    )
+    pose = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    with pytest.raises(ValueError, match="instruction token ids"):
+        prepare_evidence_inputs(model, AttrDict(inputs.copy()), [], [pose], 1, "cpu")
+
+    _, kwargs = prepare_evidence_inputs(
+        model, AttrDict(inputs.copy()), [], [pose], 1, "cpu", instruction_input_ids=[7, 8, 9]
+    )
+    assert kwargs["evidence_instruction_ids"].tolist() == [[7, 8, 9]]
+    assert kwargs["evidence_instruction_mask"].tolist() == [[True, True, True]]
+
+
 def test_habitat_pose_rejects_missing_or_nonfinite_observations():
     with pytest.raises(ValueError, match="gps and compass"):
         planar_pose_from_habitat_observation({"gps": [0, 0]})
