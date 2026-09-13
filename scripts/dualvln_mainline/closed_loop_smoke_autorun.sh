@@ -57,8 +57,10 @@ set -e
 PYTHONPATH="${internvla_site}:${python_deps}" "${habitat_python}" - <<'PY' \
     2>&1 | tee "${stage_dir}/import_smoke.log"
 import habitat, torch, transformers
-from internnav.habitat_extensions.vln.habitat_vln_evaluator import HabitatVLNEvaluator
-print("imports=passed", torch.__version__, transformers.__version__, HabitatVLNEvaluator.__name__)
+from internnav.evaluator import Evaluator
+import internnav.habitat_extensions.vln.habitat_vln_evaluator
+assert "habitat_vln" in Evaluator.evaluators
+print("imports=passed", torch.__version__, transformers.__version__, "habitat_vln_registered")
 PY
 
 run_case() {
