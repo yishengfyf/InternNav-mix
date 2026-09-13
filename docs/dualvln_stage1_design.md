@@ -121,3 +121,22 @@ B1/B2/M1/M2 使用相同的新训练数据、更新步数、历史帧、token �
 - 终端末尾打印 3--8 行关键指标及简短分析，便于自动任务结束时直接检查。
 
 报告中的“通过”只表示当前阶段预先定义的门槛通过，不等于方法有效或论文假设成立。失败报告同样保留，禁止只回传成功运行。
+
+## 9. 短闭环归因协议
+
+首个 B0/M2-lr01 配对 episode 只用于打通真实闭环。两组均未成功，M2 的终点导航误差由 `7.514 m` 降至 `4.613 m`，但 M2 在第 0 步尚无历史时已经输出与 B0 不同的动作。这说明行为差异可能来自 null evidence、late adapter、latent queries 或继续训练，而不能直接归因于空间历史和 task-state。
+
+后续 4-episode smoke 固定比较六组：
+
+|组别|权重与推理设置|主要归因|
+|---|---|---|
+|B0|原 checkpoint，无 evidence|原始导航基线|
+|B1|B1 权重，null ablation|adapter/继续训练本身|
+|B2|B2 权重，content ablation|历史 RGB 内容|
+|M1|M1 权重，spatial ablation|相对位姿、年龄和质量|
+|M2Z|M2-lr01 权重，推理时 task-state 置零|同权重下移除 task query 的因果对照|
+|M2|M2-lr01 权重，task-spatial ablation|完整原型|
+
+所有组运行排序后完全相同的 R2R val-unseen episodes，并保留每次 evidence 调用的有效历史数、task-state 范数、stage logits、read weights 和 null weights。read/null 权重用于确认是否真实读取历史；stage logits 在没有可靠阶段标签前只作为分布探针，不报告阶段准确率。4 个 episode 仍只用于接口、行为方向和归因诊断，不能作为 val-unseen 泛化结果。
+
+当前闭环输入协议明确标为：S2 使用当前/历史 RGB、指令和 Habitat GPS/compass 派生的理想相对位姿；S1/局部执行继续使用 RGB-D 与 pose。因而该版本属于 `RGB+Pose / RGB-D+Pose` 系统，不属于严格 single-RGB-only。纯 RGB、RGB+pose、RGB-D+pose 的正式分协议对照在闭环归因稳定后单独实施。

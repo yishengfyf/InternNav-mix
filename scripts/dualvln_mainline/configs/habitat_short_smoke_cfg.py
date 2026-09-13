@@ -5,11 +5,18 @@ from internnav.configs.evaluator import EnvCfg, EvalCfg
 
 
 variant = os.environ.get("DUALVLN_CLOSED_LOOP_VARIANT", "B0")
-if variant not in {"B0", "M2"}:
+if variant not in {"B0", "B1", "B2", "M1", "M2Z", "M2"}:
     raise ValueError(f"unsupported closed-loop variant: {variant}")
-adapter_path = os.environ.get("DUALVLN_EVIDENCE_ADAPTER") if variant == "M2" else None
-if variant == "M2" and not adapter_path:
-    raise ValueError("M2 closed-loop evaluation requires DUALVLN_EVIDENCE_ADAPTER")
+adapter_path = os.environ.get("DUALVLN_EVIDENCE_ADAPTER") if variant != "B0" else None
+if variant != "B0" and not adapter_path:
+    raise ValueError(f"{variant} closed-loop evaluation requires DUALVLN_EVIDENCE_ADAPTER")
+evidence_ablation = {
+    "B1": "null",
+    "B2": "content",
+    "M1": "spatial",
+    "M2Z": "spatial",
+    "M2": "task_spatial",
+}.get(variant)
 
 eval_cfg = EvalCfg(
     agent=AgentCfg(
@@ -18,6 +25,7 @@ eval_cfg = EvalCfg(
             "mode": "dual_system",
             "model_path": "/home/yifeifeng/workspace/InternNav/checkpoints/InternVLA-N1",
             "evidence_adapter_path": adapter_path,
+            "evidence_ablation": evidence_ablation,
             "num_history": 2,
             "resize_w": 384,
             "resize_h": 384,

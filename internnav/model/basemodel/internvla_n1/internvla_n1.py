@@ -190,6 +190,16 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             evidence_valid_mask,
             task_state,
         )
+        if getattr(self.config, "evidence_record_diagnostics", False):
+            with torch.no_grad():
+                self.latest_evidence_diagnostics = {
+                    "valid_history_count": evidence_valid_mask.sum(dim=1).detach().cpu().tolist(),
+                    "task_state_norm": task_state.float().norm(dim=-1).detach().cpu().tolist(),
+                    "stage_logits": evidence_output.stage_logits.float().detach().cpu().tolist(),
+                    "stage_probabilities": evidence_output.stage_logits.float().softmax(dim=-1).detach().cpu().tolist(),
+                    "read_weights": evidence_output.read_weights.float().detach().cpu().tolist(),
+                    "null_weights": evidence_output.null_weights.float().detach().cpu().tolist(),
+                }
         self._record_numeric("evidence_tokens", evidence_output.tokens)
         evidence_tokens = evidence_output.tokens
         if getattr(self.config, "numeric_diagnostics", False) and evidence_tokens.requires_grad:

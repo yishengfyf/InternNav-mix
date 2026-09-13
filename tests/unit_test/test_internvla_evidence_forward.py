@@ -111,6 +111,7 @@ def test_tiny_production_forward_injects_evidence_and_splits_s2_loss():
 
 def test_generate_latents_extends_attention_mask_for_trajectory_queries():
     model = tiny_model()
+    model.config.evidence_record_diagnostics = True
     model.config.system1 = "nextdit"
     model.config.n_query = 2
     task_state_estimator = model.model.task_state_estimator
@@ -154,6 +155,8 @@ def test_generate_latents_extends_attention_mask_for_trajectory_queries():
         evidence_prompt_lengths=torch.tensor([input_ids.shape[1]]),
     )
     assert result.shape[-1] == model.config.hidden_size
+    assert model.latest_evidence_diagnostics["valid_history_count"] == [1]
+    assert len(model.latest_evidence_diagnostics["read_weights"][0]) == model.config.num_evidence_tokens
     # The production latent path consumes the aligned mask before the final
     # transformer call; this regression test primarily asserts that no shape
     # mismatch is raised when evidence placeholders and trajectory queries coexist.

@@ -149,6 +149,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             adapter_path = getattr(self.model_args, "evidence_adapter_path", None)
             if adapter_path:
                 configure_task_spatial_inference(model_config)
+                evidence_ablation = getattr(self.model_args, "evidence_ablation", "task_spatial")
+                if evidence_ablation not in {"null", "content", "spatial", "task_spatial"}:
+                    raise ValueError(f"unsupported evidence ablation: {evidence_ablation}")
+                model_config.evidence_ablation = evidence_ablation
             model = InternVLAN1ForCausalLM.from_pretrained(
                 self.model_args.model_path,
                 config=model_config,
@@ -182,6 +186,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "mode": self.model_args.mode,
                     "evidence_enabled": bool(getattr(model.config, "use_evidence_memory", False)),
                     "evidence_adapter": self.adapter_manifest,
+                    "evidence_ablation": getattr(model.config, "evidence_ablation", None),
                     "depth_filter_backend": DEPTH_FILTER_BACKEND,
                     "dtw_backend": DTW_BACKEND,
                     "pose_source": "habitat_gps_compass_ideal_odometry",
@@ -376,6 +381,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             episode_start_time = time.monotonic()
             s2_calls = 0
             s2_latency_s = 0.0
+            evidence_trace = []
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id < self.max_steps_per_episode):
@@ -495,6 +501,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         ).sequences
                     s2_calls += 1
                     s2_latency_s += time.monotonic() - s2_start_time
+                    evidence_diagnostic = getattr(self.model, "latest_evidence_diagnostics", None)
+                    if evidence_diagnostic is not None:
+                        evidence_trace.append(
+                            {"step_id": step_id, "phase": "s2_generate", **copy.deepcopy(evidence_diagnostic)}
+                        )
 
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
@@ -523,6 +534,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 image_grid_thw,
                                 attention_mask=torch.ones_like(output_ids),
                                 **evidence_kwargs,
+                            )
+                        evidence_diagnostic = getattr(self.model, "latest_evidence_diagnostics", None)
+                        if evidence_diagnostic is not None:
+                            evidence_trace.append(
+                                {"step_id": step_id, "phase": "trajectory_latents", **copy.deepcopy(evidence_diagnostic)}
                             )
 
                         # prepocess align with navdp
@@ -679,6 +695,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "s2_latency_s": s2_latency_s,
                 "mean_s2_latency_s": s2_latency_s / max(s2_calls, 1),
                 "depth_filter_backend": DEPTH_FILTER_BACKEND,
+                "evidence_trace_events": len(evidence_trace),
+                "history_conditioned_events": sum(
+                    max(event["valid_history_count"], default=0) > 0 for event in evidence_trace
+                ),
             }
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
@@ -687,6 +707,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             os.makedirs(self.output_path, exist_ok=True)
             with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
                 f.write(json.dumps(result) + "\n")
+            if evidence_trace:
+                with open(os.path.join(self.output_path, "evidence_trace.jsonl"), "a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {"scene_id": scene_id, "episode_id": episode_id, "events": evidence_trace},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
 
             # save video
             if self.save_video and metrics['success'] == 1.0:

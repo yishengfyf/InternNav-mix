@@ -32,6 +32,7 @@ TASK_SPATIAL_INFERENCE_CONFIG = {
     "evidence_ablation": "task_spatial",
     "evidence_task_state_scale": 1.0,
     "evidence_normalize_task_state": False,
+    "evidence_record_diagnostics": True,
 }
 
 
