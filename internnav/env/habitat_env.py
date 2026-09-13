@@ -97,6 +97,12 @@ class HabitatEnv(base.Env):
         return self._last_obs
 
     def step(self, action: List[Any]):
+        # The legacy evaluator may probe a look-down frame after an action has
+        # already terminated the episode. Habitat rejects that second step;
+        # expose the terminal observation instead so metrics can be collected.
+        if self._env.episode_over:
+            info = self._env.get_metrics()
+            return self._env.get_observations(), info.get('reward', 0.0), True, info
         obs = self._env.step(action)
         done = self._env.episode_over
         info = self._env.get_metrics()
