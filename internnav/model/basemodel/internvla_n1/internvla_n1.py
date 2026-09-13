@@ -672,15 +672,14 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             if "positive_state" in task_aux:
                 valid = task_aux["pair_valid"].to(device=task_aux["anchor_state"].device, dtype=torch.bool)
                 if valid.any():
-                    positive_similarity = F.cosine_similarity(
-                        task_aux["anchor_state"], task_aux["positive_state"], dim=-1
-                    )
-                    negative_similarity = F.cosine_similarity(
-                        task_aux["anchor_state"], task_aux["negative_state"], dim=-1
-                    )
+                    anchor_state = F.normalize(task_aux["anchor_state"].float(), dim=-1)
+                    positive_state = F.normalize(task_aux["positive_state"].float(), dim=-1)
+                    negative_state = F.normalize(task_aux["negative_state"].float(), dim=-1)
+                    positive_distance = (anchor_state - positive_state).norm(dim=-1)
+                    negative_distance = (anchor_state - negative_state).norm(dim=-1)
                     margin = float(getattr(self.config, "evidence_task_contrastive_margin", 0.2))
-                    task_contrastive_loss = F.relu(
-                        margin - positive_similarity[valid] + negative_similarity[valid]
+                    task_contrastive_loss = (
+                        positive_distance[valid] + F.relu(margin - negative_distance[valid])
                     ).mean()
         weighted_losses = []
         if s2_loss is not None:
