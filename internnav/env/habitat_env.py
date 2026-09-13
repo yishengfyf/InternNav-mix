@@ -102,7 +102,7 @@ class HabitatEnv(base.Env):
         # expose the terminal observation instead so metrics can be collected.
         if self._env.episode_over:
             info = self._env.get_metrics()
-            return self._env.get_observations(), info.get('reward', 0.0), True, info
+            return self._last_obs, info.get('reward', 0.0), True, info
         obs = self._env.step(action)
         done = self._env.episode_over
         info = self._env.get_metrics()
