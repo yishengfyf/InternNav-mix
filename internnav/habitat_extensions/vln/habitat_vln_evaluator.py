@@ -65,6 +65,7 @@ from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 
 # Import for Habitat registry side effects — do not remove
 import internnav.habitat_extensions.vln.measures  # noqa: F401 # isort: skip
+from internnav.habitat_extensions.vln.measures import DTW_BACKEND
 
 
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -182,6 +183,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "evidence_enabled": bool(getattr(model.config, "use_evidence_memory", False)),
                     "evidence_adapter": self.adapter_manifest,
                     "depth_filter_backend": DEPTH_FILTER_BACKEND,
+                    "dtw_backend": DTW_BACKEND,
                     "pose_source": "habitat_gps_compass_ideal_odometry",
                     "max_episodes": cfg.env.env_settings.get("max_episodes"),
                     "max_steps_per_episode": self.max_steps_per_episode,

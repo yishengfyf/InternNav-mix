@@ -147,7 +147,25 @@ class StepsTaken(Measure):
         self._metric += 1.0
 
 
-from dtw import dtw
+try:
+    from dtw import dtw
+
+    DTW_BACKEND = "dtw_package"
+except ImportError:
+    DTW_BACKEND = "local_dynamic_programming"
+
+    def dtw(x, y, dist=euclidean_distance):
+        """Small dependency-free DTW fallback matching the evaluator's usage."""
+        if not x or not y:
+            return (float("inf"), None, None, None)
+        costs = np.full((len(x) + 1, len(y) + 1), np.inf, dtype=np.float64)
+        costs[0, 0] = 0.0
+        for i, x_item in enumerate(x, start=1):
+            for j, y_item in enumerate(y, start=1):
+                costs[i, j] = dist(x_item, y_item) + min(
+                    costs[i - 1, j], costs[i, j - 1], costs[i - 1, j - 1]
+                )
+        return (float(costs[-1, -1]), None, None, None)
 
 
 @registry.register_measure
