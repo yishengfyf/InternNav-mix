@@ -109,6 +109,39 @@ def test_tiny_production_forward_injects_evidence_and_splits_s2_loss():
     assert model.model.evidence_memory.output_projection.weight.grad is not None
 
 
+def test_generate_latents_extends_attention_mask_for_trajectory_queries():
+    model = tiny_model()
+    model.config.system1 = "nextdit"
+    model.config.n_query = 2
+    model.get_model().latent_queries = nn.Parameter(torch.zeros(1, 2, model.config.hidden_size))
+    model.model = nn.Module()  # make the base transformer call observable
+    model.model.embed_tokens = nn.Embedding(model.config.vocab_size, model.config.hidden_size)
+    model.model.device = torch.device("cpu")
+    model.visual = FakeVisual(model.config.hidden_size)
+    captured = {}
+
+    class FakeOutput:
+        hidden_states = (torch.zeros(1, 8, model.config.hidden_size),)
+
+    def fake_model(**kwargs):
+        captured["inputs_embeds"] = kwargs["inputs_embeds"]
+        captured["attention_mask"] = kwargs.get("attention_mask")
+        return FakeOutput()
+
+    model.model.forward = fake_model
+    input_ids = torch.tensor([[10, 151652, IMAGE_TOKEN_INDEX, 151653, 11]])
+    pixel_values = torch.zeros(1, 3)
+    image_grid_thw = torch.tensor([[1, 2, 2]])
+    result = model.generate_latents(
+        input_ids,
+        pixel_values,
+        image_grid_thw,
+        attention_mask=torch.ones_like(input_ids),
+    )
+    assert result.shape[-1] == model.config.hidden_size
+    assert captured["attention_mask"].shape[1] == input_ids.shape[1] + model.config.n_query
+
+
 def test_late_evidence_residual_is_position_specific_and_differentiable():
     hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
     evidence = torch.tensor([[[2.0, 0.0], [0.0, 3.0]]], requires_grad=True)
