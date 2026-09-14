@@ -21,7 +21,9 @@
     .instruction { margin:0 0 14px; padding:12px 14px; border-left:4px solid var(--blue); background:#fff; font-size:16px; }
     .meta { display:flex; flex-wrap:wrap; gap:8px 18px; margin-bottom:14px; color:var(--muted); }
     .current { display:grid; grid-template-columns:minmax(280px,620px) 1fr; gap:16px; align-items:start; }
-    .current img { display:block; width:100%; max-height:54vh; object-fit:contain; background:#111; }
+    .current img { display:block; width:100%; background:#111; }
+    .current-visual { position:relative; }
+    #goal-marker { position:absolute; transform:translate(-50%,-50%); width:28px; height:28px; border:2px solid white; border-radius:50%; background:#ae3b32; color:white; font-size:24px; line-height:22px; text-align:center; pointer-events:none; }
     .decision { padding:12px 14px; border:1px solid var(--line); background:#fff; }
     .decision strong { display:block; margin-bottom:6px; font-size:16px; }
     h2 { margin:18px 0 10px; font-size:16px; }
@@ -57,7 +59,7 @@
       <p class="instruction" id="instruction"></p>
       <div class="meta" id="meta"></div>
       <div class="current">
-        <img id="current-image" alt="当前 RGB">
+        <div class="current-visual"><img id="current-image" alt="当前 RGB"><span id="goal-marker" title="专家当前局部像素目标" hidden>+</span></div>
         <div class="decision"><strong>专家局部决策</strong><div id="action"></div><div id="goal"></div></div>
       </div>
       <h2>因果历史候选</h2>
@@ -77,7 +79,7 @@
   </main>
   <script>
     const options={need_history:['yes','no','uncertain'],evidence_role:['localization','direction','landmark','revisit','safety','none','uncertain'],confidence:['high','medium','low']};
-    let rows=[],index=0,stateKey='dualvln_annotation_pilot_v1';
+    let rows=[],baseRows=[],index=0,stateKey='dualvln_annotation_pilot_v1';
     const $=id=>document.getElementById(id);
     function radioGroup(id,values){$(id).innerHTML=values.map(v=>`<label class="choice"><input type="radio" name="${id}" value="${v}">${v}</label>`).join('')}
     function checkGroup(id,values){$(id).innerHTML=values.map(v=>`<label class="choice"><input type="checkbox" name="${id}" value="${v}">${v}</label>`).join('')}
@@ -89,6 +91,11 @@
     const originalRender = render;
     render = function () {
       originalRender();
+      const image = $('current-image'), marker = $('goal-marker'), goal = rows[index].context.expert_local_goal;
+      marker.hidden = !goal;
+      const placeMarker = () => { if(goal && image.naturalWidth){marker.style.left=(100*goal[0]/image.naturalWidth)+'%';marker.style.top=(100*goal[1]/image.naturalHeight)+'%';} };
+      image.onload = placeMarker;
+      placeMarker();
       rows[index].candidates.forEach((candidate, i) => {
         const detail = document.createElement('div');
         detail.textContent = `相对位置 dx ${candidate.relative_pose.dx.toFixed(2)}m / dy ${candidate.relative_pose.dy.toFixed(2)}m`;
@@ -96,15 +103,16 @@
       });
     };
     function save(requireValid=true){let a=annotation(),err=valid(a);if(requireValid&&err){$('status').textContent=err;$('status').className='status error';return false}rows[index].annotation=a;rows[index].annotator_id=$('annotator').value.trim();rows[index].created_at=new Date().toISOString();persist();$('status').textContent='已保存在本浏览器';$('status').className='status';renderProgress();return true}
-    function renderProgress(){let done=rows.filter(x=>x.annotation&&x.annotation.need_history).length;$('progress').textContent=`${index+1}/${rows.length} · 已完成 ${done}`;$('bar').style.width=`${100*done/rows.length}%`}
+    function renderProgress(){let done=rows.filter(x=>x.annotation&&!valid(x.annotation)).length;$('progress').textContent=`${index+1}/${rows.length} · 已完成 ${done}`;$('bar').style.width=`${100*done/rows.length}%`}
     function render(){let r=rows[index],a=r.annotation||{};$('instruction').textContent=r.instruction;$('meta').textContent=`${r.annotation_id} · scene ${r.scene_id} · episode ${r.episode_id} · frame ${r.current_frame_id}`;$('current-image').src=r.current_image_path;$('action').textContent=r.context.expert_action;$('goal').textContent=r.context.expert_local_goal?`像素目标：${r.context.expert_local_goal.join(', ')}`:'像素目标：不适用';$('history').innerHTML=r.candidates.map(c=>`<article><img src="${c.image_path}" alt="历史 ${c.label}"><div class="caption"><span class="tag">${c.label}</span>frame ${c.frame_id} · age ${c.age}<br>距离 ${c.relative_pose.distance.toFixed(2)}m · 朝向 ${c.relative_pose.dyaw_deg.toFixed(1)}°</div></article>`).join('');setChecked('need_history',a.need_history||'');setChecked('preferred_evidence',a.preferred_evidence||[]);setChecked('evidence_role',a.evidence_role||'');setChecked('misleading_evidence',a.misleading_evidence||[]);setChecked('confidence',a.confidence||'');$('reason').value=a.short_reason||'';$('annotator').value=r.annotator_id||$('annotator').value||'annotator_01';$('reason-count').textContent=$('reason').value.length;$('prev').disabled=index===0;$('next').disabled=index===rows.length-1;$('status').textContent='';renderProgress()}
-    async function load(){let text=await fetch('annotations_template.jsonl').then(r=>r.text()),base=text.trim().split(/\n/).map(JSON.parse);stateKey='dualvln_final_v2_'+base[0].annotation_id+'_'+base.length;let saved=JSON.parse(localStorage.getItem(stateKey)||'null');rows=base;if(saved&&saved.length===base.length&&saved.every((r,i)=>r.annotation_id===base[i].annotation_id)){rows.forEach((r,i)=>{r.annotation=saved[i].annotation;r.annotator_id=saved[i].annotator_id;r.created_at=saved[i].created_at})}render()}
+    async function load(){let text=await fetch('annotations_template.jsonl').then(r=>r.text()),base=text.trim().split(/\n/).map(JSON.parse);baseRows=structuredClone(base);stateKey='dualvln_final_v2_'+base[0].annotation_id+'_'+base.length;let saved=JSON.parse(localStorage.getItem(stateKey)||'null');rows=base;if(saved&&saved.length===base.length&&saved.every((r,i)=>r.annotation_id===base[i].annotation_id)){rows.forEach((r,i)=>{r.annotation=saved[i].annotation;r.annotator_id=saved[i].annotator_id;r.created_at=saved[i].created_at})}render()}
     function exportRows(){save(false);let blob=new Blob([rows.map(x=>JSON.stringify(x)).join('\n')+'\n'],{type:'application/jsonl'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`dualvln_annotations_${$('annotator').value.trim()||'anonymous'}.jsonl`;a.click();URL.revokeObjectURL(a.href)}
     radioGroup('need_history',options.need_history);radioGroup('evidence_role',options.evidence_role);radioGroup('confidence',options.confidence);checkGroup('preferred_evidence',['A','B','C','none','uncertain']);checkGroup('misleading_evidence',['A','B','C','none','uncertain']);
     $('reason').oninput=()=>{$('reason-count').textContent=$('reason').value.length};$('save').onclick=()=>{if(save()&&index<rows.length-1){index++;render()}};$('prev').onclick=()=>{save(false);index--;render()};$('next').onclick=()=>{save(false);index++;render()};$('export').onclick=exportRows;$('file').onchange=async e=>{let text=await e.target.files[0].text();let imported=text.trim().split(/\n/).map(JSON.parse);if(imported.length!==rows.length||imported[0].annotation_id!==rows[0].annotation_id){alert('导入文件与当前 pilot 不匹配');return}rows=imported;persist();render()};
     document.addEventListener('change',e=>{if(['preferred_evidence','misleading_evidence'].includes(e.target.name)){let exclusive=['none','uncertain'];if(exclusive.includes(e.target.value)&&e.target.checked){document.querySelectorAll(`[name=${e.target.name}]`).forEach(x=>{if(x!==e.target)x.checked=false})}else if(e.target.checked){document.querySelectorAll(`[name=${e.target.name}]`).forEach(x=>{if(exclusive.includes(x.value))x.checked=false})}}if(e.target.name==='preferred_evidence'&&checked('preferred_evidence').filter(x=>['A','B','C'].includes(x)).length>2){e.target.checked=false;$('status').textContent='有效证据最多选择两项';$('status').className='status error'}});
     let draftTimer;
     document.querySelector('aside').addEventListener('input',()=>{clearTimeout(draftTimer);draftTimer=setTimeout(()=>save(false),300)});
+    $('file').onchange=async e=>{try{const imported=(await e.target.files[0].text()).trim().split(/\n/).map(JSON.parse);if(imported.length!==baseRows.length||!imported.every((r,i)=>r.annotation_id===baseRows[i].annotation_id&&r.annotation&&Array.isArray(r.annotation.preferred_evidence)&&Array.isArray(r.annotation.misleading_evidence))){throw Error('标注 ID 或字段格式不匹配')}rows=structuredClone(baseRows);rows.forEach((r,i)=>{r.annotation=imported[i].annotation;r.annotator_id=imported[i].annotator_id;r.created_at=imported[i].created_at});persist();render()}catch(e){$('status').textContent='导入失败：'+e.message;$('status').className='status error'}};
     load().catch(e=>{$('status').textContent='载入失败：'+e;$('status').className='status error'});
   </script>
 </body>
