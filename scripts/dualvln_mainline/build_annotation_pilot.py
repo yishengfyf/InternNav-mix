@@ -130,6 +130,20 @@ def local_goal(value):
     return None
 
 
+def decision_for_frame(frame_id, actions, goals, relative_goal_ids):
+    shifted_action = actions[frame_id + 1] if frame_id + 1 < len(actions) else 0
+    relative_goal_id = int(scalar(relative_goal_ids[frame_id])) if relative_goal_ids else -1
+    goal = local_goal(goals[frame_id]) if goals else None
+    if relative_goal_id >= 3:
+        return ("pixel_goal", goal) if goal is not None else (None, None)
+    if relative_goal_id != -1:
+        return None, None
+    action = action_name(shifted_action)
+    if relative_goal_id == -1 and action == "forward":
+        return None, None
+    return action, None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", required=True, type=Path)
@@ -164,21 +178,28 @@ def main():
         episode = by_ep.get(ep_id, {})
         task_ids = cols.get("task_index", [0])
         instruction = (episode.get("tasks") or [tasks.get(int(scalar(task_ids[0])), "")])[0]
-        pose_col = find_column(table, ["pose.125cm_0deg", "pose.rgb", "pose.rgb_front", "pose"])
+        pose_col = find_column(table, ["pose.60cm_15deg"])
         action_col = find_column(table, ["action", "actions"])
-        goal_col = find_column(table, ["goal.125cm_0deg", "goal.rgb", "goal"])
+        goal_col = find_column(table, ["goal.60cm_15deg"])
+        relative_goal_col = find_column(table, ["relative_goal_frame_id.60cm_15deg"])
         if not pose_col:
             continue
         poses = cols[pose_col]
         actions = cols.get(action_col, [None] * n)
+        decision_actions = actions[1:] + [0]
+        goals = cols.get(goal_col, [])
+        relative_goal_ids = cols.get(relative_goal_col, [])
         audit["episodes"] += 1
         audit["frames"] += n
         episode_added = 0
         frame_candidates = sorted(set([max(2, n // 3), max(2, n // 2), max(2, (2 * n) // 3), max(2, n - 2)]))
         for i in frame_candidates:
+            expert_action, expert_goal = decision_for_frame(i, actions, goals, relative_goal_ids)
+            if expert_action is None:
+                continue
             pool = []
             for j in range(max(0, i - 40), i):
-                score, rp = candidate_score(i, j, poses, actions)
+                score, rp = candidate_score(i, j, poses, decision_actions)
                 if score < 0 or rp is None:
                     continue
                 pool.append((score, j, rp))
@@ -211,6 +232,7 @@ def main():
                 continue
             current_image = image_path(args.data_root, ep_id, i)
             history_items = [{"label": label, "frame_id": j, "age": i-j, "relative_pose": rp,
+                              "quality": {"pose": 1.0, "observation": 1.0},
                               "image_path": image_path(args.data_root, ep_id, j)}
                              for label, (_, j, rp) in zip(labels, selected)]
             if not current_image or any(not x["image_path"] for x in history_items):
@@ -223,8 +245,8 @@ def main():
                 "instruction": instruction, "candidate_frame_ids": [j for _, j, _ in selected],
                 "candidate_display_order": labels,
                 "causal_check": {"all_history_before_current": True, "future_input_exposed": False},
-                "context": {"expert_action": action_name(actions[i]),
-                            "expert_local_goal": local_goal(cols[goal_col][i]) if goal_col else None,
+                "context": {"expert_action": expert_action,
+                            "expert_local_goal": expert_goal,
                             "relative_pose_available": True},
                 "current_image_path": current_image, "candidates": history_items,
                 "annotation": {"need_history": "", "preferred_evidence": [], "evidence_role": "",

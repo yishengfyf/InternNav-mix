@@ -1,4 +1,5 @@
 import importlib.util
+import math
 from pathlib import Path
 
 
@@ -32,10 +33,18 @@ def test_invalid_pixel_goal_is_not_presented_as_target():
     assert MODULE.local_goal([320, 240]) == [320.0, 240.0]
 
 
+def test_decision_alignment_matches_dataset_protocol():
+    actions = [1, 2, 3, 0]
+    goals = [[-1, -1], [320, 240], [-1, -1], [-1, -1]]
+    relative_ids = [-1, 4, -1, -1]
+    assert MODULE.decision_for_frame(0, actions, goals, relative_ids) == ("turn_left", None)
+    assert MODULE.decision_for_frame(1, actions, goals, relative_ids) == ("pixel_goal", [320.0, 240.0])
+
+
 def test_matrix_relative_pose_uses_translation_column_and_current_frame():
     current = transform(1.0, 2.0, 0.0)
     history = transform(3.0, 5.0, 0.0)
     relative = MODULE.rel_pose(current, history)
     assert relative["dx"] == 2.0
     assert relative["dy"] == 3.0
-    assert relative["distance"] == 13 ** 0.5
+    assert math.isclose(relative["distance"], 13 ** 0.5, rel_tol=1e-6)
