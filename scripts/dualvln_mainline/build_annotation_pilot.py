@@ -32,6 +32,8 @@ def as_float_list(value):
 
 def yaw_from_pose(pose):
     pose = as_float_list(pose)
+    if len(pose) == 16:
+        return math.atan2(pose[4], pose[0])
     if len(pose) >= 3:
         return float(pose[2])
     if len(pose) >= 7:
@@ -54,6 +56,8 @@ def action_name(action):
     a = as_float_list(action)
     if not a:
         return "unknown"
+    if len(a) == 1:
+        return {0: "forward", 1: "turn_left", 2: "turn_right", 3: "look_down", 4: "stop"}.get(int(a[0]), "unknown")
     if len(a) >= 2:
         if abs(a[1]) < 0.05 and abs(a[0]) < 0.05:
             return "stop"
@@ -114,6 +118,7 @@ def main():
     meta = args.data_root / "meta"
     episodes = read_jsonl(meta / "episodes.jsonl")
     by_ep = {int(e.get("episode_index", e.get("episode_id", -1))): e for e in episodes}
+    tasks = {int(e.get("task_index", -1)): str(e.get("task", "")).strip() for e in read_jsonl(meta / "tasks.jsonl")}
     parquet_paths = sorted((args.data_root / "data").glob("chunk-*/*.parquet"))
     if args.max_episodes:
         parquet_paths = parquet_paths[:args.max_episodes]
@@ -130,11 +135,11 @@ def main():
         ep_ids = cols.get("episode_index", [path.stem] * n)
         ep_id = int(scalar(ep_ids[0]))
         episode = by_ep.get(ep_id, {})
-        tasks = str(scalar(cols.get("tasks", [""])[0]))
-        instruction = tasks.split("<INSTRUCTION_SEP>")[0].strip()
-        pose_col = find_column(table, ["pose.rgb", "pose.rgb_front", "pose"])
+        task_ids = cols.get("task_index", [0])
+        instruction = tasks.get(int(scalar(task_ids[0])), "")
+        pose_col = find_column(table, ["pose.125cm_0deg", "pose.rgb", "pose.rgb_front", "pose"])
         action_col = find_column(table, ["action", "actions"])
-        goal_col = find_column(table, ["goal.rgb", "goal"])
+        goal_col = find_column(table, ["goal.125cm_0deg", "goal.rgb", "goal"])
         if not pose_col:
             continue
         poses = cols[pose_col]
