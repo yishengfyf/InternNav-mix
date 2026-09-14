@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import random
+import shutil
 from pathlib import Path
 
 
@@ -77,10 +78,10 @@ def find_column(table, names):
     return None
 
 
-def image_path(root, episode_id, frame_id, rgb_dir):
+def image_path(root, episode_id, frame_id, rgb_dir="observation.images.rgb.60cm_15deg"):
     candidates = [
-        root / "videos" / rgb_dir / f"episode_{episode_id:06d}.mp4",
-        root / "video" / rgb_dir / f"episode_{episode_id:06d}.mp4",
+        root / "videos" / "chunk-000" / rgb_dir / f"episode_{episode_id:06d}_{frame_id}.jpg",
+        root / "videos" / "chunk-000" / rgb_dir / f"episode_{episode_id:06d}_{frame_id:03d}.jpg",
     ]
     for path in candidates:
         if path.exists():
@@ -138,7 +139,7 @@ def main():
         ep_id = int(scalar(ep_ids[0]))
         episode = by_ep.get(ep_id, {})
         task_ids = cols.get("task_index", [0])
-        instruction = tasks.get(int(scalar(task_ids[0])), "")
+        instruction = (episode.get("tasks") or [tasks.get(int(scalar(task_ids[0])), "")])[0]
         pose_col = find_column(table, ["pose.125cm_0deg", "pose.rgb", "pose.rgb_front", "pose"])
         action_col = find_column(table, ["action", "actions"])
         goal_col = find_column(table, ["goal.125cm_0deg", "goal.rgb", "goal"])
@@ -148,6 +149,7 @@ def main():
         actions = cols.get(action_col, [None] * n)
         audit["episodes"] += 1
         audit["frames"] += n
+        episode_added = 0
         for i in range(2, n):
             pool = []
             for j in range(max(0, i - 40), i):
@@ -168,6 +170,13 @@ def main():
             if not future_ok:
                 audit["causal_violations"] += 1
                 continue
+            current_image = image_path(args.data_root, ep_id, i)
+            history_items = [{"label": label, "frame_id": j, "age": i-j, "relative_pose": rp,
+                              "image_path": image_path(args.data_root, ep_id, j)}
+                             for label, (_, j, rp) in zip(labels, selected)]
+            if not current_image or any(not x["image_path"] for x in history_items):
+                audit["missing_rgb"] += 1
+                continue
             item = {
                 "schema_version": 1, "annotation_id": annotation_id, "split": "train",
                 "scene_id": episode.get("scene_id", episode.get("scene", "unknown")),
@@ -178,26 +187,65 @@ def main():
                 "context": {"expert_action": action_name(actions[i]),
                             "expert_local_goal": as_float_list(cols[goal_col][i]) if goal_col else [],
                             "relative_pose_available": True},
-                "candidates": [{"label": label, "frame_id": j, "age": i-j, "relative_pose": rp,
-                                "image_path": None} for label, (_, j, rp) in zip(labels, selected)],
+                "current_image_path": current_image, "candidates": history_items,
                 "annotation": {"need_history": "", "preferred_evidence": [], "evidence_role": "",
                                "misleading_evidence": [], "confidence": "", "short_reason": ""},
                 "annotator_id": "", "created_at": ""
             }
             candidates.append(item)
             audit["candidate_pool"] += 1
-            if len(candidates) >= args.limit:
+            episode_added += 1
+            if episode_added >= 2:
                 break
         if len(candidates) >= args.limit:
             break
     if not candidates:
         raise SystemExit("未生成候选：请检查 parquet 字段、pose 列和数据路径")
     args.output.mkdir(parents=True, exist_ok=True)
+    images = args.output / "images"
+    images.mkdir(exist_ok=True)
+    for item in candidates:
+        paths = [item["current_image_path"]] + [x["image_path"] for x in item["candidates"]]
+        for source in paths:
+            target = images / (item["annotation_id"] + "_" + Path(source).name)
+            shutil.copy2(source, target)
+        item["current_image_path"] = "images/" + (item["annotation_id"] + "_" + Path(paths[0]).name)
+        for x, source in zip(item["candidates"], paths[1:]):
+            x["image_path"] = "images/" + (item["annotation_id"] + "_" + Path(source).name)
     (args.output / "annotations_template.jsonl").write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in candidates) + "\n")
     (args.output / "candidate_manifest.jsonl").write_text("\n".join(json.dumps({k:v for k,v in x.items() if k != 'annotation'}, ensure_ascii=False) for x in candidates) + "\n")
     (args.output / "candidate_stats.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n")
     (args.output / "source_manifest.json").write_text(json.dumps({"data_root": str(args.data_root), "seed": args.seed, "limit": args.limit}, ensure_ascii=False, indent=2) + "\n")
     (args.output / "schema.json").write_text(json.dumps({"schema_version": 1, "annotation_fields": ["need_history", "preferred_evidence", "evidence_role", "misleading_evidence", "confidence", "short_reason"]}, ensure_ascii=False, indent=2) + "\n")
+    cards = args.output / "cards"
+    cards.mkdir(exist_ok=True)
+    for item in candidates:
+        rows = ["<h2>%s</h2><p>指令：%s</p><p>当前动作：%s；当前帧：%s</p>" % (item["annotation_id"], item["instruction"], item["context"]["expert_action"], item["current_frame_id"]),
+                '<h3>当前帧</h3><img src="../%s" width="480">' % item["current_image_path"]]
+        for c in item["candidates"]:
+            rp = c["relative_pose"]
+            rows.append('<h3>历史 %s（frame %s，age %s，距当前 %.2fm，朝向 %.1f°）</h3><img src="../%s" width="320">' % (c["label"], c["frame_id"], c["age"], rp["distance"], rp["dyaw_deg"], c["image_path"]))
+        rows.append("<p>人工填写：need_history / preferred_evidence / evidence_role / misleading_evidence / confidence / short_reason</p>")
+        (cards / (item["annotation_id"] + ".html")).write_text("<html><meta charset='utf-8'><body>%s</body></html>" % "\n".join(rows), encoding="utf-8")
+    metrics = {"candidate_count": len(candidates), "episodes_with_candidates": len(set(x["episode_id"] for x in candidates)),
+               "causal_all_history_before_current": audit["causal_violations"] == 0,
+               "future_input_exposed": False, "missing_rgb_candidates": audit["missing_rgb"]}
+    (args.output / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n")
+    summary = """# DualVLN 人工证据标注 Pilot 自动挖掘结果
+
+本目录只包含程序生成的候选，不包含人工标签。候选排序启发式不是监督标签，后续必须由人工填写 `annotation` 字段。
+
+- 候选数：%d
+- 覆盖 episode 数：%d
+- 因果前缀检查：%s
+- 未来输入暴露：否
+- RGB 缺失候选：%d
+
+下一步：先抽查 HTML 卡片和图像，再由第一位标注者填写 30--40 张；其中约 20--30%% 交给第二位标注者复核。只有一致性和 relevance probe 达标后，才扩展到 100--200 张。
+""" % (metrics["candidate_count"], metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败", metrics["missing_rgb_candidates"])
+    (args.output / "summary.md").write_text(summary, encoding="utf-8")
+    svg = "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='220'><rect width='100%%' height='100%%' fill='white'/><text x='24' y='32' font-size='20'>Annotation pilot candidate audit</text><text x='24' y='78'>候选数</text><rect x='140' y='60' width='%d' height='24' fill='#3878c7'/><text x='150' y='78' fill='white'>%d</text><text x='24' y='124'>覆盖 episode</text><rect x='140' y='106' width='%d' height='24' fill='#4b9e62'/><text x='150' y='124' fill='white'>%d</text><text x='24' y='170'>因果检查：%s</text></svg>" % (min(420, metrics["candidate_count"] * 10), metrics["candidate_count"], min(420, metrics["episodes_with_candidates"] * 10), metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败")
+    (args.output / "metrics.svg").write_text(svg, encoding="utf-8")
     print(json.dumps({"generated": len(candidates), **audit}, ensure_ascii=False))
 
 
