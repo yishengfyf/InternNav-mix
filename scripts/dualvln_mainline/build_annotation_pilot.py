@@ -150,7 +150,8 @@ def main():
         audit["episodes"] += 1
         audit["frames"] += n
         episode_added = 0
-        for i in range(2, n):
+        frame_candidates = sorted(set([max(2, n // 3), max(2, n // 2), max(2, (2 * n) // 3), max(2, n - 2)]))
+        for i in frame_candidates:
             pool = []
             for j in range(max(0, i - 40), i):
                 score, rp = candidate_score(i, j, poses, actions)
@@ -159,8 +160,22 @@ def main():
                 pool.append((score, j, rp))
             if len(pool) < 2:
                 continue
+            # Stratify ages so cards contain recent, medium and older evidence.
             pool.sort(reverse=True)
-            selected = pool[:3]
+            strata = [[], [], []]
+            for entry in pool:
+                age = i - entry[1]
+                strata[0 if age <= 3 else 1 if age <= 10 else 2].append(entry)
+            selected = []
+            for bucket in strata:
+                if bucket:
+                    selected.append(bucket[0])
+            for entry in pool:
+                if len(selected) >= 3:
+                    break
+                if entry not in selected:
+                    selected.append(entry)
+            selected = selected[:3]
             if len(selected) < 2:
                 continue
             rng.shuffle(selected)
