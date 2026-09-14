@@ -178,3 +178,9 @@ B1/B2/M1/M2 使用相同的新训练数据、更新步数、历史帧、token �
 R1P 使用同一视觉与历史输入构造三元组：anchor 为转换样本的原指令，positive 为同一官方 `trajectory_id` 的另一条人工指令，negative 为不同 `trajectory_id` 的指令。监督继续施加在 memory 实际使用的 `task_projection` query 空间。它只约束路线级任务身份，不提供当前任务阶段或哪一帧历史最相关的真值。
 
 公平对照固定为 R0P 与 R1P：两组使用相同 8 条官方路径、seed、初始化、80 steps、instruction-only task-state 与 task-state `0.1x` 学习率；R1P 唯一增加路径复述对比 loss。训练后各自在 32 个真实因果样本上同时测量同路径复述变化和异路径指令变化。进入闭环必须同时满足：梯度有限且冻结参数无梯度；R1P 的 S2/trajectory 最终损失不超过 R0P 的 `105%/110%`；异路径 task cosine `<0.995`、relative L2 `>0.05`，且 read L1 `>=0.01` 或 stage 翻转 `>=0.1`；同路径复述必须在 task-state 距离和 read L1 上均比异路径更接近。任一条件失败即停止继续叠加 task-state 辅助损失，转向 evidence relevance 或同地点不同阶段监督。
+
+## 人工证据偏好标注 Pilot（2026-09-14）
+
+R1P 已证明官方同路径复述监督可以保持原生损失与复述一致性，但仍未让 reader 对异路径产生足够敏感的读取差异。因此下一阶段不继续叠加无专家依据的 task-state 辅助损失，而是按《DualVLN人工标注阶段规范》先验证人类能否稳定判断“哪些因果历史更支持当前局部决策”。
+
+新增 `scripts/dualvln_mainline/build_annotation_pilot.py`，只读取 R2R train 的专家轨迹、当前/历史 RGB、位姿、动作与局部目标。候选历史严格满足 `history_frame_id < current_frame_id`，程序启发式只负责筛选和随机显示，不生成 preferred evidence 标签。首轮固定 40 张、覆盖 20 个 episode，每个时刻展示 3 个按近期/中期/较旧年龄分层的历史候选。质量门槛为：卡片与图像完整、无未来信息、人工标签一致性可接受，以及 relevance probe 优于随机/最近帧基线。在这些门槛通过前不扩大标注规模，也不启动新一轮训练或闭环。

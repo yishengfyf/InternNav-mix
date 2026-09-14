@@ -18,6 +18,14 @@ def read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def scalar(value):
     if hasattr(value, "tolist"):
         value = value.tolist()
@@ -230,7 +238,12 @@ def main():
     (args.output / "annotations_template.jsonl").write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in candidates) + "\n")
     (args.output / "candidate_manifest.jsonl").write_text("\n".join(json.dumps({k:v for k,v in x.items() if k != 'annotation'}, ensure_ascii=False) for x in candidates) + "\n")
     (args.output / "candidate_stats.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n")
-    (args.output / "source_manifest.json").write_text(json.dumps({"data_root": str(args.data_root), "seed": args.seed, "limit": args.limit}, ensure_ascii=False, indent=2) + "\n")
+    script_path = Path(__file__).resolve()
+    sources = {str(path.relative_to(args.data_root)): sha256(path) for path in
+               [meta / "episodes.jsonl", meta / "tasks.jsonl", meta / "info.json"]}
+    (args.output / "source_manifest.json").write_text(json.dumps({"data_root": str(args.data_root), "seed": args.seed, "limit": args.limit,
+                                                                   "script_path": str(script_path), "script_sha256": sha256(script_path),
+                                                                   "source_sha256": sources}, ensure_ascii=False, indent=2) + "\n")
     (args.output / "schema.json").write_text(json.dumps({"schema_version": 1, "annotation_fields": ["need_history", "preferred_evidence", "evidence_role", "misleading_evidence", "confidence", "short_reason"]}, ensure_ascii=False, indent=2) + "\n")
     cards = args.output / "cards"
     cards.mkdir(exist_ok=True)
@@ -259,6 +272,8 @@ def main():
 下一步：先抽查 HTML 卡片和图像，再由第一位标注者填写 30--40 张；其中约 20--30%% 交给第二位标注者复核。只有一致性和 relevance probe 达标后，才扩展到 100--200 张。
 """ % (metrics["candidate_count"], metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败", metrics["missing_rgb_candidates"])
     (args.output / "summary.md").write_text(summary, encoding="utf-8")
+    (args.output / "README.md").write_text("# 标注目录使用说明\n\n先打开 `cards/` 中的 HTML 抽查候选，再在 `annotations_template.jsonl` 的 `annotation` 内填写人工字段。禁止修改帧号、位姿、动作和因果检查字段。当前文件不含人工标签。\n", encoding="utf-8")
+    (args.output / "run.log").write_text(json.dumps({"status": "completed", **metrics}, ensure_ascii=False) + "\n", encoding="utf-8")
     svg = "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='220'><rect width='100%%' height='100%%' fill='white'/><text x='24' y='32' font-size='20'>Annotation pilot candidate audit</text><text x='24' y='78'>候选数</text><rect x='140' y='60' width='%d' height='24' fill='#3878c7'/><text x='150' y='78' fill='white'>%d</text><text x='24' y='124'>覆盖 episode</text><rect x='140' y='106' width='%d' height='24' fill='#4b9e62'/><text x='150' y='124' fill='white'>%d</text><text x='24' y='170'>因果检查：%s</text></svg>" % (min(420, metrics["candidate_count"] * 10), metrics["candidate_count"], min(420, metrics["episodes_with_candidates"] * 10), metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败")
     (args.output / "metrics.svg").write_text(svg, encoding="utf-8")
     print(json.dumps({"generated": len(candidates), **audit}, ensure_ascii=False))
