@@ -27,6 +27,8 @@ def scalar(value):
 
 def as_float_list(value):
     value = scalar(value)
+    if isinstance(value, list) and value and isinstance(value[0], list):
+        value = [x for row in value for x in row]
     return [float(x) for x in value] if isinstance(value, (list, tuple)) else []
 
 
