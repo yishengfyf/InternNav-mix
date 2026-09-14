@@ -57,18 +57,27 @@ def rel_pose(current, history):
     c, h = as_float_list(current), as_float_list(history)
     if len(c) < 2 or len(h) < 2:
         return None
-    dx, dy = h[0] - c[0], h[1] - c[1]
+    if len(c) == 16 and len(h) == 16:
+        world_dx, world_dy = h[3] - c[3], h[7] - c[7]
+        current_yaw = yaw_from_pose(current)
+        dx = math.cos(current_yaw) * world_dx + math.sin(current_yaw) * world_dy
+        dy = -math.sin(current_yaw) * world_dx + math.cos(current_yaw) * world_dy
+    else:
+        dx, dy = h[0] - c[0], h[1] - c[1]
     dyaw = (yaw_from_pose(history) - yaw_from_pose(current) + math.pi) % (2 * math.pi) - math.pi
     return {"dx": dx, "dy": dy, "distance": math.hypot(dx, dy),
             "dyaw_rad": dyaw, "dyaw_deg": math.degrees(dyaw)}
 
 
 def action_name(action):
+    action = scalar(action)
+    if isinstance(action, (int, float)):
+        return {0: "stop", 1: "forward", 2: "turn_left", 3: "turn_right", 5: "look_down"}.get(int(action), "unknown")
     a = as_float_list(action)
     if not a:
         return "unknown"
     if len(a) == 1:
-        return {0: "forward", 1: "turn_left", 2: "turn_right", 3: "look_down", 4: "stop"}.get(int(a[0]), "unknown")
+        return {0: "stop", 1: "forward", 2: "turn_left", 3: "turn_right", 5: "look_down"}.get(int(a[0]), "unknown")
     if len(a) >= 2:
         if abs(a[1]) < 0.05 and abs(a[0]) < 0.05:
             return "stop"
@@ -112,6 +121,13 @@ def candidate_score(i, j, poses, actions):
     if action_name(actions[i]) != action_name(actions[j]):
         score += 0.7
     return score, rp
+
+
+def local_goal(value):
+    goal = as_float_list(value)
+    if len(goal) >= 2 and goal[0] >= 0 and goal[1] >= 0:
+        return goal[:2]
+    return None
 
 
 def main():
@@ -202,13 +218,13 @@ def main():
                 continue
             item = {
                 "schema_version": 1, "annotation_id": annotation_id, "split": "train",
-                "scene_id": episode.get("scene_id", episode.get("scene", "unknown")),
+                "scene_id": episode.get("scene_id", episode.get("scene", args.data_root.name)),
                 "episode_id": str(ep_id), "current_frame_id": i,
                 "instruction": instruction, "candidate_frame_ids": [j for _, j, _ in selected],
                 "candidate_display_order": labels,
                 "causal_check": {"all_history_before_current": True, "future_input_exposed": False},
                 "context": {"expert_action": action_name(actions[i]),
-                            "expert_local_goal": as_float_list(cols[goal_col][i]) if goal_col else [],
+                            "expert_local_goal": local_goal(cols[goal_col][i]) if goal_col else None,
                             "relative_pose_available": True},
                 "current_image_path": current_image, "candidates": history_items,
                 "annotation": {"need_history": "", "preferred_evidence": [], "evidence_role": "",
@@ -245,6 +261,10 @@ def main():
                                                                    "script_path": str(script_path), "script_sha256": sha256(script_path),
                                                                    "source_sha256": sources}, ensure_ascii=False, indent=2) + "\n")
     (args.output / "schema.json").write_text(json.dumps({"schema_version": 1, "annotation_fields": ["need_history", "preferred_evidence", "evidence_role", "misleading_evidence", "confidence", "short_reason"]}, ensure_ascii=False, indent=2) + "\n")
+    ui_source = Path(__file__).with_name("annotation_ui.html")
+    if not ui_source.exists():
+        raise SystemExit("缺少标注页面模板: %s" % ui_source)
+    shutil.copy2(ui_source, args.output / "index.html")
     cards = args.output / "cards"
     cards.mkdir(exist_ok=True)
     for item in candidates:
@@ -272,7 +292,7 @@ def main():
 下一步：先抽查 HTML 卡片和图像，再由第一位标注者填写 30--40 张；其中约 20--30%% 交给第二位标注者复核。只有一致性和 relevance probe 达标后，才扩展到 100--200 张。
 """ % (metrics["candidate_count"], metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败", metrics["missing_rgb_candidates"])
     (args.output / "summary.md").write_text(summary, encoding="utf-8")
-    (args.output / "README.md").write_text("# 标注目录使用说明\n\n先打开 `cards/` 中的 HTML 抽查候选，再在 `annotations_template.jsonl` 的 `annotation` 内填写人工字段。禁止修改帧号、位姿、动作和因果检查字段。当前文件不含人工标签。\n", encoding="utf-8")
+    (args.output / "README.md").write_text("# 标注目录使用说明\n\n推荐启动本地静态服务后打开 `index.html`：页面支持逐张填写、浏览器自动暂存、导入已有 JSONL 和导出标注 JSONL。也可以打开 `cards/` 中的只读 HTML 抽查候选。禁止修改帧号、位姿、动作和因果检查字段；人工只填写 `annotation` 字段。\n", encoding="utf-8")
     (args.output / "run.log").write_text(json.dumps({"status": "completed", **metrics}, ensure_ascii=False) + "\n", encoding="utf-8")
     svg = "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='220'><rect width='100%%' height='100%%' fill='white'/><text x='24' y='32' font-size='20'>Annotation pilot candidate audit</text><text x='24' y='78'>候选数</text><rect x='140' y='60' width='%d' height='24' fill='#3878c7'/><text x='150' y='78' fill='white'>%d</text><text x='24' y='124'>覆盖 episode</text><rect x='140' y='106' width='%d' height='24' fill='#4b9e62'/><text x='150' y='124' fill='white'>%d</text><text x='24' y='170'>因果检查：%s</text></svg>" % (min(420, metrics["candidate_count"] * 10), metrics["candidate_count"], min(420, metrics["episodes_with_candidates"] * 10), metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败")
     (args.output / "metrics.svg").write_text(svg, encoding="utf-8")

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DualVLN 证据偏好标注</title>
+  <style>
+    :root { color-scheme: light; --ink:#18212a; --muted:#66727d; --line:#d8dee4; --bg:#f5f7f8; --panel:#fff; --blue:#1769aa; --green:#277a4b; --red:#ae3b32; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--bg); font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; letter-spacing:0; }
+    header { position:sticky; top:0; z-index:4; display:flex; align-items:center; gap:14px; padding:10px 18px; border-bottom:1px solid var(--line); background:#fff; }
+    h1 { margin:0; font-size:18px; }
+    .progress { color:var(--muted); white-space:nowrap; }
+    .bar { flex:1; height:7px; background:#e4e8eb; }
+    .bar > i { display:block; height:100%; background:var(--green); }
+    button,.file-label { min-height:36px; padding:7px 12px; border:1px solid #aeb7bf; border-radius:4px; background:#fff; color:var(--ink); cursor:pointer; font:inherit; }
+    button.primary { border-color:var(--blue); background:var(--blue); color:white; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    main { display:grid; grid-template-columns:minmax(0,1fr) 350px; min-height:calc(100vh - 58px); }
+    .evidence { padding:18px; min-width:0; }
+    .instruction { margin:0 0 14px; padding:12px 14px; border-left:4px solid var(--blue); background:#fff; font-size:16px; }
+    .meta { display:flex; flex-wrap:wrap; gap:8px 18px; margin-bottom:14px; color:var(--muted); }
+    .current { display:grid; grid-template-columns:minmax(280px,620px) 1fr; gap:16px; align-items:start; }
+    .current img { display:block; width:100%; max-height:54vh; object-fit:contain; background:#111; }
+    .decision { padding:12px 14px; border:1px solid var(--line); background:#fff; }
+    .decision strong { display:block; margin-bottom:6px; font-size:16px; }
+    h2 { margin:18px 0 10px; font-size:16px; }
+    .history { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+    .history article { border:1px solid var(--line); border-radius:6px; overflow:hidden; background:var(--panel); }
+    .history img { display:block; width:100%; aspect-ratio:4/3; object-fit:cover; background:#111; }
+    .history .caption { padding:9px 10px; }
+    .tag { display:inline-block; min-width:26px; margin-right:6px; padding:2px 7px; background:#243746; color:#fff; text-align:center; font-weight:700; }
+    aside { position:sticky; top:57px; align-self:start; height:calc(100vh - 57px); overflow:auto; padding:16px; border-left:1px solid var(--line); background:#fff; }
+    fieldset { margin:0 0 14px; padding:0; border:0; }
+    legend { margin-bottom:7px; font-weight:700; }
+    label.choice { display:inline-flex; align-items:center; gap:5px; margin:0 5px 6px 0; padding:6px 8px; border:1px solid var(--line); border-radius:4px; cursor:pointer; }
+    textarea,input[type=text] { width:100%; padding:8px; border:1px solid #aeb7bf; border-radius:4px; font:inherit; }
+    textarea { min-height:58px; resize:vertical; }
+    .count { text-align:right; color:var(--muted); font-size:12px; }
+    .status { min-height:22px; margin:8px 0; color:var(--green); }
+    .error { color:var(--red); }
+    .nav { display:grid; grid-template-columns:44px 1fr 44px; gap:8px; margin-top:12px; }
+    #file { display:none; }
+    @media (max-width:980px) { main{grid-template-columns:1fr} aside{position:static;height:auto;border:1px solid var(--line);margin:0 12px 12px}.current{grid-template-columns:1fr}.history{grid-template-columns:1fr} header{flex-wrap:wrap}.bar{order:5;flex-basis:100%} }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DualVLN 证据偏好标注</h1>
+    <span class="progress" id="progress">载入中</span>
+    <span class="bar"><i id="bar"></i></span>
+    <label class="file-label" for="file">导入</label><input id="file" type="file" accept=".jsonl,.json">
+    <button id="export" class="primary">导出 JSONL</button>
+  </header>
+  <main>
+    <section class="evidence">
+      <p class="instruction" id="instruction"></p>
+      <div class="meta" id="meta"></div>
+      <div class="current">
+        <img id="current-image" alt="当前 RGB">
+        <div class="decision"><strong>专家局部决策</strong><div id="action"></div><div id="goal"></div></div>
+      </div>
+      <h2>因果历史候选</h2>
+      <div class="history" id="history"></div>
+    </section>
+    <aside>
+      <fieldset><legend>1. 当前决策需要历史吗？</legend><div id="need_history"></div></fieldset>
+      <fieldset><legend>2. 哪些历史最有帮助？（最多两项）</legend><div id="preferred_evidence"></div></fieldset>
+      <fieldset><legend>3. 主要帮助类型</legend><div id="evidence_role"></div></fieldset>
+      <fieldset><legend>4. 哪些历史可能误导？</legend><div id="misleading_evidence"></div></fieldset>
+      <fieldset><legend>置信度</legend><div id="confidence"></div></fieldset>
+      <fieldset><legend for="reason">短原因（可选，最多 30 字）</legend><textarea id="reason" maxlength="30"></textarea><div class="count"><span id="reason-count">0</span>/30</div></fieldset>
+      <fieldset><legend for="annotator">标注者 ID</legend><input id="annotator" type="text" value="annotator_01"></fieldset>
+      <div class="status" id="status"></div>
+      <div class="nav"><button id="prev" title="上一张">←</button><button id="save" class="primary">保存并前往下一张</button><button id="next" title="下一张">→</button></div>
+    </aside>
+  </main>
+  <script>
+    const options={need_history:['yes','no','uncertain'],evidence_role:['localization','direction','landmark','revisit','safety','none','uncertain'],confidence:['high','medium','low']};
+    let rows=[],index=0,stateKey='dualvln_annotation_pilot_v1';
+    const $=id=>document.getElementById(id);
+    function radioGroup(id,values){$(id).innerHTML=values.map(v=>`<label class="choice"><input type="radio" name="${id}" value="${v}">${v}</label>`).join('')}
+    function checkGroup(id,values){$(id).innerHTML=values.map(v=>`<label class="choice"><input type="checkbox" name="${id}" value="${v}">${v}</label>`).join('')}
+    function checked(name){return [...document.querySelectorAll(`[name=${name}]:checked`)].map(x=>x.value)}
+    function setChecked(name,values){let set=new Set(Array.isArray(values)?values:[values]);document.querySelectorAll(`[name=${name}]`).forEach(x=>x.checked=set.has(x.value))}
+    function annotation(){return {need_history:checked('need_history')[0]||'',preferred_evidence:checked('preferred_evidence'),evidence_role:checked('evidence_role')[0]||'',misleading_evidence:checked('misleading_evidence'),confidence:checked('confidence')[0]||'',short_reason:$('reason').value.trim()}}
+    function valid(a){let evidence=a.preferred_evidence.filter(x=>['A','B','C'].includes(x));if(!a.need_history||!a.evidence_role||!a.confidence)return '请完成必填单选项';if(a.preferred_evidence.length===0)return '请选择有效证据、none 或 uncertain';if(evidence.length>2)return '有帮助的历史最多选择两项';if(a.need_history==='yes'&&evidence.length===0)return '选择需要历史时，请选 1–2 项有效证据';if(a.need_history==='no'&&!a.preferred_evidence.includes('none'))return '选择不需要历史时，有效证据应选 none';if(a.need_history==='uncertain'&&!a.preferred_evidence.includes('uncertain')&&evidence.length===0)return '无法判断时请选择 uncertain 或已有依据的候选';if(a.misleading_evidence.length===0)return '请选择误导证据，或明确选择 none/uncertain';return ''}
+    function persist(){localStorage.setItem(stateKey,JSON.stringify(rows))}
+    function save(requireValid=true){let a=annotation(),err=valid(a);if(requireValid&&err){$('status').textContent=err;$('status').className='status error';return false}rows[index].annotation=a;rows[index].annotator_id=$('annotator').value.trim();rows[index].created_at=new Date().toISOString();persist();$('status').textContent='已保存在本浏览器';$('status').className='status';renderProgress();return true}
+    function renderProgress(){let done=rows.filter(x=>x.annotation&&x.annotation.need_history).length;$('progress').textContent=`${index+1}/${rows.length} · 已完成 ${done}`;$('bar').style.width=`${100*done/rows.length}%`}
+    function render(){let r=rows[index],a=r.annotation||{};$('instruction').textContent=r.instruction;$('meta').textContent=`${r.annotation_id} · scene ${r.scene_id} · episode ${r.episode_id} · frame ${r.current_frame_id}`;$('current-image').src=r.current_image_path;$('action').textContent=r.context.expert_action;$('goal').textContent=r.context.expert_local_goal?`像素目标：${r.context.expert_local_goal.join(', ')}`:'像素目标：不适用';$('history').innerHTML=r.candidates.map(c=>`<article><img src="${c.image_path}" alt="历史 ${c.label}"><div class="caption"><span class="tag">${c.label}</span>frame ${c.frame_id} · age ${c.age}<br>距离 ${c.relative_pose.distance.toFixed(2)}m · 朝向 ${c.relative_pose.dyaw_deg.toFixed(1)}°</div></article>`).join('');setChecked('need_history',a.need_history||'');setChecked('preferred_evidence',a.preferred_evidence||[]);setChecked('evidence_role',a.evidence_role||'');setChecked('misleading_evidence',a.misleading_evidence||[]);setChecked('confidence',a.confidence||'');$('reason').value=a.short_reason||'';$('annotator').value=r.annotator_id||$('annotator').value||'annotator_01';$('reason-count').textContent=$('reason').value.length;$('prev').disabled=index===0;$('next').disabled=index===rows.length-1;$('status').textContent='';renderProgress()}
+    async function load(){let text=await fetch('annotations_template.jsonl').then(r=>r.text()),base=text.trim().split(/\n/).map(JSON.parse);stateKey='dualvln_'+base[0].annotation_id+'_'+base.length;let saved=JSON.parse(localStorage.getItem(stateKey)||'null');rows=saved&&saved.length===base.length&&saved[0].annotation_id===base[0].annotation_id?saved:base;render()}
+    function exportRows(){save(false);let blob=new Blob([rows.map(x=>JSON.stringify(x)).join('\n')+'\n'],{type:'application/jsonl'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`dualvln_annotations_${$('annotator').value.trim()||'anonymous'}.jsonl`;a.click();URL.revokeObjectURL(a.href)}
+    radioGroup('need_history',options.need_history);radioGroup('evidence_role',options.evidence_role);radioGroup('confidence',options.confidence);checkGroup('preferred_evidence',['A','B','C','none','uncertain']);checkGroup('misleading_evidence',['A','B','C','none','uncertain']);
+    $('reason').oninput=()=>{$('reason-count').textContent=$('reason').value.length};$('save').onclick=()=>{if(save()&&index<rows.length-1){index++;render()}};$('prev').onclick=()=>{save(false);index--;render()};$('next').onclick=()=>{save(false);index++;render()};$('export').onclick=exportRows;$('file').onchange=async e=>{let text=await e.target.files[0].text();let imported=text.trim().split(/\n/).map(JSON.parse);if(imported.length!==rows.length||imported[0].annotation_id!==rows[0].annotation_id){alert('导入文件与当前 pilot 不匹配');return}rows=imported;persist();render()};
+    document.addEventListener('change',e=>{if(['preferred_evidence','misleading_evidence'].includes(e.target.name)){let exclusive=['none','uncertain'];if(exclusive.includes(e.target.value)&&e.target.checked){document.querySelectorAll(`[name=${e.target.name}]`).forEach(x=>{if(x!==e.target)x.checked=false})}else if(e.target.checked){document.querySelectorAll(`[name=${e.target.name}]`).forEach(x=>{if(exclusive.includes(x.value))x.checked=false})}}if(e.target.name==='preferred_evidence'&&checked('preferred_evidence').filter(x=>['A','B','C'].includes(x)).length>2){e.target.checked=false;$('status').textContent='有效证据最多选择两项';$('status').className='status error'}});
+    load().catch(e=>{$('status').textContent='载入失败：'+e;$('status').className='status error'});
+  </script>
+</body>
+</html>
