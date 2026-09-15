@@ -97,3 +97,23 @@
 服务器随后从官方 `InternRobotics/InternData-N1` 选择性下载并核验 6 个较小 R2R train 场景，共 2,471,101,485 字节、90 个 episode；LFS 大小/SHA256、安全解包均通过，报告为 `multiscene_bootstrap_20260915_38ff89a/`。自动挖掘和合并得到第二批 104 张因果卡片，覆盖 6 场景、52 episode，ID 冲突、未来泄漏和缺图均为 0，目录为 `annotation_multiscene_candidates_20260915_38ff89a/merged/`。
 
 多场景协议已改用 `(scene_id, episode_id, current_frame_id)` 唯一键，旧单场景 manifest 保持兼容；相关 evidence、dataset、推理和候选测试为 `49 passed`。第二批当前只有候选、没有自动伪标签。下一门槛是完成跨场景标注与独立复核，再按 scene-held-out 而非仅 episode-held-out 训练 reader；通过后才恢复联合 S2 训练和 1--4 episode 配对闭环。
+
+## 多场景候选 v3 与模型盲审
+
+提交 `87a6c36` 固化了 scene-aware relevance 协议、联合 reader 诊断、闭环归因、多场景准备工具和 held-out relevance 门槛；服务器隔离 worktree 的相关回归为 `59 passed`。提交 `96fa690` 进一步增加候选帧黑区质量过滤，候选选择测试为 `7 passed`。旧实验 worktree 保持原样，新建干净 detached worktree 运行本轮工具，未修改服务器正式工作树。
+
+对第二批 104 张旧候选进行 18 张 annotation-blind 模型复核，结果为 yes/no/uncertain=`1/10/7`。这说明原时间分层候选仍以同一路段近邻视角为主，任务相关历史密度偏低。模型复核文件明确标记 `reviewer_id=model_reviewer` 和 `training_supervision_allowed=false`，只用于候选筛查，不是第二位人工标注，也不得转为训练监督。
+
+候选器随后改为“近邻连续帧 + 跨朝向/动作阶段帧 + 有效位移锚点”，并拒绝黑像素占比超过 25% 的当前或历史画面。相同 6 场景、104 张、52 episode 的 v3 与旧版对比如下：
+
+|指标|旧时间分层|v3 阶段/空间分层|
+|---|---:|---:|
+|历史平均年龄|7.35 帧|12.34 帧|
+|历史平均位移|1.09 m|1.59 m|
+|位移至少 2 m|9.3%|35.6%|
+|黑区超过 25% 的历史候选|12|0|
+|同一 18 张盲审 yes/no/uncertain|1/10/7|6/7/5|
+
+完整对比见 `annotation_candidate_strategy_comparison_20260915/`。盲审改善只证明候选更值得人工判断，不能替代人工真值。`XcA2TqTSSAj` 仍存在无法由黑区规则捕获的白墙和几何破损，因此不进入首轮人工批次。最终 curated 包为 `annotation_multiscene_candidates_v3_20260915_96fa690/curated/`：5 个新场景、84 张、42 episode、因果违规 0；与既有 40 张人工 pilot 合计 124 张。
+
+当前停止条件是人工监督而非算力：完成 curated 包人工填写后，先校验 schema/因果性并抽取 20--30% 独立人工复核，再生成 scene-aware relevance manifest 和 scene-held-out reader 对照。只有跨场景 reader 明显超过逐卡随机、Yes 历史选择不塌缩且 No/null 正常，才恢复联合 S2 小样本训练；之后才允许 1--4 episode 配对闭环。

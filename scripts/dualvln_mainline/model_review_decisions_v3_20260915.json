@@ -1,0 +1,20 @@
+{
+  "r2r_train_GdvgFV5R1Z5_ep000007_t0019_86089d03": ["no", ["none"], "none", ["none"], "high", "当前帧已清楚看到目标窗户"],
+  "r2r_train_HxpKQynjfin_ep000003_t0025_8ad4bf93": ["yes", ["B"], "localization", ["none"], "high", "浴室历史确认已完成离开浴室"],
+  "r2r_train_Pm6F8kyY3z2_ep000001_t0023_ff2a5161": ["uncertain", ["uncertain"], "uncertain", ["uncertain"], "low", "蜗牛地标不可辨且历史无补充"],
+  "r2r_train_gZ6f7yhEvPG_ep000002_t0015_50f999a8": ["no", ["none"], "none", ["none"], "high", "当前已到祭坛和舞台区域"],
+  "r2r_train_YmJkqBEsHnH_ep000006_t0020_55cca784": ["yes", ["A", "C"], "localization", ["none"], "medium", "较早侧向视角有助判断行进进度"],
+  "r2r_train_Pm6F8kyY3z2_ep000004_t0042_17ed6baf": ["no", ["none"], "none", ["none"], "medium", "当前仍沿泳池且前路可见"],
+  "r2r_train_Pm6F8kyY3z2_ep000005_t0014_eeab5ee3": ["uncertain", ["uncertain"], "uncertain", ["uncertain"], "low", "浴室和梳妆台仍难以辨认"],
+  "r2r_train_YmJkqBEsHnH_ep000000_t0017_db22ce15": ["yes", ["A", "C"], "localization", ["none"], "medium", "侧后历史有助判断是否走完长椅"],
+  "r2r_train_HxpKQynjfin_ep000000_t0013_638b9bf5": ["yes", ["A", "C"], "localization", ["none"], "high", "门廊入口历史确认已进入卧室"],
+  "r2r_train_XcA2TqTSSAj_ep000007_t0021_e10f1754": ["uncertain", ["uncertain"], "uncertain", ["uncertain"], "low", "历史多为墙面且路线阶段歧义"],
+  "r2r_train_GdvgFV5R1Z5_ep000002_t0014_ce786c0e": ["yes", ["B", "C"], "localization", ["none"], "high", "走廊历史确认转弯已完成"],
+  "r2r_train_gZ6f7yhEvPG_ep000000_t0010_72465fa1": ["no", ["none"], "none", ["none"], "medium", "当前祭坛和长椅足以局部决策"],
+  "r2r_train_gZ6f7yhEvPG_ep000001_t0015_0e8c5a85": ["no", ["none"], "none", ["none"], "medium", "当前已在教堂前部目标区域"],
+  "r2r_train_Pm6F8kyY3z2_ep000003_t0024_c909e420": ["no", ["none"], "none", ["none"], "high", "当前已清楚看到楼梯底马赛克"],
+  "r2r_train_GdvgFV5R1Z5_ep000003_t0027_a0660484": ["uncertain", ["uncertain"], "uncertain", ["uncertain"], "low", "浴室入口与当前画面不一致"],
+  "r2r_train_YmJkqBEsHnH_ep000008_t0011_cf851a68": ["uncertain", ["uncertain"], "uncertain", ["uncertain"], "low", "候选仅原地旋转且位移退化"],
+  "r2r_train_GdvgFV5R1Z5_ep000004_t0012_07e424be": ["no", ["none"], "none", ["none"], "high", "当前已看到地毯和豆袋椅"],
+  "r2r_train_XcA2TqTSSAj_ep000006_t0031_1848e101": ["yes", ["A", "C"], "localization", ["none"], "medium", "起点和楼梯历史确认当前阶段" ]
+}
