@@ -178,9 +178,9 @@ def balanced_episode_folds(cards, fold_count, trials=5000):
     for episode in episodes:
         episode_cards = [card for card in cards if card["episode_id"] == episode]
         stats[episode] = (
-            sum((card["targets"] >= 0).any() and (card["targets"] > 0.5).any() for card in episode_cards),
-            sum((card["targets"] >= 0).any() and not (card["targets"] > 0.5).any() for card in episode_cards),
-            sum(not (card["targets"] >= 0).any() for card in episode_cards),
+            int(sum((card["targets"] >= 0).any() and (card["targets"] > 0.5).any() for card in episode_cards)),
+            int(sum((card["targets"] >= 0).any() and not (card["targets"] > 0.5).any() for card in episode_cards)),
+            int(sum(not (card["targets"] >= 0).any() for card in episode_cards)),
         )
     targets = [sum(value[index] for value in stats.values()) / fold_count for index in range(3)]
     best = None
@@ -197,7 +197,7 @@ def balanced_episode_folds(cards, fold_count, trials=5000):
         if best is None or candidate[:2] < best[:2]:
             best = candidate
     return {
-        "score": best[0],
+        "score": float(best[0]),
         "search_seed": best[1],
         "folds": [
             {"fold": index, "episodes": fold, "yes_no_uncertain": list(counts)}
