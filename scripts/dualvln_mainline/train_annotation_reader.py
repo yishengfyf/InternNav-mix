@@ -73,7 +73,7 @@ def tensor_batch(cards, indices, device):
     }
 
 
-def forward_reader(memory, estimator, batch, variant):
+def forward_reader(memory, estimator, batch, variant, normalize_task_state=False):
     if variant == "content":
         poses, ages, qualities = torch.zeros_like(batch["poses"]), torch.zeros_like(batch["ages"]), torch.zeros_like(batch["qualities"])
     else:
@@ -83,6 +83,8 @@ def forward_reader(memory, estimator, batch, variant):
             batch["current"], batch["text"].unsqueeze(1),
             torch.ones((len(batch["current"]), 1), dtype=torch.bool, device=batch["current"].device),
         )
+        if normalize_task_state:
+            task_state = torch.nn.functional.normalize(task_state, p=2, dim=-1)
     else:
         task_state = torch.zeros(
             (len(batch["current"]), memory.task_dim), device=batch["current"].device
@@ -90,10 +92,10 @@ def forward_reader(memory, estimator, batch, variant):
     return memory(batch["history"], poses, ages, qualities, batch["valid"], task_state)
 
 
-def evaluate(memory, estimator, batch, variant):
+def evaluate(memory, estimator, batch, variant, normalize_task_state=False):
     memory.eval(); estimator.eval()
     with torch.no_grad():
-        output = forward_reader(memory, estimator, batch, variant)
+        output = forward_reader(memory, estimator, batch, variant, normalize_task_state)
         loss = multi_positive_relevance_loss(
             output.read_weights, output.null_weights, batch["targets"], batch["valid"]
         )
@@ -127,7 +129,19 @@ def evaluate(memory, estimator, batch, variant):
     }
 
 
-def run_one(cards, train_indices, val_indices, variant, seed, steps, learning_rate, device):
+def run_one(
+    cards,
+    train_indices,
+    val_indices,
+    variant,
+    seed,
+    steps,
+    learning_rate,
+    device,
+    task_learning_rate_scale=1.0,
+    normalize_task_state=False,
+    freeze_task_estimator=False,
+):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     feature_dim = cards[0]["history"].shape[-1]
@@ -137,17 +151,35 @@ def run_one(cards, train_indices, val_indices, variant, seed, steps, learning_ra
     ).to(device)
     estimator = ObservableTaskStateEstimator(feature_dim, 128).to(device)
     parameters = list(memory.parameters())
+    optimizer_groups = [{"params": parameters, "lr": learning_rate}]
     if variant == "task_spatial":
-        parameters += list(estimator.parameters())
-    optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=1e-4)
+        task_projection_parameters = list(memory.task_projection.parameters())
+        task_projection_ids = {id(parameter) for parameter in task_projection_parameters}
+        base_memory_parameters = [
+            parameter for parameter in parameters if id(parameter) not in task_projection_ids
+        ]
+        estimator_parameters = list(estimator.parameters())
+        if freeze_task_estimator:
+            for parameter in estimator_parameters:
+                parameter.requires_grad_(False)
+            parameters = base_memory_parameters + task_projection_parameters
+            optimizer_groups = [{"params": parameters, "lr": learning_rate}]
+        else:
+            task_parameters = task_projection_parameters + estimator_parameters
+            parameters = base_memory_parameters + task_parameters
+            optimizer_groups = [
+                {"params": base_memory_parameters, "lr": learning_rate},
+                {"params": task_parameters, "lr": learning_rate * task_learning_rate_scale},
+            ]
+    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=1e-4)
     train_batch = tensor_batch(cards, train_indices, device)
     val_batch = tensor_batch(cards, val_indices, device)
-    initial_train = evaluate(memory, estimator, train_batch, variant)
-    initial_val = evaluate(memory, estimator, val_batch, variant)
+    initial_train = evaluate(memory, estimator, train_batch, variant, normalize_task_state)
+    initial_val = evaluate(memory, estimator, val_batch, variant, normalize_task_state)
     curve = []
     for step in range(steps):
         memory.train(); estimator.train(); optimizer.zero_grad(set_to_none=True)
-        output = forward_reader(memory, estimator, train_batch, variant)
+        output = forward_reader(memory, estimator, train_batch, variant, normalize_task_state)
         loss = multi_positive_relevance_loss(
             output.read_weights, output.null_weights, train_batch["targets"], train_batch["valid"]
         )
@@ -163,10 +195,13 @@ def run_one(cards, train_indices, val_indices, variant, seed, steps, learning_ra
         "seed": seed,
         "initial_train": initial_train,
         "initial_val": initial_val,
-        "final_train": evaluate(memory, estimator, train_batch, variant),
-        "final_val": evaluate(memory, estimator, val_batch, variant),
+        "final_train": evaluate(memory, estimator, train_batch, variant, normalize_task_state),
+        "final_val": evaluate(memory, estimator, val_batch, variant, normalize_task_state),
         "curve": curve,
         "trainable_parameters": sum(parameter.numel() for parameter in parameters),
+        "task_learning_rate_scale": task_learning_rate_scale,
+        "normalize_task_state": normalize_task_state,
+        "freeze_task_estimator": freeze_task_estimator,
     }
 
 
@@ -235,6 +270,13 @@ def main():
     parser.add_argument("--seeds", nargs="+", type=int, default=[23, 47, 71])
     parser.add_argument("--folds", type=int, default=4)
     parser.add_argument("--split-strategy", choices=("balanced", "modulo"), default="balanced")
+    parser.add_argument(
+        "--variants", nargs="+", choices=("content", "spatial", "task_spatial"),
+        default=["content", "spatial", "task_spatial"],
+    )
+    parser.add_argument("--task-learning-rate-scale", type=float, default=1.0)
+    parser.add_argument("--normalize-task-state", action="store_true")
+    parser.add_argument("--freeze-task-estimator", action="store_true")
     args = parser.parse_args(); args.output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cards = load_cards(args.features, args.supervision)
@@ -263,16 +305,19 @@ def main():
         val_indices = [index for index, card in enumerate(cards) if card["episode_id"] in val_episodes]
         train_indices = [index for index in range(len(cards)) if index not in val_indices]
         for seed in args.seeds:
-            for variant in ("content", "spatial", "task_spatial"):
+            for variant in args.variants:
                 run = run_one(
                     cards, train_indices, val_indices, variant, seed + fold * 1000,
                     args.steps, args.learning_rate, device,
+                    task_learning_rate_scale=args.task_learning_rate_scale,
+                    normalize_task_state=args.normalize_task_state,
+                    freeze_task_estimator=args.freeze_task_estimator,
                 )
                 run["fold"] = fold
                 runs.append(run)
                 print(json.dumps({"fold": fold, "seed": seed, "variant": variant, "final_val": run["final_val"]}, ensure_ascii=False), flush=True)
     variants = []
-    for variant in ("content", "spatial", "task_spatial"):
+    for variant in args.variants:
         selected = [run for run in runs if run["variant"] == variant]
         variants.append(
             {
@@ -289,6 +334,9 @@ def main():
         "schema_version": 1, "status": "completed", "device": str(device),
         "cards": len(cards), "folds": args.folds, "seeds": args.seeds, "steps": args.steps,
         "learning_rate": args.learning_rate, "split_strategy": args.split_strategy,
+        "task_learning_rate_scale": args.task_learning_rate_scale,
+        "normalize_task_state": args.normalize_task_state,
+        "freeze_task_estimator": args.freeze_task_estimator,
         "fold_manifest": fold_manifest, "variants": variants, "best_by_val_loss": best["variant"], "runs": runs,
     }
     (args.output_dir / "metrics.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

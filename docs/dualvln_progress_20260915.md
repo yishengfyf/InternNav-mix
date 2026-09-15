@@ -57,3 +57,15 @@
 本地已生成最小监督 manifest，共 40 条、9129 字节，SHA256 为 `50f4e278aa36f8db8cf77c34892bcc55ea57a3eae49e2678a030a286ef8b59ed`。文件不包含指令、图像路径、理由、标注者或时间，只保留卡片/候选 ID 与 `1/0/-1` target；它仍属于未公开研究监督数据，上传服务器前需要针对该具体文件的明确批准。
 
 新增 `train_annotation_reader.py`：直接读取冻结 3584 维视觉特征，以 4 折 episode 隔离、seed 23/47/71 比较 content、spatial、task-spatial；只训练 128 维轻量 memory/estimator，不加载或更新 S2 checkpoint。输出验证 relevance loss、正例质量、yes Top-1、pairwise 和 no/null accuracy，并保留 JSON、中文摘要、SVG 与逐运行曲线。
+
+## Reader-only 矩阵与预算扫描
+
+初始按 episode ID 取模的 120-step 矩阵显示：content/spatial/task-spatial 的训练 loss 分别约 0.115/0.109/0.0001，而验证 loss 为 2.691/2.511/3.612，确认明显记忆训练集；各折 yes/no 从 5/5 到 8/1，也使 no/null accuracy 从 100% 到 0% 波动。
+
+随后改为确定性的标签分层 episode 四折：每折 yes/no/uncertain 分别为 6/4/0、6/3/1、6/4/0、6/4/0。固定其他条件扫描后：
+
+- 20 steps：content/spatial/task-spatial 验证 loss 1.030/1.028/1.800；
+- 40 steps：1.143/1.122/2.281；
+- 80 steps：1.989/1.877/2.666。
+
+因此 20 steps 是唯一使 content/spatial 验证 loss 低于初始约 1.10 的预算。task-spatial 在 20 steps 时训练 loss 已约 0.11、验证 loss 却为 1.80，说明 task 分支容量过强。下一轮固定 20 steps，只做 task 参数 0.1 倍学习率、task-state 单位范数、冻结 estimator 三项单变量实验。

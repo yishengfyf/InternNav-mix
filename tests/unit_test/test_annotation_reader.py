@@ -53,3 +53,21 @@ def test_balanced_episode_folds_keep_groups_disjoint_and_balance_labels():
     assert first.isdisjoint(second)
     assert first | second == {"0", "1", "2", "3"}
     assert all(item["yes_no_uncertain"] == [2, 2, 0] for item in manifest["folds"])
+
+
+def test_task_state_stabilizers_run_independently():
+    cards = fake_cards()
+    frozen = MODULE.run_one(
+        cards, list(range(6)), [6, 7], "task_spatial", seed=23, steps=2,
+        learning_rate=1e-3, device=torch.device("cpu"), freeze_task_estimator=True,
+    )
+    normalized = MODULE.run_one(
+        cards, list(range(6)), [6, 7], "task_spatial", seed=23, steps=2,
+        learning_rate=1e-3, device=torch.device("cpu"), normalize_task_state=True,
+        task_learning_rate_scale=0.1,
+    )
+    assert frozen["freeze_task_estimator"] is True
+    assert normalized["normalize_task_state"] is True
+    assert normalized["task_learning_rate_scale"] == 0.1
+    assert math.isfinite(frozen["final_val"]["loss"])
+    assert math.isfinite(normalized["final_val"]["loss"])
