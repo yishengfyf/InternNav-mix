@@ -7,9 +7,11 @@ import os
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 ISOLATED_DEPS = Path("/data/usr_data/yifeifeng/internnav/dualvln_mainline/python_deps")
 if ISOLATED_DEPS.is_dir():
     sys.path.insert(0, str(ISOLATED_DEPS))
+sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import torch
