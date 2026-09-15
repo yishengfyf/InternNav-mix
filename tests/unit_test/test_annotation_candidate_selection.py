@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 
+from PIL import Image
+
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -55,3 +57,14 @@ def test_phase_diverse_falls_back_without_non_degenerate_anchor():
 
     assert len(selected) == 2
     assert {item[1] for item in selected} == {5, 8}
+
+
+def test_black_pixel_fraction_detects_simulator_void(tmp_path):
+    image = Image.new("RGB", (20, 10), "black")
+    for x in range(10, 20):
+        for y in range(10):
+            image.putpixel((x, y), (120, 100, 80))
+    path = tmp_path / "half_void.png"
+    image.save(path)
+
+    assert MODULE.black_pixel_fraction(path) == 0.5

@@ -13,6 +13,8 @@ import re
 import shutil
 from pathlib import Path
 
+from PIL import Image
+
 
 def read_jsonl(path):
     with path.open() as f:
@@ -105,6 +107,15 @@ def image_path(root, episode_id, frame_id, rgb_dir="observation.images.rgb.60cm_
         if path.exists():
             return str(path)
     return None
+
+
+def black_pixel_fraction(path, sample_size=80):
+    """Estimate simulator void pixels without loading a full-resolution tensor."""
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        image.thumbnail((sample_size, sample_size))
+        pixels = list(image.getdata())
+    return sum(max(pixel) <= 4 for pixel in pixels) / max(1, len(pixels))
 
 
 def candidate_score(i, j, poses, actions):
@@ -221,6 +232,7 @@ def main():
         choices=("legacy", "phase_diverse"),
         default="phase_diverse",
     )
+    ap.add_argument("--max-black-fraction", type=float, default=0.25)
     args = ap.parse_args()
     try:
         import pyarrow.parquet as pq
@@ -236,7 +248,14 @@ def main():
     rng = random.Random(args.seed)
     candidates = []
     audit = {"parquet_files": len(parquet_paths), "episodes": 0, "frames": 0,
-             "causal_violations": 0, "missing_rgb": 0, "candidate_pool": 0}
+             "causal_violations": 0, "missing_rgb": 0, "candidate_pool": 0,
+             "invalid_current_rgb": 0, "invalid_history_rgb": 0}
+    quality_cache = {}
+
+    def image_quality(path):
+        if path not in quality_cache:
+            quality_cache[path] = 1.0 - black_pixel_fraction(path)
+        return quality_cache[path]
     for path in parquet_paths:
         table = pq.read_table(path)
         n = table.num_rows
@@ -267,10 +286,24 @@ def main():
             expert_action, expert_goal = decision_for_frame(i, actions, goals, relative_goal_ids)
             if expert_action is None:
                 continue
+            current_image = image_path(args.data_root, ep_id, i)
+            if not current_image:
+                audit["missing_rgb"] += 1
+                continue
+            if image_quality(current_image) < 1.0 - args.max_black_fraction:
+                audit["invalid_current_rgb"] += 1
+                continue
             pool = []
             for j in range(max(0, i - 40), i):
                 score, rp = candidate_score(i, j, poses, decision_actions)
                 if score < 0 or rp is None:
+                    continue
+                history_image = image_path(args.data_root, ep_id, j)
+                if not history_image:
+                    audit["missing_rgb"] += 1
+                    continue
+                if image_quality(history_image) < 1.0 - args.max_black_fraction:
+                    audit["invalid_history_rgb"] += 1
                     continue
                 pool.append((score, j, rp))
             if len(pool) < 2:
@@ -295,9 +328,8 @@ def main():
             if not future_ok:
                 audit["causal_violations"] += 1
                 continue
-            current_image = image_path(args.data_root, ep_id, i)
             history_items = [{"label": label, "frame_id": j, "age": i-j, "relative_pose": rp,
-                              "quality": {"pose": 1.0, "observation": 1.0},
+                              "quality": {"pose": 1.0, "observation": image_quality(image_path(args.data_root, ep_id, j))},
                               "image_path": image_path(args.data_root, ep_id, j)}
                              for label, (_, j, rp) in zip(labels, selected)]
             if not current_image or any(not x["image_path"] for x in history_items):
@@ -368,6 +400,9 @@ def main():
                "causal_all_history_before_current": audit["causal_violations"] == 0,
                "future_input_exposed": False, "missing_rgb_candidates": audit["missing_rgb"],
                "selection_strategy": args.selection_strategy,
+               "max_black_fraction": args.max_black_fraction,
+               "invalid_current_rgb": audit["invalid_current_rgb"],
+               "invalid_history_rgb": audit["invalid_history_rgb"],
                "selected_age_mean": sum(c["age"] for c in selected_candidates) / selected_count,
                "selected_distance_mean_m": sum(c["relative_pose"]["distance"] for c in selected_candidates) / selected_count,
                "selected_abs_yaw_mean_deg": sum(abs(c["relative_pose"]["dyaw_deg"]) for c in selected_candidates) / selected_count,
@@ -385,9 +420,10 @@ def main():
 - 选择策略：`%s`
 - 历史平均年龄：`%.2f` 帧；平均位移：`%.2f` 米；平均朝向差：`%.1f` 度
 - 退化位姿比例（位移 < 0.05 米）：`%.1f%%`
+- 黑区质量过滤：当前帧 `%d` 次、历史池 `%d` 次被拒绝（阈值 `%.0f%%`）
 
 下一步：先抽查 HTML 卡片和图像，再由第一位标注者填写 30--40 张；其中约 20--30%% 交给第二位标注者复核。只有一致性和 relevance probe 达标后，才扩展到 100--200 张。
-""" % (metrics["candidate_count"], metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败", metrics["missing_rgb_candidates"], metrics["selection_strategy"], metrics["selected_age_mean"], metrics["selected_distance_mean_m"], metrics["selected_abs_yaw_mean_deg"], 100 * metrics["degenerate_pose_rate"])
+""" % (metrics["candidate_count"], metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败", metrics["missing_rgb_candidates"], metrics["selection_strategy"], metrics["selected_age_mean"], metrics["selected_distance_mean_m"], metrics["selected_abs_yaw_mean_deg"], 100 * metrics["degenerate_pose_rate"], metrics["invalid_current_rgb"], metrics["invalid_history_rgb"], 100 * metrics["max_black_fraction"])
     (args.output / "summary.md").write_text(summary, encoding="utf-8")
     (args.output / "README.md").write_text("# 标注目录使用说明\n\n推荐启动本地静态服务后打开 `index.html`：页面支持逐张填写、浏览器自动暂存、导入已有 JSONL 和导出标注 JSONL。也可以打开 `cards/` 中的只读 HTML 抽查候选。禁止修改帧号、位姿、动作和因果检查字段；人工只填写 `annotation` 字段。\n", encoding="utf-8")
     (args.output / "run.log").write_text(json.dumps({"status": "completed", **metrics}, ensure_ascii=False) + "\n", encoding="utf-8")
