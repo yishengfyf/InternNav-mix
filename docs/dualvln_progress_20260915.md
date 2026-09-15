@@ -53,3 +53,7 @@
 多正例 pairwise 机制复验中，RGB-only 的四折与 leave-one-episode-out Top-1 均为 66.7%，pairwise accuracy 均为 70.8%；对应 pose/age 为 62.5%/60.4% 和 58.3%/52.1%。工程门槛通过，但精确随机尾概率 0.174、bootstrap 区间 45.8%--85.7%，仍保持 `promising_but_underpowered`。
 
 据此新增 evidence reader 监督协议：每条历史 target 为正例 1、负例 0、忽略 -1；一张卡片有多个正例时最大化落在整个正例集合上的平均 attention mass，不强制唯一 Top-1；`need_history=no` 时将 null evidence 作为正目标；`uncertain` 全部忽略。该 loss 独立输出为 `evidence_relevance_loss`，以显式权重接入总 loss，并保留 S2/trajectory 原始指标。
+
+本地已生成最小监督 manifest，共 40 条、9129 字节，SHA256 为 `50f4e278aa36f8db8cf77c34892bcc55ea57a3eae49e2678a030a286ef8b59ed`。文件不包含指令、图像路径、理由、标注者或时间，只保留卡片/候选 ID 与 `1/0/-1` target；它仍属于未公开研究监督数据，上传服务器前需要针对该具体文件的明确批准。
+
+新增 `train_annotation_reader.py`：直接读取冻结 3584 维视觉特征，以 4 折 episode 隔离、seed 23/47/71 比较 content、spatial、task-spatial；只训练 128 维轻量 memory/estimator，不加载或更新 S2 checkpoint。输出验证 relevance loss、正例质量、yes Top-1、pairwise 和 no/null accuracy，并保留 JSON、中文摘要、SVG 与逐运行曲线。
