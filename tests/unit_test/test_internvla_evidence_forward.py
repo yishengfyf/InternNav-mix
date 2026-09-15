@@ -148,6 +148,37 @@ def test_instruction_only_task_state_has_separate_auxiliary_losses():
     assert torch.allclose(output.loss, expected)
 
 
+def test_relevance_loss_is_separate_and_reaches_reader():
+    model = tiny_model()
+    model.config.evidence_relevance_loss_weight = 0.3
+    input_ids = torch.tensor(
+        [[10, 151652, IMAGE_TOKEN_INDEX, 151653, 11, 151652, IMAGE_TOKEN_INDEX, 151653,
+          EVIDENCE_TOKEN_INDEX, EVIDENCE_TOKEN_INDEX, 12, 13]]
+    )
+    labels = torch.tensor([[-100] * 10 + [12, 13]])
+    output = model(
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=torch.ones_like(input_ids),
+        pixel_values=torch.zeros(2, 3),
+        image_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),
+        evidence_relative_poses=torch.zeros(1, 1, 4),
+        evidence_ages=torch.ones(1, 1, 1),
+        evidence_qualities=torch.ones(1, 1, 2),
+        evidence_valid_mask=torch.ones(1, 1, dtype=torch.bool),
+        evidence_history_counts=torch.tensor([1]),
+        evidence_image_counts=torch.tensor([2]),
+        evidence_relevance_targets=torch.tensor([[1.0]]),
+        return_dict=True,
+    )
+
+    assert output.evidence_relevance_loss is not None
+    assert torch.isfinite(output.evidence_relevance_loss)
+    assert torch.allclose(output.loss, output.s2_loss + 0.3 * output.evidence_relevance_loss)
+    output.loss.backward()
+    assert model.model.evidence_memory.reader.in_proj_weight.grad is not None
+
+
 def test_generate_latents_extends_attention_mask_for_trajectory_queries():
     model = tiny_model()
     model.config.evidence_record_diagnostics = True

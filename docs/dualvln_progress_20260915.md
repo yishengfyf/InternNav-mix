@@ -39,3 +39,17 @@
 新增冻结特征两阶段入口：`extract_annotation_features.py` 在单张空闲 GPU 上只做 InternVLA 视觉塔与词嵌入前向，缓存当前/历史 RGB、指令和 pose/age；`probe_annotation_features.py` 在缓存上按 episode 四折、多 seed 比较 `pose_age`、`rgb_text` 与 `rgb_text_pose`。预设门槛为最佳 Top-1 高于随机 5 个百分点且 pairwise accuracy 超过 55%。通过后才实现多正例 reader loss；未通过则先做独立复核或第二场景 pilot。
 
 隐私边界：服务器只读取不含人工答案的 candidate manifest 并生成冻结特征；人工 JSONL 不上传。特征回传本地后，`probe_annotation_features.py` 才按 `annotation_id + candidate label` 关联人工多正例并计算指标。
+
+## 冻结特征结果与优化（提交 `adaa20f`）
+
+- 服务器 GPU 1 完成 40 张卡片、120 个候选的冻结前向；视觉特征维度 3584，峰值显存 16026.95 MiB，未更新模型。
+- 特征目录：`annotation_frozen_features_20260915_adaa20f/`；本地 probe 目录：`annotation_frozen_probe_robust_20260915_adaa20f/`。
+- 按 episode 四折：位置显示基线 37.5%，pose/age 54.2%，RGB-only 70.8%，RGB+指令 66.7%，RGB+指令+pose 66.7%。
+- leave-one-episode-out：RGB-only Top-1 70.8%、pairwise 64.6%；同卡随机 Top-1 为 55.6%。
+- RGB-only 精确同卡随机尾概率为 0.083，episode bootstrap 95% 区间为 50.0%--88.5%。
+
+结论：视觉内容信号同时通过四折与 leave-one-episode-out 工程门槛，并明显优于 pose/age；但样本量小，bootstrap 区间仍覆盖随机基线，证据等级记为 `promising_but_underpowered`。下一步允许进入不改 S2 checkpoint 的多正例 reader 机制试验；暂不进入闭环或宣称跨场景有效。由于 RGB+指令没有优于 RGB-only，首个 reader 试验必须保留 RGB-only 对照，不能把收益归因于任务条件化。
+
+多正例 pairwise 机制复验中，RGB-only 的四折与 leave-one-episode-out Top-1 均为 66.7%，pairwise accuracy 均为 70.8%；对应 pose/age 为 62.5%/60.4% 和 58.3%/52.1%。工程门槛通过，但精确随机尾概率 0.174、bootstrap 区间 45.8%--85.7%，仍保持 `promising_but_underpowered`。
+
+据此新增 evidence reader 监督协议：每条历史 target 为正例 1、负例 0、忽略 -1；一张卡片有多个正例时最大化落在整个正例集合上的平均 attention mass，不强制唯一 Top-1；`need_history=no` 时将 null evidence 作为正目标；`uncertain` 全部忽略。该 loss 独立输出为 `evidence_relevance_loss`，以显式权重接入总 loss，并保留 S2/trajectory 原始指标。

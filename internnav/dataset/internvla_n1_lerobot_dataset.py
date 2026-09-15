@@ -1459,6 +1459,21 @@ class DataCollatorForSupervisedDataset(object):
             batch["evidence_valid_mask"] = valid_mask
             batch["evidence_history_counts"] = history_counts
             batch["evidence_image_counts"] = image_counts
+            has_relevance = "evidence_relevance_targets" in instances[0]
+            if has_relevance != all("evidence_relevance_targets" in instance for instance in instances):
+                raise ValueError("evidence relevance targets must be present for every sample or none")
+            if has_relevance:
+                relevance_targets = torch.full(
+                    (len(instances), max_history), -1.0, dtype=torch.float32
+                )
+                for sample_idx, instance in enumerate(instances):
+                    count = instance["evidence_history_count"]
+                    targets = instance["evidence_relevance_targets"].float()
+                    if targets.shape != (count,):
+                        raise ValueError("evidence relevance targets must match history count")
+                    if count:
+                        relevance_targets[sample_idx, :count] = targets
+                batch["evidence_relevance_targets"] = relevance_targets
             if "evidence_instruction_ids" in instances[0]:
                 instruction_lengths = torch.tensor(
                     [len(instance["evidence_instruction_ids"]) for instance in instances], dtype=torch.long

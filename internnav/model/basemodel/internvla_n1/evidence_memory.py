@@ -15,6 +15,32 @@ class EvidenceMemoryOutput:
     no_evidence: torch.Tensor
 
 
+def multi_positive_relevance_loss(
+    read_weights: torch.Tensor,
+    null_weights: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Maximize attention mass on any annotated positive, or null for no-history cards."""
+    if read_weights.ndim != 3 or null_weights.shape != read_weights.shape[:2]:
+        raise ValueError("read and null weights must have shapes [batch, queries, history] and [batch, queries]")
+    if targets.shape != (read_weights.shape[0], read_weights.shape[2]) or valid_mask.shape != targets.shape:
+        raise ValueError("relevance targets and valid mask must have shape [batch, history]")
+    targets = targets.to(device=read_weights.device)
+    valid_mask = valid_mask.to(device=read_weights.device, dtype=torch.bool)
+    supervised = targets.ge(0).any(dim=1)
+    positive = targets.gt(0.5)
+    if torch.any(positive & ~valid_mask):
+        raise ValueError("relevance targets mark padded history as positive")
+    if not supervised.any():
+        return read_weights.sum() * 0.0
+    candidate_distribution = read_weights.mean(dim=1)
+    null_distribution = null_weights.mean(dim=1)
+    positive_mass = (candidate_distribution * positive).sum(dim=1)
+    positive_mass = positive_mass + null_distribution * ~positive.any(dim=1)
+    return -positive_mass[supervised].clamp_min(1e-8).log().mean()
+
+
 class TaskConditionedEvidenceMemory(nn.Module):
     """Encode causal spatial evidence and retrieve it with a task-state query."""
 

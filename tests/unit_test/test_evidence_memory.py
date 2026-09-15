@@ -1,7 +1,10 @@
 import pytest
 import torch
 
-from internnav.model.basemodel.internvla_n1.evidence_memory import TaskConditionedEvidenceMemory
+from internnav.model.basemodel.internvla_n1.evidence_memory import (
+    TaskConditionedEvidenceMemory,
+    multi_positive_relevance_loss,
+)
 
 
 def make_inputs(batch_size=2, history_size=5):
@@ -127,6 +130,40 @@ def test_fp32_metadata_is_cast_for_bfloat16_model():
 
     assert output.tokens.dtype == torch.bfloat16
     assert torch.isfinite(output.tokens).all()
+
+
+def test_multi_positive_relevance_uses_positive_set_and_null_target():
+    read_weights = torch.tensor(
+        [
+            [[0.3, 0.2], [0.5, 0.1]],
+            [[0.2, 0.1], [0.1, 0.2]],
+            [[0.2, 0.2], [0.2, 0.2]],
+        ],
+        requires_grad=True,
+    )
+    null_weights = torch.tensor(
+        [[0.5, 0.4], [0.7, 0.7], [0.6, 0.6]], requires_grad=True
+    )
+    targets = torch.tensor([[1.0, 1.0], [0.0, 0.0], [-1.0, -1.0]])
+    valid_mask = torch.ones(3, 2, dtype=torch.bool)
+
+    loss = multi_positive_relevance_loss(read_weights, null_weights, targets, valid_mask)
+    expected = -(torch.tensor(0.55).log() + torch.tensor(0.7).log()) / 2
+
+    assert torch.allclose(loss, expected)
+    loss.backward()
+    assert read_weights.grad is not None
+    assert null_weights.grad is not None
+
+
+def test_multi_positive_relevance_rejects_positive_padding():
+    with pytest.raises(ValueError, match="padded history"):
+        multi_positive_relevance_loss(
+            torch.tensor([[[0.2, 0.0]]]),
+            torch.tensor([[0.8]]),
+            torch.tensor([[0.0, 1.0]]),
+            torch.tensor([[True, False]]),
+        )
 
 
 def test_negative_age_is_rejected_only_for_valid_evidence():
