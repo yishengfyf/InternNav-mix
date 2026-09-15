@@ -44,3 +44,12 @@ def test_reader_only_smoke_is_finite_for_all_ablations():
         assert math.isfinite(result["final_train"]["loss"])
         assert math.isfinite(result["final_val"]["loss"])
         assert result["trainable_parameters"] > 0
+
+
+def test_balanced_episode_folds_keep_groups_disjoint_and_balance_labels():
+    cards = fake_cards()
+    manifest = MODULE.balanced_episode_folds(cards, 2, trials=100)
+    first, second = [set(item["episodes"]) for item in manifest["folds"]]
+    assert first.isdisjoint(second)
+    assert first | second == {"0", "1", "2", "3"}
+    assert all(item["yes_no_uncertain"] == [2, 2, 0] for item in manifest["folds"])

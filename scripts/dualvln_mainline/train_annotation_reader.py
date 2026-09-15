@@ -2,6 +2,7 @@
 """Train a reader-only relevance matrix from frozen InternVLA features."""
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -169,6 +170,42 @@ def run_one(cards, train_indices, val_indices, variant, seed, steps, learning_ra
     }
 
 
+def balanced_episode_folds(cards, fold_count, trials=5000):
+    episodes = sorted({card["episode_id"] for card in cards}, key=int)
+    if len(episodes) < fold_count:
+        raise ValueError("episode 数少于 fold 数")
+    stats = {}
+    for episode in episodes:
+        episode_cards = [card for card in cards if card["episode_id"] == episode]
+        stats[episode] = (
+            sum((card["targets"] >= 0).any() and (card["targets"] > 0.5).any() for card in episode_cards),
+            sum((card["targets"] >= 0).any() and not (card["targets"] > 0.5).any() for card in episode_cards),
+            sum(not (card["targets"] >= 0).any() for card in episode_cards),
+        )
+    targets = [sum(value[index] for value in stats.values()) / fold_count for index in range(3)]
+    best = None
+    for seed in range(trials):
+        shuffled = list(episodes)
+        random.Random(seed).shuffle(shuffled)
+        folds = [shuffled[index::fold_count] for index in range(fold_count)]
+        counts = [tuple(sum(stats[episode][field] for episode in fold) for field in range(3)) for fold in folds]
+        score = sum(
+            sum((count[field] - targets[field]) ** 2 for field in range(3))
+            for count in counts
+        )
+        candidate = (score, seed, folds, counts)
+        if best is None or candidate[:2] < best[:2]:
+            best = candidate
+    return {
+        "score": best[0],
+        "search_seed": best[1],
+        "folds": [
+            {"fold": index, "episodes": fold, "yes_no_uncertain": list(counts)}
+            for index, (fold, counts) in enumerate(zip(best[2], best[3]))
+        ],
+    }
+
+
 def write_svg(summary, path):
     rows = []
     for index, item in enumerate(summary["variants"]):
@@ -197,12 +234,33 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--seeds", nargs="+", type=int, default=[23, 47, 71])
     parser.add_argument("--folds", type=int, default=4)
+    parser.add_argument("--split-strategy", choices=("balanced", "modulo"), default="balanced")
     args = parser.parse_args(); args.output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cards = load_cards(args.features, args.supervision)
+    if args.split_strategy == "balanced":
+        fold_manifest = balanced_episode_folds(cards, args.folds)
+    else:
+        fold_manifest = {
+            "score": None,
+            "search_seed": None,
+            "folds": [
+                {
+                    "fold": fold,
+                    "episodes": sorted(
+                        {card["episode_id"] for card in cards if int(card["episode_id"]) % args.folds == fold},
+                        key=int,
+                    ),
+                    "yes_no_uncertain": None,
+                }
+                for fold in range(args.folds)
+            ],
+        }
     runs = []
-    for fold in range(args.folds):
-        val_indices = [index for index, card in enumerate(cards) if int(card["episode_id"]) % args.folds == fold]
+    for fold_info in fold_manifest["folds"]:
+        fold = fold_info["fold"]
+        val_episodes = set(fold_info["episodes"])
+        val_indices = [index for index, card in enumerate(cards) if card["episode_id"] in val_episodes]
         train_indices = [index for index in range(len(cards)) if index not in val_indices]
         for seed in args.seeds:
             for variant in ("content", "spatial", "task_spatial"):
@@ -230,7 +288,8 @@ def main():
     summary = {
         "schema_version": 1, "status": "completed", "device": str(device),
         "cards": len(cards), "folds": args.folds, "seeds": args.seeds, "steps": args.steps,
-        "learning_rate": args.learning_rate, "variants": variants, "best_by_val_loss": best["variant"], "runs": runs,
+        "learning_rate": args.learning_rate, "split_strategy": args.split_strategy,
+        "fold_manifest": fold_manifest, "variants": variants, "best_by_val_loss": best["variant"], "runs": runs,
     }
     (args.output_dir / "metrics.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     write_svg(summary, args.output_dir / "metrics.svg")
