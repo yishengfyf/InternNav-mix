@@ -58,6 +58,14 @@
 
 新增 `train_annotation_reader.py`：直接读取冻结 3584 维视觉特征，以 4 折 episode 隔离、seed 23/47/71 比较 content、spatial、task-spatial；只训练 128 维轻量 memory/estimator，不加载或更新 S2 checkpoint。输出验证 relevance loss、正例质量、yes Top-1、pairwise 和 no/null accuracy，并保留 JSON、中文摘要、SVG 与逐运行曲线。
 
+## Task-state 稳定化消融
+
+固定平衡四折、seed 23/47/71、20 steps 和学习率 3e-4 后，原 task-spatial 的验证 loss 为 1.7997、跨运行标准差 0.3822、训练/验证 gap 1.6897。task 分支 0.1 倍学习率将验证 loss 降至 1.4634，冻结 estimator 降至 1.5483，但仍保留明显过拟合。task-state 单位范数将验证 loss 降至 0.9953、标准差降至 0.0923、gap 降至 0.4658；yes Top-1、pairwise、no/null 分别为 73.6%、68.8%、68.8%。归一化再叠加 0.1 倍 task 学习率的验证 loss 为 1.0076，没有进一步收益。
+
+同预算 content/spatial 的验证 loss 分别为 1.0304/1.0281，yes Top-1 均为 69.4%，pairwise 为 65.3%/66.0%，no/null 为 60.4%/62.5%。因此“仅归一化 task-state”在当前单场景 40 卡片上通过了不劣于普通历史 reader 的机制门槛，主要修复的是 task query 尺度失衡。该证据仍不足以宣称跨场景或导航收益。
+
+现有闭环脚本加载的是更早的完整训练权重，不会加载本轮 reader-only 参数，不能直接用于本轮结论。下一步先把 `evidence_normalize_task_state=true` 和人工 relevance targets 接入可保存 adapter 的正式 S2 小样本训练；先通过 relevance、S2、trajectory 三类损失和冻结参数审计，再进入 1--4 episode 配对短闭环。
+
 ## Reader-only 矩阵与预算扫描
 
 初始按 episode ID 取模的 120-step 矩阵显示：content/spatial/task-spatial 的训练 loss 分别约 0.115/0.109/0.0001，而验证 loss 为 2.691/2.511/3.612，确认明显记忆训练集；各折 yes/no 从 5/5 到 8/1，也使 no/null accuracy 从 100% 到 0% 波动。
@@ -69,3 +77,23 @@
 - 80 steps：1.989/1.877/2.666。
 
 因此 20 steps 是唯一使 content/spatial 验证 loss 低于初始约 1.10 的预算。task-spatial 在 20 steps 时训练 loss 已约 0.11、验证 loss 却为 1.80，说明 task 分支容量过强。下一轮固定 20 steps，只做 task 参数 0.1 倍学习率、task-state 单位范数、冻结 estimator 三项单变量实验。
+
+## 集成 Reader 诊断、早停扫描与多场景扩展
+
+正式联合训练 adapter 的逐卡读出显示：8 个训练和 8 个 episode-held-out 样本的 Yes 全局 Top-1 均为 0，pairwise 分别为 40.0%/35.7%，而 No/null Top-1 均为 100%。历史权重归一化熵约 0.94，三张历史之间近似均匀；此前 relevance loss 的下降主要来自 `need_history=no` 卡片的 null 偏置，不能称为学会选证据。结果见 `annotation_reader_eval_joint_n20_v2_20260915_38ff89a/`。
+
+为区分容量不足和数据不足，新增显式 loss 权重及 adapter 暖启动接口，并做相同 8+8 episode 隔离的 relevance-only 扫描：
+
+|预算|训练 relevance|held-out relevance|判定|
+|---:|---:|---:|---|
+|20 steps|`1.1259 -> 0.9376`|`1.2104 -> 1.1007`|仅有早期方向性信号|
+|40 steps|`1.1260 -> 0.1419`|`1.2104 -> 2.8336`|过拟合|
+|80 steps|`1.1260 -> 0.000088`|`1.2104 -> 6.7051`|严重记忆训练集|
+
+20 步 adapter 的 held-out 历史内部 Top-1 为 75%（逐卡随机期望 50%），但含 null 的全局 Top-1 仍为 0，pairwise 为 35.7%，历史需求二分类为 50%。40/80 步训练拟合继续增强但 held-out 快速恶化，因此不再在单场景 8 样本上增加训练步数，也不从该 adapter 启动新闭环。训练入口的未来通过门槛已修正为：存在 held-out relevance 时必须同时改善，避免只凭训练集下降误判。
+
+原联合 adapter 的 4-episode 归因矩阵见 `closed_loop_matrix_20260915T095005Z_38ff89ad714f/`：B0/B1/B2/M1/M2Z/M2 的 SR/SPL 全为 0；B1 后的 NE 变化仍不能归因于历史，M2 与 M2Z 没有可辨识任务条件化增量。当前停止扩大闭环。
+
+服务器随后从官方 `InternRobotics/InternData-N1` 选择性下载并核验 6 个较小 R2R train 场景，共 2,471,101,485 字节、90 个 episode；LFS 大小/SHA256、安全解包均通过，报告为 `multiscene_bootstrap_20260915_38ff89a/`。自动挖掘和合并得到第二批 104 张因果卡片，覆盖 6 场景、52 episode，ID 冲突、未来泄漏和缺图均为 0，目录为 `annotation_multiscene_candidates_20260915_38ff89a/merged/`。
+
+多场景协议已改用 `(scene_id, episode_id, current_frame_id)` 唯一键，旧单场景 manifest 保持兼容；相关 evidence、dataset、推理和候选测试为 `49 passed`。第二批当前只有候选、没有自动伪标签。下一门槛是完成跨场景标注与独立复核，再按 scene-held-out 而非仅 episode-held-out 训练 reader；通过后才恢复联合 S2 训练和 1--4 episode 配对闭环。

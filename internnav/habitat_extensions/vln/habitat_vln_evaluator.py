@@ -149,6 +149,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             adapter_path = getattr(self.model_args, "evidence_adapter_path", None)
             if adapter_path:
                 configure_task_spatial_inference(model_config)
+                model_config.evidence_normalize_task_state = bool(
+                    getattr(self.model_args, "evidence_normalize_task_state", False)
+                )
+                model_config.evidence_latent_query_bypass = bool(
+                    getattr(self.model_args, "evidence_latent_query_bypass", True)
+                )
                 evidence_ablation = getattr(self.model_args, "evidence_ablation", "task_spatial")
                 if evidence_ablation not in {"null", "content", "spatial", "task_spatial"}:
                     raise ValueError(f"unsupported evidence ablation: {evidence_ablation}")
@@ -187,6 +193,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "evidence_enabled": bool(getattr(model.config, "use_evidence_memory", False)),
                     "evidence_adapter": self.adapter_manifest,
                     "evidence_ablation": getattr(model.config, "evidence_ablation", None),
+                    "evidence_normalize_task_state": bool(
+                        getattr(model.config, "evidence_normalize_task_state", False)
+                    ),
+                    "evidence_latent_query_bypass": bool(
+                        getattr(model.config, "evidence_latent_query_bypass", True)
+                    ),
+                    "num_history": self.model_args.num_history,
                     "depth_filter_backend": DEPTH_FILTER_BACKEND,
                     "dtw_backend": DTW_BACKEND,
                     "pose_source": "habitat_gps_compass_ideal_odometry",

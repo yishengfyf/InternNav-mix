@@ -9,11 +9,11 @@ from pathlib import Path
 VARIANTS = ("B0", "B1", "B2", "M1", "M2Z", "M2")
 LABELS = {
     "B0": "原 checkpoint",
-    "B1": "null adapter",
-    "B2": "历史视觉",
-    "M1": "历史视觉+位姿",
-    "M2Z": "M2 权重、task-state 置零",
-    "M2": "历史视觉+位姿+task-state",
+    "B1": "adapter 开启、历史输入置空",
+    "B2": "adapter 开启、仅历史视觉",
+    "M1": "adapter 开启、历史视觉+位姿",
+    "M2Z": "同 M2 权重、task-state 置零",
+    "M2": "完整历史视觉+位姿+task-state",
 }
 
 
@@ -129,11 +129,21 @@ def main():
     protocol_ok = paired and not manifests["B0"]["evidence_enabled"]
     protocol_ok &= all(manifests[name]["evidence_ablation"] == mode for name, mode in expected_ablation.items())
     protocol_ok &= all(variants[name]["evidence"]["events"] > 0 for name in VARIANTS[1:])
+    latent_query_bypass = {
+        manifests[name].get("evidence_latent_query_bypass", True) for name in VARIANTS[1:]
+    }
+    protocol_ok &= len(latent_query_bypass) == 1
+    non_base_adapters = {
+        manifests[name].get("evidence_adapter", {}).get("adapter_path") for name in VARIANTS[1:]
+    }
+    shared_adapter = len(non_base_adapters) == 1 and None not in non_base_adapters
     report = {
         "schema_version": 1,
         "status": "passed" if protocol_ok else "failed",
         "scope": "paired_closed_loop_attribution_smoke_not_generalization",
         "paired_episodes": paired,
+        "shared_adapter_across_ablations": shared_adapter,
+        "latent_query_bypass": latent_query_bypass.pop(),
         "episodes": episode_keys["B0"],
         "variants": variants,
         "delta_vs_b0": {
@@ -170,6 +180,7 @@ def main():
 - 配对 episode 数：`{len(episode_keys['B0'])}`
 - 数据：R2R `val_unseen` 排序后的相同 episodes
 - 在线输入协议：S2 为 RGB+Habitat GPS/compass 理想相对位姿；S1/执行使用 RGB-D+pose
+- 归因协议：`{'同一 adapter 权重，仅改变输入消融' if shared_adapter else '各组 adapter 权重不同，结果同时包含训练差异'}`
 
 |组别|含义|SR|SPL|NE (m)|S2 延迟 (s)|null 权重|历史读取质量|
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -177,7 +188,7 @@ def main():
 
 ## 简述与分析
 
-M2 相对 B0 的 `SR/SPL/NE` 差值为 `{m2_delta['sr']:+.3f}/{m2_delta['spl']:+.3f}/{m2_delta['ne']:+.3f}`；完整 M2 相对同权重 task-state 置零的 M2Z 差值为 `{task_delta['sr']:+.3f}/{task_delta['spl']:+.3f}/{task_delta['ne']:+.3f}`。B1 用于识别仅由 adapter 和继续训练带来的变化，B2/M1 用于区分历史视觉与位姿元数据。read/null 权重只用于检查模型是否读取历史；stage logits 尚无可靠阶段标签，不能解释为任务阶段准确率。本阶段是接口、行为方向和归因 smoke，不是 val-unseen 泛化结论。
+M2 相对 B0 的 `SR/SPL/NE` 差值为 `{m2_delta['sr']:+.3f}/{m2_delta['spl']:+.3f}/{m2_delta['ne']:+.3f}`；完整 M2 相对同权重 task-state 置零的 M2Z 差值为 `{task_delta['sr']:+.3f}/{task_delta['spl']:+.3f}/{task_delta['ne']:+.3f}`。B1 用于识别仅由 adapter/null evidence 带来的变化，B2/M1 用于区分历史视觉与位姿元数据。read/null 权重只用于检查模型是否读取历史；stage logits 尚无可靠阶段标签，不能解释为任务阶段准确率。本阶段是接口、行为方向和归因 smoke，不是 val-unseen 泛化结论。
 """
     (args.stage_dir / "summary.md").write_text(summary, encoding="utf-8")
     write_svg(report, args.stage_dir / "metrics.svg")

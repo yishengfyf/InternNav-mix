@@ -6,6 +6,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -105,6 +106,64 @@ def load_task_alignment_manifest(path):
     if manifest.get("unique_trajectories") != len(route_paraphrases):
         raise ValueError("task alignment manifest trajectory count is inconsistent")
     return result
+
+
+def load_evidence_relevance_manifest(path):
+    records = {}
+    with open(path, encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            annotation_id = str(row.get("annotation_id", ""))
+            match = re.search(r"_t(\d+)_", annotation_id)
+            if row.get("schema_version") != 1 or match is None:
+                raise ValueError(f"invalid relevance record at line {line_number}")
+            episode_id = int(row["episode_id"])
+            scene_id = str(row.get("scene_id", "")).strip() or None
+            current_frame_id = int(match.group(1))
+            frame_ids = [int(frame_id) for frame_id in row["candidate_frame_ids"]]
+            targets = [float(target) for target in row["targets"]]
+            if len(frame_ids) != len(targets) or not frame_ids:
+                raise ValueError(f"relevance candidates and targets disagree at line {line_number}")
+            if len(set(frame_ids)) != len(frame_ids) or any(frame_id >= current_frame_id for frame_id in frame_ids):
+                raise ValueError(f"relevance history is not a strict causal set at line {line_number}")
+            if any(target not in (-1.0, 0.0, 1.0) for target in targets):
+                raise ValueError(f"invalid relevance target at line {line_number}")
+            ordered = sorted(zip(frame_ids, targets))
+            key = (scene_id, episode_id, current_frame_id) if scene_id else (episode_id, current_frame_id)
+            if key in records:
+                raise ValueError(f"duplicate relevance key {key}")
+            records[key] = {
+                **row,
+                "current_frame_id": current_frame_id,
+                "candidate_frame_ids": [item[0] for item in ordered],
+                "targets": [item[1] for item in ordered],
+            }
+    if not records:
+        raise ValueError("relevance manifest is empty")
+    return records
+
+
+def evidence_sample_identity(sample):
+    """Return the scene-aware identity for a dataset tuple without changing its schema."""
+    video = sample[2]
+    scene_id = None
+    if video:
+        parents = Path(str(video)).parents
+        if len(parents) >= 2:
+            scene_id = parents[1].name
+    return scene_id, int(sample[0]), int(sample[7][0])
+
+
+def evidence_relevance_for_sample(records, sample):
+    """Resolve new scene-aware records, with compatibility for the single-scene pilot."""
+    scene_id, episode_id, frame_id = evidence_sample_identity(sample)
+    if scene_id is not None:
+        record = records.get((scene_id, episode_id, frame_id))
+        if record is not None:
+            return record
+    return records.get((episode_id, frame_id))
 
 
 R2R_125CM_0_30 = {
@@ -1015,6 +1074,18 @@ class NavPixelGoalDataset(Dataset):
             self.list_data_dict.extend(list_data_dict)
 
         self.num_history = data_args.num_history
+        self.evidence_relevance = {}
+        relevance_path = getattr(data_args, "evidence_relevance_path", None)
+        if relevance_path:
+            self.evidence_relevance = load_evidence_relevance_manifest(relevance_path)
+            if getattr(data_args, "evidence_relevance_only", False):
+                self.list_data_dict = [
+                    sample
+                    for sample in self.list_data_dict
+                    if evidence_relevance_for_sample(self.evidence_relevance, sample) is not None
+                ]
+                if not self.list_data_dict:
+                    raise ValueError("no dataset samples match the relevance manifest")
         self.task_alignment = None
         alignment_path = getattr(data_args, "task_alignment_path", None)
         if alignment_path:
@@ -1121,7 +1192,12 @@ class NavPixelGoalDataset(Dataset):
             pose,
             episode_poses,
         ) = self.list_data_dict[i]
-        history_id = select_causal_history_ids(start_frame_id, self.num_history)
+        relevance = evidence_relevance_for_sample(self.evidence_relevance, self.list_data_dict[i])
+        history_id = (
+            relevance["candidate_frame_ids"]
+            if relevance is not None
+            else select_causal_history_ids(start_frame_id, self.num_history)
+        )
 
         images = []
         grid_thws = []
@@ -1249,6 +1325,10 @@ class NavPixelGoalDataset(Dataset):
             data_dict["evidence_qualities"] = torch.from_numpy(history_metadata.qualities)
             data_dict["evidence_history_count"] = len(history_id)
             data_dict["evidence_image_count"] = len(images)
+            if relevance is not None:
+                data_dict["evidence_relevance_targets"] = torch.tensor(
+                    relevance["targets"], dtype=torch.float32
+                )
             instruction_ids = self.tokenizer(instruction, add_special_tokens=False)["input_ids"]
             data_dict["evidence_instruction_ids"] = torch.tensor(instruction_ids, dtype=torch.long)
 

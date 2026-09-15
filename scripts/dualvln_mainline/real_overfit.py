@@ -16,7 +16,8 @@ DATA_ROOT = Path("/data/usr_data/yifeifeng/internnav/dualvln_mainline/data/traj_
 CHECKPOINT = Path("/home/yifeifeng/workspace/InternNav/checkpoints/InternVLA-N1")
 TASK_ALIGNMENT = Path("/data/usr_data/yifeifeng/internnav/dualvln_mainline/data/task_alignment/r2r_17DRP5sb8fy.json")
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(ISOLATED_DEPS))
+if ISOLATED_DEPS.is_dir():
+    sys.path.append(str(ISOLATED_DEPS))
 os.environ["INTERNNAV_TRAJ_DATA_ROOT"] = str(DATA_ROOT)
 os.environ["INTERNNAV_CHECKPOINT_ROOT"] = str(CHECKPOINT.parent)
 
@@ -27,7 +28,12 @@ def write_curve(series, path, samples):
     all_values = [value for values in series.values() for value in values]
     low, high = min(all_values), max(all_values)
     span = max(high - low, 1e-8)
-    colors = {"total_loss": "#2b6cb0", "s2_loss": "#2f855a", "trajectory_loss": "#c05621"}
+    colors = {
+        "total_loss": "#2b6cb0",
+        "s2_loss": "#2f855a",
+        "trajectory_loss": "#c05621",
+        "evidence_relevance_loss": "#805ad5",
+    }
     lines = []
     legend = []
     for line_index, (name, values) in enumerate(series.items()):
@@ -60,6 +66,7 @@ def write_report(args, report, series=None):
 |指标|结果|
 |---|---:|
 |真实训练样本|{metrics.get('samples', 0)}|
+|Held-out 样本|{metrics.get('validation_samples', 0)}|
 |优化步数|{metrics.get('steps_completed', 0)}|
 |实验模式|{metrics.get('experiment', 'unknown')}|
 |训练结构|{metrics.get('architecture', 'unknown')}|
@@ -68,6 +75,8 @@ def write_report(args, report, series=None):
 |总 loss 下降|{metrics.get('total_loss_reduction', 0):.2%}|
 |初始/最终 S2 loss|{metrics.get('initial_s2_loss', 0):.6f} / {metrics.get('final_s2_loss', 0):.6f}|
 |初始/最终轨迹 loss|{metrics.get('initial_trajectory_loss', 0):.6f} / {metrics.get('final_trajectory_loss', 0):.6f}|
+|初始/最终 relevance loss|{metrics.get('initial_evidence_relevance_loss', 0):.6f} / {metrics.get('final_evidence_relevance_loss', 0):.6f}|
+|Held-out 初始/最终 relevance loss|{metrics.get('initial_validation_evidence_relevance_loss', 0):.6f} / {metrics.get('final_validation_evidence_relevance_loss', 0):.6f}|
 |初始/最终任务对比 loss|{metrics.get('initial_task_contrastive_loss', 0):.6f} / {metrics.get('final_task_contrastive_loss', 0):.6f}|
 |初始/最终软进度 loss|{metrics.get('initial_stage_loss', 0):.6f} / {metrics.get('final_stage_loss', 0):.6f}|
 |峰值本进程显存 MiB|{metrics.get('peak_allocated_mib', 0):.1f}|
@@ -162,6 +171,48 @@ def select_task_state_samples(dataset, samples, seed):
     return selected
 
 
+def select_relevance_samples(dataset, samples, seed, excluded_episodes=()):
+    from internnav.dataset.internvla_n1_lerobot_dataset import (
+        evidence_relevance_for_sample,
+        evidence_sample_identity,
+    )
+
+    if samples % 2:
+        raise ValueError("relevance samples must be divisible by two")
+    groups = {"yes": [], "no": []}
+    excluded_episodes = set(excluded_episodes)
+    for index, entry in enumerate(dataset.list_data_dict):
+        if entry[9] is None:
+            continue
+        scene_id, episode_id, _ = evidence_sample_identity(entry)
+        episode_key = (scene_id, episode_id)
+        if episode_key in excluded_episodes or episode_id in excluded_episodes:
+            continue
+        relevance = evidence_relevance_for_sample(dataset.evidence_relevance, entry)
+        if relevance is None or not relevance.get("supervised", False):
+            continue
+        state = "yes" if any(target > 0.5 for target in relevance["targets"]) else "no"
+        groups[state].append((index, episode_key))
+    rng = random.Random(seed)
+    for values in groups.values():
+        rng.shuffle(values)
+    selected, used_episodes = [], set()
+    for state in ("yes", "no"):
+        selected_for_state = 0
+        for index, episode_id in groups[state]:
+            if episode_id in used_episodes:
+                continue
+            selected.append(index)
+            used_episodes.add(episode_id)
+            selected_for_state += 1
+            if selected_for_state == samples // 2:
+                break
+    if len(selected) != samples:
+        raise RuntimeError(f"only found {len(selected)} balanced distinct-episode relevance samples")
+    rng.shuffle(selected)
+    return selected
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -169,19 +220,26 @@ def main():
     parser.add_argument("--commit", required=True)
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--samples", type=int, default=8)
+    parser.add_argument("--validation-samples", type=int, default=0)
     parser.add_argument("--sharded", action="store_true")
     parser.add_argument("--gradient-bypass", action="store_true")
     parser.add_argument("--bypass-mode", choices=("mean", "cross_attention"), default="mean")
     parser.add_argument("--bypass-scale", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--s2-loss-weight", type=float, default=1.0)
+    parser.add_argument("--trajectory-loss-weight", type=float, default=1.0)
     parser.add_argument("--task-state-lr-scale", type=float, default=1.0)
     parser.add_argument("--task-state-scale", type=float, default=1.0)
     parser.add_argument("--normalize-task-state", action="store_true")
     parser.add_argument("--freeze-task-state", action="store_true")
+    parser.add_argument("--freeze-trajectory-backbone", action="store_true")
     parser.add_argument("--instruction-only-task-state", action="store_true")
     parser.add_argument("--task-contrastive-weight", type=float, default=0.0)
     parser.add_argument("--stage-loss-weight", type=float, default=0.0)
+    parser.add_argument("--relevance-supervision", type=Path)
+    parser.add_argument("--relevance-loss-weight", type=float, default=0.0)
+    parser.add_argument("--init-adapter", type=Path)
     parser.add_argument("--task-contrastive-margin", type=float, default=0.2)
     parser.add_argument("--task-alignment-path", type=Path)
     parser.add_argument("--smoke-only", action="store_true")
@@ -194,29 +252,51 @@ def main():
     args = parser.parse_args()
     if (args.task_contrastive_weight > 0 or args.stage_loss_weight > 0) and args.task_alignment_path is None:
         args.task_alignment_path = TASK_ALIGNMENT
+    if bool(args.relevance_supervision) != (args.relevance_loss_weight > 0):
+        raise ValueError("relevance supervision and a positive relevance loss weight must be enabled together")
+    if args.relevance_supervision and args.experiment == "B0":
+        raise ValueError("B0 does not contain an evidence reader for relevance supervision")
+    if min(args.s2_loss_weight, args.trajectory_loss_weight, args.relevance_loss_weight) < 0:
+        raise ValueError("loss weights must be non-negative")
+    if args.s2_loss_weight + args.trajectory_loss_weight + args.relevance_loss_weight <= 0:
+        raise ValueError("at least one training loss weight must be positive")
+    if args.init_adapter and args.experiment == "B0":
+        raise ValueError("B0 cannot load an evidence adapter")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    trainable_allowlist = ["model.evidence_memory.*"]
+    if not args.freeze_task_state:
+        trainable_allowlist.insert(0, "model.task_state_estimator.*")
+    if not args.freeze_trajectory_backbone:
+        trainable_allowlist.extend(("model.cond_projector.*", "model.latent_queries"))
     planned_config = {
         "checkpoint": str(CHECKPOINT),
         "visible_gpu": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "samples": args.samples,
+        "validation_samples": args.validation_samples,
         "steps": args.steps,
         "batch_size": 1,
         "gradient_accumulation": 1,
         "seed": args.seed,
         "learning_rate": args.learning_rate,
+        "s2_loss_weight": args.s2_loss_weight,
+        "trajectory_loss_weight": args.trajectory_loss_weight,
         "task_state_learning_rate": args.learning_rate * args.task_state_lr_scale,
         "task_state_scale": args.task_state_scale,
         "normalize_task_state": args.normalize_task_state,
         "freeze_task_state": args.freeze_task_state,
+        "freeze_trajectory_backbone": args.freeze_trajectory_backbone,
         "instruction_only_task_state": args.instruction_only_task_state,
         "task_contrastive_weight": args.task_contrastive_weight,
         "stage_loss_weight": args.stage_loss_weight,
+        "relevance_supervision": str(args.relevance_supervision) if args.relevance_supervision else None,
+        "relevance_loss_weight": args.relevance_loss_weight,
+        "init_adapter": str(args.init_adapter) if args.init_adapter else None,
         "task_contrastive_margin": args.task_contrastive_margin,
         "task_alignment_path": str(args.task_alignment_path) if args.task_alignment_path else None,
         "smoke_only": args.smoke_only,
         "max_pixels": 224 * 224,
         "model_max_length": 1024,
-        "num_history": 2,
+        "num_history": 3 if args.relevance_supervision else 2,
         "memory_fraction": 0.50,
         "architecture": (
             "original checkpoint evaluation"
@@ -233,12 +313,7 @@ def main():
         "dtype": "bfloat16",
         "attention": "flash_attention_2",
         "trainable_dtype": "float32",
-        "trainable_allowlist": [
-            "model.task_state_estimator.*",
-            "model.evidence_memory.*",
-            "model.cond_projector.*",
-            "model.latent_queries",
-        ],
+        "trainable_allowlist": trainable_allowlist,
     }
     (args.output_dir / "config.json").write_text(
         json.dumps(planned_config, ensure_ascii=False, indent=2) + "\n",
@@ -259,10 +334,15 @@ def main():
         from transformers import AutoProcessor, AutoTokenizer
 
         from internnav.dataset.internvla_n1_lerobot_dataset import DataCollatorForSupervisedDataset, NavPixelGoalDataset
+        from internnav.dataset.internvla_n1_lerobot_dataset import (
+            evidence_relevance_for_sample,
+            evidence_sample_identity,
+        )
         from internnav.model.basemodel.internvla_n1.internvla_n1 import (
             InternVLAN1ForCausalLM,
             InternVLAN1ModelConfig,
         )
+        from internnav.model.basemodel.internvla_n1.evidence_inference import load_evidence_adapter
         from internnav.model.basemodel.internvla_n1.trainable import configure_trainable_parameters
 
         if not torch.cuda.is_available():
@@ -281,44 +361,94 @@ def main():
             video_max_total_pixels=1664 * 28 * 28,
             video_min_total_pixels=256 * 28 * 28,
             model_type="internvla-n1",
-            sample_step=4,
+            sample_step=1 if args.relevance_supervision else 4,
             predict_step_num=32,
             pixel_goal_only=True,
             num_future_steps=4,
-            num_history=2,
+            num_history=3 if args.relevance_supervision else 2,
             image_processor=processor.image_processor,
             transform_train=None,
             use_evidence_memory=args.experiment != "B0",
             task_state_supervision=args.task_contrastive_weight > 0 or args.stage_loss_weight > 0,
             task_alignment_path=str(args.task_alignment_path) if args.task_alignment_path else None,
+            evidence_relevance_path=(
+                str(args.relevance_supervision) if args.relevance_supervision else None
+            ),
+            evidence_relevance_only=bool(args.relevance_supervision),
             max_pixels=224 * 224,
             min_pixels=224 * 224,
         )
         dataset = NavPixelGoalDataset(tokenizer, data_args)
-        selected = (
-            select_task_state_samples(dataset, args.samples, args.seed)
-            if args.instruction_only_task_state
-            else [
+        if args.relevance_supervision:
+            selected = select_relevance_samples(dataset, args.samples, args.seed)
+        elif args.instruction_only_task_state:
+            selected = select_task_state_samples(dataset, args.samples, args.seed)
+        else:
+            selected = [
                 index
                 for index, entry in enumerate(dataset.list_data_dict)
                 if entry[7][0] >= 2 and entry[9] is not None
             ][: args.samples]
-        )
         if len(selected) != args.samples:
             raise RuntimeError(f"only found {len(selected)} eligible training samples")
+        validation_selected = []
+        if args.validation_samples:
+            if not args.relevance_supervision:
+                raise ValueError("held-out validation currently requires relevance supervision")
+            training_episodes = {
+                evidence_sample_identity(dataset.list_data_dict[index])[:2] for index in selected
+            }
+            validation_selected = select_relevance_samples(
+                dataset,
+                args.validation_samples,
+                args.seed + 100,
+                excluded_episodes=training_episodes,
+            )
         collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, num_evidence_tokens=4)
         cpu_batches = [collator([dataset[index]]) for index in selected]
-        manifest = [
-            {
+        cpu_validation_batches = [collator([dataset[index]]) for index in validation_selected]
+        manifest = []
+        for index in selected:
+            entry = dataset.list_data_dict[index]
+            item = {
                 "dataset_index": index,
-                "episode_id": dataset.list_data_dict[index][0],
-                "current_frame_id": dataset.list_data_dict[index][7][0],
+                "episode_id": entry[0],
+                "current_frame_id": entry[7][0],
             }
-            for index in selected
-        ]
+            scene_id, _, _ = evidence_sample_identity(entry)
+            item["scene_id"] = scene_id
+            relevance = evidence_relevance_for_sample(dataset.evidence_relevance, entry)
+            if relevance is not None:
+                item.update(
+                    annotation_id=relevance["annotation_id"],
+                    candidate_frame_ids=relevance["candidate_frame_ids"],
+                    relevance_targets=relevance["targets"],
+                )
+            manifest.append(item)
         (args.output_dir / "sample_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+        if validation_selected:
+            validation_manifest = []
+            for index in validation_selected:
+                entry = dataset.list_data_dict[index]
+                scene_id, _, _ = evidence_sample_identity(entry)
+                relevance = evidence_relevance_for_sample(dataset.evidence_relevance, entry)
+                validation_manifest.append(
+                    {
+                        "dataset_index": index,
+                        "scene_id": scene_id,
+                        "episode_id": entry[0],
+                        "current_frame_id": entry[7][0],
+                        "annotation_id": relevance["annotation_id"],
+                        "candidate_frame_ids": relevance["candidate_frame_ids"],
+                        "relevance_targets": relevance["targets"],
+                    }
+                )
+            (args.output_dir / "validation_manifest.json").write_text(
+                json.dumps(validation_manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
         config = InternVLAN1ModelConfig.from_pretrained(CHECKPOINT, local_files_only=True)
         config.use_evidence_memory = args.experiment != "B0"
@@ -328,17 +458,19 @@ def main():
         config.evidence_num_heads = 8
         config.evidence_num_stages = 4
         config.evidence_dropout = 0.0
-        config.s2_loss_weight = 1.0
-        config.trajectory_loss_weight = 1.0
+        config.s2_loss_weight = args.s2_loss_weight
+        config.trajectory_loss_weight = args.trajectory_loss_weight
         config.use_cache = False
         config.evidence_gradient_bypass = args.gradient_bypass
         config.evidence_gradient_bypass_scale = args.bypass_scale
         config.evidence_gradient_bypass_mode = args.bypass_mode
+        config.evidence_latent_query_bypass = not args.freeze_trajectory_backbone
         config.evidence_task_state_scale = args.task_state_scale
         config.evidence_normalize_task_state = args.normalize_task_state
         config.evidence_instruction_only_task_state = args.instruction_only_task_state
         config.evidence_task_contrastive_weight = args.task_contrastive_weight
         config.evidence_stage_loss_weight = args.stage_loss_weight
+        config.evidence_relevance_loss_weight = args.relevance_loss_weight
         config.evidence_task_contrastive_margin = args.task_contrastive_margin
         config.evidence_ablation = {
             "B0": "null",
@@ -349,9 +481,9 @@ def main():
         }[args.experiment]
         load_kwargs = {}
         if args.sharded:
-            load_kwargs.update(
-                device_map="auto", max_memory={0: "20GiB", 1: "20GiB", 2: "20GiB", 3: "20GiB", "cpu": "64GiB"}
-            )
+            max_memory = {index: "20GiB" for index in range(torch.cuda.device_count())}
+            max_memory["cpu"] = "64GiB"
+            load_kwargs.update(device_map="auto", max_memory=max_memory)
         model = InternVLAN1ForCausalLM.from_pretrained(
             CHECKPOINT,
             config=config,
@@ -368,18 +500,14 @@ def main():
         trainable = None
         if args.experiment != "B0":
             model.enable_input_require_grads()
-            allowlist = [
-                "model.evidence_memory.*",
-                "model.cond_projector.*",
-                "model.latent_queries",
-            ]
-            if not args.freeze_task_state:
-                allowlist.insert(0, "model.task_state_estimator.*")
-            trainable = configure_trainable_parameters(model, tuple(allowlist))
+            trainable = configure_trainable_parameters(model, tuple(trainable_allowlist))
             for parameter in model.parameters():
                 if parameter.requires_grad:
                     parameter.data = parameter.data.float()
             model.get_model().reset_evidence_parameters()
+            init_adapter_manifest = (
+                load_evidence_adapter(model, args.init_adapter) if args.init_adapter else None
+            )
         input_device = model.get_input_embeddings().weight.device
         completed_config = {
             **planned_config,
@@ -389,17 +517,19 @@ def main():
                 trainable.frozen_parameters if trainable else sum(p.numel() for p in model.parameters())
             ),
             "matched_parameters": trainable.matched_parameters if trainable else [],
+            "init_adapter_manifest": init_adapter_manifest if args.experiment != "B0" else None,
         }
         (args.output_dir / "config.json").write_text(
             json.dumps(completed_config, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
 
-        def evaluate():
+        def evaluate(batches):
             model.eval()
-            totals, s2_values, trajectory_values, contrastive_values, stage_values = [], [], [], [], []
+            totals, s2_values, trajectory_values = [], [], []
+            contrastive_values, stage_values, relevance_values = [], [], []
             with torch.no_grad():
-                for sample_idx, cpu_batch in enumerate(cpu_batches):
+                for sample_idx, cpu_batch in enumerate(batches):
                     torch.manual_seed(args.seed + 1000 + sample_idx)
                     torch.cuda.manual_seed_all(args.seed + 1000 + sample_idx)
                     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -411,15 +541,29 @@ def main():
                         float(output.task_contrastive_loss) if output.task_contrastive_loss is not None else 0.0
                     )
                     stage_values.append(float(output.stage_loss) if output.stage_loss is not None else 0.0)
+                    relevance_values.append(
+                        float(output.evidence_relevance_loss)
+                        if output.evidence_relevance_loss is not None
+                        else 0.0
+                    )
             return (
                 sum(totals) / len(totals),
                 sum(s2_values) / len(s2_values),
                 sum(trajectory_values) / len(trajectory_values),
                 sum(contrastive_values) / len(contrastive_values),
                 sum(stage_values) / len(stage_values),
+                sum(relevance_values) / len(relevance_values),
             )
 
-        initial_total, initial_s2, initial_trajectory, initial_contrastive, initial_stage = evaluate()
+        (
+            initial_total,
+            initial_s2,
+            initial_trajectory,
+            initial_contrastive,
+            initial_stage,
+            initial_relevance,
+        ) = evaluate(cpu_batches)
+        initial_validation = evaluate(cpu_validation_batches) if cpu_validation_batches else None
         if args.experiment == "B0":
             finite = all(
                 torch.isfinite(torch.tensor(value)) for value in (initial_total, initial_s2, initial_trajectory)
@@ -442,6 +586,8 @@ def main():
                     "final_task_contrastive_loss": initial_contrastive,
                     "initial_stage_loss": initial_stage,
                     "final_stage_loss": initial_stage,
+                    "initial_evidence_relevance_loss": initial_relevance,
+                    "final_evidence_relevance_loss": initial_relevance,
                     "duration_s": time.monotonic() - start,
                     "trainable_parameters": 0,
                     "frozen_gradient_parameters": 0,
@@ -470,11 +616,17 @@ def main():
         optimizer = torch.optim.AdamW(optimizer_groups)
         model.train()
         gradient_audit = {}
-        audit_loss_names = ["s2_loss", "trajectory_loss"]
+        audit_loss_names = []
+        if args.s2_loss_weight > 0:
+            audit_loss_names.append("s2_loss")
+        if args.trajectory_loss_weight > 0:
+            audit_loss_names.append("trajectory_loss")
         if args.task_contrastive_weight > 0:
             audit_loss_names.append("task_contrastive_loss")
         if args.stage_loss_weight > 0:
             audit_loss_names.append("stage_loss")
+        if args.relevance_loss_weight > 0:
+            audit_loss_names.append("evidence_relevance_loss")
         for loss_name in audit_loss_names:
             optimizer.zero_grad(set_to_none=True)
             torch.manual_seed(args.seed + 2000)
@@ -491,18 +643,28 @@ def main():
         nonfinite_audit = sum(
             group["nonfinite_gradients"] for loss_summary in gradient_audit.values() for group in loss_summary.values()
         )
-        required_gradient_groups = {
-            "s2_loss": (
+        required_gradient_groups = {}
+        if args.s2_loss_weight > 0:
+            required_gradient_groups["s2_loss"] = (
                 ("task_state_estimator", "evidence_memory")
                 if args.experiment == "M2" and not args.freeze_task_state
                 else ("evidence_memory",)
-            ),
-            "trajectory_loss": ("latent_queries", "cond_projector"),
-        }
+            )
+        if args.trajectory_loss_weight > 0:
+            required_gradient_groups["trajectory_loss"] = (
+                ("evidence_memory",)
+                if args.freeze_trajectory_backbone
+                else ("latent_queries", "cond_projector")
+            )
         if args.task_contrastive_weight > 0:
             required_gradient_groups["task_contrastive_loss"] = ("task_state_estimator",)
         if args.stage_loss_weight > 0:
             required_gradient_groups["stage_loss"] = ("task_state_estimator", "evidence_memory")
+        if args.relevance_loss_weight > 0:
+            required_gradient_groups["evidence_relevance_loss"] = (
+                "task_state_estimator",
+                "evidence_memory",
+            )
         missing_gradient_groups = [
             f"{loss_name}:{group_name}"
             for loss_name, group_names in required_gradient_groups.items()
@@ -521,6 +683,7 @@ def main():
                 "initial_trajectory_loss": initial_trajectory,
                 "initial_task_contrastive_loss": initial_contrastive,
                 "initial_stage_loss": initial_stage,
+                "initial_evidence_relevance_loss": initial_relevance,
                 "gradient_audit_nonfinite": nonfinite_audit,
                 "missing_gradient_groups": missing_gradient_groups,
             }
@@ -530,6 +693,8 @@ def main():
         if missing_gradient_groups:
             raise FloatingPointError(f"pre-update gradient audit found zero gradients: {missing_gradient_groups}")
         series = {"total_loss": [], "s2_loss": [], "trajectory_loss": []}
+        if args.relevance_loss_weight > 0:
+            series["evidence_relevance_loss"] = []
         with (args.output_dir / "train_log.jsonl").open("w", encoding="utf-8") as log_file:
             for step in range(args.steps):
                 batch = move_batch(cpu_batches[step % len(cpu_batches)], input_device)
@@ -544,20 +709,20 @@ def main():
                     error_if_nonfinite=True,
                 )
                 optimizer.step()
-                values = (
-                    float(output.loss.detach()),
-                    float(output.s2_loss.detach()),
-                    float(output.trajectory_loss.detach()),
-                )
-                for key, value in zip(series, values):
-                    series[key].append(value)
+                values = {
+                    "total_loss": float(output.loss.detach()),
+                    "s2_loss": float(output.s2_loss.detach()),
+                    "trajectory_loss": float(output.trajectory_loss.detach()),
+                }
+                if args.relevance_loss_weight > 0:
+                    values["evidence_relevance_loss"] = float(output.evidence_relevance_loss.detach())
+                for key in series:
+                    series[key].append(values[key])
                 log_file.write(
                     json.dumps(
                         {
                             "step": step,
-                            "total_loss": values[0],
-                            "s2_loss": values[1],
-                            "trajectory_loss": values[2],
+                            **values,
                             "task_contrastive_loss": (
                                 float(output.task_contrastive_loss.detach())
                                 if output.task_contrastive_loss is not None
@@ -571,28 +736,51 @@ def main():
                     )
                     + "\n"
                 )
-        final_total, final_s2, final_trajectory, final_contrastive, final_stage = evaluate()
+        (
+            final_total,
+            final_s2,
+            final_trajectory,
+            final_contrastive,
+            final_stage,
+            final_relevance,
+        ) = evaluate(cpu_batches)
+        final_validation = evaluate(cpu_validation_batches) if cpu_validation_batches else None
         reduction = 1.0 - final_total / initial_total
         frozen_gradient_parameters = sum(
             parameter.numel()
             for parameter in model.parameters()
             if not parameter.requires_grad and parameter.grad is not None
         )
-        finite_final = all(
-            torch.isfinite(torch.tensor(value)) for value in (final_total, final_s2, final_trajectory)
-        )
+        final_losses = [final_total, final_s2, final_trajectory]
+        if args.relevance_loss_weight > 0:
+            final_losses.append(final_relevance)
+        finite_final = all(torch.isfinite(torch.tensor(value)) for value in final_losses)
         passed = (
             finite_final and frozen_gradient_parameters == 0
             if args.smoke_only
             else (
                 reduction >= 0.30
-                and final_s2 < initial_s2
-                and final_trajectory < initial_trajectory
+                and (args.s2_loss_weight <= 0 or final_s2 < initial_s2)
+                and (args.trajectory_loss_weight <= 0 or final_trajectory < initial_trajectory)
+                and (args.relevance_loss_weight <= 0 or final_relevance < initial_relevance)
+                and (
+                    initial_validation is None
+                    or args.relevance_loss_weight <= 0
+                    or final_validation[5] < initial_validation[5]
+                )
                 and frozen_gradient_parameters == 0
             )
         )
+        adapter_prefixes = (
+            "model.task_state_estimator.",
+            "model.evidence_memory.",
+            "model.cond_projector.",
+            "model.latent_queries",
+        )
         adapter_state = {
-            name: parameter.detach().cpu() for name, parameter in model.named_parameters() if parameter.requires_grad
+            name: parameter.detach().cpu()
+            for name, parameter in model.named_parameters()
+            if any(name == prefix or name.startswith(prefix) for prefix in adapter_prefixes)
         }
         torch.save(adapter_state, args.output_dir / "adapter_state.pt")
         report["status"] = "passed" if passed else "failed"
@@ -602,6 +790,7 @@ def main():
         report["metrics"].update(
             {
                 "samples": args.samples,
+                "validation_samples": len(cpu_validation_batches),
                 "steps_completed": args.steps,
                 "initial_total_loss": initial_total,
                 "final_total_loss": final_total,
@@ -614,6 +803,19 @@ def main():
                 "final_task_contrastive_loss": final_contrastive,
                 "initial_stage_loss": initial_stage,
                 "final_stage_loss": final_stage,
+                "initial_evidence_relevance_loss": initial_relevance,
+                "final_evidence_relevance_loss": final_relevance,
+                "initial_validation_total_loss": initial_validation[0] if initial_validation else 0.0,
+                "final_validation_total_loss": final_validation[0] if final_validation else 0.0,
+                "initial_validation_s2_loss": initial_validation[1] if initial_validation else 0.0,
+                "final_validation_s2_loss": final_validation[1] if final_validation else 0.0,
+                "initial_validation_trajectory_loss": initial_validation[2] if initial_validation else 0.0,
+                "final_validation_trajectory_loss": final_validation[2] if final_validation else 0.0,
+                "initial_validation_evidence_relevance_loss": initial_validation[5] if initial_validation else 0.0,
+                "final_validation_evidence_relevance_loss": final_validation[5] if final_validation else 0.0,
+                "heldout_relevance_improved": (
+                    final_validation[5] < initial_validation[5] if initial_validation else None
+                ),
                 "peak_allocated_mib": max(per_gpu_peak_mib.values()),
                 "per_gpu_peak_allocated_mib": per_gpu_peak_mib,
                 "frozen_gradient_parameters": frozen_gradient_parameters,
@@ -626,7 +828,7 @@ def main():
             if args.smoke_only and passed
             else "真实 R2R train 样本与 InternVLA-N1 checkpoint 已完成过拟合门槛。"
             if passed
-            else "训练完成但 S2/trajectory 双 loss 未同时达到 30% 总下降门槛，需要依据曲线调整学习率、步数或训练范围后重试。"
+            else "训练完成但 relevance/S2/trajectory loss 未同时通过总下降门槛，需要依据曲线调整权重、学习率或步数后重试。"
         )
     except Exception as error:
         error_traceback = traceback.format_exc()

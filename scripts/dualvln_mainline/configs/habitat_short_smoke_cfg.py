@@ -17,6 +17,9 @@ evidence_ablation = {
     "M2Z": "spatial",
     "M2": "task_spatial",
 }.get(variant)
+normalize_task_state = os.environ.get("DUALVLN_NORMALIZE_TASK_STATE", "0") == "1"
+latent_query_bypass = os.environ.get("DUALVLN_LATENT_QUERY_BYPASS", "1") == "1"
+num_history = int(os.environ.get("DUALVLN_NUM_HISTORY", "2"))
 
 eval_cfg = EvalCfg(
     agent=AgentCfg(
@@ -26,7 +29,9 @@ eval_cfg = EvalCfg(
             "model_path": "/home/yifeifeng/workspace/InternNav/checkpoints/InternVLA-N1",
             "evidence_adapter_path": adapter_path,
             "evidence_ablation": evidence_ablation,
-            "num_history": 2,
+            "evidence_normalize_task_state": normalize_task_state,
+            "evidence_latent_query_bypass": latent_query_bypass,
+            "num_history": num_history,
             "resize_w": 384,
             "resize_h": 384,
             "max_new_tokens": 128,
@@ -48,7 +53,7 @@ eval_cfg = EvalCfg(
         "max_steps_per_episode": int(os.environ.get("DUALVLN_MAX_STEPS", "24")),
         "protocol_name": "r2r_val_unseen_sorted_ideal_pose_short_smoke_v1",
         "seed": int(os.environ.get("DUALVLN_CLOSED_LOOP_SEED", "23")),
-        "port": "2347",
+        "port": os.environ.get("DUALVLN_DIST_PORT", "2347"),
         "dist_url": "env://",
     },
 )

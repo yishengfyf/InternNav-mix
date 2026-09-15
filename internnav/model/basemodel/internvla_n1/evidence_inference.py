@@ -29,6 +29,7 @@ TASK_SPATIAL_INFERENCE_CONFIG = {
     "evidence_gradient_bypass": True,
     "evidence_gradient_bypass_mode": "cross_attention",
     "evidence_gradient_bypass_scale": 0.5,
+    "evidence_latent_query_bypass": True,
     "evidence_ablation": "task_spatial",
     "evidence_task_state_scale": 1.0,
     "evidence_normalize_task_state": False,

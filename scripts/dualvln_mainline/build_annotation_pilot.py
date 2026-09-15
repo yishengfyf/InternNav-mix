@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import shutil
 from pathlib import Path
 
@@ -123,6 +124,70 @@ def candidate_score(i, j, poses, actions):
     return score, rp
 
 
+def select_history_candidates(i, pool, actions, strategy):
+    """Pick causal frames with complementary temporal and spatial roles."""
+    if strategy == "legacy":
+        pool = sorted(pool, reverse=True)
+        strata = [[], [], []]
+        for entry in pool:
+            age = i - entry[1]
+            strata[0 if age <= 3 else 1 if age <= 10 else 2].append(entry)
+        selected = [bucket[0] for bucket in strata if bucket]
+        selected.extend(entry for entry in pool if entry not in selected)
+        return selected[:3]
+
+    selected = []
+
+    def add_best(entries, key):
+        remaining = [entry for entry in entries if entry not in selected]
+        if remaining:
+            selected.append(max(remaining, key=key))
+
+    recent = [entry for entry in pool if 2 <= i - entry[1] <= 4]
+    add_best(recent, lambda entry: (-(i - entry[1]), entry[0]))
+
+    transition = [
+        entry for entry in pool
+        if 4 <= i - entry[1] <= 24 and entry[2]["distance"] >= 0.35
+    ]
+    add_best(
+        transition,
+        lambda entry: (
+            abs(entry[2]["dyaw_rad"]),
+            action_name(actions[i]) != action_name(actions[entry[1]]),
+            min(entry[2]["distance"], 4.0),
+            i - entry[1],
+        ),
+    )
+
+    anchor = [
+        entry for entry in pool
+        if i - entry[1] >= 8 and entry[2]["distance"] >= 0.75
+    ]
+    add_best(
+        anchor,
+        lambda entry: (
+            min(entry[2]["distance"], 6.0),
+            i - entry[1],
+            abs(entry[2]["dyaw_rad"]),
+        ),
+    )
+
+    fallback = sorted(
+        pool,
+        key=lambda entry: (
+            entry[2]["distance"] >= 0.35,
+            min(entry[2]["distance"], 6.0),
+            abs(entry[2]["dyaw_rad"]),
+            i - entry[1],
+            entry[0],
+        ),
+        reverse=True,
+    )
+    selected.extend(entry for entry in fallback if entry not in selected)
+    return selected[:3]
+
+
 def local_goal(value):
     goal = as_float_list(value)
     if len(goal) >= 2 and goal[0] >= 0 and goal[1] >= 0:
@@ -151,6 +216,11 @@ def main():
     ap.add_argument("--limit", type=int, default=40)
     ap.add_argument("--seed", type=int, default=20260914)
     ap.add_argument("--max-episodes", type=int, default=0)
+    ap.add_argument(
+        "--selection-strategy",
+        choices=("legacy", "phase_diverse"),
+        default="phase_diverse",
+    )
     args = ap.parse_args()
     try:
         import pyarrow.parquet as pq
@@ -205,27 +275,22 @@ def main():
                 pool.append((score, j, rp))
             if len(pool) < 2:
                 continue
-            # Stratify ages so cards contain recent, medium and older evidence.
-            pool.sort(reverse=True)
-            strata = [[], [], []]
-            for entry in pool:
-                age = i - entry[1]
-                strata[0 if age <= 3 else 1 if age <= 10 else 2].append(entry)
-            selected = []
-            for bucket in strata:
-                if bucket:
-                    selected.append(bucket[0])
-            for entry in pool:
-                if len(selected) >= 3:
-                    break
-                if entry not in selected:
-                    selected.append(entry)
-            selected = selected[:3]
+            selected = select_history_candidates(
+                i, pool, decision_actions, args.selection_strategy
+            )
             if len(selected) < 2:
                 continue
             rng.shuffle(selected)
             labels = [chr(ord("A") + k) for k in range(len(selected))]
-            annotation_id = "r2r_train_ep%06d_t%04d_%s" % (ep_id, i, hashlib.sha1((str(ep_id)+":"+str(i)).encode()).hexdigest()[:8])
+            scene_id = str(episode.get("scene_id", episode.get("scene", args.data_root.name)))
+            scene_slug = re.sub(r"[^A-Za-z0-9_-]", "_", Path(scene_id).stem)
+            identity = f"{scene_slug}:{ep_id}:{i}"
+            annotation_id = "r2r_train_%s_ep%06d_t%04d_%s" % (
+                scene_slug,
+                ep_id,
+                i,
+                hashlib.sha1(identity.encode()).hexdigest()[:8],
+            )
             future_ok = all(j < i for _, j, _ in selected)
             if not future_ok:
                 audit["causal_violations"] += 1
@@ -240,7 +305,7 @@ def main():
                 continue
             item = {
                 "schema_version": 1, "annotation_id": annotation_id, "split": "train",
-                "scene_id": episode.get("scene_id", episode.get("scene", args.data_root.name)),
+                "scene_id": scene_id,
                 "episode_id": str(ep_id), "current_frame_id": i,
                 "instruction": instruction, "candidate_frame_ids": [j for _, j, _ in selected],
                 "candidate_display_order": labels,
@@ -297,9 +362,16 @@ def main():
             rows.append('<h3>历史 %s（frame %s，age %s，距当前 %.2fm，朝向 %.1f°）</h3><img src="../%s" width="320">' % (c["label"], c["frame_id"], c["age"], rp["distance"], rp["dyaw_deg"], c["image_path"]))
         rows.append("<p>人工填写：need_history / preferred_evidence / evidence_role / misleading_evidence / confidence / short_reason</p>")
         (cards / (item["annotation_id"] + ".html")).write_text("<html><meta charset='utf-8'><body>%s</body></html>" % "\n".join(rows), encoding="utf-8")
+    selected_candidates = [c for item in candidates for c in item["candidates"]]
+    selected_count = max(1, len(selected_candidates))
     metrics = {"candidate_count": len(candidates), "episodes_with_candidates": len(set(x["episode_id"] for x in candidates)),
                "causal_all_history_before_current": audit["causal_violations"] == 0,
-               "future_input_exposed": False, "missing_rgb_candidates": audit["missing_rgb"]}
+               "future_input_exposed": False, "missing_rgb_candidates": audit["missing_rgb"],
+               "selection_strategy": args.selection_strategy,
+               "selected_age_mean": sum(c["age"] for c in selected_candidates) / selected_count,
+               "selected_distance_mean_m": sum(c["relative_pose"]["distance"] for c in selected_candidates) / selected_count,
+               "selected_abs_yaw_mean_deg": sum(abs(c["relative_pose"]["dyaw_deg"]) for c in selected_candidates) / selected_count,
+               "degenerate_pose_rate": sum(c["relative_pose"]["distance"] < 0.05 for c in selected_candidates) / selected_count}
     (args.output / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n")
     summary = """# DualVLN 人工证据标注 Pilot 自动挖掘结果
 
@@ -310,9 +382,12 @@ def main():
 - 因果前缀检查：%s
 - 未来输入暴露：否
 - RGB 缺失候选：%d
+- 选择策略：`%s`
+- 历史平均年龄：`%.2f` 帧；平均位移：`%.2f` 米；平均朝向差：`%.1f` 度
+- 退化位姿比例（位移 < 0.05 米）：`%.1f%%`
 
 下一步：先抽查 HTML 卡片和图像，再由第一位标注者填写 30--40 张；其中约 20--30%% 交给第二位标注者复核。只有一致性和 relevance probe 达标后，才扩展到 100--200 张。
-""" % (metrics["candidate_count"], metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败", metrics["missing_rgb_candidates"])
+""" % (metrics["candidate_count"], metrics["episodes_with_candidates"], "通过" if metrics["causal_all_history_before_current"] else "失败", metrics["missing_rgb_candidates"], metrics["selection_strategy"], metrics["selected_age_mean"], metrics["selected_distance_mean_m"], metrics["selected_abs_yaw_mean_deg"], 100 * metrics["degenerate_pose_rate"])
     (args.output / "summary.md").write_text(summary, encoding="utf-8")
     (args.output / "README.md").write_text("# 标注目录使用说明\n\n推荐启动本地静态服务后打开 `index.html`：页面支持逐张填写、浏览器自动暂存、导入已有 JSONL 和导出标注 JSONL。也可以打开 `cards/` 中的只读 HTML 抽查候选。禁止修改帧号、位姿、动作和因果检查字段；人工只填写 `annotation` 字段。\n", encoding="utf-8")
     (args.output / "run.log").write_text(json.dumps({"status": "completed", **metrics}, ensure_ascii=False) + "\n", encoding="utf-8")

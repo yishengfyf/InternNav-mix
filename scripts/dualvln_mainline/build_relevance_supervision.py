@@ -41,6 +41,7 @@ def build_rows(annotations, manifest):
             {
                 "schema_version": 1,
                 "annotation_id": annotation_id,
+                "scene_id": str(source.get("scene_id", "")),
                 "episode_id": str(source["episode_id"]),
                 "candidate_labels": labels,
                 "candidate_frame_ids": [candidate["frame_id"] for candidate in source["candidates"]],

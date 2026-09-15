@@ -573,7 +573,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
             traj_hidden_states = torch.stack(traj_hidden_states, dim=0)
             self._record_numeric("trajectory_hidden_states", traj_hidden_states)
-            if gradient_bypass:
+            if gradient_bypass and getattr(self.config, "evidence_latent_query_bypass", True):
                 latent_queries = self.get_model().latent_queries.to(
                     device=traj_hidden_states.device, dtype=traj_hidden_states.dtype
                 )
@@ -806,10 +806,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         hidden_states = outputs.hidden_states[-1][:, -N_QUERY:, :]
         if gradient_bypass:
             hidden_states = hidden_states.detach()
-            residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
-            hidden_states = hidden_states + residual_scale * latent_queries.to(
-                hidden_states.device, hidden_states.dtype
-            )
+            if getattr(self.config, "evidence_latent_query_bypass", True):
+                residual_scale = float(getattr(self.config, "evidence_gradient_bypass_scale", 0.1))
+                hidden_states = hidden_states + residual_scale * latent_queries.to(
+                    hidden_states.device, hidden_states.dtype
+                )
             if evidence_output is not None:
                 hidden_states = self._apply_late_evidence_adapter(hidden_states, evidence_output)
 
