@@ -34,14 +34,14 @@ def sha256(path):
 
 def main():
     parser = argparse.ArgumentParser(description="提取人工标注卡片的冻结 InternVLA 特征")
-    parser.add_argument("--annotations", required=True, type=Path)
+    parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--base-dir", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--max-pixels", type=int, default=224 * 224)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    rows = read_jsonl(args.annotations)
+    rows = read_jsonl(args.manifest)
 
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, local_files_only=True, use_fast=False)
     processor = AutoProcessor.from_pretrained(args.checkpoint, local_files_only=True)
@@ -77,7 +77,6 @@ def main():
             tokenized = tokenizer(row["instruction"], return_tensors="pt", add_special_tokens=True)
             input_ids = tokenized["input_ids"].to(model.get_input_embeddings().weight.device)
             instruction = model.get_input_embeddings()(input_ids).float().mean(dim=1).cpu()[0]
-            preferred = set(row.get("annotation", {}).get("preferred_evidence", []))
             for candidate_index, (label, _, candidate) in enumerate(entries[1:], 1):
                 pose = candidate["relative_pose"]
                 visual.append(torch.stack((pooled[0], pooled[candidate_index])).numpy())
@@ -85,7 +84,7 @@ def main():
                 annotation_ids.append(row["annotation_id"])
                 episode_ids.append(str(row["episode_id"]))
                 candidate_labels.append(label)
-                targets.append(int(label in preferred))
+                targets.append(0)
                 metadata.append(
                     [
                         candidate["age"], pose["dx"], pose["dy"], pose["distance"],
@@ -118,11 +117,10 @@ def main():
         "status": "completed",
         "rows": len(rows),
         "candidate_examples": len(targets),
-        "positive_examples": int(sum(targets)),
         "feature_dim": int(visual[0].shape[-1]),
         "checkpoint": str(args.checkpoint),
         "checkpoint_config_sha256": sha256(args.checkpoint / "config.json"),
-        "annotations_sha256": sha256(args.annotations),
+        "source_manifest_sha256": sha256(args.manifest),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "gpu_peak_mb": torch.cuda.max_memory_allocated() / 2**20,
     }

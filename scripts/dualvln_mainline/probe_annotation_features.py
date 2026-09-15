@@ -12,6 +12,27 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 
+def read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def attach_targets(data, annotation_path):
+    annotations = {row["annotation_id"]: row for row in read_jsonl(annotation_path)}
+    targets = []
+    missing = set()
+    for annotation_id, label in zip(data["annotation_ids"], data["candidate_labels"]):
+        row = annotations.get(str(annotation_id))
+        if row is None:
+            missing.add(str(annotation_id))
+            targets.append(0)
+            continue
+        preferred = set(row.get("annotation", {}).get("preferred_evidence", []))
+        targets.append(int(str(label) in preferred))
+    if missing:
+        raise ValueError("特征中存在人工文件未覆盖的 annotation_id: " + ", ".join(sorted(missing)))
+    return {**data, "targets": np.asarray(targets, dtype=np.int64)}
+
+
 def feature_matrix(data, variant):
     current, history = data["visual"][:, 0], data["visual"][:, 1]
     if variant == "pose_age":
@@ -97,12 +118,14 @@ def write_svg(summary, path):
 def main():
     parser = argparse.ArgumentParser(description="运行冻结 InternVLA 特征 relevance probe")
     parser.add_argument("--features", required=True, type=Path)
+    parser.add_argument("--annotations", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--seeds", nargs="+", type=int, default=[23, 47, 71])
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     loaded = np.load(args.features)
     data = {key: loaded[key] for key in loaded.files}
+    data = attach_targets(data, args.annotations)
     positive_cards = np.unique(data["annotation_ids"][data["targets"] == 1])
     useful = np.isin(data["annotation_ids"], positive_cards)
     data = {key: value[useful] for key, value in data.items()}

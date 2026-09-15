@@ -49,3 +49,18 @@ def test_grouped_probe_evaluates_every_card_without_episode_leakage():
     for fold in result["folds"]:
         assert fold["train_episodes"] == 6
         assert fold["test_episodes"] == 2
+
+
+def test_attach_targets_preserves_multiple_positive_candidates(tmp_path):
+    data = fake_data()
+    annotation_ids = np.asarray(["card", "card", "card"])
+    labels = np.asarray(["A", "B", "C"])
+    annotations = tmp_path / "annotations.jsonl"
+    annotations.write_text(
+        '{"annotation_id":"card","annotation":{"preferred_evidence":["A","C"]}}\n',
+        encoding="utf-8",
+    )
+    attached = MODULE.attach_targets(
+        {**data, "annotation_ids": annotation_ids, "candidate_labels": labels}, annotations
+    )
+    assert attached["targets"].tolist() == [1, 0, 1]

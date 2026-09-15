@@ -37,3 +37,5 @@
 数据格式和因果审计已达到门槛。简单年龄/位姿启发式没有超过随机，这不能推出人工标签不可用；它说明人工选择不能被“越近越好”的位置偏差解释。真正的下一层门槛改为：冻结 InternVLA 视觉特征在 episode 隔离的 relevance probe 中能否稳定高于同卡片随机多正例基线。因此本轮暂不启动 S2/evidence reader 训练、不进入短闭环，也不把自动模型判断混入人工文件。
 
 新增冻结特征两阶段入口：`extract_annotation_features.py` 在单张空闲 GPU 上只做 InternVLA 视觉塔与词嵌入前向，缓存当前/历史 RGB、指令和 pose/age；`probe_annotation_features.py` 在缓存上按 episode 四折、多 seed 比较 `pose_age`、`rgb_text` 与 `rgb_text_pose`。预设门槛为最佳 Top-1 高于随机 5 个百分点且 pairwise accuracy 超过 55%。通过后才实现多正例 reader loss；未通过则先做独立复核或第二场景 pilot。
+
+隐私边界：服务器只读取不含人工答案的 candidate manifest 并生成冻结特征；人工 JSONL 不上传。特征回传本地后，`probe_annotation_features.py` 才按 `annotation_id + candidate label` 关联人工多正例并计算指标。
