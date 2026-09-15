@@ -47,6 +47,7 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, local_files_only=True, use_fast=False)
     processor = AutoProcessor.from_pretrained(args.checkpoint, local_files_only=True)
+    processor.image_processor.max_pixels = args.max_pixels
     config = InternVLAN1ModelConfig.from_pretrained(args.checkpoint, local_files_only=True)
     config.use_evidence_memory = False
     model = InternVLAN1ForCausalLM.from_pretrained(
@@ -69,7 +70,7 @@ def main():
                 (candidate["label"], candidate["image_path"], candidate) for candidate in row["candidates"]
             ]
             images = [Image.open(args.base_dir / image_path).convert("RGB") for _, image_path, _ in entries]
-            inputs = processor(images=images, return_tensors="pt", max_pixels=args.max_pixels)
+            inputs = processor.image_processor(images=images, return_tensors="pt")
             pixels = inputs["pixel_values"].to(device=device, dtype=model.visual.dtype)
             grids = inputs["image_grid_thw"].to(device)
             image_tokens = model.visual(pixels, grid_thw=grids)
